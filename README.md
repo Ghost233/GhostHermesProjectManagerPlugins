@@ -2,7 +2,7 @@
 
 Hermes 分层协作与 Codex 监督插件。当前阶段为规格规划，尚未实现或安装插件。
 
-- [决策地图](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/1)：共享的目标、研究与待决问题。
+- [Hermes 分层协作与 Codex 监督插件决策地图](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/1)：共享的目标、研究与待决问题。
 - [首版范围草案](docs/planning/hermes-plugin-scope.md)：已确认的需求、边界与待定的验收场景。
 - [领域术语](GLOSSARY.md)：责任角色、Profile 分类与独立助手。
 - [Issue tracker 约定](docs/agents/issue-tracker.md)：GitHub 工单、原生依赖与 Wayfinder 操作。
