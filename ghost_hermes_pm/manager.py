@@ -44,6 +44,14 @@ _MESSAGE_NAMESPACE = ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient
                       'recipient_open_id', 'chat_id', 'sender_open_id')
 
 
+def _delivery_status(record):
+    statuses = [s['status'] for p in record['outbox'] for s in p['segments']]
+    for state in ('unknown', 'sending', 'failed', 'pending'):
+        if state in statuses:
+            return state
+    return 'delivered' if statuses else 'pending'
+
+
 def _git(path, *args):
     result = subprocess.run(['git', '-C', str(path), *args], capture_output=True,
                             text=True, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
@@ -96,6 +104,7 @@ class Manager:
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._inflight = set()
         self._db = sqlite3.connect(self.state_dir / 'manager.sqlite3', check_same_thread=False)
         self._db.execute('CREATE TABLE IF NOT EXISTS directory (id INTEGER PRIMARY KEY CHECK(id=1), schema_version INTEGER NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL)')
         self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 1, 0, ?)',
@@ -119,6 +128,14 @@ class Manager:
         data = json.loads(payload)
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
+        for record in data['requests'].values():
+            for publication in record['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
+            record['delivery'] = _delivery_status(record)
         return version, data
 
     def _principal(self, identity, data):
@@ -264,6 +281,7 @@ class Manager:
                  'status': 'pending', 'attempts': []}
                 for index, start in enumerate(range(0, len(text), 1800))]}
             record['outbox'].append(publication)
+            record['delivery'] = _delivery_status(record)
             self._save(version, data)
             return publication
 
@@ -278,19 +296,19 @@ class Manager:
                     if segment['status'] == 'delivered':
                         continue
                     if segment['status'] == 'sending':
-                        segment['status'] = 'unknown'
-                        record['delivery'] = 'unknown'
-                        self._save(version, data)
+                        return None
                     if segment['status'] != 'pending':
                         return None
                     anchor = record['task_start_anchor'] or record['source_anchor']
                     if publication['kind'] != 'confirmation' and record['task_start_anchor'] is None:
                         return None
                     segment['status'] = 'sending'
+                    self._inflight.add(segment['uuid'])
                     segment['attempts'].append({'status': 'sending', 'path': 'reply',
                                                 'intended_chat_id': anchor['chat_id'],
                                                 'intended_reply_to': anchor['message_id'],
                                                 'intended_thread_id': anchor.get('thread_id')})
+                    record['delivery'] = _delivery_status(record)
                     self._save(version, data)
                     return {**segment, 'kind': publication['kind'], 'chat_id': anchor['chat_id'],
                             'reply_to': anchor['message_id'], 'thread_id': anchor.get('thread_id'),
@@ -329,11 +347,11 @@ class Manager:
             if receipt['status'] == 'delivered' and (not receipt.get('message_id') or receipt.get('chat_id') != record['source_anchor']['chat_id']):
                 receipt['status'] = 'unknown'
             segment['status'] = receipt['status']
+            self._inflight.discard(segment['uuid'])
             segment['attempts'][-1].update(receipt)
             if receipt['status'] == 'delivered' and publication['kind'] == 'confirmation' and segment['number'] == 1 and record['task_start_anchor'] is None:
                 record['task_start_anchor'] = {k: receipt.get(k) for k in ('message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id')}
-            statuses = [s['status'] for p in record['outbox'] for s in p['segments']]
-            record['delivery'] = 'unknown' if 'unknown' in statuses else 'failed' if 'failed' in statuses else 'delivered' if all(s == 'delivered' for s in statuses) else 'pending'
+            record['delivery'] = _delivery_status(record)
             self._save(version, data)
             return {'status': 'completed', 'request': record}
 

@@ -150,3 +150,22 @@ def test_explicit_parent_start_anchor_disambiguates_shared_native_thread(tmp_pat
             {**MESSAGE, 'message_id': 'om_reply', 'parent_id': 'om_ack_1', 'root_id': 'om_root', 'thread_id': 'omt_shared'}, '请核对')
         assert result['status'] == 'associated'
         assert result['request_id'] == ids[0]
+
+
+def test_new_publication_and_inflight_restart_never_reuse_old_delivered_summary(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        record = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, ISSUE)['request']
+        manager.publish_request_message(OWNER, record['id'], 'confirmation', '已受理')
+        ack = manager.claim_delivery(OWNER, record['id'])
+        manager.record_delivery(OWNER, record['id'], ack['uuid'], {'status': 'delivered', 'chat_id': 'oc_project', 'message_id': 'om_ack'})
+        assert manager.read_snapshot(OWNER)['requests'][0]['delivery'] == 'delivered'
+        manager.publish_request_message(OWNER, record['id'], 'progress', '正在核对')
+        assert manager.read_snapshot(OWNER)['requests'][0]['delivery'] == 'pending'
+        manager.claim_delivery(OWNER, record['id'])
+        assert manager.read_snapshot(OWNER)['requests'][0]['delivery'] == 'sending'
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as restarted:
+        current = restarted.read_snapshot(OWNER)['requests'][0]
+        assert current['delivery'] == 'unknown'
+        assert current['outbox'][1]['segments'][0]['status'] == 'unknown'
+        assert restarted.claim_delivery(OWNER, record['id']) is None
