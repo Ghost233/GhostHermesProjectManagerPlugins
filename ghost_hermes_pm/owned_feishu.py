@@ -182,7 +182,7 @@ class OwnedFeishuAdapter(FeishuAdapter):
                 logger.warning('Owned intake not accepted: registered runtime responsibility requires verification.')
                 return
             owner = VerifiedIdentity(self.intake.owner, 'verified-owned-feishu-owner-entry')
-            if any(f['source_anchor'] == prepared.envelope for f in self.intake.manager().read_snapshot(owner)['intake_failures']):
+            if self.intake.manager().read_intake_failure(owner, prepared.envelope) is not None:
                 return
             key = tuple(prepared.envelope.get(k) for k in ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id', 'message_id'))
             if key in self._committed:
