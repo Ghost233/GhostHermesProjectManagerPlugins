@@ -1,0 +1,23 @@
+%%{init: {"theme": "neutral", "themeVariables": {"fontSize": "16px", "lineColor": "#475569", "edgeLabelBackground": "#ffffff"}}}%%
+flowchart TB
+    subgraph System["首版协作与管理"]
+        direction TB
+        Operator["本人：飞书入口群与项目群"]
+        Dashboard["Hermes Web Dashboard"]
+        Sources["授权资料来源<br/>Wiki 原库 / 登记旧档案"]
+        Gateway["Hermes Gateway<br/>总管、负责人、独立助手"]
+        Coordinator["统一管理实例<br/>授权、队列、监督"]
+        Codex["实际 Codex 执行服务"]
+        Repos["登记的仓库<br/>源码 / Git / 测试产物"]
+        Store["SQLite 状态<br/>受保护档案与备份"]
+        Operator <-->|"群内真实 @ 请求与答复"| Gateway
+        Dashboard <-->|"查看与管理：同一规则"| Coordinator
+        Gateway <-->|"核验后的请求与进展"| Coordinator
+        Coordinator <-->|"原会话控制与事件"| Codex
+        Codex -->|"已核验的仓库范围"| Repos
+        Coordinator <-->|"按来源范围查询"| Sources
+        Coordinator -->|"持久化处理凭据"| Store
+    end
+    classDef component fill:#ffffff,stroke:#64748b,color:#0f172a
+    class Operator,Dashboard,Sources,Gateway,Coordinator,Codex,Repos,Store component
+    style System fill:#ffffff,stroke:#cbd5e1
