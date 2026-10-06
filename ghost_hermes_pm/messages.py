@@ -4,7 +4,7 @@ import inspect
 import json
 import re
 
-from .manager import ManagementError, VerifiedIdentity
+from .manager import VerifiedIdentity
 
 
 class FeishuEntry:
