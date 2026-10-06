@@ -79,3 +79,29 @@ def test_native_dashboard_owner_mapping_rejects_other_authenticated_users_and_ma
     authorized = browser.get('/snapshot', headers={'x-fixture-user': 'owner'})
     assert authorized.status_code == 503
     assert 'fixture-only-secret' not in authorized.text
+
+
+def test_dashboard_reads_authoritative_acceptance_delivery_and_unexecuted_reason(tmp_path):
+    from test_requests import MESSAGE, ISSUE
+    with tempfile.TemporaryDirectory(prefix='hpm-requests-', dir='/tmp') as state:
+        with Manager(state, owner_identity_ref=OWNER.subject) as manager:
+            manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+            accepted = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, ISSUE)['request']
+            manager.publish_request_message(OWNER, accepted['id'], 'confirmation', '已受理')
+            segment = manager.claim_delivery(OWNER, accepted['id'])
+            manager.record_delivery(OWNER, accepted['id'], segment['uuid'], {'status': 'failed', 'code': 999})
+            with ManagementServer(manager, {'fixture-token': OWNER}):
+                client = ManagementClient(state, 'fixture-token')
+                app = FastAPI()
+                app.include_router(create_router(lambda request: client))
+                browser = TestClient(app)
+                snapshot = browser.get('/snapshot').json()
+                assert snapshot == manager.read_snapshot(OWNER)
+                task = snapshot['requests'][0]
+                assert task['acceptance'] == 'accepted'
+                assert task['delivery'] == 'failed'
+                assert task['execution'] == 'waiting'
+                assert task['unexecuted_reason'] == 'Codex execution is not enabled.'
+            offline = browser.get('/snapshot').json()
+            assert offline['status'] == 'unverified'
+            assert offline['requests'][0] == task

@@ -14,6 +14,7 @@ class Context:
         self.commands = {}
         self.cleanups = []
         self.hooks = {}
+        self.platform_handlers = {}
     def get_config(self, key, default=None):
         return self.settings.get(key, default)
     def register_tool(self, **kwargs):
@@ -22,6 +23,8 @@ class Context:
         self.commands[name] = handler
     def register_hook(self, name, callback):
         self.hooks[name] = callback
+    def register_platform_handler(self, name, factory):
+        self.platform_handlers[name] = factory
     def on_unload(self, callback):
         self.cleanups.append(callback)
 

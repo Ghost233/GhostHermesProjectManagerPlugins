@@ -24,6 +24,22 @@ class ManagementError(Exception):
         super().__init__(message)
 
 
+def _public_text(text):
+    if not isinstance(text, str) or not text.strip() or len(text) > 100000:
+        raise ManagementError('invalid_change', 'Bounded public material is required.')
+    if re.search(r'(?:password|passwd|secret|token|api[_ -]?key|private[_ -]?key)\s*[:=]\s*\S+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,}|-----BEGIN[^\n]*PRIVATE KEY', text, re.IGNORECASE):
+        raise ManagementError('invalid_change', 'Sensitive material must be handled in the original private interface.')
+
+
+def _message_anchor(message):
+    allowed = {'tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id',
+               'parent_id', 'root_id', 'thread_id', 'app_id', 'recipient_tenant_key', 'transport_tenant_key'}
+    required = ('tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id')
+    if not isinstance(message, dict) or set(message) - allowed or any(not isinstance(message.get(k), str) or not message[k] for k in required) or any(v is not None and (not isinstance(v, str) or len(v) > 256) for v in message.values()):
+        raise ManagementError('invalid_change', 'Only verified scalar message and transport identities are accepted.')
+    return required
+
+
 def _git(path, *args):
     result = subprocess.run(['git', '-C', str(path), *args], capture_output=True,
                             text=True, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
@@ -97,6 +113,7 @@ class Manager:
             raise ManagementError('unknown_version', 'Directory schema requires a verified upgrade.')
         data = json.loads(payload)
         data.setdefault('requests', {})
+        data.setdefault('clarifications', {})
         return version, data
 
     def _principal(self, identity, data):
@@ -126,7 +143,8 @@ class Manager:
             visible_ids = {p['id'] for p in profiles}
             requests = [r for r in data['requests'].values() if r['profile_id'] in visible_ids]
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
-                    'projects': projects, 'profiles': profiles, 'requests': requests, 'runtime': 'directory_available',
+                    'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'execution': 'not_enabled', 'needs_human': ['Execution and channel capabilities are not verified.']}
 
     def accept_request(self, identity, project_id, profile_id, message, issue):
@@ -139,14 +157,14 @@ class Manager:
             profile = data['profiles'].get(profile_id)
             if project_id not in data['projects'] or not profile or profile['project_id'] != project_id or profile['capability'] != 'development':
                 raise ManagementError('invalid_change', 'An explicitly registered development project and responsible Profile are required.')
-            required = ('tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id')
-            if not isinstance(message, dict) or any(not isinstance(message.get(k), str) or not message[k] for k in required):
-                raise ManagementError('invalid_change', 'Verified source message and transport identities are required.')
+            required = _message_anchor(message)
             key = hashlib.sha256(json.dumps([message[k] for k in required[:4]]).encode()).hexdigest()
             if key in data['requests']:
                 return {'status': 'accepted', 'duplicate': True, 'request': data['requests'][key]}
             if not isinstance(issue, dict) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', issue.get('url', '')) or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
                 raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
+            _public_text(issue['title'])
+            _public_text(issue['body'])
             record = {'id': key, 'project_id': project_id, 'profile_id': profile_id,
                       'accepted_scope': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')},
                       'source_anchor': dict(message), 'task_start_anchor': None,
@@ -166,6 +184,56 @@ class Manager:
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
 
+    def associate_message(self, identity, project_id, profile_id, message, text):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'Plain owner input requires the verified owner entry.')
+            _message_anchor(message)
+            _public_text(text)
+            if re.fullmatch(r'(收到|谢谢|感谢|好的|ok|thanks)[。.!！\s]*', text.strip(), re.IGNORECASE):
+                return {'status': 'ignored'}
+            candidates = [r for r in data['requests'].values() if r['project_id'] == project_id and r['profile_id'] == profile_id
+                          and all(r['source_anchor'][k] == message.get(k) for k in ('tenant_key', 'recipient_open_id', 'chat_id', 'sender_open_id'))]
+            references = {message.get(k) for k in ('parent_id', 'root_id', 'thread_id')} - {None, ''}
+            if references:
+                candidates = [r for r in candidates if references & {
+                    a.get(k) for a in [r['source_anchor'], r['task_start_anchor'] or {}]
+                    for k in ('message_id', 'root_id', 'thread_id')}]
+            key = hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
+            if not candidates:
+                return {'status': 'unassociated'}
+            if len(candidates) > 1:
+                record = data['clarifications'].get(key)
+                if record is None:
+                    record = {'id': key, 'status': 'needs_clarification', 'project_id': project_id, 'profile_id': profile_id,
+                              'source_anchor': dict(message), 'candidate_ids': [r['id'] for r in candidates],
+                              'uuid': str(uuid.uuid4()), 'delivery': 'pending'}
+                    data['clarifications'][key] = record
+                    self._save(version, data)
+                return record
+            record = candidates[0]
+            existing = next((m for m in record['messages'] if m['id'] == key), None)
+            if existing:
+                return existing
+            kind = 'progress' if text.startswith('进度') else 'result' if text.startswith('结果') else 'input'
+            associated = {'id': key, 'status': 'associated', 'request_id': record['id'], 'kind': kind,
+                          'source_anchor': dict(message), 'text': text}
+            record['messages'].append(associated)
+            self._save(version, data)
+            return associated
+
+    def record_clarification_delivery(self, identity, clarification_id, receipt):
+        with self._lock, self._db:
+            version, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'Only the owner entry may record this clarification.')
+            clarification = data['clarifications'][clarification_id]
+            clarification['delivery'] = receipt.get('status', 'unknown')
+            clarification['receipt'] = receipt
+            self._save(version, data)
+
     def _save(self, version, data):
         self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
 
@@ -176,6 +244,7 @@ class Manager:
             record = self._request(identity, request_id, data)
             if kind not in {'confirmation', 'material', 'progress', 'result', 'clarification'} or not isinstance(text, str) or not text.strip():
                 raise ManagementError('invalid_change', 'An explicit message kind and public material are required.')
+            _public_text(text)
             key = hashlib.sha256((kind + ':' + text).encode()).hexdigest()
             existing = next((p for p in record['outbox'] if p['id'] == key), None)
             if existing:
@@ -214,6 +283,23 @@ class Manager:
                             'reply_to': anchor['message_id'], 'thread_id': anchor.get('thread_id'),
                             'mention_open_id': record['source_anchor']['sender_open_id']}
             return None
+
+    def retry_delivery(self, identity, request_id):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            record = self._request(identity, request_id, data)
+            segments = [s for p in record['outbox'] for s in p['segments']]
+            if any(s['status'] in {'sending', 'unknown'} for s in segments):
+                raise ManagementError('version_conflict', 'Unknown delivery must be reconciled before retrying.')
+            failed = [s for s in segments if s['status'] == 'failed']
+            if not failed:
+                return {'status': 'completed', 'request': record}
+            for segment in failed:
+                segment['status'] = 'pending'
+            record['delivery'] = 'pending'
+            self._save(version, data)
+            return {'status': 'accepted', 'request': record}
 
     def record_delivery(self, identity, request_id, segment_uuid, outcome):
         with self._lock, self._db:

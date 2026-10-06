@@ -7,17 +7,20 @@ from test_requests import ISSUE
 
 
 CONFIG = {'enabled': True, 'verification_ref': 'fixture:controlled-contract', 'bindings': [
-    {'tenant_key': 'tenant-fixture', 'chat_id': 'oc_project', 'owner_open_id': 'ou_owner',
+    {'sender_tenant_key': 'tenant-fixture', 'recipient_tenant_key': 'tenant-bot',
+     'transport_tenant_key': 'tenant-transport', 'verification_ref': 'fixture:identity-map',
+     'chat_id': 'oc_project', 'owner_open_id': 'ou_owner',
      'recipient_open_id': 'ou_lead', 'app_id': 'cli_fixture',
      'project_id': 'mono', 'profile_id': 'mono-lead', 'repository': 'Ghost233/fixture'}]}
 
 
 def event(text='@_user_1 派发 https://github.com/Ghost233/fixture/issues/15', message_id='om_request'):
-    raw = NS(event=NS(sender=NS(sender_type='user', tenant_key='tenant-fixture',
+    raw = NS(header=NS(app_id='cli_fixture', tenant_key='tenant-transport', event_type='im.message.receive_v1'),
+             event=NS(sender=NS(sender_type='user', tenant_key='tenant-fixture',
                                sender_id=NS(open_id='ou_owner', user_id='u_owner', union_id='on_owner')),
                       message=NS(message_id=message_id, chat_id='oc_project', chat_type='group',
                                  message_type='text', content=__import__('json').dumps({'text': text}),
-                                 mentions=[NS(key='@_user_1', mentioned_type='bot', tenant_key='tenant-fixture',
+                                 mentions=[NS(key='@_user_1', mentioned_type='bot', tenant_key='tenant-bot',
                                               id=NS(open_id='ou_lead'))], parent_id=None,
                                  upper_message_id=None, root_id=None, thread_id=None)))
     source = NS(platform='feishu', user_id='u_owner', user_id_alt='on_owner', chat_id='oc_project',
@@ -77,7 +80,8 @@ async def test_native_entry_preserves_original_source_auth_and_accepts_real_ment
 @pytest.mark.asyncio
 @pytest.mark.parametrize('case', ['auth_false', 'auth_unknown', 'auth_raises', 'missing_auth', 'sender',
                                  'source_chat', 'tenant', 'mention_text', 'mention_tenant',
-                                 'mention_type', 'recipient', 'debounced', 'echo', 'disabled'])
+                                 'mention_type', 'recipient', 'debounced', 'echo', 'disabled',
+                                 'header_app', 'header_type', 'missing_header_tenant', 'unknown_sender'])
 async def test_unverified_sources_never_accept_or_send_and_preserve_host_path(tmp_path, case):
     from ghost_hermes_pm.messages import FeishuEntry
     adapter, transport = object(), Transport()
@@ -100,6 +104,10 @@ async def test_unverified_sources_never_accept_or_send_and_preserve_host_path(tm
     if case == 'debounced': incoming.message_id = incoming.source.message_id = 'om_last'
     if case == 'echo': incoming.source.is_bot = True
     if case == 'disabled': config['enabled'] = False
+    if case == 'header_app': incoming.raw_message.header.app_id = 'cli_other'
+    if case == 'header_type': incoming.raw_message.header.event_type = 'synthetic'
+    if case == 'missing_header_tenant': incoming.raw_message.header.tenant_key = None
+    if case == 'unknown_sender': incoming.source.is_bot = None
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
         manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
         intake = FeishuEntry(lambda: manager, OWNER.subject, config, lambda url: ISSUE)
@@ -107,3 +115,51 @@ async def test_unverified_sources_never_accept_or_send_and_preserve_host_path(tm
         assert await intake.receive(incoming, gateway) is None
         assert manager.read_snapshot(OWNER)['requests'] == []
         assert transport.sent == []
+
+
+@pytest.mark.asyncio
+async def test_plain_input_uses_original_ack_and_ambiguity_sends_explicit_clarification(tmp_path):
+    from ghost_hermes_pm.messages import FeishuEntry
+    adapter, transport = object(), Transport()
+    gateway = Gateway(adapter)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda url: ISSUE)
+        intake.attach_transport(adapter, transport)
+        await intake.receive(event(), gateway)
+        assert await intake.receive(event('请保留测试证据', 'om_followup'), gateway) == {'action': 'skip'}
+        assert transport.sent[-1]['reply_to'] == 'om_ack_1'
+        await intake.receive(event(message_id='om_second'), gateway)
+        assert await intake.receive(event('请继续', 'om_ambiguous'), gateway) == {'action': 'skip'}
+        assert '请引用任务起始消息' in transport.sent[-1]['text']
+        assert transport.sent[-1]['reply_to'] == 'om_ambiguous'
+        assert manager.read_snapshot(OWNER)['clarifications'][0]['delivery'] == 'delivered'
+        count = len(transport.sent)
+        await intake.receive(event('谢谢', 'om_echo'), gateway)
+        assert len(transport.sent) == count
+
+
+@pytest.mark.asyncio
+async def test_explicit_owner_retry_reuses_failed_confirmation_and_accepts_only_once(tmp_path):
+    from ghost_hermes_pm.messages import FeishuEntry
+    adapter, transport = object(), Transport()
+    gateway = Gateway(adapter)
+    async def failed(segment):
+        transport.sent.append(segment)
+        return {'status': 'failed', 'code': 999}
+    transport.send = failed
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda url: ISSUE)
+        intake.attach_transport(adapter, transport)
+        await intake.receive(event(), gateway)
+        request = manager.read_snapshot(OWNER)['requests'][0]
+        original_uuid = transport.sent[0]['uuid']
+        await intake.receive(event(), gateway)
+        assert len(transport.sent) == 1
+        transport.send = Transport.send.__get__(transport)
+        assert await intake.receive(event('重试投递 ' + request['id'], 'om_retry'), gateway) == {'action': 'skip'}
+        assert len(transport.sent) == 3
+        assert transport.sent[1]['uuid'] == original_uuid
+        assert len(manager.read_snapshot(OWNER)['requests']) == 1
+        assert manager.read_snapshot(OWNER)['requests'][0]['delivery'] == 'delivered'

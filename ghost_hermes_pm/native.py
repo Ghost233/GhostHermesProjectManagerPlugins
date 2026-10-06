@@ -5,6 +5,8 @@ from pathlib import Path
 
 from .manager import Manager, ManagementError, VerifiedIdentity
 from .transport import ManagementClient, ManagementServer
+from .messages import FeishuEntry
+from .feishu import NativeFeishuTransport, read_github_issue
 
 PLUGIN_ID = 'ghost-hermes-pm'
 
@@ -24,6 +26,9 @@ def register_native(ctx):
     registered_home = None
     runtime = 'configuring'
     resources = None
+    intake = FeishuEntry(lambda: resources[0] if resources else None, owner,
+                         ctx.get_config('feishu_intake', {}), read_github_issue)
+    ctx.register_platform_handler('feishu', lambda native, adapter: intake.attach_transport(adapter, NativeFeishuTransport(native)))
     if state_dir and (ctx.get_config('participant_credential_ref') or (manager_profile and owner)):
         runtime = 'manager_unavailable'
     if manager_profile == registered_profile:
@@ -62,6 +67,7 @@ def register_native(ctx):
             if not participant_token or participant_token in credentials or entry.get('identity_ref') == owner:
                 raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
             credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
+        intake.secret_values = tuple(credentials)
         manager = Manager(state_dir, owner_identity_ref=owner)
         server = ManagementServer(manager, credentials)
         try:
@@ -81,9 +87,12 @@ def register_native(ctx):
 
         ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
 
-    # This hook receives the actual Gateway object from the native inbound pipeline.
-    # It returns no directive, so host sender authorization and dispatch remain in force.
-    ctx.register_hook('pre_gateway_dispatch', start_for_gateway)
+    async def dispatch(event=None, gateway=None):
+        await start_for_gateway(event, gateway)
+        if event is not None and gateway is not None:
+            return await intake.receive(event, gateway)
+
+    ctx.register_hook('pre_gateway_dispatch', dispatch)
 
     def snapshot(args=None):
         if args:

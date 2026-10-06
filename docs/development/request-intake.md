@@ -1,0 +1,63 @@
+# Feishu Issue intake slice (#15)
+
+This slice implements acceptance only. It never creates a Codex session, reports a task as running, edits an Issue, or starts a second manager. `Manager.accept_request` freezes the Issue URL, title, body and `updated_at` obtained at acceptance. A repeated source event keeps that original scope. `read_snapshot` returns the same requests, delivery ledgers and clarifications to native participant readers and Dashboard through the existing private bridge. Dashboard shows acceptance, message delivery, the original/local start anchors and the reason execution is waiting.
+
+The public message syntax is a **real Feishu mention of the registered responsible bot**, followed by `派发 https://github.com/OWNER/REPO/issues/NUMBER`. A display name, literal `@Name`, a mention hint in normalized text, another app's IDs or an unverified sender cannot authorize intake. The Issue repository must exactly match the trusted binding. GitHub reads switch to Ghost233, verify the effective login (including token overrides), then read only `url,title,body,updatedAt`. Failures do not create acceptance evidence. An explicit Issue URL without the `派发` verb does not create new work.
+
+The native plugin registers synchronous `register_platform_handler("feishu", factory)` to pair each connected native client with its exact adapter. Its async `pre_gateway_dispatch` entry uses the pinned host's `_intake_adapter_for(original_source)`, `_is_user_authorized_for_source(original_source)` and bot admission receipt/helper before returning `skip`. These are private compatibility seams fixed to Hermes `bd0affe5e5f723579df8902852f5d0c47795f355`; absence, exceptions or unknown authorization results fail closed. Source provenance is retained by passing the original source object. Bot/app senders are excluded in this owner-to-responsible-role slice, so a public confirmation cannot feed back into new work.
+
+Raw SDK `P2ImMessageReceiveV1` header, sender and mention identities are checked independently. Header app/tenant, sender tenant and recipient mention tenant are separate facts; Feishu does not promise all three tenants are equal. The runtime Profile is not used as app identity. The captured native client's public `config` must establish the supported automatic SELF token path, and the formal bot-info request must return valid JSON with `activate_status=2` and the exact expected `bot.open_id`. Manual-token and ISV paths remain unsupported. No config object, token, raw SDK event or raw error response is persisted. Known resolved bridge secrets and recognizable credential/private-key material are rejected before acceptance or public message storage; sensitive answers belong in the original private interface. This is a bounded public-material policy, not a promise to recognize every arbitrary secret string.
+
+Trusted settings add this **synthetic shape**, with `enabled` remaining false by default:
+
+```yaml
+feishu_intake:
+  enabled: false
+  verification_ref: evidence:approved-test-intake-plan
+  bindings:
+    - project_id: fixture-project
+      profile_id: fixture-lead
+      repository: Ghost233/fixture
+      app_id: cli_fixture
+      recipient_open_id: ou_fixture_bot
+      owner_open_id: ou_fixture_owner
+      chat_id: oc_fixture_project
+      transport_tenant_key: fixture_receiving_tenant
+      sender_tenant_key: fixture_owner_tenant
+      recipient_tenant_key: fixture_bot_tenant
+      verification_ref: evidence:verified-identity-map
+```
+
+The owner-approved binding is an identity mapping reference; it does not itself prove real-message delivery, full incoming-message coverage or production readiness. IDs must come from the approved app/sender/tenant namespaces. The management Profile must own the authority, and the registered target must be a development Profile of the specified project. No bot, Profile, app, group, credential or repository is created by these settings. This turn supplied no real test-group or credential references; no real connection is enabled.
+
+`publish_request_message` persists an outbox before sending. The short confirmation becomes the local task start anchor only when its returned message ID and actual chat are known. Long material is split into bounded logical segments; each segment has its own persistent UUID, number, attempts, intended reply anchor and scalar response receipt. The captured client uses the **formal** `ReplyMessageRequest`/`ReplyMessageRequestBody` builders with a post `at` element and that segment's UUID. It does not rely on adapter `.send`'s last-chunk result or private retry/fallback behavior. Missing message IDs/chats, exceptions and interrupted in-flight sends remain unknown. Actual root/parent/thread fields remain null if the response does not supply them; no message URL or quoted relationship is invented. A normal root quote remains distinct from native `thread_id`.
+
+Only definite API failures can be retried. In the same verified group/app/sender scope, the owner can send `重试投递 FULL_REQUEST_ID` (the ID is shown on Dashboard). It reuses failed segment UUIDs, preserves successful segments and the original anchor, and resumes later pending segments. Duplicate request delivery does not retry failures by itself. Unknown delivery rejects retry until reconciliation; this slice deliberately has no speculative reconciliation or automatic replay operation.
+
+Ordinary owner input associates with one request by source/confirmed anchor or by a unique candidate in the same group, app and responsibility scope. Multiple candidates produce a persisted clarification and a reply asking for the task start quote. They do not choose the latest task. `收到`, `谢谢`, `好的`, `ok` and `thanks` terminate the reply chain. Progress/result inputs are associated observations, not new work or proof that Codex executed. They preserve accepted scope and waiting execution. `publish_request_message` supports progress/result output at the same public management seam and uses the same local start anchor.
+
+## Isolated verification
+
+Install the test extra in a disposable development environment. It pins `lark-oapi==1.6.8`, the version in the fixed Hermes SDK. Run:
+
+```sh
+HERMES_TEST_SDK_ROOT=/tmp/pristine-hermes-sdk \
+HERMES_REQUIRE_SDK_SMOKE=1 python -m pytest -q
+node --check dashboard/dist/index.js
+```
+
+Tests use public management operations and the native entry/transport boundary. They never manufacture state by writing SQLite or invoking Manager private methods. Native smoke stages pristine Hermes sources in a temporary home, invokes the actual PluginManager loader and async hooks, the formal platform factory, native `MessageEvent`/`SessionSource`, actual Lark receive models and request builders, native Dashboard scanner/backend and the private bridge. Only the external HTTP/Issue boundaries are controlled substitutes; audit tripwires refuse real Hermes files and network connections. It verifies long-message segments, genuine `at` request shape, duplicate delivery, same-authority snapshots and restart/shutdown. Ordinary tests also cover rejection, immutable scope, known failure retry, unknown delivery and unique/ambiguous/echo input. Passing this smoke is **not real Feishu acceptance**.
+
+## Approved real-group smoke and outstanding gates
+
+The executable isolated smoke is `tests/test_native_runtime.py`. For real acceptance, use an explicitly approved **test-only** management Profile, target development Profile, app, group and fixture Issue. Keep production `enabled=false`. Before any test-only enablement, obtain the non-sensitive native Profile/state-directory references, project/Profile IDs, exact GitHub repository/Issue and expected update time, app/bot/owner IDs, the three independently verified tenant references, allowed group ID and native credential **references**. Credentials stay in native secret storage. Record the allowed test plan and identity-map evidence refs. Verify existing native group/admission policy rather than weakening it. No real service installation or configuration changes are authorized by this development document.
+
+1. In the approved inactive test lane, have the actual owner use Feishu's mention picker to address the actual registered bot and send the exact `派发 ISSUE_URL` command. Verify the resulting actual `at`, source/app identity, public short confirmation and each long-material reply in the group. Match original/source IDs and returned local start IDs to Dashboard. Confirm `acceptance=accepted`, `execution=waiting`, `delivery=delivered` only when every segment has a distinct recorded receipt. The actual group observation is required in addition to a successful send response.
+2. Redeliver the same original event using the approved test harness's event replay path, without creating a new message ID. Confirm one accepted request and no duplicate successful segment. Where the approved harness can produce a definite failed API response, use `重试投递 FULL_REQUEST_ID`, then verify only failed/pending segments are sent. Do not replay a timeout/unknown delivery as if it were a definite rejection.
+3. Quote the actual start confirmation and send progress/result input; verify association and the original anchor, then send `谢谢` and confirm no new work/reply chain. Create a second explicitly separate fixture request; ordinary ambiguous input must ask for a quote. Verify foreign app/tenant/sender, a display-only mention, missing identity evidence and unauthorized source never receive plugin confirmation or acceptance.
+4. Restart only the approved test instance and verify the same frozen scope, receipts and pending reasons. Preserve unknown sends. Export the authenticated Dashboard snapshot as evidence without credentials and run `python tools/check_feishu_acceptance.py SNAPSHOT.json --chat-id CHAT_ID --source-message-id SOURCE_ID --start-message-id START_ID --issue-url ISSUE_URL`. This validates the exported record's structure against observed IDs; it does not authenticate the export or replace group observations.
+5. Separately verify messages while a native agent is active and rapid TEXT debounce. The current **cold-path hook cannot guarantee busy-lane interception**: native busy processing can steer/queue without reaching this hook. TEXT merging preserves first raw fields but last normalized IDs, so mismatched IDs are deliberately left to the host and are never accepted by this plugin. These paths need a supported host ingress seam or separately validated host behavior before any claim of complete incoming coverage. A cold-path success must not enable or advertise full production intake.
+
+No real group smoke has run. Busy/debounce full coverage, production installation and Codex execution remain unverified/not enabled. A test-only cold path can be reviewed and exercised now; the outstanding gates must stay visible in release/Issue acceptance records.
+
+Official SDK contract sources: [receive event](https://open.feishu.cn/document/server-docs/im-v1/message/events/receive), [bot-info](https://open.feishu.cn/document/client-docs/bot-v3/obtain-bot-info), [reply](https://open.feishu.cn/document/server-docs/im-v1/message/reply). Local research evidence is retained at `/private/tmp/hermes-implementation/feishu-contracts.md` and `feishu-bot-identity-contract.md`; those temporary files are not an installation dependency.
