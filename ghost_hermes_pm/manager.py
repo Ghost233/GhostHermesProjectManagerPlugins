@@ -222,12 +222,12 @@ class Manager:
             version, data = self._load()
             if self._principal(identity, data) is not None or code not in reasons:
                 raise ManagementError('forbidden', 'A trusted owner intake failure code is required.')
-            _message_anchor(message)
+            required = _message_anchor(message)
             profile = data['profiles'].get(profile_id)
             if not profile or profile['project_id'] != project_id:
                 raise ManagementError('invalid_change', 'Unknown intake responsibility.')
-            key = hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
-            existing = data['intake_failures'].get(key)
+            key = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
+            existing = next((f for f in data['intake_failures'].values() if all(f['source_anchor'].get(k) == message[k] for k in required)), None)
             if existing:
                 return {**existing, 'notification_claimed': False}
             accepted = any(r['source_anchor'] == message for r in data['requests'].values())
@@ -237,6 +237,14 @@ class Manager:
             data['intake_failures'][key] = record
             self._save(version, data)
             return {**record, 'notification_claimed': True}
+
+    def read_intake_failure(self, identity, message):
+        with self._lock:
+            _, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'Only the verified owner entry checks original intake failures.')
+            required = _message_anchor(message)
+            return next((f for f in data['intake_failures'].values() if all(f['source_anchor'].get(k) == message[k] for k in required)), None)
 
     def record_intake_conditions(self, identity, conditions):
         allowed = {'enabled', 'runtime_route', 'compatibility', 'sdk_revision', 'lark_version',

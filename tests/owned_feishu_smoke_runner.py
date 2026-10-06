@@ -14,7 +14,7 @@ os.environ['HERMES_SKIP_PM_BOOTSTRAP'] = '1'
 os.environ['HERMES_DISABLE_PROJECT_PLUGINS'] = '1'
 os.environ['HERMES_FEISHU_TEXT_BATCH_DELAY_SECONDS'] = '0.01'
 os.environ['HERMES_FEISHU_TEXT_BATCH_SPLIT_DELAY_SECONDS'] = '0.01'
-if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'failure_replay':
+if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') in {'failure_replay', 'failure_optional'}:
     os.environ['HERMES_FEISHU_DEDUP_CACHE_SIZE'] = '32'
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
@@ -174,6 +174,42 @@ async def main():
             assert stopped.read_snapshot(VerifiedIdentity('fixture:owner', 'fixture-audit'))['requests'] == []
         print('native load, Dashboard bridge, restart, teardown: OK')
         return
+    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'issue_queue':
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        loop = asyncio.get_running_loop()
+        occupied, release = threading.Event(), threading.Event()
+        queued = asyncio.Event()
+        reader, calls = adapter.intake.issue_reader, []
+        def observed_reader(url):
+            calls.append(url)
+            return reader(url)
+        adapter.intake.issue_reader = observed_reader
+        class SourceQueue(ThreadPoolExecutor):
+            def submit(self, function, *args, **kwargs):
+                inner = getattr(function, 'args', ())
+                source = inner[0] if inner else function
+                if getattr(source, '__name__', '') in {'observed_reader', 'read_if_active'}:
+                    def occupy():
+                        occupied.set()
+                        release.wait(8)
+                    super().submit(occupy)
+                    assert occupied.wait(2)
+                    future = super().submit(function, *args, **kwargs)
+                    loop.call_soon_threadsafe(queued.set)
+                    return future
+                return super().submit(function, *args, **kwargs)
+        pool = SourceQueue(max_workers=1)
+        loop.set_default_executor(pool)
+        pending = asyncio.create_task(adapter._handle_message_event_data(raw('om_queued_issue', 15)))
+        await asyncio.wait_for(queued.wait(), timeout=4)
+        assert calls == [] and len(runner.budget_sources) == 1
+        assert plugins.unload('ghost-hermes-pm')
+        release.set()
+        await asyncio.wait_for(pending, timeout=6)
+        assert calls == [] and not sent and not (state / 'manager.sock').exists()
+        print('native load, Dashboard bridge, restart, teardown: OK')
+        return
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'issue':
         started, release = asyncio.Event(), asyncio.Event()
         reader = adapter.intake.issue_reader
@@ -193,7 +229,7 @@ async def main():
             assert stopped.read_snapshot(VerifiedIdentity('fixture:owner', 'fixture-audit'))['requests'] == []
         print('native load, Dashboard bridge, restart, teardown: OK')
         return
-    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'failure_replay':
+    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') in {'failure_replay', 'failure_optional'}:
         await adapter._handle_message_event_data(raw('om_seed', 15))
         def unknown_notice(request):
             sent.append(request)
@@ -205,9 +241,14 @@ async def main():
         for number in range(33):
             await adapter._handle_message_event_data(raw('om_thanks_' + str(number), text='谢谢'))
         budget_before_replay = len(runner.budget_sources)
-        await adapter._handle_message_event_data(raw('om_fail', 18))
+        replay = raw('om_fail', 18)
+        if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'failure_optional':
+            replay.event.message.thread_id = ''
+        await adapter._handle_message_event_data(replay)
         assert len(sent) == before, 'An evicted original must not resend its unknown durable failure notice.'
         assert len(runner.budget_sources) == budget_before_replay
+        failure = client.read_snapshot()['intake_failures']
+        assert len(failure) == 1 and failure[0]['source_anchor']['thread_id'] is None
         assert plugins.unload('ghost-hermes-pm')
         print('native load, Dashboard bridge, restart, teardown: OK')
         return

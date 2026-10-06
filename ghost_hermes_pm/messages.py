@@ -140,7 +140,10 @@ class FeishuEntry:
             if existing:
                 record = existing
             else:
-                issue = await asyncio.to_thread(self.issue_reader, prepared.issue_url)
+                def read_if_active():
+                    self.require_active(generation)
+                    return self.issue_reader(prepared.issue_url)
+                issue = await asyncio.to_thread(read_if_active)
                 self.require_active(generation)
                 if inspect.isawaitable(issue):
                     issue = await issue
