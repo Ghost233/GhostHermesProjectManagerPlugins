@@ -34,10 +34,22 @@ def _public_text(text, sensitive_values=()):
 def _message_anchor(message):
     allowed = {'tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id',
                'parent_id', 'root_id', 'thread_id', 'app_id', 'recipient_tenant_key', 'transport_tenant_key'}
-    required = ('tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id')
+    required = _MESSAGE_NAMESPACE + ('message_id',)
     if not isinstance(message, dict) or set(message) - allowed or any(not isinstance(message.get(k), str) or not message[k] for k in required) or any(v is not None and (not isinstance(v, str) or len(v) > 256) for v in message.values()):
         raise ManagementError('invalid_change', 'Only verified scalar message and transport identities are accepted.')
     return required
+
+
+_MESSAGE_NAMESPACE = ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                      'recipient_open_id', 'chat_id', 'sender_open_id')
+
+
+def _delivery_status(record):
+    statuses = [s['status'] for p in record['outbox'] for s in p['segments']]
+    for state in ('unknown', 'sending', 'failed', 'pending'):
+        if state in statuses:
+            return state
+    return 'delivered' if statuses else 'pending'
 
 
 def _git(path, *args):
@@ -92,6 +104,7 @@ class Manager:
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._inflight = set()
         self._db = sqlite3.connect(self.state_dir / 'manager.sqlite3', check_same_thread=False)
         self._db.execute('CREATE TABLE IF NOT EXISTS directory (id INTEGER PRIMARY KEY CHECK(id=1), schema_version INTEGER NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL)')
         self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 1, 0, ?)',
@@ -115,6 +128,14 @@ class Manager:
         data = json.loads(payload)
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
+        for record in data['requests'].values():
+            for publication in record['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
+            record['delivery'] = _delivery_status(record)
         return version, data
 
     def _principal(self, identity, data):
@@ -159,9 +180,10 @@ class Manager:
             if project_id not in data['projects'] or not profile or profile['project_id'] != project_id or profile['capability'] != 'development':
                 raise ManagementError('invalid_change', 'An explicitly registered development project and responsible Profile are required.')
             required = _message_anchor(message)
-            key = hashlib.sha256(json.dumps([message[k] for k in required[:4]]).encode()).hexdigest()
-            if key in data['requests']:
-                return {'status': 'accepted', 'duplicate': True, 'request': data['requests'][key]}
+            key = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
+            existing = next((r for r in data['requests'].values() if all(r['source_anchor'].get(k) == message[k] for k in required)), None)
+            if existing:
+                return {'status': 'accepted', 'duplicate': True, 'request': existing}
             if not isinstance(issue, dict) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', issue.get('url', '')) or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
                 raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
             _public_text(issue['title'], self._sensitive_values)
@@ -196,9 +218,13 @@ class Manager:
             if re.fullmatch(r'(收到|谢谢|感谢|好的|ok|thanks)[。.!！\s]*', text.strip(), re.IGNORECASE):
                 return {'status': 'ignored'}
             candidates = [r for r in data['requests'].values() if r['project_id'] == project_id and r['profile_id'] == profile_id
-                          and all(r['source_anchor'][k] == message.get(k) for k in ('tenant_key', 'recipient_open_id', 'chat_id', 'sender_open_id'))]
-            references = {message.get(k) for k in ('parent_id', 'root_id', 'thread_id')} - {None, ''}
-            if references:
+                          and all(r['source_anchor'].get(k) == message[k] for k in _MESSAGE_NAMESPACE)]
+            parent = message.get('parent_id')
+            references = {message.get(k) for k in ('root_id', 'thread_id')} - {None, ''}
+            if parent:
+                candidates = [r for r in candidates if parent in {
+                    a.get('message_id') for a in [r['source_anchor'], r['task_start_anchor'] or {}]}]
+            elif references:
                 candidates = [r for r in candidates if references & {
                     a.get(k) for a in [r['source_anchor'], r['task_start_anchor'] or {}]
                     for k in ('message_id', 'root_id', 'thread_id')}]
@@ -255,6 +281,7 @@ class Manager:
                  'status': 'pending', 'attempts': []}
                 for index, start in enumerate(range(0, len(text), 1800))]}
             record['outbox'].append(publication)
+            record['delivery'] = _delivery_status(record)
             self._save(version, data)
             return publication
 
@@ -269,19 +296,19 @@ class Manager:
                     if segment['status'] == 'delivered':
                         continue
                     if segment['status'] == 'sending':
-                        segment['status'] = 'unknown'
-                        record['delivery'] = 'unknown'
-                        self._save(version, data)
+                        return None
                     if segment['status'] != 'pending':
                         return None
                     anchor = record['task_start_anchor'] or record['source_anchor']
                     if publication['kind'] != 'confirmation' and record['task_start_anchor'] is None:
                         return None
                     segment['status'] = 'sending'
+                    self._inflight.add(segment['uuid'])
                     segment['attempts'].append({'status': 'sending', 'path': 'reply',
                                                 'intended_chat_id': anchor['chat_id'],
                                                 'intended_reply_to': anchor['message_id'],
                                                 'intended_thread_id': anchor.get('thread_id')})
+                    record['delivery'] = _delivery_status(record)
                     self._save(version, data)
                     return {**segment, 'kind': publication['kind'], 'chat_id': anchor['chat_id'],
                             'reply_to': anchor['message_id'], 'thread_id': anchor.get('thread_id'),
@@ -320,11 +347,11 @@ class Manager:
             if receipt['status'] == 'delivered' and (not receipt.get('message_id') or receipt.get('chat_id') != record['source_anchor']['chat_id']):
                 receipt['status'] = 'unknown'
             segment['status'] = receipt['status']
+            self._inflight.discard(segment['uuid'])
             segment['attempts'][-1].update(receipt)
             if receipt['status'] == 'delivered' and publication['kind'] == 'confirmation' and segment['number'] == 1 and record['task_start_anchor'] is None:
                 record['task_start_anchor'] = {k: receipt.get(k) for k in ('message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id')}
-            statuses = [s['status'] for p in record['outbox'] for s in p['segments']]
-            record['delivery'] = 'unknown' if 'unknown' in statuses else 'failed' if 'failed' in statuses else 'delivered' if all(s == 'delivered' for s in statuses) else 'pending'
+            record['delivery'] = _delivery_status(record)
             self._save(version, data)
             return {'status': 'completed', 'request': record}
 
