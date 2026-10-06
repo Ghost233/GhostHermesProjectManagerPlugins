@@ -3,8 +3,22 @@ import asyncio
 import inspect
 import json
 import re
+from dataclasses import dataclass
 
 from .manager import VerifiedIdentity
+
+OWNED_PLATFORM = 'hermes_feishu_pm'
+
+
+@dataclass(frozen=True)
+class PreparedMessage:
+    event: object
+    adapter: object
+    transport: object
+    binding: dict
+    envelope: dict
+    command: str
+    issue_url: str | None
 
 
 class FeishuEntry:
@@ -16,31 +30,34 @@ class FeishuEntry:
         self.secret_values = secret_values
         self.transports = []
         self.lock = asyncio.Lock()
+        self.closed = False
+
+    def deactivate(self):
+        self.closed = True
+        self.transports.clear()
 
     def attach_transport(self, adapter, transport):
         self.transports = [(a, t) for a, t in self.transports if a is not adapter]
         self.transports.append((adapter, transport))
+        self.secret_values = tuple(dict.fromkeys((*self.secret_values, *getattr(transport, 'sensitive_values', ()))))
 
-    async def receive(self, event, gateway):
-        if self.settings.get('enabled') is not True or not self.settings.get('verification_ref') or self.manager() is None:
+    def detach_transport(self, adapter):
+        self.transports = [(a, t) for a, t in self.transports if a is not adapter]
+
+    def prepare(self, event, adapter):
+        """Inspect one original event without auth charges, writes or external requests."""
+        if self.closed or self.settings.get('enabled') is not True or not self.settings.get('verification_ref'):
             return None
-        consumed = False
         try:
-            source = event.source
-            if getattr(source.platform, 'value', source.platform) != 'feishu' or source.is_bot is not False:
+            source, header, raw = event.source, event.raw_message.header, event.raw_message.event
+            if getattr(source.platform, 'value', source.platform) not in {'feishu', OWNED_PLATFORM} or source.is_bot is not False:
                 return None
-            header = event.raw_message.header
-            if header.event_type != 'im.message.receive_v1':
-                return None
-            raw = event.raw_message.event
             sender, message = raw.sender, raw.message
             ids = sender.sender_id
+            if header.event_type != 'im.message.receive_v1' or sender.sender_type != 'user' or message.chat_type != 'group' or message.message_type != 'text':
+                return None
             if any(not isinstance(v, str) or not v for v in (header.app_id, header.tenant_key, sender.tenant_key, ids.open_id, message.chat_id, message.message_id)):
                 return None
-            if sender.sender_type != 'user' or message.chat_type != 'group' or message.message_type != 'text':
-                return None
-            # TEXT debounce retains the first raw event and the last normalized ID.
-            # Fail closed instead of assigning the merged text to an invented anchor.
             if source.user_id != (getattr(ids, 'user_id', None) or ids.open_id) or source.chat_id != message.chat_id or event.message_id != message.message_id or source.message_id != message.message_id:
                 return None
             if getattr(ids, 'union_id', None) and getattr(source, 'user_id_alt', None) != ids.union_id:
@@ -51,67 +68,96 @@ class FeishuEntry:
             if len(bindings) != 1:
                 return None
             binding = bindings[0]
+            owner_ids = binding.get('owner_native_ids')
+            if owner_ids is not None and source.user_id not in owner_ids and getattr(source, 'user_id_alt', None) not in owner_ids:
+                return None
             text = json.loads(message.content)['text']
             if not isinstance(text, str) or any(secret and secret in text for secret in self.secret_values):
                 return None
             mentions = [m for m in (message.mentions or []) if m.id.open_id == binding['recipient_open_id']
                         and m.tenant_key == binding['recipient_tenant_key'] and m.mentioned_type == 'bot'
                         and isinstance(m.key, str) and m.key in text]
-            command = text
             for mention in mentions:
-                command = command.replace(mention.key, '')
-            command = command.strip()
+                text = text.replace(mention.key, '')
+            command = text.strip()
             work = re.fullmatch(r'派发\s+(https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*)', command)
-            if work and len(mentions) != 1:
+            if work and (len(mentions) != 1 or not work.group(1).startswith('https://github.com/' + binding['repository'] + '/issues/')):
                 return None
-            adapter = gateway._intake_adapter_for(source)
             transport = next((t for a, t in self.transports if a is adapter), None)
-            if transport is None or gateway._is_user_authorized_for_source(source) is not True:
+            if transport is None:
                 return None
-            # skip bypasses native authorization; preserve its bot admission too.
-            if getattr(event, '_bot_loop_admitted', False) is not True and gateway._admit_bot_message_for_source(source) is not True:
-                return None
-            recipient = await transport.verify_identity(binding)
-            if not recipient or recipient.get('app_id') != binding['app_id'] or recipient.get('open_id') != binding['recipient_open_id']:
-                return None
-            envelope = {'tenant_key': sender.tenant_key, 'recipient_open_id': recipient['open_id'],
-                        'app_id': recipient['app_id'], 'recipient_tenant_key': binding['recipient_tenant_key'],
-                        'transport_tenant_key': header.tenant_key,
-                        'chat_id': message.chat_id, 'message_id': message.message_id, 'sender_open_id': ids.open_id,
+            envelope = {'tenant_key': sender.tenant_key, 'recipient_open_id': binding['recipient_open_id'],
+                        'app_id': binding['app_id'], 'recipient_tenant_key': binding['recipient_tenant_key'],
+                        'transport_tenant_key': header.tenant_key, 'chat_id': message.chat_id,
+                        'message_id': message.message_id, 'sender_open_id': ids.open_id,
                         'parent_id': getattr(message, 'parent_id', None) or getattr(message, 'upper_message_id', None),
                         'root_id': getattr(message, 'root_id', None), 'thread_id': getattr(message, 'thread_id', None)}
-            identity = VerifiedIdentity(self.owner, 'verified-feishu-owner-entry')
-            async with self.lock:
-                if not work:
-                    return await self._associate(identity, binding, envelope, command, transport)
-                url = work.group(1)
-                if not url.startswith('https://github.com/' + binding['repository'] + '/issues/'):
+            if not work:
+                manager = self.manager()
+                if manager is None or not any(r['profile_id'] == binding['profile_id'] and all(r['source_anchor'].get(k) == envelope[k] for k in ('app_id', 'tenant_key', 'recipient_tenant_key', 'transport_tenant_key', 'recipient_open_id', 'chat_id', 'sender_open_id'))
+                    for r in manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))['requests']):
                     return None
-                snapshot = self.manager().read_snapshot(identity)
-                existing = next((r for r in snapshot['requests'] if r['source_anchor'] == envelope), None)
-                if existing:
-                    record = existing
-                else:
-                    issue = await asyncio.to_thread(self.issue_reader, url)
-                    if inspect.isawaitable(issue):
-                        issue = await issue
-                    if any(secret and secret in json.dumps(issue) for secret in self.secret_values):
-                        return None
-                    if issue.get('url') != url:
-                        return None
-                    record = self.manager().accept_request(identity, binding['project_id'], binding['profile_id'], envelope, issue)['request']
-                consumed = True
-                scope = record['accepted_scope']
-                self.manager().publish_request_message(identity, record['id'], 'confirmation',
-                    '已受理：项目 ' + record['project_id'] + ' · 负责人 ' + record['profile_id'] + '\n' + scope['url']
-                    + '\n范围：' + scope['title'] + '\nIssue 版本：' + scope['updated_at']
-                    + '\n等待执行：Codex 执行尚未启用。受理与消息送达分别核对。')
-                self.manager().publish_request_message(identity, record['id'], 'material', '已受理范围：\n' + scope['body'])
-                await self.deliver(identity, record['id'], transport)
-                return {'action': 'skip'}
+            return PreparedMessage(event, adapter, transport, binding, envelope, command, work.group(1) if work else None)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+
+    def in_scope(self, prepared, runtime_profile):
+        manager = self.manager()
+        if manager is None:
+            return False
+        snapshot = manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))
+        return any(p['id'] == prepared.binding['profile_id'] and p['project_id'] == prepared.binding['project_id']
+                   and p['native_profile'] == runtime_profile and p['capability'] == 'development'
+                   for p in snapshot['profiles'])
+
+    async def process_prepared(self, prepared):
+        """Business processing after the owned driver has irrevocably consumed this original."""
+        identity = VerifiedIdentity(self.owner, 'verified-feishu-owner-entry')
+        binding, envelope, transport = prepared.binding, prepared.envelope, prepared.transport
+        async with self.lock:
+            if not prepared.issue_url:
+                return await self._associate(identity, binding, envelope, prepared.command, transport)
+            existing = next((r for r in self.manager().read_snapshot(identity)['requests'] if r['source_anchor'] == envelope), None)
+            if existing:
+                record = existing
+            else:
+                issue = await asyncio.to_thread(self.issue_reader, prepared.issue_url)
+                if inspect.isawaitable(issue):
+                    issue = await issue
+                if issue.get('url') != prepared.issue_url or any(secret and secret in json.dumps(issue) for secret in self.secret_values):
+                    from .manager import ManagementError
+                    raise ManagementError('invalid_change', 'The Issue source or public scope could not be verified.')
+                record = self.manager().accept_request(identity, binding['project_id'], binding['profile_id'], envelope, issue)['request']
+            scope = record['accepted_scope']
+            self.manager().publish_request_message(identity, record['id'], 'confirmation',
+                '已受理：项目 ' + record['project_id'] + ' · 负责人 ' + record['profile_id'] + '\n' + scope['url']
+                + '\n范围：' + scope['title'] + '\nIssue 版本：' + scope['updated_at']
+                + '\n等待执行：Codex 执行尚未启用。受理与消息送达分别核对。')
+            self.manager().publish_request_message(identity, record['id'], 'material', '已受理范围：\n' + scope['body'])
+            await self.deliver(identity, record['id'], transport)
+            return {'action': 'skip'}
+
+    async def receive(self, event, gateway):
+        """Legacy direct entry fixture; production intake is owned prebatch only."""
+        if self.manager() is None:
+            return None
+        prepared = None
+        try:
+            adapter = gateway._intake_adapter_for(event.source)
+            prepared = self.prepare(event, adapter)
+            if prepared is None or gateway._is_user_authorized_for_source(event.source) is not True:
+                return None
+            recipient = await prepared.transport.verify_identity(prepared.binding)
+            if not recipient or recipient.get('app_id') != prepared.binding['app_id'] or recipient.get('open_id') != prepared.binding['recipient_open_id']:
+                return None
+            if gateway._admit_bot_message_for_source(event.source) is not True:
+                return None
+            return await self.process_prepared(prepared)
         except Exception:
-            # A missing/broken pinned host contract never grants admission or sends.
-            return {'action': 'skip'} if consumed else None
+            if prepared and any(r['source_anchor'] == prepared.envelope for r in self.manager().read_snapshot(
+                VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))['requests']):
+                return {'action': 'skip'}
+            return None
 
     async def _associate(self, identity, binding, envelope, text, transport):
         retry = re.fullmatch(r'重试投递\s+([a-f0-9]{64})', text)

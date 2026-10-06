@@ -67,6 +67,8 @@
       snapshot && h(React.Fragment, null,
         h('p', null, '运行：' + snapshot.runtime + ' · 配置版本：' + snapshot.version),
         h('p', null, '目录最后核实：' + (snapshot.last_verified_at || '尚未核实')),
+        snapshot.intake_conditions && h('p', null, '消息入口：' + snapshot.intake_conditions.runtime_route +
+          ' · 接缝兼容：' + snapshot.intake_conditions.compatibility + ' · 真实群验收：' + snapshot.intake_conditions.real_group_acceptance),
         snapshot.status === 'unverified' && h('p', { role: 'status' }, '管理实例离线，仅显示最后核实目录；修改未执行。'),
         h('h2', null, '组织目录'),
         h('ul', null, snapshot.projects.map(function (p) {
@@ -109,6 +111,12 @@
           h('ul', null, snapshot.clarifications.map(function (c) {
             return h('li', { key: c.id }, c.source_anchor.chat_id + ' / ' + c.source_anchor.message_id +
               ' · 候选请求：' + c.candidate_ids.length + ' · 澄清回复送达：' + c.delivery);
+          }))),
+        (snapshot.intake_failures || []).length > 0 && h('section', null, h('h2', null, '受理需核对'),
+          h('ul', null, snapshot.intake_failures.map(function (f) {
+            return h('li', { key: f.id }, f.source_anchor.chat_id + ' / ' + f.source_anchor.message_id +
+              ' · 受理：' + f.acceptance + ' · 通知：' + f.notification.status,
+              h('div', null, f.reason));
           }))),
         h('h2', null, '登记或修正'),
         h('p', null, '这里只保存非敏感引用；不创建原生 Profile、机器人、仓库或 worktree。项目身份不能改绑到新项目。'),

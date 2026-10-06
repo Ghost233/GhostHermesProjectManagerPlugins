@@ -15,6 +15,7 @@ class Context:
         self.cleanups = []
         self.hooks = {}
         self.platform_handlers = {}
+        self.platforms = {}
     def get_config(self, key, default=None):
         return self.settings.get(key, default)
     def register_tool(self, **kwargs):
@@ -25,6 +26,8 @@ class Context:
         self.hooks[name] = callback
     def register_platform_handler(self, name, factory):
         self.platform_handlers[name] = factory
+    def register_platform(self, **entry):
+        self.platforms[entry['name']] = entry
     def on_unload(self, callback):
         self.cleanups.append(callback)
 
@@ -45,6 +48,8 @@ def test_formal_plugin_registers_synchronously_without_configuration_side_effect
     assert status['execution'] == 'not_enabled'
     assert 'hermes-pm' in ctx.commands
     assert not ctx.cleanups
+    assert 'hermes_feishu_pm' in ctx.platforms
+    assert 'feishu' not in ctx.platforms
 
 
 def test_native_reader_with_participant_secret_but_missing_state_path_stays_configuring(monkeypatch):
