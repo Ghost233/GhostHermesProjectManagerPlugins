@@ -7,6 +7,8 @@ import sqlite3
 import subprocess
 import threading
 import re
+import hashlib
+import uuid
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,9 @@ class Manager:
         schema, version, payload = self._db.execute('SELECT schema_version, version, payload FROM directory WHERE id=1').fetchone()
         if schema != 1:
             raise ManagementError('unknown_version', 'Directory schema requires a verified upgrade.')
-        return version, json.loads(payload)
+        data = json.loads(payload)
+        data.setdefault('requests', {})
+        return version, data
 
     def _principal(self, identity, data):
         if not isinstance(identity, VerifiedIdentity) or not identity.source:
@@ -119,9 +123,120 @@ class Manager:
             if scope is not None:
                 projects = [p for p in projects if p['id'] == scope]
                 profiles = [p for p in profiles if p['project_id'] == scope]
+            visible_ids = {p['id'] for p in profiles}
+            requests = [r for r in data['requests'].values() if r['profile_id'] in visible_ids]
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
-                    'projects': projects, 'profiles': profiles, 'runtime': 'directory_available',
+                    'projects': projects, 'profiles': profiles, 'requests': requests, 'runtime': 'directory_available',
                     'execution': 'not_enabled', 'needs_human': ['Execution and channel capabilities are not verified.']}
+
+    def accept_request(self, identity, project_id, profile_id, message, issue):
+        """Accept an Issue snapshot from a trusted message entry; never start Codex."""
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'New work requires the verified owner.')
+            profile = data['profiles'].get(profile_id)
+            if project_id not in data['projects'] or not profile or profile['project_id'] != project_id or profile['capability'] != 'development':
+                raise ManagementError('invalid_change', 'An explicitly registered development project and responsible Profile are required.')
+            required = ('tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id')
+            if not isinstance(message, dict) or any(not isinstance(message.get(k), str) or not message[k] for k in required):
+                raise ManagementError('invalid_change', 'Verified source message and transport identities are required.')
+            key = hashlib.sha256(json.dumps([message[k] for k in required[:4]]).encode()).hexdigest()
+            if key in data['requests']:
+                return {'status': 'accepted', 'duplicate': True, 'request': data['requests'][key]}
+            if not isinstance(issue, dict) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', issue.get('url', '')) or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
+                raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
+            record = {'id': key, 'project_id': project_id, 'profile_id': profile_id,
+                      'accepted_scope': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')},
+                      'source_anchor': dict(message), 'task_start_anchor': None,
+                      'acceptance': 'accepted', 'accepted_at': datetime.now(timezone.utc).isoformat(),
+                      'execution': 'waiting', 'unexecuted_reason': 'Codex execution is not enabled.',
+                      'delivery': 'pending', 'messages': [], 'outbox': []}
+            data['requests'][key] = record
+            self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
+            return {'status': 'accepted', 'duplicate': False, 'request': record}
+
+    def _request(self, identity, request_id, data):
+        principal = self._principal(identity, data)
+        record = data['requests'].get(request_id)
+        if record is None:
+            raise ManagementError('invalid_change', 'Unknown request.')
+        if principal and principal['role'] != 'steward' and record['profile_id'] not in self._visible_profile_ids(principal, data):
+            raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
+        return record
+
+    def _save(self, version, data):
+        self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
+
+    def publish_request_message(self, identity, request_id, kind, text):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            record = self._request(identity, request_id, data)
+            if kind not in {'confirmation', 'material', 'progress', 'result', 'clarification'} or not isinstance(text, str) or not text.strip():
+                raise ManagementError('invalid_change', 'An explicit message kind and public material are required.')
+            key = hashlib.sha256((kind + ':' + text).encode()).hexdigest()
+            existing = next((p for p in record['outbox'] if p['id'] == key), None)
+            if existing:
+                return existing
+            publication = {'id': key, 'kind': kind, 'segments': [
+                {'number': index + 1, 'uuid': str(uuid.uuid4()), 'text': text[start:start + 1800],
+                 'status': 'pending', 'attempts': []}
+                for index, start in enumerate(range(0, len(text), 1800))]}
+            record['outbox'].append(publication)
+            self._save(version, data)
+            return publication
+
+    def claim_delivery(self, identity, request_id):
+        """Persist intent before the external send. An interrupted send requires reconciliation."""
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            record = self._request(identity, request_id, data)
+            for publication in record['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'delivered':
+                        continue
+                    if segment['status'] == 'sending':
+                        segment['status'] = 'unknown'
+                        record['delivery'] = 'unknown'
+                        self._save(version, data)
+                    if segment['status'] != 'pending':
+                        return None
+                    anchor = record['task_start_anchor'] or record['source_anchor']
+                    if publication['kind'] != 'confirmation' and record['task_start_anchor'] is None:
+                        return None
+                    segment['status'] = 'sending'
+                    segment['attempts'].append({'status': 'sending'})
+                    self._save(version, data)
+                    return {**segment, 'kind': publication['kind'], 'chat_id': anchor['chat_id'],
+                            'reply_to': anchor['message_id'], 'thread_id': anchor.get('thread_id'),
+                            'mention_open_id': record['source_anchor']['sender_open_id']}
+            return None
+
+    def record_delivery(self, identity, request_id, segment_uuid, outcome):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            record = self._request(identity, request_id, data)
+            if not isinstance(outcome, dict) or outcome.get('status') not in {'delivered', 'failed', 'unknown'} or set(outcome) - {'status', 'code', 'message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id'}:
+                raise ManagementError('invalid_change', 'A scalar delivery receipt is required.')
+            found = next(((p, s) for p in record['outbox'] for s in p['segments'] if s['uuid'] == segment_uuid), None)
+            if not found or found[1]['status'] != 'sending':
+                raise ManagementError('version_conflict', 'There is no matching in-flight delivery.')
+            publication, segment = found
+            receipt = dict(outcome)
+            if receipt['status'] == 'delivered' and (not receipt.get('message_id') or receipt.get('chat_id') != record['source_anchor']['chat_id']):
+                receipt['status'] = 'unknown'
+            segment['status'] = receipt['status']
+            segment['attempts'][-1] = receipt
+            if receipt['status'] == 'delivered' and publication['kind'] == 'confirmation' and segment['number'] == 1 and record['task_start_anchor'] is None:
+                record['task_start_anchor'] = {k: receipt.get(k) for k in ('message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id')}
+            statuses = [s['status'] for p in record['outbox'] for s in p['segments']]
+            record['delivery'] = 'unknown' if 'unknown' in statuses else 'failed' if 'failed' in statuses else 'delivered' if all(s == 'delivered' for s in statuses) else 'pending'
+            self._save(version, data)
+            return {'status': 'completed', 'request': record}
 
     def _visible_profile_ids(self, principal, data):
         visible = {principal['id']}
