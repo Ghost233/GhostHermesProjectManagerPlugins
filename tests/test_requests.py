@@ -132,3 +132,21 @@ def test_same_literal_ids_in_another_app_never_duplicate_or_associate(tmp_path):
         assert second['duplicate'] is False
         assert second['request']['id'] != first['id']
         assert second['request']['accepted_scope']['body'] == 'Another app scope'
+
+
+def test_explicit_parent_start_anchor_disambiguates_shared_native_thread(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        ids = []
+        for number in (1, 2):
+            source = {**MESSAGE, 'message_id': 'om_request_' + str(number), 'root_id': 'om_root', 'thread_id': 'omt_shared'}
+            record = manager.accept_request(OWNER, 'mono', 'mono-lead', source, ISSUE)['request']
+            ids.append(record['id'])
+            manager.publish_request_message(OWNER, record['id'], 'confirmation', '已受理')
+            segment = manager.claim_delivery(OWNER, record['id'])
+            manager.record_delivery(OWNER, record['id'], segment['uuid'], {'status': 'delivered', 'chat_id': 'oc_project',
+                'message_id': 'om_ack_' + str(number), 'root_id': 'om_root', 'thread_id': 'omt_shared'})
+        result = manager.associate_message(OWNER, 'mono', 'mono-lead',
+            {**MESSAGE, 'message_id': 'om_reply', 'parent_id': 'om_ack_1', 'root_id': 'om_root', 'thread_id': 'omt_shared'}, '请核对')
+        assert result['status'] == 'associated'
+        assert result['request_id'] == ids[0]

@@ -202,8 +202,12 @@ class Manager:
                 return {'status': 'ignored'}
             candidates = [r for r in data['requests'].values() if r['project_id'] == project_id and r['profile_id'] == profile_id
                           and all(r['source_anchor'].get(k) == message[k] for k in _MESSAGE_NAMESPACE)]
-            references = {message.get(k) for k in ('parent_id', 'root_id', 'thread_id')} - {None, ''}
-            if references:
+            parent = message.get('parent_id')
+            references = {message.get(k) for k in ('root_id', 'thread_id')} - {None, ''}
+            if parent:
+                candidates = [r for r in candidates if parent in {
+                    a.get('message_id') for a in [r['source_anchor'], r['task_start_anchor'] or {}]}]
+            elif references:
                 candidates = [r for r in candidates if references & {
                     a.get(k) for a in [r['source_anchor'], r['task_start_anchor'] or {}]
                     for k in ('message_id', 'root_id', 'thread_id')}]
