@@ -80,6 +80,36 @@
             h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：配置中 · 执行：未启用'),
             h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
         })),
+        h('h2', null, '已受理请求'),
+        h('p', null, '受理记录来自同一管理实例。消息送达与等待执行分别显示，当前不会启动 Codex。'),
+        !(snapshot.requests || []).length && h('p', null, '尚无核实的受理记录。'),
+        h('ul', null, (snapshot.requests || []).map(function (r) {
+          const source = r.source_anchor;
+          const anchor = r.task_start_anchor;
+          return h('li', { key: r.id, style: { marginBottom: '18px' } },
+            h('strong', null, r.project_id + ' · 负责人：' + r.profile_id),
+            h('div', null, h('a', { href: r.accepted_scope.url, target: '_blank', rel: 'noreferrer' }, r.accepted_scope.title)),
+            h('div', null, '受理：' + r.acceptance + ' · 消息送达：' + r.delivery + ' · 执行：' + r.execution),
+            h('div', null, '未执行原因：' + r.unexecuted_reason),
+            h('div', null, '请求 ID：' + r.id),
+            h('div', null, '来源群 / 消息：' + source.chat_id + ' / ' + source.message_id),
+            h('div', null, '任务起始锚：' + (anchor ? anchor.chat_id + ' / ' + anchor.message_id : '待核对')),
+            h('div', null, 'Issue 受理版本：' + r.accepted_scope.updated_at + ' · 受理时间：' + r.accepted_at),
+            h('details', null, h('summary', null, '已受理范围与逐段投递凭据'),
+              h('pre', { style: { whiteSpace: 'pre-wrap' } }, r.accepted_scope.body),
+              h('ul', null, r.outbox.map(function (p) {
+                return h('li', { key: p.id }, p.kind, h('ul', null, p.segments.map(function (s) {
+                  const receipt = s.attempts[s.attempts.length - 1] || {};
+                  return h('li', { key: s.uuid }, '第 ' + s.number + ' 段 · ' + s.status +
+                    ' · 尝试：' + s.attempts.length + ' · 消息：' + (receipt.message_id || '待核对'));
+                })));
+              }))));
+        })),
+        (snapshot.clarifications || []).length > 0 && h('section', null, h('h2', null, '待澄清输入'),
+          h('ul', null, snapshot.clarifications.map(function (c) {
+            return h('li', { key: c.id }, c.source_anchor.chat_id + ' / ' + c.source_anchor.message_id +
+              ' · 候选请求：' + c.candidate_ids.length + ' · 澄清回复送达：' + c.delivery);
+          }))),
         h('h2', null, '登记或修正'),
         h('p', null, '这里只保存非敏感引用；不创建原生 Profile、机器人、仓库或 worktree。项目身份不能改绑到新项目。'),
         h('form', { onSubmit: preview },

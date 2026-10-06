@@ -1,6 +1,6 @@
 # GhostHermesProjectManagerPlugins
 
-Hermes 分层协作与 Codex 监督插件。首版规格与决策地图已定稿，尚未实现或安装插件。
+Hermes 分层协作与 Codex 监督插件。首版规格与决策地图已定稿，目录和请求受理的离线切片已实现；尚未安装插件或完成真实接口验收。
 
 - [首版插件规格](docs/specs/hermes-plugin-v1.md)：已确认的实现契约、管理入口、生命周期与验收矩阵。
 - [Hermes 分层协作与 Codex 监督插件决策地图](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/1)：规划目标、研究与决定索引。
@@ -20,3 +20,7 @@ Hermes 分层协作与 Codex 监督插件。首版规格与决策地图已定稿
 资料通过公开真实 @ 按来源范围共享，Wiki 返回相关材料及来源，开发流程不自动改写原资料库。Codex 接收当前任务所需的允许共享上下文，各角色在验收后保存自己的项目记忆，个人偏好按本人明确范围更新；封存后总管按登记授权只读代查旧档案，不恢复旧入口。
 
 首版提供飞书聊天管理与 Hermes Web Dashboard，同机运行 Hermes 管理和 Codex 执行端。一个管理实例使用独立 SQLite 保存全局协调状态；登记的旧档案与封存资料永久保护，迁移、升级和恢复均核对检查点。规格列明 16 组离线与真实环境验收场景，实施时须分别证明接口、身份及仓库边界生效。
+
+## 请求受理开发切片
+
+飞书冷路径受理切片保存明确派发的 GitHub Issue 范围、逐段公开确认凭据，并在同一 Dashboard 快照中展示等待执行的请求，不启动 Codex。消息受理默认关闭；真实测试群、busy lane 和文本合并覆盖仍是实际验收门槛。参见[请求受理开发与获准测试流程](docs/development/request-intake.md)。
