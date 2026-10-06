@@ -10,8 +10,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('runner,artifact_mismatch', [('native_smoke_runner.py', False), ('owned_feishu_smoke_runner.py', False), ('owned_feishu_smoke_runner.py', True)])
-def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(runner, artifact_mismatch):
+@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay')])
+def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(runner, artifact_mismatch, unload_stage):
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     sdk = Path(configured) if configured else ROOT / 'tests' / 'fixtures' / 'hermes-sdk'
     if not (sdk / 'hermes_cli' / 'plugins.py').exists():
@@ -37,6 +37,8 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
                'HERMES_FIXTURE_PARTICIPANT_TOKEN': 'synthetic-participant-credential'}
         if artifact_mismatch:
             env['HERMES_TEST_OWNED_ARTIFACT_MISMATCH'] = '1'
+        if unload_stage:
+            env['HERMES_TEST_OWNED_UNLOAD_STAGE'] = unload_stage
         result = subprocess.run([sys.executable, str(ROOT / 'tests' / runner), str(scratch)],
                                 cwd=scratch, env=env, text=True, capture_output=True, timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr

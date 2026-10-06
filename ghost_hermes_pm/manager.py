@@ -229,14 +229,14 @@ class Manager:
             key = hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
             existing = data['intake_failures'].get(key)
             if existing:
-                return existing
+                return {**existing, 'notification_claimed': False}
             accepted = any(r['source_anchor'] == message for r in data['requests'].values())
             record = {'id': key, 'project_id': project_id, 'profile_id': profile_id, 'source_anchor': dict(message),
                       'acceptance': 'needs_reconciliation' if accepted else 'unaccepted', 'code': code, 'reason': reasons[code],
                       'notification': {'uuid': str(uuid.uuid4()), 'status': 'unknown'}}
             data['intake_failures'][key] = record
             self._save(version, data)
-            return record
+            return {**record, 'notification_claimed': True}
 
     def record_intake_conditions(self, identity, conditions):
         allowed = {'enabled', 'runtime_route', 'compatibility', 'sdk_revision', 'lark_version',

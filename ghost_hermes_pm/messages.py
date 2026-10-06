@@ -3,9 +3,10 @@ import asyncio
 import inspect
 import json
 import re
+import threading
 from dataclasses import dataclass
 
-from .manager import VerifiedIdentity
+from .manager import VerifiedIdentity, ManagementError
 
 OWNED_PLATFORM = 'hermes_feishu_pm'
 
@@ -31,12 +32,27 @@ class FeishuEntry:
         self.transports = []
         self.lock = asyncio.Lock()
         self.closed = False
+        self.generation = 0
+        self.lifecycle_lock = threading.RLock()
 
     def deactivate(self):
-        self.closed = True
-        self.transports.clear()
+        with self.lifecycle_lock:
+            if not self.closed:
+                self.generation += 1
+                self.closed = True
+            self.transports.clear()
+
+    def require_active(self, generation):
+        with self.lifecycle_lock:
+            if self.closed or generation != self.generation:
+                raise ManagementError('unavailable', 'The intake lifecycle ended; no new action is authorized.')
 
     def attach_transport(self, adapter, transport):
+        if self.closed:
+            return
+        if callable(getattr(transport, 'bind_lifecycle_guard', None)):
+            generation = self.generation
+            transport.bind_lifecycle_guard(lambda: self.require_active(generation))
         self.transports = [(a, t) for a, t in self.transports if a is not adapter]
         self.transports.append((adapter, transport))
         self.secret_values = tuple(dict.fromkeys((*self.secret_values, *getattr(transport, 'sensitive_values', ()))))
@@ -110,31 +126,39 @@ class FeishuEntry:
                    and p['native_profile'] == runtime_profile and p['capability'] == 'development'
                    for p in snapshot['profiles'])
 
-    async def process_prepared(self, prepared):
+    async def process_prepared(self, prepared, generation=None):
         """Business processing after the owned driver has irrevocably consumed this original."""
         identity = VerifiedIdentity(self.owner, 'verified-feishu-owner-entry')
         binding, envelope, transport = prepared.binding, prepared.envelope, prepared.transport
+        generation = self.generation if generation is None else generation
+        self.require_active(generation)
         async with self.lock:
+            self.require_active(generation)
             if not prepared.issue_url:
-                return await self._associate(identity, binding, envelope, prepared.command, transport)
+                return await self._associate(identity, binding, envelope, prepared.command, transport, generation)
             existing = next((r for r in self.manager().read_snapshot(identity)['requests'] if r['source_anchor'] == envelope), None)
             if existing:
                 record = existing
             else:
                 issue = await asyncio.to_thread(self.issue_reader, prepared.issue_url)
+                self.require_active(generation)
                 if inspect.isawaitable(issue):
                     issue = await issue
+                    self.require_active(generation)
                 if issue.get('url') != prepared.issue_url or any(secret and secret in json.dumps(issue) for secret in self.secret_values):
                     from .manager import ManagementError
                     raise ManagementError('invalid_change', 'The Issue source or public scope could not be verified.')
-                record = self.manager().accept_request(identity, binding['project_id'], binding['profile_id'], envelope, issue)['request']
+                with self.lifecycle_lock:
+                    self.require_active(generation)
+                    record = self.manager().accept_request(identity, binding['project_id'], binding['profile_id'], envelope, issue)['request']
             scope = record['accepted_scope']
             self.manager().publish_request_message(identity, record['id'], 'confirmation',
                 '已受理：项目 ' + record['project_id'] + ' · 负责人 ' + record['profile_id'] + '\n' + scope['url']
                 + '\n范围：' + scope['title'] + '\nIssue 版本：' + scope['updated_at']
                 + '\n等待执行：Codex 执行尚未启用。受理与消息送达分别核对。')
             self.manager().publish_request_message(identity, record['id'], 'material', '已受理范围：\n' + scope['body'])
-            await self.deliver(identity, record['id'], transport)
+            self.require_active(generation)
+            await self.deliver(identity, record['id'], transport, generation)
             return {'action': 'skip'}
 
     async def receive(self, event, gateway):
@@ -142,31 +166,36 @@ class FeishuEntry:
         if self.manager() is None:
             return None
         prepared = None
+        generation = self.generation
         try:
             adapter = gateway._intake_adapter_for(event.source)
             prepared = self.prepare(event, adapter)
             if prepared is None or gateway._is_user_authorized_for_source(event.source) is not True:
                 return None
             recipient = await prepared.transport.verify_identity(prepared.binding)
+            self.require_active(generation)
             if not recipient or recipient.get('app_id') != prepared.binding['app_id'] or recipient.get('open_id') != prepared.binding['recipient_open_id']:
                 return None
             if gateway._admit_bot_message_for_source(event.source) is not True:
                 return None
-            return await self.process_prepared(prepared)
+            return await self.process_prepared(prepared, generation)
         except Exception:
+            if self.closed or generation != self.generation:
+                return None
             if prepared and any(r['source_anchor'] == prepared.envelope for r in self.manager().read_snapshot(
                 VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))['requests']):
                 return {'action': 'skip'}
             return None
 
-    async def _associate(self, identity, binding, envelope, text, transport):
+    async def _associate(self, identity, binding, envelope, text, transport, generation):
+        self.require_active(generation)
         retry = re.fullmatch(r'重试投递\s+([a-f0-9]{64})', text)
         if retry:
             record = next((r for r in self.manager().read_snapshot(identity)['requests'] if r['id'] == retry.group(1)), None)
             if not record or record['project_id'] != binding['project_id'] or record['profile_id'] != binding['profile_id'] or any(record['source_anchor'].get(k) != envelope.get(k) for k in ('app_id', 'tenant_key', 'recipient_open_id', 'chat_id', 'sender_open_id')):
                 return None
             self.manager().retry_delivery(identity, record['id'])
-            await self.deliver(identity, record['id'], transport)
+            await self.deliver(identity, record['id'], transport, generation)
             return {'action': 'skip'}
         result = self.manager().associate_message(identity, binding['project_id'], binding['profile_id'], envelope, text)
         if result['status'] == 'unassociated':
@@ -180,20 +209,29 @@ class FeishuEntry:
                            'thread_id': envelope['thread_id'], 'mention_open_id': envelope['sender_open_id']}
                 try:
                     receipt = await transport.send(segment)
+                    self.require_active(generation)
                 except Exception:
+                    self.require_active(generation)
                     receipt = {'status': 'unknown'}
                 self.manager().record_clarification_delivery(identity, result['id'], receipt)
         elif result['status'] == 'associated':
             self.manager().publish_request_message(identity, result['request_id'], 'progress',
                 '已关联输入 ' + envelope['message_id'] + '。已受理范围保持原 Issue 版本；执行仍等待启用。')
-            await self.deliver(identity, result['request_id'], transport)
+            await self.deliver(identity, result['request_id'], transport, generation)
         return {'action': 'skip'}
 
-    async def deliver(self, identity, request_id, transport):
-        while segment := self.manager().claim_delivery(identity, request_id):
+    async def deliver(self, identity, request_id, transport, generation=None):
+        generation = self.generation if generation is None else generation
+        while True:
+            self.require_active(generation)
+            segment = self.manager().claim_delivery(identity, request_id)
+            if segment is None:
+                break
             try:
                 receipt = await transport.send(segment)
+                self.require_active(generation)
             except Exception:
+                self.require_active(generation)
                 receipt = {'status': 'unknown'}
             self.manager().record_delivery(identity, request_id, segment['uuid'], receipt)
             if receipt.get('status') != 'delivered':
