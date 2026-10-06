@@ -20,6 +20,7 @@ Hermes 分层协作与 Codex 监督插件。首版规格与决策地图已定稿
 资料通过公开真实 @ 按来源范围共享，Wiki 返回相关材料及来源，开发流程不自动改写原资料库。Codex 接收当前任务所需的允许共享上下文，各角色在验收后保存自己的项目记忆，个人偏好按本人明确范围更新；封存后总管按登记授权只读代查旧档案，不恢复旧入口。
 
 首版提供飞书聊天管理与 Hermes Web Dashboard，同机运行 Hermes 管理和 Codex 执行端。一个管理实例使用独立 SQLite 保存全局协调状态；登记的旧档案与封存资料永久保护，迁移、升级和恢复均核对检查点。规格列明 16 组离线与真实环境验收场景，实施时须分别证明接口、身份及仓库边界生效。
-# Issue intake development
 
-The reviewable Feishu cold-path intake slice freezes explicitly assigned GitHub Issue scope, retains per-segment public confirmation receipts and exposes waiting requests in the same Dashboard snapshot. It never starts Codex. Message intake remains disabled by default; real-group and busy/debounce coverage gates are still outstanding. See [request intake development and approved smoke procedure](docs/development/request-intake.md).
+## 请求受理开发切片
+
+飞书冷路径受理切片保存明确派发的 GitHub Issue 范围、逐段公开确认凭据，并在同一 Dashboard 快照中展示等待执行的请求，不启动 Codex。消息受理默认关闭；真实测试群、busy lane 和文本合并覆盖仍是实际验收门槛。参见[请求受理开发与获准测试流程](docs/development/request-intake.md)。

@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def check_snapshot(snapshot, *, chat_id, source_message_id, start_message_id, issue_url):
-    if snapshot.get('status') != 'completed':
+    if not isinstance(snapshot, dict) or snapshot.get('status') != 'completed':
         raise ValueError('The management snapshot is unverified or offline.')
     matches = [r for r in snapshot.get('requests', []) if r.get('source_anchor', {}).get('chat_id') == chat_id
                and r['source_anchor'].get('message_id') == source_message_id]
@@ -50,7 +50,7 @@ def main():
         snapshot = json.loads(args.snapshot.read_text())
         result = check_snapshot(snapshot, chat_id=args.chat_id, source_message_id=args.source_message_id,
                                 start_message_id=args.start_message_id, issue_url=args.issue_url)
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         parser.exit(1, 'FAIL: snapshot or observed IDs do not establish the required record structure.\n')
     print(json.dumps(result))
     print('Real group observation and native authorization require separate evidence.')
