@@ -17,4 +17,4 @@
 - 所有 GitHub 操作使用 Ghost233。每次需要认证的 gh 业务操作前执行 `gh auth switch --hostname github.com --user Ghost233`，再用 `gh api --hostname github.com user --jq .login` 核验；核验失败时停止 GitHub 操作。
 - 远程更新后同步涉及的本地分支，仅允许 fast-forward；结束前核对当前工作区、本地与远端完整提交 hash。
 - 不自动 stash、移动、删除、覆盖用户的未提交或未跟踪文件。不使用额外 worktree 或临时集成分支替代当前本地分支。
-- Wayfinder 默认只规划。本轮只形成插件规格与决策地图，不安装插件或修改正在运行的 Hermes。
+- 首版规格与决策地图已定稿。实施遵循已批准的 GitHub 子工单、Implement Spec、TDD、双轴审查与 Retro；正式安装、开通机器人和迁移真实资料按具体计划另行执行。
