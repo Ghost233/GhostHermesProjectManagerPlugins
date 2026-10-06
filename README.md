@@ -23,4 +23,4 @@ Hermes 分层协作与 Codex 监督插件。首版规格与决策地图已定稿
 
 ## 请求受理开发切片
 
-飞书冷路径受理切片保存明确派发的 GitHub Issue 范围、逐段公开确认凭据，并在同一 Dashboard 快照中展示等待执行的请求，不启动 Codex。消息受理默认关闭；真实测试群、busy lane 和文本合并覆盖仍是实际验收门槛。参见[请求受理开发与获准测试流程](docs/development/request-intake.md)。
+飞书独立平台逐原消息受理切片保存明确派发的 GitHub Issue 范围、逐段公开确认凭据，并在同一 Dashboard 快照中展示等待执行的请求，不启动 Codex。消息受理默认关闭；快速文本与 busy lane 已有隔离原生 SDK 组合验证；真实连接、测试群和部署拓扑仍是实际验收门槛。参见[请求受理开发与获准测试流程](docs/development/request-intake.md)。

@@ -12,12 +12,14 @@ def audit(event, args):
         path = Path(os.fsdecode(args[0])).resolve()
         if path.is_relative_to(real_hermes) or (path.name == '.env' and not path.is_relative_to(scratch)):
             raise RuntimeError('Smoke refused a real Hermes/credential file read.')
-    if event == 'import' and args[0] in {'hermes_cli.main', 'hermes_bootstrap', 'run_agent'}:
+    if event == 'import' and args[0] in {'hermes_cli.main', 'run_agent'}:
         raise RuntimeError('Smoke refused a full launch/bootstrap import.')
     if event == 'socket.connect' and isinstance(args[1], tuple):
         raise RuntimeError('Smoke refused an external network connection.')
 
 sys.addaudithook(audit)
+os.environ['HERMES_SKIP_PM_BOOTSTRAP'] = '1'
+os.environ['HERMES_DISABLE_PROJECT_PLUGINS'] = '1'
 
 import json
 import subprocess
@@ -38,7 +40,7 @@ settings = {'manager_profile': 'default', 'state_dir': str(state), 'owner_identi
 settings['feishu_intake'] = {'enabled': True, 'verification_ref': 'fixture:controlled-smoke', 'bindings': [
     {'sender_tenant_key': 'tenant-owner', 'recipient_tenant_key': 'tenant-bot', 'transport_tenant_key': 'tenant-app',
      'verification_ref': 'fixture:identity-map', 'app_id': 'cli_fixture', 'recipient_open_id': 'ou_lead',
-     'owner_open_id': 'ou_owner', 'chat_id': 'oc_fixture', 'project_id': 'mono', 'profile_id': 'lead',
+     'owner_open_id': 'ou_owner', 'owner_native_ids': ['u_owner', 'on_owner'], 'chat_id': 'oc_fixture', 'project_id': 'mono', 'profile_id': 'lead',
      'repository': 'Ghost233/fixture'}]}
 (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'],
                                                 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
@@ -86,21 +88,26 @@ import asyncio
 from hermes_cli.lifecycle import ainvoke_hook
 from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 from agent.secret_scope import set_secret_scope, reset_secret_scope
+from gateway.run import GatewayRunner
+from gateway.config import Platform, PlatformConfig, GatewayConfig
+from gateway.bot_loop_guard import BotLoopGuard
 
 
-class GatewayFixture:
+class GatewayFixture(GatewayRunner):
     # Public Gateway lifetime seam; no real adapters, credentials or outbound work.
     def __init__(self):
         self.stopped = asyncio.Event()
+        self.config = GatewayConfig()
+        self._primary_profile_name = 'default'
+        self.adapters, self._profile_adapters = {}, {}
+        self.session_store, self.pairing_store, self.pairing_stores = None, None, {}
+        self._busy_text_mode, self._human_delay = 'steer', None
+        self._bot_loop_guard = BotLoopGuard()
     async def wait_for_shutdown(self):
         await self.stopped.wait()
-    def _intake_adapter_for(self, source):
-        return self.adapter
     def _is_user_authorized_for_source(self, source):
         self.authorized_source = source
-        return True
-    def _admit_bot_message_for_source(self, source):
-        return True
+        return super()._is_user_authorized_for_source(source)
 
 
 async def exercise_gateway_lifecycle():
@@ -147,13 +154,21 @@ async def exercise_gateway_lifecycle():
         return ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_native_' + str(len(sent)),
                                     'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     native.im.v1.message.reply = reply
-    gateway.adapter = object()
-    factories = manager.get_platform_handler_factories('feishu')
+    owned = Platform('hermes_feishu_pm')
+    gateway.adapter = gateway._create_adapter(owned, PlatformConfig(enabled=True, extra={
+        'app_id': 'cli_fixture', 'app_secret': 'synthetic-unused-secret', 'require_mention': False,
+        'default_group_policy': 'open', 'allow_bots': 'none'}))
+    assert gateway.adapter is not None
+    gateway.adapters[owned] = gateway.adapter
+    gateway._wire_adapter_handlers(gateway.adapter)
+    async def chat_info(chat_id): return {'name': 'Synthetic chat', 'type': 'group'}
+    gateway.adapter.get_chat_info = chat_info
+    factories = manager.get_platform_handler_factories('hermes_feishu_pm')
     assert len(factories) == 1
     factories[0][0](native, gateway.adapter)
-    source = SessionSource(platform=Platform.FEISHU, chat_id='oc_fixture', chat_type='group',
+    source = gateway.adapter.build_source(chat_id='oc_fixture', chat_type='group',
                            user_id='u_owner', user_id_alt='on_owner', is_bot=False,
-                           message_id='om_inbound', profile='default')
+                           message_id='om_inbound')
     raw = P2ImMessageReceiveV1({'header': {'event_type': 'im.message.receive_v1', 'app_id': 'cli_fixture', 'tenant_key': 'tenant-app'},
         'event': {'sender': {'sender_type': 'user', 'tenant_key': 'tenant-owner',
                             'sender_id': {'open_id': 'ou_owner', 'user_id': 'u_owner', 'union_id': 'on_owner'}},
@@ -162,14 +177,17 @@ async def exercise_gateway_lifecycle():
                               'mentions': [{'key': '@_user_1', 'mentioned_type': 'bot', 'tenant_key': 'tenant-bot',
                                             'id': {'open_id': 'ou_lead'}}]}}})
     inbound = MessageEvent(text='normalized fixture', source=source, message_id='om_inbound', raw_message=raw)
-    assert await ainvoke_hook('pre_gateway_dispatch', event=inbound, gateway=gateway) == [{'action': 'skip'}]
-    assert gateway.authorized_source is source
+    assert await ainvoke_hook('pre_gateway_dispatch', event=inbound, gateway=gateway) == []
+    await gateway.adapter._handle_message_event_data(raw)
+    assert gateway.authorized_source._transport_adapter_ref() is gateway.adapter
+    assert gateway.authorized_source.message_id == source.message_id
     accepted = browser.get(base + '/snapshot', headers=headers).json()
     assert len(accepted['requests']) == 1 and accepted['requests'][0]['execution'] == 'waiting'
     assert accepted['requests'][0]['delivery'] == 'delivered' and len(sent) == 4
     assert sent[0].message_id == 'om_inbound' and sent[1].message_id == 'om_native_1'
     assert json.loads(sent[0].request_body.content)['zh_cn']['content'][0][0] == {'tag': 'at', 'user_id': 'ou_owner'}
-    assert await ainvoke_hook('pre_gateway_dispatch', event=inbound, gateway=gateway) == [{'action': 'skip'}]
+    assert await ainvoke_hook('pre_gateway_dispatch', event=inbound, gateway=gateway) == []
+    await gateway.adapter._handle_message_event_data(raw)
     assert len(sent) == 4, 'Duplicate receive must not resend acknowledged segments.'
     verified_version = accepted['version']
     gateway.stopped.set()

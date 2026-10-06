@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .manager import Manager, ManagementError, VerifiedIdentity
 from .transport import ManagementClient, ManagementServer
-from .messages import FeishuEntry
+from .messages import FeishuEntry, OWNED_PLATFORM
 from .feishu import NativeFeishuTransport, read_github_issue
 
 PLUGIN_ID = 'ghost-hermes-pm'
@@ -28,7 +28,7 @@ def register_native(ctx):
     resources = None
     intake = FeishuEntry(lambda: resources[0] if resources else None, owner,
                          ctx.get_config('feishu_intake', {}), read_github_issue)
-    ctx.register_platform_handler('feishu', lambda native, adapter: intake.attach_transport(adapter, NativeFeishuTransport(native)))
+    ctx.register_platform_handler(OWNED_PLATFORM, lambda native, adapter: intake.attach_transport(adapter, NativeFeishuTransport(native)))
     if state_dir and (ctx.get_config('participant_credential_ref') or (manager_profile and owner)):
         runtime = 'manager_unavailable'
     if manager_profile == registered_profile:
@@ -38,6 +38,7 @@ def register_native(ctx):
     def close():
         nonlocal resources, runtime
         held, resources = resources, None
+        intake.deactivate()
         if held is not None:
             manager, server = held
             server.close()
@@ -67,8 +68,8 @@ def register_native(ctx):
             if not participant_token or participant_token in credentials or entry.get('identity_ref') == owner:
                 raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
             credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
-        intake.secret_values = tuple(credentials)
-        manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=credentials)
+        intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, *credentials)))
+        manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values)
         server = ManagementServer(manager, credentials)
         try:
             server.start()
@@ -89,8 +90,20 @@ def register_native(ctx):
 
     async def dispatch(event=None, gateway=None):
         await start_for_gateway(event, gateway)
-        if event is not None and gateway is not None:
-            return await intake.receive(event, gateway)
+
+    def owned_factory(config):
+        from .owned_feishu import OwnedFeishuAdapter
+        adapter = OwnedFeishuAdapter(config, intake, start_for_gateway, registered_home)
+        ctx.on_unload(intake.deactivate)
+        return adapter
+
+    def owned_dependencies():
+        import importlib.util
+        return importlib.util.find_spec('lark_oapi') is not None
+
+    ctx.register_platform(name=OWNED_PLATFORM, label='Hermes project Feishu', adapter_factory=owned_factory,
+                          check_fn=owned_dependencies, allowed_users_env='HERMES_PM_FEISHU_ALLOWED_USERS',
+                          allow_all_env='', max_message_length=8000)
 
     ctx.register_hook('pre_gateway_dispatch', dispatch)
 

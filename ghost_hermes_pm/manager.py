@@ -100,7 +100,7 @@ class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
     def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=()):
         self.owner_identity_ref = owner_identity_ref
-        self._sensitive_values = tuple(sensitive_values)
+        self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -128,6 +128,7 @@ class Manager:
         data = json.loads(payload)
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
+        data.setdefault('intake_failures', {})
         for record in data['requests'].values():
             for publication in record['outbox']:
                 for segment in publication['segments']:
@@ -167,6 +168,9 @@ class Manager:
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
+                    'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
+                    'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
+                        'compatibility': 'unverified', 'real_connect': 'unverified', 'real_group_acceptance': 'unverified'}),
                     'execution': 'not_enabled', 'needs_human': ['Execution and channel capabilities are not verified.']}
 
     def accept_request(self, identity, project_id, profile_id, message, issue):
@@ -186,8 +190,8 @@ class Manager:
                 return {'status': 'accepted', 'duplicate': True, 'request': existing}
             if not isinstance(issue, dict) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', issue.get('url', '')) or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
                 raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
-            _public_text(issue['title'], self._sensitive_values)
-            _public_text(issue['body'], self._sensitive_values)
+            _public_text(issue['title'], self._sensitive_values())
+            _public_text(issue['body'], self._sensitive_values())
             record = {'id': key, 'project_id': project_id, 'profile_id': profile_id,
                       'accepted_scope': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')},
                       'source_anchor': dict(message), 'task_start_anchor': None,
@@ -207,6 +211,57 @@ class Manager:
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
 
+    def record_intake_failure(self, identity, project_id, profile_id, message, code):
+        reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',
+                   'association_unverified': 'Input could not be associated; quote the confirmed task start message.',
+                   'public_scope_unverified': 'Public scope could not be verified; inspect the original private interface before retrying.',
+                   'processing_unverified': 'Committed request processing needs reconciliation; inspect the authoritative record.',
+                   'admission_unverified': 'Native admission could not be verified; no new work was accepted.'}
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            if self._principal(identity, data) is not None or code not in reasons:
+                raise ManagementError('forbidden', 'A trusted owner intake failure code is required.')
+            _message_anchor(message)
+            profile = data['profiles'].get(profile_id)
+            if not profile or profile['project_id'] != project_id:
+                raise ManagementError('invalid_change', 'Unknown intake responsibility.')
+            key = hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
+            existing = data['intake_failures'].get(key)
+            if existing:
+                return existing
+            accepted = any(r['source_anchor'] == message for r in data['requests'].values())
+            record = {'id': key, 'project_id': project_id, 'profile_id': profile_id, 'source_anchor': dict(message),
+                      'acceptance': 'needs_reconciliation' if accepted else 'unaccepted', 'code': code, 'reason': reasons[code],
+                      'notification': {'uuid': str(uuid.uuid4()), 'status': 'unknown'}}
+            data['intake_failures'][key] = record
+            self._save(version, data)
+            return record
+
+    def record_intake_conditions(self, identity, conditions):
+        allowed = {'enabled', 'runtime_route', 'compatibility', 'sdk_revision', 'lark_version',
+                   'allowed_users_policy', 'same_app_policy', 'real_connect', 'real_group_acceptance'}
+        with self._lock, self._db:
+            version, data = self._load()
+            if self._principal(identity, data) is not None or not isinstance(conditions, dict) or set(conditions) - allowed or conditions.get('enabled') is not False or any(not isinstance(v, str) or len(v) > 128 for k, v in conditions.items() if k != 'enabled'):
+                raise ManagementError('invalid_change', 'Only bounded owner capability conditions are accepted.')
+            if data.get('intake_conditions') != conditions:
+                data['intake_conditions'] = dict(conditions)
+                self._save(version, data)
+
+    def record_intake_failure_notification(self, identity, failure_id, receipt):
+        with self._lock, self._db:
+            version, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'Only the verified owner entry records failure notifications.')
+            if not isinstance(receipt, dict) or receipt.get('status') not in {'delivered', 'failed', 'unknown'} or set(receipt) - {'status', 'code', 'message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id'}:
+                raise ManagementError('invalid_change', 'A bounded native notification receipt is required.')
+            record = data['intake_failures'][failure_id]
+            record['notification'].update(receipt)
+            if receipt['status'] == 'delivered' and (not receipt.get('message_id') or receipt.get('chat_id') != record['source_anchor']['chat_id']):
+                record['notification']['status'] = 'unknown'
+            self._save(version, data)
+
     def associate_message(self, identity, project_id, profile_id, message, text):
         with self._lock, self._db:
             self._db.execute('BEGIN IMMEDIATE')
@@ -214,7 +269,7 @@ class Manager:
             if self._principal(identity, data) is not None:
                 raise ManagementError('forbidden', 'Plain owner input requires the verified owner entry.')
             _message_anchor(message)
-            _public_text(text, self._sensitive_values)
+            _public_text(text, self._sensitive_values())
             if re.fullmatch(r'(收到|谢谢|感谢|好的|ok|thanks)[。.!！\s]*', text.strip(), re.IGNORECASE):
                 return {'status': 'ignored'}
             candidates = [r for r in data['requests'].values() if r['project_id'] == project_id and r['profile_id'] == profile_id
@@ -271,7 +326,7 @@ class Manager:
             record = self._request(identity, request_id, data)
             if kind not in {'confirmation', 'material', 'progress', 'result', 'clarification'} or not isinstance(text, str) or not text.strip():
                 raise ManagementError('invalid_change', 'An explicit message kind and public material are required.')
-            _public_text(text, self._sensitive_values)
+            _public_text(text, self._sensitive_values())
             key = hashlib.sha256((kind + ':' + text).encode()).hexdigest()
             existing = next((p for p in record['outbox'] if p['id'] == key), None)
             if existing:
