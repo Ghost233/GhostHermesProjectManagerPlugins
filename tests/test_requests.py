@@ -38,6 +38,7 @@ def test_confirmation_material_is_tracked_per_segment_and_unknown_send_is_not_re
         assert pending['delivery'] == 'unknown'
         assert len(pending['outbox'][0]['segments']) == 2
         assert pending['task_start_anchor'] is None
+        assert pending['outbox'][0]['segments'][0]['attempts'][0]['intended_reply_to'] == 'om_request'
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as restarted:
         assert restarted.claim_delivery(OWNER, request['id']) is None
 
@@ -102,7 +103,7 @@ def test_retry_only_definite_failed_segment_retains_uuid_and_confirmed_anchor(tm
 def test_secret_material_is_rejected_before_records_or_group_publications(tmp_path):
     import pytest
     from ghost_hermes_pm import ManagementError
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, sensitive_values=('opaque-fixture-secret',)) as manager:
         manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
         with pytest.raises(ManagementError):
             manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE,
@@ -111,6 +112,8 @@ def test_secret_material_is_rejected_before_records_or_group_publications(tmp_pa
         record = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, ISSUE)['request']
         with pytest.raises(ManagementError):
             manager.publish_request_message(OWNER, record['id'], 'result', 'token: fixture-sensitive-value')
+        with pytest.raises(ManagementError):
+            manager.publish_request_message(OWNER, record['id'], 'result', 'The opaque-fixture-secret must stay private.')
         with pytest.raises(ManagementError):
             manager.associate_message(OWNER, 'mono', 'mono-lead', {**MESSAGE, 'message_id': 'om_secret'},
                                       'password=fixture-sensitive-value')

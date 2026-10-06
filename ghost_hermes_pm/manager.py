@@ -24,10 +24,10 @@ class ManagementError(Exception):
         super().__init__(message)
 
 
-def _public_text(text):
+def _public_text(text, sensitive_values=()):
     if not isinstance(text, str) or not text.strip() or len(text) > 100000:
         raise ManagementError('invalid_change', 'Bounded public material is required.')
-    if re.search(r'(?:password|passwd|secret|token|api[_ -]?key|private[_ -]?key)\s*[:=]\s*\S+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,}|-----BEGIN[^\n]*PRIVATE KEY', text, re.IGNORECASE):
+    if any(value and value in text for value in sensitive_values) or re.search(r'(?:password|passwd|secret|token|api[_ -]?key|private[_ -]?key)\s*[:=]\s*\S+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,}|-----BEGIN[^\n]*PRIVATE KEY', text, re.IGNORECASE):
         raise ManagementError('invalid_change', 'Sensitive material must be handled in the original private interface.')
 
 
@@ -86,8 +86,9 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=()):
         self.owner_identity_ref = owner_identity_ref
+        self._sensitive_values = tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -163,8 +164,8 @@ class Manager:
                 return {'status': 'accepted', 'duplicate': True, 'request': data['requests'][key]}
             if not isinstance(issue, dict) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', issue.get('url', '')) or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
                 raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
-            _public_text(issue['title'])
-            _public_text(issue['body'])
+            _public_text(issue['title'], self._sensitive_values)
+            _public_text(issue['body'], self._sensitive_values)
             record = {'id': key, 'project_id': project_id, 'profile_id': profile_id,
                       'accepted_scope': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')},
                       'source_anchor': dict(message), 'task_start_anchor': None,
@@ -191,7 +192,7 @@ class Manager:
             if self._principal(identity, data) is not None:
                 raise ManagementError('forbidden', 'Plain owner input requires the verified owner entry.')
             _message_anchor(message)
-            _public_text(text)
+            _public_text(text, self._sensitive_values)
             if re.fullmatch(r'(收到|谢谢|感谢|好的|ok|thanks)[。.!！\s]*', text.strip(), re.IGNORECASE):
                 return {'status': 'ignored'}
             candidates = [r for r in data['requests'].values() if r['project_id'] == project_id and r['profile_id'] == profile_id
@@ -244,7 +245,7 @@ class Manager:
             record = self._request(identity, request_id, data)
             if kind not in {'confirmation', 'material', 'progress', 'result', 'clarification'} or not isinstance(text, str) or not text.strip():
                 raise ManagementError('invalid_change', 'An explicit message kind and public material are required.')
-            _public_text(text)
+            _public_text(text, self._sensitive_values)
             key = hashlib.sha256((kind + ':' + text).encode()).hexdigest()
             existing = next((p for p in record['outbox'] if p['id'] == key), None)
             if existing:
@@ -277,7 +278,10 @@ class Manager:
                     if publication['kind'] != 'confirmation' and record['task_start_anchor'] is None:
                         return None
                     segment['status'] = 'sending'
-                    segment['attempts'].append({'status': 'sending'})
+                    segment['attempts'].append({'status': 'sending', 'path': 'reply',
+                                                'intended_chat_id': anchor['chat_id'],
+                                                'intended_reply_to': anchor['message_id'],
+                                                'intended_thread_id': anchor.get('thread_id')})
                     self._save(version, data)
                     return {**segment, 'kind': publication['kind'], 'chat_id': anchor['chat_id'],
                             'reply_to': anchor['message_id'], 'thread_id': anchor.get('thread_id'),
@@ -316,7 +320,7 @@ class Manager:
             if receipt['status'] == 'delivered' and (not receipt.get('message_id') or receipt.get('chat_id') != record['source_anchor']['chat_id']):
                 receipt['status'] = 'unknown'
             segment['status'] = receipt['status']
-            segment['attempts'][-1] = receipt
+            segment['attempts'][-1].update(receipt)
             if receipt['status'] == 'delivered' and publication['kind'] == 'confirmation' and segment['number'] == 1 and record['task_start_anchor'] is None:
                 record['task_start_anchor'] = {k: receipt.get(k) for k in ('message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id')}
             statuses = [s['status'] for p in record['outbox'] for s in p['segments']]

@@ -68,7 +68,7 @@ def register_native(ctx):
                 raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
             credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
         intake.secret_values = tuple(credentials)
-        manager = Manager(state_dir, owner_identity_ref=owner)
+        manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=credentials)
         server = ManagementServer(manager, credentials)
         try:
             server.start()
