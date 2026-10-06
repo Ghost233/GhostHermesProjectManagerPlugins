@@ -9,7 +9,7 @@ from test_directory import registration, make_repo, OWNER
 
 def test_authenticated_bridge_uses_one_manager_and_cleans_only_its_socket(tmp_path):
     repo = make_repo(tmp_path / 'repo')
-    with tempfile.TemporaryDirectory(prefix='hpm-', dir='/private/tmp') as runtime:
+    with tempfile.TemporaryDirectory(prefix='hpm-', dir='/tmp') as runtime:
         state = Path(runtime)
         preserved = state / 'user-file'
         preserved.write_text('keep')

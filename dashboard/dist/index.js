@@ -37,7 +37,7 @@
       if (form.profileId) change.profile = { id: form.profileId, native_profile: form.nativeProfile,
         identity_ref: form.identityRef, role: form.role, capability: form.capability,
         project_id: ['steward', 'independent'].includes(form.role) ? null : form.projectId,
-        parent_profile_id: form.parent || null, connection_refs: refs };
+        parent_profile_id: form.role === 'subproject_lead' ? form.parent || null : null, connection_refs: refs };
       setReview({ expected_version: snapshot.version, change: change });
     }
     async function apply() {
@@ -89,7 +89,7 @@
             field('identityRef', '已核验身份引用'),
             field('role', '责任角色', [['steward', '总管'], ['project_lead', '项目总负责人'], ['subproject_lead', '子项目负责人'], ['independent', '独立助手']]),
             field('capability', '能力分类', [['development', '开发型'], ['non_development', '非开发型']]),
-            field('parent', '上级 Profile ID（可选）'), field('bot', '机器人引用（identity:...）'),
+            field('parent', '上级 Profile ID（子负责人必填）'), field('bot', '机器人引用（identity:...）'),
             field('credential', '原生凭据引用（native:...）'), field('codex', '本机服务引用（local:...）')),
           h('label', { style: { display: 'block', margin: '12px 0' } }, '允许测试产物绝对路径（每行一个）',
             h('textarea', { value: form.artifacts, onChange: function (e) { setForm(Object.assign({}, form, { artifacts: e.target.value })); setReview(null); },

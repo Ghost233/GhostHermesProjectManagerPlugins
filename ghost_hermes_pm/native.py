@@ -1,5 +1,7 @@
 """Current Hermes-specific entry adapters; no actor fields become authorization."""
 import json
+import hmac
+from pathlib import Path
 
 from .manager import Manager, ManagementError, VerifiedIdentity
 from .transport import ManagementClient, ManagementServer
@@ -18,39 +20,83 @@ def register_native(ctx):
     state_dir = ctx.get_config('state_dir')
     manager_profile = ctx.get_config('manager_profile')
     owner = ctx.get_config('owner_identity_ref')
+    registered_profile = ctx.profile_name
+    registered_home = None
     runtime = 'configuring'
-    if manager_profile == ctx.profile_name and state_dir and owner:
+    resources = None
+    if state_dir and (ctx.get_config('participant_credential_ref') or (manager_profile and owner)):
+        runtime = 'manager_unavailable'
+    if manager_profile == registered_profile:
+        from hermes_constants import get_hermes_home
+        registered_home = get_hermes_home().resolve()
+
+    def close():
+        nonlocal resources, runtime
+        held, resources = resources, None
+        if held is not None:
+            manager, server = held
+            server.close()
+            manager.close()
+        runtime = 'manager_unavailable'
+
+    async def start_for_gateway(event=None, gateway=None):
+        nonlocal resources, runtime
+        if resources is not None or event is None or gateway is None or not callable(getattr(gateway, 'wait_for_shutdown', None)):
+            return
+        if manager_profile != registered_profile or not state_dir or not owner:
+            return
+        from hermes_constants import get_hermes_home
+        from agent.secret_scope import current_secret_scope, current_secret_scope_home
+        if ctx.profile_name != registered_profile or get_hermes_home().resolve() != registered_home:
+            return
+        secret_home = current_secret_scope_home()
+        if current_secret_scope() is not None and (not secret_home or Path(secret_home).resolve() != registered_home):
+            return
         token = _credential(ctx.get_config('dashboard_credential_ref'))
-        if token:
-            credentials = {token: VerifiedIdentity(owner, 'authenticated-dashboard-bridge')}
-            for entry in ctx.get_config('participant_entries', []):
-                participant_token = _credential(entry.get('credential_ref'))
-                if not participant_token or participant_token in credentials or entry.get('identity_ref') == owner:
-                    raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
-                credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
-            manager = Manager(state_dir, owner_identity_ref=owner)
-            server = ManagementServer(manager, credentials)
+        if not token:
+            runtime = 'configuring'
+            return
+        credentials = {token: VerifiedIdentity(owner, 'authenticated-dashboard-bridge')}
+        for entry in ctx.get_config('participant_entries', []):
+            participant_token = _credential(entry.get('credential_ref'))
+            if not participant_token or participant_token in credentials or entry.get('identity_ref') == owner:
+                raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
+            credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
+        manager = Manager(state_dir, owner_identity_ref=owner)
+        server = ManagementServer(manager, credentials)
+        try:
+            server.start()
+        except Exception:
+            manager.close()
+            raise
+        resources = manager, server
+        ctx.on_unload(close)
+        runtime = 'directory_available'
+
+        async def gateway_lifetime():
             try:
-                server.start()
-            except Exception:
-                manager.close()
-                raise
-            def close():
-                server.close()
-                manager.close()
-            ctx.on_unload(close)
-            runtime = 'directory_available'
+                await gateway.wait_for_shutdown()
+            finally:
+                close()
+
+        ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
+
+    # This hook receives the actual Gateway object from the native inbound pipeline.
+    # It returns no directive, so host sender authorization and dispatch remain in force.
+    ctx.register_hook('pre_gateway_dispatch', start_for_gateway)
 
     def snapshot(args=None):
         if args:
             return json.dumps({'status': 'rejected', 'code': 'invalid_change', 'message': 'Snapshot accepts no actor or role.'})
         reference = ctx.get_config('participant_credential_ref')
         token = _credential(reference) if reference else None
-        if not token or reference == ctx.get_config('dashboard_credential_ref'):
+        owner_reference = ctx.get_config('dashboard_credential_ref')
+        owner_token = _credential(owner_reference) if owner_reference else None
+        if not state_dir or not token or (owner_token and hmac.compare_digest(token.encode(), owner_token.encode())):
             return json.dumps({'status': 'unverified', 'runtime': runtime, 'execution': 'not_enabled',
                                'needs_human': ['Configure a distinct registered participant credential for directory visibility.']})
         try:
-            return json.dumps(ManagementClient(state_dir, token).read_snapshot())
+            return json.dumps(ManagementClient(state_dir, token).read_participant_snapshot())
         except ManagementError as exc:
             return json.dumps({'status': 'unverified', 'code': exc.code, 'runtime': runtime, 'execution': 'not_enabled'})
 

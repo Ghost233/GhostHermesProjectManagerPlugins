@@ -12,7 +12,7 @@ from test_directory import OWNER, registration, make_repo
 
 def test_dashboard_registers_corrects_and_reads_same_gateway_state_and_rejects_actor(tmp_path):
     repo = make_repo(tmp_path / 'repo')
-    with tempfile.TemporaryDirectory(prefix='hpm-', dir='/private/tmp') as state:
+    with tempfile.TemporaryDirectory(prefix='hpm-', dir='/tmp') as state:
         with Manager(state, owner_identity_ref=OWNER.subject) as manager:
             with ManagementServer(manager, {'fixture-token': OWNER}):
                 client = ManagementClient(state, 'fixture-token')

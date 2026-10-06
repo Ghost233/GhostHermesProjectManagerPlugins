@@ -141,3 +141,40 @@ def test_malformed_public_directory_input_is_rejected_atomically(tmp_path, chang
             manager.apply_directory_change(OWNER, 0, change)
         assert denied.value.code == 'invalid_change'
         assert manager.read_snapshot(OWNER)['version'] == 0
+
+
+def test_steward_cannot_cycle_project_leads_but_can_transfer_long_term_child_binding(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    first = registration(make_repo(tmp_path / 'first'), 'first', 'first-lead')
+    first['profile']['identity_ref'] = 'fixture:first'
+    second = registration(make_repo(tmp_path / 'second'), 'second', 'second-lead')
+    second['profile']['identity_ref'] = 'fixture:second'
+    steward_profile = {'id': 'steward', 'native_profile': 'steward', 'identity_ref': 'fixture:steward',
+                       'role': 'steward', 'capability': 'non_development', 'project_id': None,
+                       'parent_profile_id': None, 'connection_refs': {}}
+    steward = VerifiedIdentity('fixture:steward', 'trusted-steward-entry')
+    first_lead = VerifiedIdentity('fixture:first', 'trusted-lead-entry')
+    second_lead = VerifiedIdentity('fixture:second', 'trusted-lead-entry')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        manager.apply_directory_change(OWNER, 0, first)
+        manager.apply_directory_change(OWNER, 1, second)
+        manager.apply_directory_change(OWNER, 2, {'profile': steward_profile})
+        for target, parent in ((second, 'first-lead'), (first, 'second-lead'), (first, 'first-lead')):
+            invalid = {**target['profile'], 'parent_profile_id': parent}
+            with pytest.raises(ManagementError) as rejected:
+                manager.apply_directory_change(steward, 3, {'profile': invalid})
+            assert rejected.value.code == 'invalid_change'
+        assert manager.read_snapshot(OWNER)['version'] == 3
+        assert [p['id'] for p in manager.read_snapshot(first_lead)['projects']] == ['first']
+        child = registration(make_repo(tmp_path / 'child'), 'child', 'child-lead')
+        child['profile'].update(identity_ref='fixture:child', role='subproject_lead', parent_profile_id='first-lead')
+        manager.apply_directory_change(OWNER, 3, child)
+        moved = {**child['profile'], 'parent_profile_id': 'second-lead'}
+        manager.apply_directory_change(steward, 4, {'profile': moved})
+        assert manager.read_snapshot(OWNER)['profiles'][-1]['project_id'] == 'child'
+        assert [p['id'] for p in manager.read_snapshot(first_lead)['projects']] == ['first']
+        assert [p['id'] for p in manager.read_snapshot(second_lead)['projects']] == ['second', 'child']
+        invalid_parent = {**second['profile'], 'role': 'subproject_lead', 'parent_profile_id': 'first-lead'}
+        with pytest.raises(ManagementError):
+            manager.apply_directory_change(OWNER, 5, {'profile': invalid_parent})
+        assert manager.read_snapshot(OWNER)['version'] == 5
