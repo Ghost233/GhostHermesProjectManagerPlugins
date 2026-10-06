@@ -1,0 +1,4 @@
+include __init__.py plugin.yaml
+recursive-include dashboard *.json *.py *.js
+recursive-include tests *.py
+include docs/development/project-directory.md

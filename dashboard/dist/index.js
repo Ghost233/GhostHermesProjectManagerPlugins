@@ -1,0 +1,104 @@
+(function () {
+  'use strict';
+  const sdk = window.__HERMES_PLUGIN_SDK__;
+  const React = sdk.React;
+  const h = React.createElement;
+  const api = '/api/plugins/ghost-hermes-pm';
+  const blank = { projectId: '', name: '', repoPath: '', artifacts: '', profileId: '', nativeProfile: '',
+    identityRef: '', role: 'project_lead', capability: 'development', parent: '', bot: '', credential: '', codex: '' };
+
+  function Projects() {
+    const [snapshot, setSnapshot] = React.useState(null);
+    const [error, setError] = React.useState('');
+    const [form, setForm] = React.useState(blank);
+    const [review, setReview] = React.useState(null);
+    const [saving, setSaving] = React.useState(false);
+    async function refresh() {
+      try { setSnapshot(await sdk.fetchJSON(api + '/snapshot')); setError(''); }
+      catch (e) { setError(String(e.message || e)); }
+    }
+    React.useEffect(function () { refresh(); }, []);
+    function field(key, label, options) {
+      const props = { value: form[key], onChange: function (e) {
+        setForm(Object.assign({}, form, { [key]: e.target.value })); setReview(null);
+      }, style: { width: '100%', padding: '7px', border: '1px solid #8886', borderRadius: '5px',
+                  color: 'inherit', background: 'transparent' } };
+      return h('label', { key: key, style: { display: 'block', fontSize: '13px' } }, label,
+        options ? h('select', props, options.map(function (o) { return h('option', { key: o[0], value: o[0] }, o[1]); }))
+                : h('input', props));
+    }
+    function preview(e) {
+      e.preventDefault();
+      const refs = {};
+      ['bot', 'credential', 'codex'].forEach(function (key) { if (form[key]) refs[key] = form[key]; });
+      const change = {};
+      if (form.projectId) change.project = { id: form.projectId, name: form.name, repo_path: form.repoPath,
+        test_artifact_paths: form.artifacts.split('\n').map(function (p) { return p.trim(); }).filter(Boolean) };
+      if (form.profileId) change.profile = { id: form.profileId, native_profile: form.nativeProfile,
+        identity_ref: form.identityRef, role: form.role, capability: form.capability,
+        project_id: ['steward', 'independent'].includes(form.role) ? null : form.projectId,
+        parent_profile_id: form.parent || null, connection_refs: refs };
+      setReview({ expected_version: snapshot.version, change: change });
+    }
+    async function apply() {
+      setSaving(true);
+      try { await sdk.fetchJSON(api + '/directory', { method: 'POST', body: JSON.stringify(review) });
+        setReview(null); await refresh(); }
+      catch (e) { setError(String(e.message || e)); }
+      finally { setSaving(false); }
+    }
+    function editProject(project) {
+      const profile = snapshot.profiles.find(function (p) { return p.project_id === project.id; });
+      setForm(Object.assign({}, blank, { projectId: project.id, name: project.name, repoPath: project.repo.worktree,
+        artifacts: project.repo.test_artifact_paths.join('\n') }, profile ? {
+        profileId: profile.id, nativeProfile: profile.native_profile, identityRef: profile.identity_ref,
+        role: profile.role, capability: profile.capability, parent: profile.parent_profile_id || '',
+        bot: profile.connection_refs.bot || '', credential: profile.connection_refs.credential || '',
+        codex: profile.connection_refs.codex || '' } : {}));
+      setReview(null);
+    }
+    const button = { padding: '7px 12px', border: '1px solid #8886', borderRadius: '6px',
+      cursor: 'pointer', color: 'inherit', background: 'transparent' };
+    return h('main', { style: { maxWidth: '1040px', margin: 'auto', padding: '24px', color: 'inherit' } },
+      h('h1', null, '项目与 Profile'),
+      h('p', null, '登记已有本地仓库和长期项目身份。开发执行与消息通道保持未启用，等待实际能力验证。'),
+      h('button', { style: button, onClick: refresh }, '刷新目录'),
+      error && h('p', { role: 'alert', style: { color: '#e66' } }, error),
+      snapshot && h(React.Fragment, null,
+        h('p', null, '运行：' + snapshot.runtime + ' · 配置版本：' + snapshot.version),
+        h('p', null, '目录最后核实：' + (snapshot.last_verified_at || '尚未核实')),
+        snapshot.status === 'unverified' && h('p', { role: 'status' }, '管理实例离线，仅显示最后核实目录；修改未执行。'),
+        h('h2', null, '组织目录'),
+        h('ul', null, snapshot.projects.map(function (p) {
+          return h('li', { key: p.id, style: { marginBottom: '10px' } }, h('strong', null, p.name + ' (' + p.id + ')'),
+            h('div', null, p.repo.worktree), h('div', null, '逻辑 Git 公共目录：' + p.repo.common_dir),
+            h('div', null, '嵌套只读仓库：' + p.repo.nested_repositories.length),
+            h('button', { style: button, onClick: function () { editProject(p); } }, '修正登记'));
+        })),
+        h('ul', null, snapshot.profiles.map(function (p) {
+          return h('li', { key: p.id }, p.id + ' · ' + p.role + ' · ' + p.capability + ' · 项目：' + (p.project_id || '独立'),
+            h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：配置中 · 执行：未启用'),
+            h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
+        })),
+        h('h2', null, '登记或修正'),
+        h('p', null, '这里只保存非敏感引用；不创建原生 Profile、机器人、仓库或 worktree。项目身份不能改绑到新项目。'),
+        h('form', { onSubmit: preview },
+          h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(240px,1fr))', gap: '12px' } },
+            field('projectId', '项目稳定 ID'), field('name', '项目名称'), field('repoPath', '已有仓库绝对路径'),
+            field('profileId', 'Profile 稳定 ID（可选）'), field('nativeProfile', '原生 Profile 引用'),
+            field('identityRef', '已核验身份引用'),
+            field('role', '责任角色', [['steward', '总管'], ['project_lead', '项目总负责人'], ['subproject_lead', '子项目负责人'], ['independent', '独立助手']]),
+            field('capability', '能力分类', [['development', '开发型'], ['non_development', '非开发型']]),
+            field('parent', '上级 Profile ID（可选）'), field('bot', '机器人引用（identity:...）'),
+            field('credential', '原生凭据引用（native:...）'), field('codex', '本机服务引用（local:...）')),
+          h('label', { style: { display: 'block', margin: '12px 0' } }, '允许测试产物绝对路径（每行一个）',
+            h('textarea', { value: form.artifacts, onChange: function (e) { setForm(Object.assign({}, form, { artifacts: e.target.value })); setReview(null); },
+              style: { width: '100%', color: 'inherit', background: 'transparent', border: '1px solid #8886' } })),
+          h('button', { type: 'submit', style: button, disabled: snapshot.status !== 'completed' || saving }, '预览变更')),
+        review && h('section', null, h('h3', null, '待提交变更'),
+          h('p', null, '提交仅更新目录；身份和实际能力仍需验证，不会开始执行。版本冲突时请刷新并重新确认。'),
+          h('pre', { style: { overflowX: 'auto', padding: '12px', background: '#8881' } }, JSON.stringify(review, null, 2)),
+          h('button', { style: button, onClick: apply, disabled: saving }, saving ? '提交中…' : '确认目录变更'))));
+  }
+  window.__HERMES_PLUGINS__.register('ghost-hermes-pm', Projects);
+}());
