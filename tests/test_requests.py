@@ -3,6 +3,7 @@ from test_directory import OWNER, make_repo, registration
 
 
 MESSAGE = {'tenant_key': 'tenant-fixture', 'recipient_open_id': 'ou_lead',
+           'app_id': 'cli_fixture', 'transport_tenant_key': 'tenant-transport', 'recipient_tenant_key': 'tenant-bot',
            'chat_id': 'oc_project', 'message_id': 'om_request', 'sender_open_id': 'ou_owner',
            'parent_id': None, 'root_id': None, 'thread_id': None}
 ISSUE = {'url': 'https://github.com/Ghost233/fixture/issues/15', 'title': 'Fix fixture behavior',
@@ -118,3 +119,16 @@ def test_secret_material_is_rejected_before_records_or_group_publications(tmp_pa
             manager.associate_message(OWNER, 'mono', 'mono-lead', {**MESSAGE, 'message_id': 'om_secret'},
                                       'password=fixture-sensitive-value')
         assert 'fixture-sensitive-value' not in str(manager.read_snapshot(OWNER))
+
+
+def test_same_literal_ids_in_another_app_never_duplicate_or_associate(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        first = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, ISSUE)['request']
+        other = {**MESSAGE, 'app_id': 'cli_other', 'transport_tenant_key': 'other-transport', 'recipient_tenant_key': 'other-bot'}
+        plain = manager.associate_message(OWNER, 'mono', 'mono-lead', {**other, 'message_id': 'om_input'}, '请核对')
+        assert plain['status'] == 'unassociated'
+        second = manager.accept_request(OWNER, 'mono', 'mono-lead', other, {**ISSUE, 'body': 'Another app scope'})
+        assert second['duplicate'] is False
+        assert second['request']['id'] != first['id']
+        assert second['request']['accepted_scope']['body'] == 'Another app scope'

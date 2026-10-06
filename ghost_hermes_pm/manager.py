@@ -34,10 +34,14 @@ def _public_text(text, sensitive_values=()):
 def _message_anchor(message):
     allowed = {'tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id',
                'parent_id', 'root_id', 'thread_id', 'app_id', 'recipient_tenant_key', 'transport_tenant_key'}
-    required = ('tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id')
+    required = _MESSAGE_NAMESPACE + ('message_id',)
     if not isinstance(message, dict) or set(message) - allowed or any(not isinstance(message.get(k), str) or not message[k] for k in required) or any(v is not None and (not isinstance(v, str) or len(v) > 256) for v in message.values()):
         raise ManagementError('invalid_change', 'Only verified scalar message and transport identities are accepted.')
     return required
+
+
+_MESSAGE_NAMESPACE = ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                      'recipient_open_id', 'chat_id', 'sender_open_id')
 
 
 def _git(path, *args):
@@ -159,9 +163,10 @@ class Manager:
             if project_id not in data['projects'] or not profile or profile['project_id'] != project_id or profile['capability'] != 'development':
                 raise ManagementError('invalid_change', 'An explicitly registered development project and responsible Profile are required.')
             required = _message_anchor(message)
-            key = hashlib.sha256(json.dumps([message[k] for k in required[:4]]).encode()).hexdigest()
-            if key in data['requests']:
-                return {'status': 'accepted', 'duplicate': True, 'request': data['requests'][key]}
+            key = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
+            existing = next((r for r in data['requests'].values() if all(r['source_anchor'].get(k) == message[k] for k in required)), None)
+            if existing:
+                return {'status': 'accepted', 'duplicate': True, 'request': existing}
             if not isinstance(issue, dict) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', issue.get('url', '')) or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
                 raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
             _public_text(issue['title'], self._sensitive_values)
@@ -196,7 +201,7 @@ class Manager:
             if re.fullmatch(r'(收到|谢谢|感谢|好的|ok|thanks)[。.!！\s]*', text.strip(), re.IGNORECASE):
                 return {'status': 'ignored'}
             candidates = [r for r in data['requests'].values() if r['project_id'] == project_id and r['profile_id'] == profile_id
-                          and all(r['source_anchor'][k] == message.get(k) for k in ('tenant_key', 'recipient_open_id', 'chat_id', 'sender_open_id'))]
+                          and all(r['source_anchor'].get(k) == message[k] for k in _MESSAGE_NAMESPACE)]
             references = {message.get(k) for k in ('parent_id', 'root_id', 'thread_id')} - {None, ''}
             if references:
                 candidates = [r for r in candidates if references & {
