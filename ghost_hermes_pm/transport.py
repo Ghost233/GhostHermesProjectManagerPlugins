@@ -7,8 +7,31 @@ import os
 import socket
 import socketserver
 import threading
+import struct
 
 from .manager import ManagementError
+
+
+def _read_frame(reader, limit=None):
+    def read_exact(size):
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = reader.read(min(remaining, 65536))
+            if not chunk:
+                raise ValueError('Incomplete management frame.')
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b''.join(chunks)
+    size = struct.unpack('!Q', read_exact(8))[0]
+    if limit is not None and size > limit:
+        raise ValueError('Management request frame exceeds its bound.')
+    return json.loads(read_exact(size))
+
+
+def _frame(value):
+    payload = json.dumps(value).encode()
+    return struct.pack('!Q', len(payload)) + payload
 
 
 class ManagementServer:
@@ -31,7 +54,7 @@ class ManagementServer:
                 def handle(self):
                     self.request.settimeout(3)
                     try:
-                        payload = json.loads(self.rfile.readline(1024 * 1024))
+                        payload = _read_frame(self.rfile, limit=1024 * 1024)
                         if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
@@ -52,7 +75,7 @@ class ManagementServer:
                         response = {'error': {'code': exc.code, 'message': str(exc)}}
                     except (ValueError, TypeError, KeyError):
                         response = {'error': {'code': 'invalid_change', 'message': 'Malformed management input.'}}
-                    self.wfile.write(json.dumps(response).encode() + b'\n')
+                    self.wfile.write(_frame(response))
 
             class Server(socketserver.ThreadingUnixStreamServer):
                 daemon_threads = False
@@ -101,9 +124,9 @@ class ManagementClient:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(3)
                 connection.connect(str(self.path))
-                connection.sendall(json.dumps({'token': self.token, 'operation': operation, **args}).encode() + b'\n')
+                connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
-                    response = json.loads(reader.readline(1024 * 1024))
+                    response = _read_frame(reader)
         except (OSError, ValueError) as exc:
             raise ManagementError('unavailable', 'The management instance is unavailable; no operation was confirmed.') from exc
         if 'error' in response:
