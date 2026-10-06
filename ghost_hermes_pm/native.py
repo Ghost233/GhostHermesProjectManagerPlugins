@@ -37,56 +37,58 @@ def register_native(ctx):
 
     def close():
         nonlocal resources, runtime
-        held, resources = resources, None
-        intake.deactivate()
-        if held is not None:
-            manager, server = held
-            server.close()
-            manager.close()
-        runtime = 'manager_unavailable'
+        with intake.lifecycle_lock:
+            held, resources = resources, None
+            intake.deactivate()
+            if held is not None:
+                manager, server = held
+                server.close()
+                manager.close()
+            runtime = 'manager_unavailable'
 
     async def start_for_gateway(event=None, gateway=None):
         nonlocal resources, runtime
-        if resources is not None or event is None or gateway is None or not callable(getattr(gateway, 'wait_for_shutdown', None)):
-            return
-        if manager_profile != registered_profile or not state_dir or not owner:
-            return
-        from hermes_constants import get_hermes_home
-        from agent.secret_scope import current_secret_scope, current_secret_scope_home
-        if ctx.profile_name != registered_profile or get_hermes_home().resolve() != registered_home:
-            return
-        secret_home = current_secret_scope_home()
-        if current_secret_scope() is not None and (not secret_home or Path(secret_home).resolve() != registered_home):
-            return
-        token = _credential(ctx.get_config('dashboard_credential_ref'))
-        if not token:
-            runtime = 'configuring'
-            return
-        credentials = {token: VerifiedIdentity(owner, 'authenticated-dashboard-bridge')}
-        for entry in ctx.get_config('participant_entries', []):
-            participant_token = _credential(entry.get('credential_ref'))
-            if not participant_token or participant_token in credentials or entry.get('identity_ref') == owner:
-                raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
-            credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
-        intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, *credentials)))
-        manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values)
-        server = ManagementServer(manager, credentials)
-        try:
-            server.start()
-        except Exception:
-            manager.close()
-            raise
-        resources = manager, server
-        ctx.on_unload(close)
-        runtime = 'directory_available'
-
-        async def gateway_lifetime():
+        with intake.lifecycle_lock:
+            if intake.closed or resources is not None or event is None or gateway is None or not callable(getattr(gateway, 'wait_for_shutdown', None)):
+                return
+            if manager_profile != registered_profile or not state_dir or not owner:
+                return
+            from hermes_constants import get_hermes_home
+            from agent.secret_scope import current_secret_scope, current_secret_scope_home
+            if ctx.profile_name != registered_profile or get_hermes_home().resolve() != registered_home:
+                return
+            secret_home = current_secret_scope_home()
+            if current_secret_scope() is not None and (not secret_home or Path(secret_home).resolve() != registered_home):
+                return
+            token = _credential(ctx.get_config('dashboard_credential_ref'))
+            if not token:
+                runtime = 'configuring'
+                return
+            credentials = {token: VerifiedIdentity(owner, 'authenticated-dashboard-bridge')}
+            for entry in ctx.get_config('participant_entries', []):
+                participant_token = _credential(entry.get('credential_ref'))
+                if not participant_token or participant_token in credentials or entry.get('identity_ref') == owner:
+                    raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
+                credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
+            intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, *credentials)))
+            manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values)
+            server = ManagementServer(manager, credentials)
             try:
-                await gateway.wait_for_shutdown()
-            finally:
-                close()
+                server.start()
+            except Exception:
+                manager.close()
+                raise
+            resources = manager, server
+            ctx.on_unload(close)
+            runtime = 'directory_available'
 
-        ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
+            async def gateway_lifetime():
+                try:
+                    await gateway.wait_for_shutdown()
+                finally:
+                    close()
+
+            ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
 
     async def dispatch(event=None, gateway=None):
         await start_for_gateway(event, gateway)
@@ -94,6 +96,7 @@ def register_native(ctx):
     def owned_factory(config):
         from .owned_feishu import OwnedFeishuAdapter
         adapter = OwnedFeishuAdapter(config, intake, start_for_gateway, registered_home)
+        adapter.bind_lifecycle(ctx)
         ctx.on_unload(intake.deactivate)
         return adapter
 

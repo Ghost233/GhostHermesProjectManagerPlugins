@@ -14,6 +14,8 @@ os.environ['HERMES_SKIP_PM_BOOTSTRAP'] = '1'
 os.environ['HERMES_DISABLE_PROJECT_PLUGINS'] = '1'
 os.environ['HERMES_FEISHU_TEXT_BATCH_DELAY_SECONDS'] = '0.01'
 os.environ['HERMES_FEISHU_TEXT_BATCH_SPLIT_DELAY_SECONDS'] = '0.01'
+if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'failure_replay':
+    os.environ['HERMES_FEISHU_DEDUP_CACHE_SIZE'] = '32'
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
         path = Path(os.fsdecode(args[0])).resolve()
@@ -150,6 +152,88 @@ async def main():
     client.apply_directory_change(0, {'project': {'id': 'mono', 'name': 'Fixture', 'repo_path': str(repo)},
         'profile': {'id': 'lead', 'native_profile': 'fixture-runtime', 'identity_ref': 'fixture:lead',
             'role': 'project_lead', 'capability': 'development', 'project_id': 'mono'}})
+    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'verify':
+        transport = next(t for a, t in adapter.intake.transports if a is adapter)
+        verify = transport.verify_identity
+        started, release = asyncio.Event(), asyncio.Event()
+        async def pending_verify(binding):
+            started.set()
+            await release.wait()
+            return await verify(binding)
+        transport.verify_identity = pending_verify
+        pending = asyncio.create_task(adapter._handle_message_event_data(raw('om_unload_pending', 15)))
+        await asyncio.wait_for(started.wait(), timeout=3)
+        assert plugins.unload('ghost-hermes-pm')
+        assert not (state / 'manager.sock').exists() and adapter.intake.closed
+        release.set()
+        await asyncio.wait_for(pending, timeout=6)
+        assert not (state / 'manager.sock').exists(), 'Resumed verification must not resurrect authority.'
+        assert not sent and not runner.budget_sources
+        from ghost_hermes_pm import Manager, VerifiedIdentity
+        with Manager(state, owner_identity_ref='fixture:owner') as stopped:
+            assert stopped.read_snapshot(VerifiedIdentity('fixture:owner', 'fixture-audit'))['requests'] == []
+        print('native load, Dashboard bridge, restart, teardown: OK')
+        return
+    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'issue':
+        started, release = asyncio.Event(), asyncio.Event()
+        reader = adapter.intake.issue_reader
+        async def pending_issue(url):
+            started.set()
+            await release.wait()
+            return reader(url)
+        adapter.intake.issue_reader = pending_issue
+        pending = asyncio.create_task(adapter._handle_message_event_data(raw('om_unload_issue', 15)))
+        await asyncio.wait_for(started.wait(), timeout=3)
+        assert plugins.unload('ghost-hermes-pm')
+        release.set()
+        await asyncio.wait_for(pending, timeout=6)
+        assert not (state / 'manager.sock').exists() and not sent
+        from ghost_hermes_pm import Manager, VerifiedIdentity
+        with Manager(state, owner_identity_ref='fixture:owner') as stopped:
+            assert stopped.read_snapshot(VerifiedIdentity('fixture:owner', 'fixture-audit'))['requests'] == []
+        print('native load, Dashboard bridge, restart, teardown: OK')
+        return
+    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'failure_replay':
+        await adapter._handle_message_event_data(raw('om_seed', 15))
+        def unknown_notice(request):
+            sent.append(request)
+            return ReplyMessageResponse({'code': 0, 'data': {}})
+        native.im.v1.message.reply = unknown_notice
+        await adapter._handle_message_event_data(raw('om_fail', 18))
+        before = len(sent)
+        assert client.read_snapshot()['intake_failures'][0]['notification']['status'] == 'unknown'
+        for number in range(33):
+            await adapter._handle_message_event_data(raw('om_thanks_' + str(number), text='谢谢'))
+        budget_before_replay = len(runner.budget_sources)
+        await adapter._handle_message_event_data(raw('om_fail', 18))
+        assert len(sent) == before, 'An evicted original must not resend its unknown durable failure notice.'
+        assert len(runner.budget_sources) == budget_before_replay
+        assert plugins.unload('ghost-hermes-pm')
+        print('native load, Dashboard bridge, restart, teardown: OK')
+        return
+    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'send':
+        transport = next(t for a, t in adapter.intake.transports if a is adapter)
+        send = transport.send
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        async def pending_send(segment):
+            calls.append(segment)
+            started.set()
+            await release.wait()
+            return await send(segment)
+        transport.send = pending_send
+        pending = asyncio.create_task(adapter._handle_message_event_data(raw('om_unload_send', 15)))
+        await asyncio.wait_for(started.wait(), timeout=3)
+        assert plugins.unload('ghost-hermes-pm')
+        release.set()
+        await asyncio.wait_for(pending, timeout=6)
+        assert len(calls) == 1 and not sent and not (state / 'manager.sock').exists()
+        from ghost_hermes_pm import Manager, VerifiedIdentity
+        with Manager(state, owner_identity_ref='fixture:owner') as stopped:
+            record = stopped.read_snapshot(VerifiedIdentity('fixture:owner', 'fixture-audit'))['requests'][0]
+            assert record['delivery'] == 'unknown' and record['task_start_anchor'] is None
+        print('native load, Dashboard bridge, restart, teardown: OK')
+        return
     await adapter._handle_message_event_data(raw('om_one', 15))
     await adapter._handle_message_event_data(raw('om_two', 16))
     snapshot = client.read_snapshot()
@@ -278,6 +362,32 @@ async def main():
         response = RawResponse()
         response.status_code, response.headers, response.content = 200, {'Content-Type': 'application/json'}, json.dumps(payload).encode()
         return response
+    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'connected':
+        ready = asyncio.Event()
+        main_loop = asyncio.get_running_loop()
+        sockets = []
+        class SocketBoundary:
+            closed = False
+            async def close(self): self.closed = True
+        def active_start(ws):
+            ws._conn = SocketBoundary()
+            sockets.append((ws, ws._conn))
+            main_loop.call_soon_threadsafe(ready.set)
+            asyncio.get_event_loop().run_forever()
+        with patch.object(SdkHTTP, 'execute', side_effect=sdk_http), patch.object(SdkWebSocket, 'start', active_start):
+            assert await adapter.connect() is True
+            await asyncio.wait_for(ready.wait(), timeout=3)
+            assert adapter._running and adapter._ws_supervisor is not None and adapter._app_lock_identity
+            assert plugins.unload('ghost-hermes-pm')
+            for _ in range(100):
+                if not adapter._running and adapter._ws_supervisor is None and adapter._app_lock_identity is None and sockets[0][1].closed:
+                    break
+                await asyncio.sleep(0.02)
+            assert not adapter._running and adapter._ws_supervisor is None and adapter._app_lock_identity is None
+            assert sockets[0][1].closed and sockets[0][0]._auto_reconnect is False
+            assert not (state / 'manager.sock').exists()
+        print('native load, Dashboard bridge, restart, teardown: OK')
+        return
     with patch.object(SdkHTTP, 'execute', side_effect=sdk_http), patch.object(SdkWebSocket, 'start', return_value=None):
         assert await adapter.connect() is True
         await adapter._handle_message_event_data(raw('om_connected', 26))

@@ -6,6 +6,7 @@ from collections import OrderedDict
 import hashlib
 import inspect
 from importlib.metadata import version
+import asyncio
 
 from gateway.config import Platform
 from gateway.run import _async_profile_runtime_scope
@@ -63,9 +64,28 @@ class OwnedFeishuAdapter(FeishuAdapter):
             *(v for v in (self._app_secret, self._encrypt_key, self._verification_token) if isinstance(v, str) and v))))
         self.platform = Platform(OWNED_PLATFORM)
         self._committed = OrderedDict()
+        self._close_requested = False
+
+    def bind_lifecycle(self, ctx):
+        async def owner_lifetime():
+            try:
+                await asyncio.Future()
+            finally:
+                self.request_close()
+                await self.disconnect()
+        ctx.on_unload(self.request_close)
+        ctx.spawn_task(owner_lifetime(), name='hermes-pm-owned-adapter-lifetime')
+
+    def request_close(self):
+        self._close_requested = True
+        self._running = False
+        if self._ws_client is not None:
+            self._ws_client._auto_reconnect = False
+        if self._ws_supervisor is not None:
+            self._ws_supervisor.cancel()
 
     async def connect(self, *, is_reconnect=False):
-        if self.intake.closed:
+        if self.intake.closed or self._close_requested:
             self._set_fatal_error('intake_closed', 'The plugin owner is unloaded; reconnect was not attempted.', retryable=False)
             return False
         runner = self.gateway_runner
@@ -76,7 +96,11 @@ class OwnedFeishuAdapter(FeishuAdapter):
         if any(other is not self and isinstance(other, FeishuAdapter) and getattr(other, '_app_id', None) == self._app_id for other in adapters):
             self._set_fatal_error('feishu_app_conflict', 'Another configured Feishu driver owns this app; connection was not attempted.', retryable=False)
             return False
+        generation = self.intake.generation
         connected = await super().connect(is_reconnect=is_reconnect)
+        if self.intake.closed or self._close_requested or generation != self.intake.generation:
+            await self.disconnect()
+            return False
         if connected:
             from .feishu import NativeFeishuTransport
             # This client belongs to this owned instance; secondary runtime scopes
@@ -126,6 +150,7 @@ class OwnedFeishuAdapter(FeishuAdapter):
     async def _dispatch_inbound_event(self, event):
         if self.intake.closed:
             return
+        generation = self.intake.generation
         if self._drop_unresolved(event):
             return
         prepared = self.intake.prepare(event, self)
@@ -142,6 +167,7 @@ class OwnedFeishuAdapter(FeishuAdapter):
             return
         try:
             recipient = await prepared.transport.verify_identity(prepared.binding)
+            self.intake.require_active(generation)
             if not recipient or recipient.get('app_id') != prepared.binding['app_id'] or recipient.get('open_id') != prepared.binding['recipient_open_id']:
                 logger.warning('Owned intake not accepted: recipient identity requires verification.')
                 return
@@ -149,9 +175,14 @@ class OwnedFeishuAdapter(FeishuAdapter):
             if identity is None:
                 return
             async with _async_profile_runtime_scope(self.manager_home):
+                self.intake.require_active(generation)
                 await self.ensure_manager(event, runner)
+            self.intake.require_active(generation)
             if not self.intake.in_scope(prepared, identity.runtime_profile):
                 logger.warning('Owned intake not accepted: registered runtime responsibility requires verification.')
+                return
+            owner = VerifiedIdentity(self.intake.owner, 'verified-owned-feishu-owner-entry')
+            if any(f['source_anchor'] == prepared.envelope for f in self.intake.manager().read_snapshot(owner)['intake_failures']):
                 return
             key = tuple(prepared.envelope.get(k) for k in ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id', 'message_id'))
             if key in self._committed:
@@ -167,6 +198,7 @@ class OwnedFeishuAdapter(FeishuAdapter):
         while len(self._committed) > self._dedup_cache_size:
             self._committed.popitem(last=False)
         try:
+            self.intake.require_active(generation)
             owner = VerifiedIdentity(self.intake.owner, 'verified-owned-feishu-owner-entry')
             self.intake.manager().record_intake_conditions(owner, {
                 'enabled': False, 'runtime_route': 'owned_prebatch', 'compatibility': 'pinned_seams_matched',
@@ -175,20 +207,27 @@ class OwnedFeishuAdapter(FeishuAdapter):
                 'same_app_policy': 'configured_driver_conflict_and_native_lock', 'real_connect': 'unverified',
                 'real_group_acceptance': 'unverified'})
             async with _async_profile_runtime_scope(identity.runtime_home):
-                result = await self.intake.process_prepared(prepared)
+                self.intake.require_active(generation)
+                result = await self.intake.process_prepared(prepared, generation)
+                self.intake.require_active(generation)
                 if result is None:
                     raise ManagementError('invalid_change', 'Committed input could not be associated.')
         except Exception as exc:
+            if self.intake.closed or generation != self.intake.generation:
+                return
             identity = VerifiedIdentity(self.intake.owner, 'verified-owned-feishu-owner-entry')
             try:
                 existing = any(r['source_anchor'] == prepared.envelope for r in self.intake.manager().read_snapshot(identity)['requests'])
                 code = 'processing_unverified' if existing else 'association_unverified' if not prepared.issue_url else 'public_scope_unverified' if isinstance(exc, ManagementError) and exc.code == 'invalid_change' else 'source_unavailable'
                 failure = self.intake.manager().record_intake_failure(identity, prepared.binding['project_id'], prepared.binding['profile_id'],
                     prepared.envelope, code)
+                if not failure['notification_claimed']:
+                    return
                 receipt = await prepared.transport.send({'uuid': failure['notification']['uuid'],
                     'text': '受理需核对：' + failure['reason'] + '\n请查看 Dashboard；当前不会启动 Codex。',
                     'chat_id': prepared.envelope['chat_id'], 'reply_to': prepared.envelope['message_id'],
                     'thread_id': prepared.envelope.get('thread_id'), 'mention_open_id': prepared.envelope['sender_open_id']})
+                self.intake.require_active(generation)
                 self.intake.manager().record_intake_failure_notification(identity, failure['id'], receipt)
             except Exception:
                 logger.warning('Owned intake needs reconciliation: failure notification is unverified; native dispatch was suppressed.')
