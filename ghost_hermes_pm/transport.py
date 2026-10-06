@@ -39,7 +39,9 @@ class ManagementServer:
                                          if isinstance(token, str) and hmac.compare_digest(secret.encode(), token.encode())), None)
                         if identity is None:
                             raise ManagementError('unauthorized', 'Invalid entry credential.')
-                        if payload.get('operation') == 'read_snapshot':
+                        if payload.get('operation') in {'read_snapshot', 'read_participant_snapshot'}:
+                            if payload['operation'] == 'read_participant_snapshot' and identity.subject == bridge.manager.owner_identity_ref:
+                                raise ManagementError('forbidden', 'The participant entry cannot borrow owner authority.')
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
                         elif payload.get('operation') == 'apply_directory_change':
                             result = bridge.manager.apply_directory_change(identity, payload.get('expected_version'), payload.get('change'))
@@ -110,6 +112,9 @@ class ManagementClient:
 
     def read_snapshot(self, scope=None):
         return self._call('read_snapshot', scope=scope)
+
+    def read_participant_snapshot(self):
+        return self._call('read_participant_snapshot')
 
     def apply_directory_change(self, expected_version, change):
         return self._call('apply_directory_change', expected_version=expected_version, change=change)

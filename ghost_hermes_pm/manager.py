@@ -179,6 +179,15 @@ class Manager:
                 raise ManagementError('invalid_change', 'Parent must be a registered project lead.')
         if value['role'] == 'subproject_lead' and parent is None:
             raise ManagementError('invalid_change', 'Subproject lead requires its project lead.')
+        profiles = {**data['profiles'], value['id']: value}
+        for profile in profiles.values():
+            parent_id = profile.get('parent_profile_id')
+            if profile['role'] == 'subproject_lead':
+                lead = profiles.get(parent_id)
+                if lead is None or lead['role'] != 'project_lead' or lead.get('parent_profile_id') is not None:
+                    raise ManagementError('invalid_change', 'Subproject lead requires a root project lead; existing children must remain valid.')
+            elif parent_id is not None:
+                raise ManagementError('invalid_change', 'Only subproject leads have a parent; project leads cannot form cycles or extra responsibility layers.')
         for profile in data['profiles'].values():
             if profile['id'] != value['id'] and (profile['native_profile'] == value['native_profile'] or profile['identity_ref'] == value['identity_ref']):
                 raise ManagementError('binding_conflict', 'Native Profile and identity already belong to another Profile.')

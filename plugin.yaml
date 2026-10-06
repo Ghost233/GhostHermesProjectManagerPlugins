@@ -5,5 +5,7 @@ kind: standalone
 manifest_version: 2
 provides_tools:
   - hermes_pm_snapshot
+provides_hooks:
+  - pre_gateway_dispatch
 python_dependencies:
   - fastapi
