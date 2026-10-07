@@ -21,6 +21,9 @@ class TaskOperation(BaseModel):
     instruction_id: str | None = None
     text: str | None = None
     expected_turn_id: str | None = None
+    human_request_id: str | None = None
+    reply_id: str | None = None
+    response: dict | None = None
 
 class ObservationOperation(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -74,6 +77,12 @@ def create_router(authenticated_client):
     def task(body: TaskOperation, request: Request):
         client = authenticated_client(request)
         try:
+            if body.action == 'answer':
+                if any(v is not None for v in (body.report, body.plan, body.instruction_id, body.text, body.expected_turn_id)):
+                    raise ManagementError('invalid_change', 'Human response fields cannot carry other task operations.')
+                return client.answer_human_request(body.request_id, body.human_request_id, body.reply_id, body.response)
+            if any(v is not None for v in (body.human_request_id, body.reply_id, body.response)):
+                raise ManagementError('invalid_change', 'Human response fields require answer action.')
             if body.action == 'prepare':
                 if body.report is not None or any(v is not None for v in (body.instruction_id, body.text, body.expected_turn_id)):
                     raise ManagementError('invalid_change', 'Preparation accepts only the explicit baseline plan.')
