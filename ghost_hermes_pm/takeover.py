@@ -27,16 +27,23 @@ class OriginalControlAdapter(CodexStdioAdapter):
     def _proof(self, repository, context):
         binding = {'generation': self.generation, 'service_ref': self.service_ref, 'service_id': context['original_executor_id'],
                    'endpoint_ref': self.endpoint_ref, 'source_kind': self.source_kind, 'transport': 'original_proxy_stdio'}
+        if self.connection is not None:
+            binding['platform'] = self.connection['platform']
         proof = self.control_verifier(binding, repository, context) if callable(self.control_verifier) else None
         required = ('permission_profile', 'policy_digest', 'platform_enforcement', 'tool_paths', 'manual_execution_coverage', 'takeover', 'control_access')
         if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in binding.items()) or proof.get('grant_binding') != context or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']] or any(not isinstance(proof.get(k), str) or not proof[k] for k in required) or proof.get('control_access') != 'verified-original-input-path':
             raise ManagementError('capability_unverified', 'Current original-service control, task scope and complete write/tool boundary evidence are unavailable; takeover is not enabled.')
+        actions = {'append', 'stop', 'continue', 'idle_input', 'related_execution', 'human_response'}
+        if not isinstance(proof.get('task_control'), dict) or any(not isinstance(proof['task_control'].get(action), str) or not proof['task_control'][action] for action in actions):
+            raise ManagementError('capability_unverified', 'Original append, stop, continuation and owner-response methods need their own current capability evidence.')
         return proof
 
     def verify_takeover(self, repository, context):
         proof = self._proof(repository, context)
         self.origin_proof = proof
         self.connect()
+        proof = self._proof(repository, context)
+        self.origin_proof = proof
         return proof
 
     def connect(self):
@@ -83,10 +90,10 @@ class OriginalControlAdapter(CodexStdioAdapter):
             raise ManagementError('capability_unverified', 'No original work grant exists.')
         return self.verify_control(repository, 'continue', self.origin_proof)
 
-    def revoke(self):
+    def revoke(self, thread_id=None):
         with self._condition:
             for incoming in self._server_requests.values():
-                if incoming['state'] == 'pending':
+                if incoming['state'] == 'pending' and (thread_id is None or incoming['envelope'].get('params', {}).get('threadId') == thread_id):
                     incoming['state'] = 'control_returned'
 
 
@@ -108,7 +115,10 @@ def _authority(manager, grant_id):
     if not grant:
         return None
     record = data['requests'][grant['request_id']]
-    return {**grant, 'turn_id': record['session']['turn_id']}
+    effective = grant['status']
+    if record.get('control_grant_id') != grant_id or record.get('session', {}).get('control') != 'assigned_task' or record.get('task_delivery') == 'delivered':
+        effective = 'expired'
+    return {**grant, 'status': effective, 'turn_id': record['session']['turn_id']}
 
 
 def take_over_session(manager, identity, request_id, manual_session_id, grant_id, expected_turn_id):
@@ -132,7 +142,10 @@ def take_over_session(manager, identity, request_id, manual_session_id, grant_id
         manual = data.get('manual_sessions', {}).get(manual_session_id)
         source = data.get('manual_sources', {}).get((manual or {}).get('source_id'), {})
         repository = record['accepted_repository']
-        if record.get('session') or record.get('task_delivery') == 'delivered' or record['task_start_anchor'] is None or not manual or source.get('status') != 'verified' or manual['state'] not in {'active', 'inactive_verified'} or manual['logical_repository'] != repository['logical_id'] or manual['cwd'] != repository['worktree']:
+        prior_session = record.get('session')
+        prior_grant = grants.get(record.get('control_grant_id'), {})
+        retaking = bool(prior_session and prior_session.get('origin') == 'manual_takeover' and prior_session.get('manual_session_id') == manual_session_id and prior_grant.get('status') == 'returned')
+        if prior_session and not retaking or record.get('task_delivery') == 'delivered' or record['task_start_anchor'] is None or not manual or source.get('status') != 'verified' or manual['state'] not in {'active', 'inactive_verified'} or manual['logical_repository'] != repository['logical_id'] or manual['cwd'] != repository['worktree']:
             raise ManagementError('binding_conflict', 'Takeover needs this accepted work and a current original session in its exact existing repository boundary.')
         if any(g['status'] in {'active', 'pending', 'suspended'} and g['original_executor_id'] == manual['original_executor_id'] and g['thread_id'] == manual['thread_id'] for g in grants.values()):
             raise ManagementError('binding_conflict', 'One current controller already owns or is reconciling this original session.')
@@ -155,22 +168,25 @@ def take_over_session(manager, identity, request_id, manual_session_id, grant_id
             if adapter is None or adapter.source_kind != source['kind'] or adapter.endpoint_ref != grant['endpoint_ref']:
                 raise ManagementError('capability_unverified', 'This source has no verified controllable original endpoint; it remains observe-only.')
             context = {k: grant[k] for k in ('request_id', 'manual_session_id', 'controller_profile_id', 'controller_identity_ref', 'source_id', 'original_executor_id', 'observation_generation', 'thread_id', 'endpoint_ref', 'scope_digest')}
-            context.update(grant_id=grant_id, current_turn_id=expected_turn_id)
+            context.update(grant_id=grant_id, current_turn_id=expected_turn_id, original_turn_id=expected_turn_id)
             proof = adapter.verify_takeover(repository, context)
             thread = adapter.read_thread(manual['thread_id'])
             active = [t['id'] for t in thread.get('turns', []) if t.get('status') == 'inProgress']
             if adapter.connection['service_id'] != manual['original_executor_id'] or thread.get('cwd') != repository['worktree'] or thread.get('canAcceptDirectInput') is not True or expected_turn_id not in [t.get('id') for t in thread.get('turns', [])] or thread['status'].get('type') == 'active' and active != [expected_turn_id]:
                 raise ManagementError('binding_conflict', 'The actual original execution or current turn does not match; no takeover input was sent.')
             from .queue import workspace
-            baseline = workspace(repository)
-            record['preparation'] = {'status': 'ready', 'plan': {'branch': baseline['branch'], 'commit': baseline['head'], 'dependencies': [], 'issue_updated_at': record['accepted_scope']['updated_at']},
+            baseline = prior_session['baseline'] if retaking else workspace(repository)
+            preparation = {'status': 'ready', 'plan': {'branch': baseline['branch'], 'commit': baseline['head'], 'dependencies': [], 'issue_updated_at': record['accepted_scope']['updated_at']},
                 'workspace': baseline, 'preserved_files': {p: baseline['file_digests'].get(p) for p in baseline['dirty_paths']}, 'prepared_by': identity.subject}
+            if not retaking:
+                record['preparation'] = preparation
             record['session'] = {**adapter.connection, 'thread_id': manual['thread_id'], 'turn_id': expected_turn_id, 'origin': 'manual_takeover',
                 'manual_source_id': manual['source_id'], 'manual_session_id': manual_session_id, 'grant_id': grant_id, 'control': 'assigned_task',
                 'logical_repository': repository['logical_id'], 'repository': repository, 'baseline': baseline, 'capability': proof,
                 'known_turn_ids': [t['id'] for t in thread.get('turns', [])], 'start_phase': 'original_thread_granted'}
             record.update(execution='running' if active else 'turn_ended', outer_task_status='running', repository_released=False, task_delivery='unmet', unexecuted_reason=None)
             grant.update(status='active', control_generation=adapter.generation, granted_at=_now())
+            record['execution_capability'] = {'status': 'verified', 'enabled': True, 'connection': adapter.connection, 'proof': proof, 'operation': 'manual_takeover'}
             adapter.authority = lambda: _authority(manager, grant_id)
         except ManagementError as exc:
             grant.update(status='blocked', reason=str(exc))
@@ -193,6 +209,8 @@ def return_session_control(manager, identity, request_id, grant_id):
             raise ManagementError('forbidden', 'Control return must identify this work grant and its owner or current controller.')
         if grant['status'] == 'returned':
             return {**grant, 'duplicate': True}
+        if record.get('control_grant_id') != grant_id:
+            raise ManagementError('forbidden', 'A superseded grant cannot revoke another current-work authorization.')
         grant.update(status='returned', returned_at=_now())
         if record.get('session'):
             record['session']['control'] = 'observe_only'
@@ -201,8 +219,117 @@ def return_session_control(manager, identity, request_id, grant_id):
                 question.update(resolution='expired', control_enabled=False)
         adapter = manager.control_adapters.get(grant['source_id'])
         if adapter is not None:
-            adapter.revoke()
+            adapter.revoke(grant['thread_id'])
         with manager._db:
             manager._save(version, data)
         manager.publish_request_message(identity, request_id, 'progress', '本次原会话控制已归还，只观察保留；未发送中断。运行执行与仓库占用仍待核对。')
         return grant
+
+
+def bind_executor(manager, record):
+    adapter = executor_for(manager, record)
+    if adapter is not None and record.get('session', {}).get('origin') == 'manual_takeover':
+        grant_id = record.get('control_grant_id')
+        adapter.authority = lambda: _authority(manager, grant_id)
+    return adapter
+
+
+def _expire_grant(data, grant, status, reason=None):
+    grant.update(status=status, reason=reason, ended_at=_now())
+    record = data['requests'][grant['request_id']]
+    if record.get('control_grant_id') == grant['id'] and record.get('session'):
+        record['session']['control'] = 'observe_only'
+        record['execution_capability'] = {'status': 'blocked', 'enabled': False, 'reason': reason or 'Current-work control has ended.'}
+        if status == 'suspended':
+            record.update(execution='unverified', unexecuted_reason=reason)
+        for question in record.get('human_requests', []):
+            if question['resolution'] == 'pending':
+                question.update(resolution='expired', control_enabled=False)
+
+
+def suspend_grant(manager, identity, request_id, reason):
+    with manager._lock, manager._db:
+        version, data = manager._load()
+        record = manager._request(identity, request_id, data)
+        grant = data.get('control_grants', {}).get(record.get('control_grant_id'))
+        if not grant or grant['status'] not in {'active', 'suspended'}:
+            return
+        _expire_grant(data, grant, 'suspended', reason)
+        adapter = manager.control_adapters.get(grant['source_id'])
+        if adapter is not None:
+            adapter.revoke(grant['thread_id'])
+        manager._save(version, data)
+    manager.publish_request_message(identity, request_id, 'progress', '原会话控制待本人核对，已暂停本次授权：' + reason + '\n其他桌面操作的识别仍未知，原执行未被宣称停止。')
+
+
+def reconcile_grants(manager, data):
+    for grant in data.get('control_grants', {}).values():
+        if grant['status'] != 'active':
+            continue
+        record = data['requests'][grant['request_id']]
+        adapter = executor_for(manager, record)
+        source = data.get('manual_sources', {}).get(grant['source_id'], {})
+        reason = None
+        if adapter is None or adapter.generation != grant['control_generation'] or adapter._closed:
+            reason = 'Original control connection generation is unavailable; history is not renewed authorization.'
+        elif source.get('status') == 'conflict' or source.get('scope', {}).get('executor') != grant['original_executor_id']:
+            reason = 'The original observation source has an identity/service conflict.'
+        else:
+            try:
+                _assignment(record, data)
+            except ManagementError as exc:
+                reason = str(exc)
+        if reason:
+            _expire_grant(data, grant, 'suspended', reason)
+
+
+def complete_grant(manager, record, data):
+    grant = data.get('control_grants', {}).get(record.get('control_grant_id'))
+    if not grant:
+        return
+    _expire_grant(data, grant, 'completed', 'Frozen Issue delivery and original execution end were verified.')
+    grant['completed_at'] = _now()
+    adapter = manager.control_adapters.get(grant['source_id'])
+    if adapter is not None:
+        adapter.revoke(grant['thread_id'])
+
+
+def configured_control_adapters(configs, state_dir):
+    """Only trusted native original-proxy settings and hashed current-grant evidence."""
+    if not configs:
+        return {}
+    allowed = {'source_id', 'executable', 'cwd', 'environment', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref'}
+    adapters = {}
+    if not isinstance(configs, list):
+        raise ManagementError('invalid_change', 'Manual control requires an explicit native configuration list.')
+    for config in configs:
+        if not isinstance(config, dict) or set(config) != allowed or any(not isinstance(config.get(k), str) or not config[k] for k in ('source_id', 'executable', 'cwd', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref')) or not Path(config['executable']).is_absolute() or not Path(config['endpoint']).is_absolute() or config['source_id'] in adapters:
+            raise ManagementError('invalid_change', 'Specify the original source, fixed executable and registered endpoint; no default daemon or new server is accepted.')
+        command = [config['executable'], 'app-server', 'proxy', '--sock', config['endpoint']]
+        frozen = dict(config)
+        def verifier(binding, repository, context, frozen=frozen, command=command):
+            try:
+                base = Path(state_dir).resolve()
+                manifest_path = base / 'manual-control.json'
+                if manifest_path != manifest_path.resolve() or manifest_path.stat().st_size > 65536:
+                    raise ValueError('Invalid control manifest.')
+                reference = json.loads(manifest_path.read_text())[context['grant_id']]
+                path = base / reference['path']
+                if path != path.resolve() or not path.is_relative_to(base / 'manual-control-evidence') or path.stat().st_size > 1024 * 1024:
+                    raise ValueError('Invalid control receipt.')
+                raw = path.read_bytes()
+                if hashlib.sha256(raw).hexdigest() != reference['sha256']:
+                    raise ValueError('Control receipt digest mismatch.')
+                report = json.loads(raw)
+                if not isinstance(report, dict) or report.get('grant_binding') != context or report.get('source_id') != frozen['source_id'] or report.get('endpoint_ref') != frozen['endpoint_ref'] or report.get('endpoint_sha256') != hashlib.sha256(frozen['endpoint'].encode()).hexdigest() or report.get('source_kind') != frozen['source_kind']:
+                    raise ValueError('The current work/source scope differs.')
+                connection = {'generation': binding['generation'], 'service_id': binding['service_id'], 'platform': binding.get('platform', report.get('platform'))}
+                from .validation import validate_receipts
+                proof = validate_receipts(report, connection, repository, command, frozen['environment'], state_dir, startup_kind='manual_takeover')
+                return {**proof, **binding, 'grant_binding': context, 'takeover': proof['manual_takeover'],
+                        'control_access': 'verified-original-input-path', 'external_actor_coverage': 'unknown'}
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise ManagementError('capability_unverified', 'Current hashed original takeover/write/tool/control evidence is missing; original control remains disabled.') from exc
+        adapters[config['source_id']] = OriginalControlAdapter(command, cwd=config['cwd'], env=config['environment'], service_ref=config['service_ref'],
+            source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'], verifier=verifier)
+    return adapters

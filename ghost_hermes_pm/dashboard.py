@@ -18,6 +18,8 @@ class TaskOperation(BaseModel):
     request_id: str
     report: dict | None = None
     plan: dict | None = None
+    manual_session_id: str | None = None
+    grant_id: str | None = None
     instruction_id: str | None = None
     text: str | None = None
     expected_turn_id: str | None = None
@@ -77,6 +79,16 @@ def create_router(authenticated_client):
     def task(body: TaskOperation, request: Request):
         client = authenticated_client(request)
         try:
+            if body.action in {'takeover', 'return'}:
+                if any(v is not None for v in (body.report, body.plan, body.instruction_id, body.text, body.human_request_id, body.reply_id, body.response)):
+                    raise ManagementError('invalid_change', 'A current-work grant cannot carry other task operations.')
+                if body.action == 'takeover':
+                    return client.take_over_session(body.request_id, body.manual_session_id, body.grant_id, body.expected_turn_id)
+                if body.manual_session_id is not None or body.expected_turn_id is not None:
+                    raise ManagementError('invalid_change', 'Return identifies the existing grant only.')
+                return client.return_session_control(body.request_id, body.grant_id)
+            if body.manual_session_id is not None or body.grant_id is not None:
+                raise ManagementError('invalid_change', 'Manual grant fields require takeover or return.')
             if body.action == 'answer':
                 if any(v is not None for v in (body.report, body.plan, body.instruction_id, body.text, body.expected_turn_id)):
                     raise ManagementError('invalid_change', 'Human response fields cannot carry other task operations.')

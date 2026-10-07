@@ -134,8 +134,8 @@ def refresh_task(manager, identity, request_id):
         if record.get('outer_task_status') == 'stopped':
             return record
         session = record.get('session')
-        from .takeover import executor_for
-        adapter = executor_for(manager, record)
+        from .takeover import bind_executor
+        adapter = bind_executor(manager, record)
         if not session or not session.get('thread_id'):
             raise ManagementError('binding_conflict', 'No confirmed original thread is available for observation.')
         if adapter is None or adapter.generation != session['generation']:

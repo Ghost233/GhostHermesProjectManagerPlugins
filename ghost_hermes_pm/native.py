@@ -75,9 +75,11 @@ def register_native(ctx):
             from .github import GitHubDeliverySource
             from .observation import configured_observation_adapters
             observation_adapters = configured_observation_adapters(ctx.get_config('codex_observation', []), state_dir)
+            from .takeover import configured_control_adapters
+            control_adapters = configured_control_adapters(ctx.get_config('codex_manual_control', []), state_dir)
             codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
-                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters)
+                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters, control_adapters=control_adapters)
             for registration in ctx.get_config('manual_sources', []):
                 manager.register_observation_source(VerifiedIdentity(owner, 'trusted-native-source-registration'), registration)
             server = ManagementServer(manager, credentials)
@@ -98,7 +100,7 @@ def register_native(ctx):
 
             ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
 
-            if codex_adapter is not None or observation_adapters:
+            if codex_adapter is not None or observation_adapters or control_adapters:
                 async def supervise_single_issue():
                     import asyncio
                     identity = VerifiedIdentity(owner, 'verified-manager-supervision')
@@ -113,7 +115,9 @@ def register_native(ctx):
                         tasks = manager.read_snapshot(identity)['requests']
                         for record in tasks:
                             session = record.get('session')
-                            if codex_adapter is not None and session and session.get('thread_id') and session['generation'] == codex_adapter.generation and not record.get('repository_released'):
+                            from .takeover import executor_for
+                            actual_executor = executor_for(manager, record)
+                            if actual_executor is not None and session and session.get('thread_id') and session['generation'] == actual_executor.generation and not record.get('repository_released'):
                                 def observe_if_active(request_id=record['id']):
                                     with intake.lifecycle_lock:
                                         intake.require_active(generation)
@@ -194,7 +198,7 @@ def register_native(ctx):
 
     def task_operation(args):
         try:
-            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan'}:
+            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'manual_session_id', 'grant_id'}:
                 raise ManagementError('invalid_change', 'Task input cannot assert actor, permission or capability.')
             reference = ctx.get_config('participant_credential_ref')
             token = _credential(reference) if reference else None
@@ -203,11 +207,22 @@ def register_native(ctx):
             client = ManagementClient(state_dir, token)
             client.read_participant_snapshot()  # Reject owner aliases at the authoritative bridge.
             action = args.get('action')
+            if action not in {'takeover', 'return'} and any(args.get(k) is not None for k in ('manual_session_id', 'grant_id')):
+                raise ManagementError('invalid_change', 'Manual grant fields require takeover or return.')
             if action != 'answer' and any(args.get(k) is not None for k in ('human_request_id', 'reply_id', 'response')):
                 raise ManagementError('invalid_change', 'Human response fields require answer action.')
             if action != 'prepare' and args.get('plan') is not None:
                 raise ManagementError('invalid_change', 'Baseline plan requires preparation.')
-            if action == 'answer':
+            if action in {'takeover', 'return'}:
+                if any(args.get(k) is not None for k in ('report', 'plan', 'instruction_id', 'text', 'human_request_id', 'reply_id', 'response')):
+                    raise ManagementError('invalid_change', 'Current-work grant fields cannot carry another operation.')
+                if action == 'takeover':
+                    result = client.take_over_session(args.get('request_id'), args.get('manual_session_id'), args.get('grant_id'), args.get('expected_turn_id'))
+                else:
+                    if args.get('manual_session_id') is not None or args.get('expected_turn_id') is not None:
+                        raise ManagementError('invalid_change', 'Return accepts the existing grant only.')
+                    result = client.return_session_control(args.get('request_id'), args.get('grant_id'))
+            elif action == 'answer':
                 if any(args.get(k) is not None for k in ('report', 'instruction_id', 'text', 'expected_turn_id')):
                     raise ManagementError('invalid_change', 'Human response fields cannot carry other operations.')
                 result = client.answer_human_request(args.get('request_id'), args.get('human_request_id'), args.get('reply_id'), args.get('response'))
@@ -234,9 +249,9 @@ def register_native(ctx):
 
     ctx.register_tool(name='hermes_pm_task', toolset='hermes_pm',
                       schema={'name': 'hermes_pm_task', 'description': 'Verify, start, observe or record evidence for one accepted Issue.',
-                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery', 'append', 'stop', 'continue', 'answer', 'prepare', 'source']},
+                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery', 'append', 'stop', 'continue', 'answer', 'prepare', 'source', 'takeover', 'return']},
                                   'request_id': {'type': 'string'}, 'report': {'type': 'object'}, 'plan': {'type': 'object'},
-                                  'instruction_id': {'type': 'string'}, 'text': {'type': 'string'}, 'expected_turn_id': {'type': 'string'}, 'human_request_id': {'type': 'string'}, 'reply_id': {'type': 'string'}, 'response': {'type': 'object'}},
+                                  'instruction_id': {'type': 'string'}, 'text': {'type': 'string'}, 'expected_turn_id': {'type': 'string'}, 'human_request_id': {'type': 'string'}, 'reply_id': {'type': 'string'}, 'response': {'type': 'object'}, 'manual_session_id': {'type': 'string'}, 'grant_id': {'type': 'string'}},
                                   'required': ['action', 'request_id'], 'additionalProperties': False}},
                       handler=task_operation, description='Single Issue execution and evidence')
     ctx.register_command('hermes-pm', lambda raw_args: snapshot({} if not raw_args.strip() else {'unsupported': True}),

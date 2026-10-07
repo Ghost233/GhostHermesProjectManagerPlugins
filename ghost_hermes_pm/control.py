@@ -28,8 +28,8 @@ def _authorize(manager, identity, request_id, data):
 
 def _binding(manager, identity, request_id, data, action):
     record, session = _authorize(manager, identity, request_id, data)
-    from .takeover import executor_for
-    adapter = executor_for(manager, record)
+    from .takeover import bind_executor
+    adapter = bind_executor(manager, record)
     if adapter is None or adapter.generation != session['generation'] or not adapter.connection or adapter.connection['service_id'] != session['service_id']:
         raise ManagementError('capability_unverified', 'The original executor generation is unavailable; history is not control.')
     repository = session['repository']

@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
+emitted = set()
 for line in sys.stdin:
     request = json.loads(line)
     with (root / 'original-wire.jsonl').open('a') as log:
@@ -44,4 +45,9 @@ for line in sys.stdin:
         result = {'turn': turn}
     else:
         raise RuntimeError('Takeover must not create/resume/fork a thread or change daemon: ' + method)
+    for envelope in state.get('server_requests', []):
+        key = (type(envelope['id']).__name__, envelope['id'])
+        if key not in emitted:
+            print(json.dumps(envelope), flush=True)
+            emitted.add(key)
     print(json.dumps({'id': request['id'], 'result': result}), flush=True)

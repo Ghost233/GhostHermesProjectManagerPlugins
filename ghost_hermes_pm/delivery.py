@@ -65,8 +65,8 @@ def record_task_delivery(manager, identity, request_id, report):
             raise ManagementError('evidence_missing', 'Original execution and complete terminal history must be verified before delivery.')
         from .control import terminal_evidence, _thread
         session = record['session']
-        from .takeover import executor_for
-        adapter = executor_for(manager, record)
+        from .takeover import bind_executor
+        adapter = bind_executor(manager, record)
         related, execution_end = terminal_evidence(adapter, session, _thread(adapter, session, require_input=False), session['turn_id'])
         if related:
             record.update(related_execution=related, handoff_reason='Related original execution has not finished.')
@@ -189,6 +189,8 @@ def record_task_delivery(manager, identity, request_id, report):
                       test_evidence=list(tests.values()), delivery_evidence={'issue_updated_at': scope['updated_at'], 'criteria': criteria,
                       'source_commit': commit or current['head'], 'source_changed': source_changed, 'execution_end': execution_end, 'leftover_changes': current['workspace_status'], 'workspace': current, 'artifacts': artifacts,
                       'pr': pr, 'sync': sync, 'verified_at': datetime.now(timezone.utc).isoformat()})
+        from .takeover import complete_grant
+        complete_grant(manager, record, data)
         for arrangement in record.get('execution_arrangements', []):
             if arrangement['id'] == record.get('current_arrangement_id'):
                 arrangement.update(phase='delivered', ended_at=record['delivery_evidence']['verified_at'])

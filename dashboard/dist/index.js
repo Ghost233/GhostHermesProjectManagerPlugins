@@ -19,6 +19,8 @@
     const [humanReviewed, setHumanReviewed] = React.useState({});
     const [humanIntents, setHumanIntents] = React.useState({});
     const [preparationPlans, setPreparationPlans] = React.useState({});
+    const [manualTargets, setManualTargets] = React.useState({});
+    const [manualGrantIntents, setManualGrantIntents] = React.useState({});
     const [observerForm, setObserverForm] = React.useState({ id: '', kind: 'daemon', projects: '', adapter_ref: '' });
     async function refresh() {
       try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
@@ -52,6 +54,23 @@
       try { await sdk.fetchJSON(api + '/directory', { method: 'POST', body: JSON.stringify(review) });
         setReview(null); await refresh(); }
       catch (e) { setError(String(e.message || e)); }
+      finally { setSaving(false); }
+    }
+    function manualField(record, key, label) {
+      const selected = manualTargets[record.id] || {};
+      return h('label', { style: { display: 'block' } }, label, h('input', { value: selected[key] || '',
+        onChange: function (e) { setManualTargets(Object.assign({}, manualTargets, { [record.id]: Object.assign({}, selected, { [key]: e.target.value }) })); },
+        style: { margin: '6px', padding: '7px', color: 'inherit', background: 'transparent', border: '1px solid #8886' } }));
+    }
+    async function manualGrantAction(action, record) {
+      const selected = manualTargets[record.id] || {};
+      const body = action === 'return' ? { action: 'return', request_id: record.id, grant_id: record.control_grant_id } :
+        manualGrantIntents[record.id] || { action: 'takeover', request_id: record.id, grant_id: window.crypto.randomUUID(),
+          manual_session_id: String(selected.manual_session_id || '').trim(), expected_turn_id: String(selected.turn_id || '').trim() };
+      if (action === 'takeover') setManualGrantIntents(Object.assign({}, manualGrantIntents, { [record.id]: body }));
+      setSaving(true);
+      try { await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify(body) }); await refresh(); }
+      catch (e) { await refresh(); setError(String(e.message || e) + ' · 授权 ID：' + body.grant_id); }
       finally { setSaving(false); }
     }
     async function observationAction(register) {
@@ -210,6 +229,7 @@
         h('ul', null, (snapshot.requests || []).map(function (r) {
           const source = r.source_anchor;
           const anchor = r.task_start_anchor;
+          const grant = (snapshot.control_grants || []).find(function (g) { return g.id === r.control_grant_id; });
           const controlled = r.session && r.session.control === 'assigned_task' && r.task_delivery !== 'delivered';
           const inputOpen = controlled && !r.repository_released && !['stopping', 'stopped'].includes(r.execution);
           const continueOpen = controlled && r.execution === 'stopped' && r.outer_task_status === 'stopped' &&
@@ -229,6 +249,13 @@
               r.preparation && h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(r.preparation, null, 2))),
             r.handoff_reason && h('div', null, '交付交接受阻：' + r.handoff_reason),
             h('div', null, '交付：' + (r.task_delivery || 'unmet') + ' · PR：' + (r.pr_status || 'none')),
+            grant && h('div', null, '本次手动控制：' + grant.status + ' · 负责人：' + grant.controller_profile_id + ' · 原服务：' + grant.original_executor_id + ' · 授权：' + grant.id),
+            grant && grant.reason && h('div', null, '原控制待核对：' + grant.reason),
+            grant && h('button', { style: button, onClick: function () { manualGrantAction('return', r); }, disabled: saving || snapshot.status !== 'completed' || ['returned', 'completed'].includes(grant.status) }, '归还本次控制（不中断）'),
+            !r.session && h('details', null, h('summary', null, '本人接管此 Issue 的当前手动工作'),
+              h('p', null, '指定本次请求的负责人控制已核实原会话。原服务或能力不支持时保持只观察，其他桌面操作识别仍未知。'),
+              manualField(r, 'manual_session_id', '已观察手动记录 ID'), manualField(r, 'turn_id', '明确当前原 turn ID'),
+              h('button', { style: button, onClick: function () { manualGrantAction('takeover', r); }, disabled: saving || snapshot.status !== 'completed' || !r.task_start_anchor }, '授权本次工作接管')),
             r.session && h('div', null, '原 Codex 会话：' + (r.session.thread_id || '创建待核对') + ' · 轮次：' + (r.session.turn_id || '启动待核对') + ' · 控制：' + r.session.control),
             r.last_execution_verified_at && h('div', null, '执行最后核实：' + r.last_execution_verified_at),
             h('button', { style: button, onClick: function () { taskAction('verify', r.id); }, disabled: saving || snapshot.status !== 'completed' }, '核验执行能力'),

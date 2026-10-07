@@ -19,9 +19,12 @@ TOOLS = {'model_files', 'shell_git', 'test_process', 'code_mode', 'local_mcp', '
          'filesystem_rpc', 'process_spawn', 'thread_shell'}
 
 
-def validate_receipts(report, connection, repository, command, env, state_dir):
+def validate_receipts(report, connection, repository, command, env, state_dir, *, startup_kind='task_start'):
+    if startup_kind not in {'task_start', 'manual_takeover'}:
+        raise ManagementError('capability_unverified', 'Unknown execution evidence kind.')
+    kinds = tuple(startup_kind if k == 'task_start' else k for k in KINDS)
     receipts = report.get('receipts') if isinstance(report, dict) else None
-    if not isinstance(receipts, dict) or not set(KINDS).issubset(receipts) or set(receipts) - set(KINDS) - {'task_control', 'human_response'}:
+    if not isinstance(receipts, dict) or not set(kinds).issubset(receipts) or set(receipts) - set(kinds) - {'task_control', 'human_response'}:
         raise ManagementError('capability_unverified', 'Hashed current-service enforcement, tool, startup and executor-coverage receipts are required.')
     binary_digest = hashlib.sha256(Path(command[0]).read_bytes()).hexdigest()
     configuration_digest = hashlib.sha256(json.dumps({'command': command, 'environment': env}, sort_keys=True).encode()).hexdigest()
@@ -32,7 +35,7 @@ def validate_receipts(report, connection, repository, command, env, state_dir):
     evidence_root = (Path(state_dir) / 'validation-evidence').resolve()
     control = None
     human_response = None
-    for kind in (*KINDS, *(k for k in ('task_control', 'human_response') if k in receipts)):
+    for kind in (*kinds, *(k for k in ('task_control', 'human_response') if k in receipts)):
         reference = receipts[kind]
         if not isinstance(reference, dict) or set(reference) != {'path', 'sha256'}:
             raise ManagementError('capability_unverified', 'Each validation receipt needs a fixed local digest.')
@@ -63,6 +66,12 @@ def validate_receipts(report, connection, repository, command, env, state_dir):
         elif kind == 'task_start':
             if receipt.get('actual_methods') != ['initialize', 'initialized', 'permissionProfile/list', 'thread/start', 'turn/start', 'thread/read'] or receipt.get('runtime_roots') != report.get('runtime_roots') or receipt.get('permission_profile') != report.get('permission_profile') or not receipt.get('thread_id') or not receipt.get('turn_id'):
                 raise ManagementError('capability_unverified', 'Actual controlled task-start receipts are incomplete.')
+        elif kind == 'manual_takeover':
+            context = report.get('grant_binding', {})
+            checks = {'owner_only', 'original_executor', 'same_thread', 'single_controller', 'scope_bound', 'return_running', 'completion_expiry', 'wrong_turn', 'foreign_service', 'desktop_unsupported', 'no_new_thread', 'no_replayed_approval', 'original_request_routing'}
+            binding = {k: v for k, v in context.items() if k != 'current_turn_id'}
+            if receipt.get('actual_methods') != ['initialize', 'initialized', 'thread/loaded/list', 'thread/read'] or receipt.get('grant_binding') != binding or receipt.get('thread_id') != context.get('thread_id') or receipt.get('turn_id') != context.get('original_turn_id') or receipt.get('runtime_roots') != report.get('runtime_roots') or receipt.get('permission_profile') != report.get('permission_profile') or receipt.get('control_access') != 'verified-original-input-path' or not isinstance(receipt.get('checks'), dict) or set(receipt['checks']) != checks or any(v != 'PASS' for v in receipt['checks'].values()):
+                raise ManagementError('capability_unverified', 'Actual original current-work takeover, return, scope and no-replay evidence is incomplete.')
         elif kind == 'task_control':
             methods, checks = receipt.get('actual_methods'), receipt.get('checks')
             if not isinstance(methods, list) or any(not isinstance(m, str) for m in methods) or set(methods) != CONTROL_METHODS or not isinstance(checks, dict) or set(checks) != CONTROL_CHECKS or any(v != 'PASS' for v in checks.values()) or not receipt.get('thread_id') or not receipt.get('turn_id') or not receipt.get('new_turn_id') or receipt['turn_id'] == receipt['new_turn_id']:
@@ -81,7 +90,7 @@ def validate_receipts(report, connection, repository, command, env, state_dir):
     result = {k: report[k] for k in ('generation', 'service_id', 'repository_fingerprint', 'permission_profile',
                                    'runtime_roots', 'policy_digest', 'model')} | {
         'platform_enforcement': 'receipt:' + verified['platform_enforcement'],
-        'tool_paths': 'receipt:' + verified['tool_paths'], 'task_start': 'receipt:' + verified['task_start'],
+        'tool_paths': 'receipt:' + verified['tool_paths'], startup_kind: 'receipt:' + verified[startup_kind],
         'manual_execution_coverage': 'receipt:' + verified['manual_execution_coverage'],
         'binary_sha256': binary_digest, 'configuration_sha256': configuration_digest}
 
