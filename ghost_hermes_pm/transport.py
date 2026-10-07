@@ -69,6 +69,8 @@ class ManagementServer:
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
                         elif payload.get('operation') == 'global_validation':
                             result = bridge.manager.global_validation(identity, payload.get('action'), payload.get('details'))
+                        elif payload.get('operation') == 'lifecycle':
+                            result = bridge.manager.lifecycle(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'take_over_session':
                             result = bridge.manager.take_over_session(identity, payload.get('request_id'), payload.get('manual_session_id'), payload.get('grant_id'), payload.get('expected_turn_id'))
                         elif payload.get('operation') == 'return_session_control':
@@ -187,12 +189,14 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'reconcile_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate', 'answer_from_knowledge', 'supplement_project_memory', 'manage_memory', 'global_validation'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'reconcile_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate', 'answer_from_knowledge', 'supplement_project_memory', 'manage_memory', 'global_validation', 'lifecycle'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
                     response = _read_frame(reader)
         except (OSError, ValueError) as exc:
+            if operation == 'lifecycle':
+                raise ManagementError('outcome_unknown', 'Lifecycle response was not confirmed; inspect the same durable operation ID and original approved scope before any new decision.') from exc
             if operation in {'query_archive', 'protect_archive', 'backup_archive', 'restore_archive'}:
                 raise ManagementError('outcome_unknown', 'The archive operation response was not confirmed; inspect the same durable query/protection/backup/restore ID before retrying. Original entries remain inactive.') from exc
             if operation in {'start_task', 'control_task', 'answer_human_request', 'reconcile_task', 'answer_from_knowledge', 'supplement_project_memory', 'manage_memory', 'global_validation'}:
@@ -210,6 +214,9 @@ class ManagementClient:
 
     def global_validation(self, action, details):
         return self._call('global_validation', action=action, details=details)
+
+    def lifecycle(self, action, details):
+        return self._call('lifecycle', action=action, details=details)
 
     def collaborate(self, action, details):
         return self._call('collaborate', action=action, details=details)

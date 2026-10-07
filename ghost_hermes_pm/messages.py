@@ -1,6 +1,7 @@
 """Verified Feishu cold-path entry. Host compatibility stays at this boundary."""
 import asyncio
 import inspect
+import hashlib
 import json
 import re
 import threading
@@ -120,6 +121,21 @@ class FeishuEntry:
                         'root_id': getattr(message, 'root_id', None), 'thread_id': getattr(message, 'thread_id', None)}
             if not work:
                 manager = self.manager()
+                from .lifecycle_entry import parse as parse_lifecycle, allowed as lifecycle_allowed
+                lifecycle = parse_lifecycle(command)
+                if lifecycle:
+                    if manager is None:
+                        return None
+                    snapshot = manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))
+                    operation_id = 'group-' + hashlib.sha256(json.dumps(envelope, sort_keys=True).encode()).hexdigest()
+                    duplicate = next((o for o in snapshot['lifecycle_operations'] if o['id'] == operation_id), None)
+                    if duplicate is None and not lifecycle_allowed(snapshot, binding, command):
+                        return None
+                    from .lifecycle_entry import PreparedLifecycleMessage, reviewed
+                    details = reviewed(snapshot, command)
+                    if duplicate:
+                        details.update(duplicate['approved_scope'])
+                    return PreparedLifecycleMessage(event, adapter, transport, binding, envelope, command, None, details)
                 human_reply = bool(re.match(r'^(回答|批准|拒绝)', command))
                 if human_reply:
                     if manager is None:
@@ -143,6 +159,9 @@ class FeishuEntry:
         if manager is None:
             return False
         snapshot = manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))
+        from .lifecycle_entry import parse as parse_lifecycle
+        if parse_lifecycle(prepared.command):
+            return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile for p in snapshot['profiles'])
         if getattr(prepared, 'knowledge_kind', None):
             return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile for p in snapshot['profiles'])
         if re.match(r'^(回答|批准|拒绝)', prepared.command):
@@ -169,6 +188,9 @@ class FeishuEntry:
         async with self.lock:
             self.require_active(generation)
             if not prepared.issue_url:
+                from .lifecycle_entry import parse as parse_lifecycle, process as process_lifecycle
+                if parse_lifecycle(prepared.command):
+                    return await process_lifecycle(self, identity, prepared, generation)
                 return await self._associate(identity, binding, envelope, prepared.command, transport, generation)
             existing = next((r for r in self.manager().read_snapshot(identity)['requests'] if r['source_anchor'] == envelope), None)
             if existing:

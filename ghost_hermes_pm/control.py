@@ -57,6 +57,9 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
     with manager._lock:
         version, data = manager._load()
         record, session = _authorize(manager, identity, request_id, data)
+        if action != 'stop':
+            from .lifecycle import require_active
+            require_active(data, record['profile_id'], record['project_id'])
         existing = next((c for c in record.get('controls', []) if c['id'] == instruction_id), None)
         request = {'action': action, 'text': text, 'expected_turn_id': expected_turn_id, 'actor': identity.subject}
         if existing:
