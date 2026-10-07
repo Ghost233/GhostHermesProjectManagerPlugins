@@ -33,3 +33,9 @@
 公共离线路径使用实际 SQLite、临时 Git、原 JSONL 执行 peer、原观察 peer和明确人工 native boundary。固定 SDK 场景使用 pristine `bd0affe5e5f723579df8902852f5d0c47795f355` 的真实 loader/control socket/registry/native hook/management server；外部 verifier 仅覆盖拥有的人工 gateway、无模型/外部任务的明确运行范围及显式配置/data/archive 文件。测试副本通过 SDK 公开 build-stamp writer 声明固定 core 构建 metadata；此 metadata 与新插件实际执行 fingerprint、控制效果分开，不是生产版本发布证明。场景实际覆盖旧桥关闭、失 ACK、原 ID 新桥 check、切换失败、真实文件回退、恢复对账、强制卸载及 stale bytecode。
 
 父规格全部已有切片、获准真实群/Profile/服务/仓库、当前模型端点、完整资料/进程/保留保护和正式安装计划继续独立执行。本票不替代前票测试，不操作本人当前任务，不迁移真实资料。Dashboard 的 `release_verified` 仍为 false；没有当前真实验证的能力不能作为已启用发布。本地已批准资源可以只读预检，但原真实模型端点和原 Codex 控制/全资料保护的 unknown/blocked 门槛不会被人工 fixture report 消除。
+
+## 当前入口权限与未决原操作
+
+维护 snapshot 的 `permissions.status/can_manage` 由已验证入口身份生成；只有 Owner 的当前入口得到 true，已登记只读身份为 false。它是显示用事实，不能通过请求 body 授权。Dashboard 在缺失、未核实、非 true、只读或离线权限下隐藏维护控制，预览和提交再次核对权限；Owner 切换为 reader 或刷新后旧预览失效，后端继续拒绝非 Owner。原实际浏览器 reader P1 与修复后独立真实 React 验证均保留。
+
+一致性交接还核对原 Owner 回复 ledger 和通知 ledger 的未知送达，原生生命周期未决 component request、全局验证尚未释放的原 action，以及迁移 preparing/native-state-unverified/cutover-unknown。只读查询不会重发这些原请求。已验证生命周期结果、已经核对结束并释放的原验证 run、尚未开始原生操作的 migration draft 和已完成迁移/回退历史不因此被永久视作在途。每个新增门禁都有公共入口真实反例：unknown 回复/通知、原 stop 已确认后的 lost validation ACK、原 native stop ACK 未核实及原 migration prepare 实际产生人工 artifact 后 lost response；原服务公开 check/reconcile 结束后可以交接，原 run/control 不重播。

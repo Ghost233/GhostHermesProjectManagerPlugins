@@ -138,6 +138,9 @@ def _inflight(manager, data):
     for attempt in data.get('global_validations', {}).values():
         if attempt.get('occupancy', {}).get('released') is False:
             pending.append('global_validations:' + attempt['id'] + ':original_action_unreconciled')
+    for operation in data.get('migration_plans', {}).values():
+        if operation.get('status') not in {'switched', 'rolled_back'} and (operation.get('status') == 'preparing' or operation.get('native_state') == 'unverified' or operation.get('switch_state') in {'intent', 'outcome_unknown', 'rollback_execution_unverified'}):
+            pending.append('migration_plans:' + operation['id'] + ':original_native_action_unreconciled')
     return pending
 
 

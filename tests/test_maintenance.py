@@ -382,3 +382,32 @@ def test_unknown_original_global_validation_run_blocks_handoff_until_reconciled_
             assert manager.global_validation(LEAD, 'reconcile', {'validation_id': validation['id']})['status'] == 'passed'
             assert len(validator.runs) == 1
             assert client.maintenance('checkpoint', {'operation_id': 'validation-handoff'})['status'] == 'checkpoint_verified'
+
+
+def test_migration_draft_does_not_block_but_unknown_original_native_prepare_blocks_checkpoint(tmp_path):
+    from maintenance_fixture_host import MaintenanceHost
+    from test_migration import setup, proposal
+    class UnknownNativePrepare:
+        def __init__(self): self.effects = []
+        def prepare(self, operation):
+            artifact = tmp_path / 'native-prepare-effect.json'
+            artifact.write_text(json.dumps({'plan_id': operation['id'], 'original_native_request': 'started'}))
+            self.effects.append(operation['id'])
+            raise ManagementError('outcome_unknown', 'Original native preparation response lost after its actual effect.')
+    native, host = UnknownNativePrepare(), MaintenanceHost(tmp_path / 'host')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, migration_host=native, maintenance_host=host) as manager:
+        setup(manager, tmp_path)
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            planned = client.migrate_profile('plan', proposal(client))
+            assert planned['status'] == 'planned' and native.effects == []
+            client.maintenance('enter', approval(client, 'migration-handoff', expected_release=host.release))
+            assert client.maintenance('check', {'operation_id': 'migration-handoff'})['status'] == 'handoff_verified'
+            prepared = client.migrate_profile('prepare', {'plan_id': planned['id'], 'digest': planned['digest']})
+            assert prepared['status'] == 'blocked' and prepared['native_state'] == 'unverified'
+            blocked = client.maintenance('checkpoint', {'operation_id': 'migration-handoff'})
+            assert blocked['status'] == 'blocked'
+            assert blocked.get('checkpoint') is None
+            assert any('migration_plans' in request for request in blocked['checks']['inflight_requests'])
+            assert native.effects == [planned['id']]
+            assert json.loads((tmp_path / 'native-prepare-effect.json').read_text())['plan_id'] == planned['id']
