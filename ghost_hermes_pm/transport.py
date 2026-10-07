@@ -179,7 +179,7 @@ class ManagementClient:
         except (OSError, ValueError) as exc:
             if operation in {'query_archive', 'protect_archive', 'backup_archive', 'restore_archive'}:
                 raise ManagementError('outcome_unknown', 'The archive operation response was not confirmed; inspect the same durable query/protection/backup/restore ID before retrying. Original entries remain inactive.') from exc
-            if operation in {'start_task', 'control_task', 'answer_human_request'}:
+            if operation in {'start_task', 'control_task', 'answer_human_request', 'reconcile_task'}:
                 raise ManagementError('outcome_unknown', 'Task start response was not confirmed; read the same durable request before retrying. Repository occupancy is retained.') from exc
             raise ManagementError('unavailable', 'The management instance is unavailable; no operation was confirmed.') from exc
         if 'error' in response:

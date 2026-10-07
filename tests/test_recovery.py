@@ -290,6 +290,7 @@ def test_returned_manual_control_remains_observation_after_restart(tmp_path):
         service_id = manager.read_snapshot(OWNER)['requests'][0]['session']['service_id']
     recovery = recovery_adapter(tmp_path, service_id, permission_profile='original-fixture-policy', policy_digest='original-fixture-policy-digest')
     recovery.service_ref = 'local:manual-daemon-control'
+    recovery.endpoint_ref = 'local:registered-daemon'
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, recovery_adapters={recovery.service_ref: recovery}) as manager:
         task = manager.reconcile_task(OWNER, request_id)
         assert task['execution'] == 'running'
