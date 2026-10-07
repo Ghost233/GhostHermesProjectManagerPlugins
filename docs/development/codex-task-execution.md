@@ -63,3 +63,7 @@ node --check dashboard/dist/index.js
 ```
 
 使用短 basetemp 避免 macOS Unix socket 路径长度限制。真实能力验收报告与静态/离线结果分别保存；真实群与服务证据缺席仍列为 acceptance gap。
+
+## 合并验收解释
+
+受理时从原 Issue 冻结明确的合并义务。`must/必须` 的合并操作、状态展示、可选及禁止合并分别核对；仅出现 `merged/合并` 不添加义务。历史关键词版本的义务按原已冻结 body 纠正解释，原验收文本不自动替换为后来 Issue 内容。必要 merge 仍要求真实 merged PR 与 local/remote 同步；明确禁止的实际 merged 结果不能交付。条件、冲突或不能唯一解释的条目清楚返回 `needs_clarification` 并保持未交付，沿已有 Owner intake/范围确认处理，不擅自追加 merge，也不把消息目标澄清或真实 Codex 的答复 RPC 伪装为 Issue 解释协议。

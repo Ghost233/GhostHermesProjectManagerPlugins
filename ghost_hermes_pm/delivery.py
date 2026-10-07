@@ -57,16 +57,40 @@ def executed_tests(command, output):
     return 0
 
 def delivery_requirements(body):
-    # Freeze the requirement from the accepted Issue; a later report cannot waive it.
-    clauses = acceptance_criteria(body)
-    required = []
-    for clause in clauses:
-        if not re.search(r'\bmerg(?:e|ed|es|ing)\b|合并', clause, re.IGNORECASE):
-            continue
-        if re.search(r'\b(?:no|without)\s+(?:PR\s+)?merg(?:e|ing)\b|\bmerg(?:e|ing)\s+(?:is\s+)?(?:not required|optional)\b|(?:无需|不要求|不需要)\s*(?:PR\s*)?合并', clause, re.IGNORECASE):
-            continue
-        required.append(clause)
-    return {'merge_required': bool(required), 'merge_criteria': required}
+    """Freeze explicit merge duties; mentions and uncertain language are not duties."""
+    required, forbidden, unclear = [], [], []
+    for criterion in acceptance_criteria(body):
+        for clause in re.split(r'[；;。\n]+', criterion):
+            if not re.search(r'\bmerg(?:e|ed|es|ing)\b|合并', clause, re.IGNORECASE):
+                continue
+            negative = re.search(r"\b(?:must not|shall not|do not|don't|never)\s+(?:be\s+)?merg(?:e|ed)\b|(?:禁止|不得|不要|不能|勿)\s*(?:合并|(?:此|本|该)?\s*PR\s*合并)", clause, re.IGNORECASE)
+            optional_pattern = r'\b(?:not required|not necessary|does not need)\b.{0,40}?\bmerg(?:e|ed|ing)\b|(?:不是必须|并非必须|非必须|未要求).{0,30}?合并|\b(?:no|without)\s+(?:PR\s+)?merg(?:e|ing)\b|\bmerg(?:e|ed|ing)\b.{0,40}?\b(?:not required|optional)\b|\b(?:may|can|could|optional)\b.{0,40}?\bmerg(?:e|ed)\b|(?:无需|不要求|不需要|可选|酌情|可以).{0,30}?合并|合并.{0,20}(?:可选|不作要求|不作为交付条件)'
+            optional = re.search(optional_pattern, clause, re.IGNORECASE)
+            affirmative = re.sub(optional_pattern, ' ', clause, flags=re.IGNORECASE)
+            obligation = re.search(r'\b(?:must|shall|has to|have to|needs to|is required to)\s+(?:be\s+)?merg(?:e|ed)\b|\bmerg(?:e|ed|ing)\b.{0,40}\b(?:is required|is mandatory)\b|^\s*merge\b|(?:必须|务必|须|应当|需要|要求)\s*(?:先|完成\s*(?:此|本|该)?\s*PR\s*)?合并|^\s*(?:合并(?:此|本|该)?\s*PR|将.+合并到)|完成\s*PR\s*合并(?:后|之后).{0,20}(?:交付|验收)', affirmative, re.IGNORECASE)
+            reporting = re.search(r'\b(?:show|display|report|list|record|track|describe)\b|展示|显示|呈现|记录|列出|跟踪', clause, re.IGNORECASE) and re.search(r'\b(?:status|state|whether)\b|状态|是否|待审查|待合并|已合并', clause, re.IGNORECASE)
+            conditional = re.search(r'\b(?:if|unless)\b|(?:如果|若|除非)', clause, re.IGNORECASE)
+            if optional and obligation:
+                unclear.append(criterion)
+            elif negative:
+                forbidden.append(criterion)
+            elif optional:
+                continue
+            elif obligation and not conditional:
+                required.append(criterion)
+            elif reporting and not obligation:
+                continue
+            else:
+                unclear.append(criterion)
+    if required and forbidden:
+        unclear.extend(required + forbidden)
+    return {'version': 2, 'merge_required': bool(required), 'merge_forbidden': bool(forbidden),
+            'merge_criteria': list(dict.fromkeys(required)), 'clarification_criteria': list(dict.fromkeys(unclear))}
+
+
+def frozen_delivery_requirements(record):
+    value = record.get('delivery_requirements', {})
+    return value if value.get('version') == 2 else delivery_requirements(record['accepted_scope']['body'])
 
 
 def acceptance_criteria(body):
@@ -200,7 +224,12 @@ def record_task_delivery(manager, identity, request_id, report):
             if not re.fullmatch(r'[a-f0-9]{40}', local) or remote != local:
                 raise ManagementError('evidence_missing', 'A involved local branch is not synchronized with its actual remote hash.')
             sync.append({'branch': branch, 'local_commit': local, 'remote_commit': remote, 'source': 'local_git_and_github_read'})
-        merge_required = record.get('delivery_requirements', delivery_requirements(scope['body']))['merge_required']
+        requirements = frozen_delivery_requirements(record)
+        if requirements['clarification_criteria']:
+            raise ManagementError('needs_clarification', 'The accepted Issue does not uniquely define its merge obligation; confirm the original acceptance scope with the Owner before delivery.')
+        if requirements['merge_forbidden'] and pr and pr['state'] == 'merged':
+            raise ManagementError('evidence_missing', 'The frozen acceptance forbids merging this PR.')
+        merge_required = requirements['merge_required']
         if any(c.get('pr_evidence') is True for c in criteria) and pr is None:
             raise ManagementError('evidence_missing', 'PR acceptance requires an actual PR read result.')
         if merge_required and (not pr or pr['state'] != 'merged' or not sync or pr.get('base_branch') not in branches):
