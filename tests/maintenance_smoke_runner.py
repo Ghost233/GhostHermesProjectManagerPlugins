@@ -131,8 +131,22 @@ def wait_loaded(version):
     raise AssertionError('Actual SDK loaded implementation did not reach ' + version)
 
 def bootstrap():
-    asyncio.run_coroutine_threadsafe(ainvoke_hook('pre_gateway_dispatch', event=object(), gateway=gateway), loop).result(timeout=10)
-    return ManagementClient(state, os.environ['HERMES_FIXTURE_OWNER_TOKEN'])
+    client = ManagementClient(state, os.environ['HERMES_FIXTURE_OWNER_TOKEN'])
+    deadline = time.monotonic() + 15
+    last_unavailable = None
+    while time.monotonic() < deadline:
+        # The version tool registers before the Gateway hook. A completed public
+        # read, rather than tool visibility, proves this new bridge is reachable.
+        asyncio.run_coroutine_threadsafe(ainvoke_hook('pre_gateway_dispatch', event=object(), gateway=gateway), loop).result(timeout=10)
+        try:
+            client.read_snapshot()
+            return client
+        except Exception as error:
+            if getattr(error, 'code', None) != 'unavailable':
+                raise
+            last_unavailable = error
+        time.sleep(0.02)
+    raise AssertionError('The actual new management bridge did not become publicly reachable.') from last_unavailable
 
 def approval(client, operation, **extra):
     snapshot = client.read_snapshot()
@@ -155,7 +169,12 @@ try:
     shutil.copytree(plugin, target)
     (target / 'plugin.yaml').write_text((target / 'plugin.yaml').read_text().replace('version: "0.2.0"', 'version: "0.3.0"'))
     target_code = target / 'ghost_hermes_pm' / 'native.py'
-    target_code.write_text(target_code.read_text().replace("'native_probe': 'target-v2'", "'native_probe': 'target-v3'"))
+    target_text = target_code.read_text().replace("'native_probe': 'target-v2'", "'native_probe': 'target-v3'")
+    # Keep the real reload window deterministic: the actual target version tool
+    # is available while its new Gateway registration is still in progress.
+    target_text = target_text.replace("    state_dir = ctx.get_config('state_dir')",
+                                      "    import time\n    time.sleep(0.5)\n    state_dir = ctx.get_config('state_dir')", 1)
+    target_code.write_text(target_text)
     releases['release-v3'] = {'path': str(target), 'plugin_version': '0.3.0', 'source_digest': source_digest(target)}
     client = bootstrap()
     app = FastAPI(); app.include_router(create_router(lambda request: client)); browser = TestClient(app)
