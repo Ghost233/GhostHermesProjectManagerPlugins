@@ -58,7 +58,7 @@ def _git(path, *args):
                                             'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'})
     if result.returncode:
         raise ManagementError('invalid_repository', 'The existing path must be a Git worktree.')
-    return result.stdout.strip()
+    return result.stdout if '-z' in args else result.stdout.strip()
 
 
 def _repository(value):
@@ -112,6 +112,11 @@ class Manager:
         self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 1, 0, ?)',
                          (json.dumps({'projects': {}, 'profiles': {}, 'last_verified_at': None}),))
         self._db.commit()
+        version, data = self._load()
+        from .queue import ensure_queues
+        if ensure_queues(data):
+            with self._db:
+                self._save(version, data)
 
     def close(self):
         with self._lock:
@@ -153,6 +158,8 @@ class Manager:
                         if segment['attempts']:
                             segment['attempts'][-1]['status'] = 'unknown'
             record['delivery'] = _delivery_status(record)
+        from .queue import refresh
+        refresh(data)
         return version, data
 
     def _principal(self, identity, data):
@@ -236,6 +243,8 @@ class Manager:
                       'execution': 'waiting', 'unexecuted_reason': 'Codex execution is not enabled.',
                       'delivery': 'pending', 'messages': [], 'outbox': []}
             data['requests'][key] = record
+            from .queue import enroll
+            enroll(data, record, data['projects'][project_id]['repo'])
             self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
             return {'status': 'accepted', 'duplicate': False, 'request': record}
 
@@ -247,6 +256,18 @@ class Manager:
         if principal and principal['role'] != 'steward' and record['profile_id'] not in self._visible_profile_ids(principal, data):
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
+
+    def refresh_task_source(self, identity, request_id):
+        from .queue import refresh_task_source
+        return refresh_task_source(self, identity, request_id)
+
+    def dispatch_tasks(self):
+        from .queue import dispatch_tasks
+        return dispatch_tasks(self)
+
+    def prepare_task(self, identity, request_id, plan):
+        from .queue import prepare_task
+        return prepare_task(self, identity, request_id, plan)
 
     def start_task(self, identity, request_id):
         from .execution import start_task
@@ -270,7 +291,21 @@ class Manager:
 
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
-        return record_task_delivery(self, identity, request_id, report)
+        try:
+            return record_task_delivery(self, identity, request_id, report)
+        except ManagementError as exc:
+            with self._lock, self._db:
+                version, data = self._load()
+                record = self._request(identity, request_id, data)
+                # Report only an authorized task operation; visibility is not authority.
+                from .execution import _responsible
+                _responsible(self, identity, request_id, data)
+                if record.get('session') and not record.get('repository_released'):
+                    record.update(handoff_reason=str(exc))
+                    self._save(version, data)
+            if record.get('session') and not record.get('repository_released'):
+                self.publish_request_message(identity, request_id, 'progress', '交付交接受阻；仓库占用保留：' + str(exc))
+            raise
 
     def verify_task_execution(self, identity, request_id):
         from .execution import verify_task_execution

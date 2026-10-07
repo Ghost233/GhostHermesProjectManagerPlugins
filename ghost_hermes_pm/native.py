@@ -100,6 +100,7 @@ def register_native(ctx):
                     identity = VerifiedIdentity(owner, 'verified-manager-supervision')
                     generation = intake.generation
                     while resources is not None and not intake.closed:
+                        await asyncio.to_thread(manager.dispatch_tasks)
                         tasks = manager.read_snapshot(identity)['requests']
                         for record in tasks:
                             session = record.get('session')
@@ -165,7 +166,7 @@ def register_native(ctx):
                       handler=snapshot, description='Project directory and verified capability status')
     def task_operation(args):
         try:
-            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response'}:
+            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan'}:
                 raise ManagementError('invalid_change', 'Task input cannot assert actor, permission or capability.')
             reference = ctx.get_config('participant_credential_ref')
             token = _credential(reference) if reference else None
@@ -174,12 +175,18 @@ def register_native(ctx):
             client = ManagementClient(state_dir, token)
             client.read_participant_snapshot()  # Reject owner aliases at the authoritative bridge.
             action = args.get('action')
+            if action != 'answer' and any(args.get(k) is not None for k in ('human_request_id', 'reply_id', 'response')):
+                raise ManagementError('invalid_change', 'Human response fields require answer action.')
+            if action != 'prepare' and args.get('plan') is not None:
+                raise ManagementError('invalid_change', 'Baseline plan requires preparation.')
             if action == 'answer':
                 if any(args.get(k) is not None for k in ('report', 'instruction_id', 'text', 'expected_turn_id')):
                     raise ManagementError('invalid_change', 'Human response fields cannot carry other operations.')
                 result = client.answer_human_request(args.get('request_id'), args.get('human_request_id'), args.get('reply_id'), args.get('response'))
-            elif any(args.get(k) is not None for k in ('human_request_id', 'reply_id', 'response')):
-                raise ManagementError('invalid_change', 'Human response fields require answer action.')
+            elif action == 'prepare':
+                if args.get('report') is not None or any(args.get(k) is not None for k in ('instruction_id', 'text', 'expected_turn_id')):
+                    raise ManagementError('invalid_change', 'Preparation accepts only the explicit baseline plan.')
+                result = client.prepare_task(args.get('request_id'), args.get('plan'))
             elif action in {'append', 'stop', 'continue'}:
                 if args.get('report') is not None:
                     raise ManagementError('invalid_change', 'Control cannot assert delivery evidence.')
@@ -189,7 +196,7 @@ def register_native(ctx):
             elif action == 'delivery':
                 result = client.record_task_delivery(args.get('request_id'), args.get('report'))
             else:
-                operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task'}.get(action)
+                operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task', 'source': 'refresh_task_source'}.get(action)
                 if operation is None or args.get('report') is not None:
                     raise ManagementError('invalid_change', 'Unsupported task operation.')
                 result = getattr(client, operation)(args.get('request_id'))
@@ -199,8 +206,8 @@ def register_native(ctx):
 
     ctx.register_tool(name='hermes_pm_task', toolset='hermes_pm',
                       schema={'name': 'hermes_pm_task', 'description': 'Verify, start, observe or record evidence for one accepted Issue.',
-                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery', 'append', 'stop', 'continue', 'answer']},
-                                  'request_id': {'type': 'string'}, 'report': {'type': 'object'},
+                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery', 'append', 'stop', 'continue', 'answer', 'prepare', 'source']},
+                                  'request_id': {'type': 'string'}, 'report': {'type': 'object'}, 'plan': {'type': 'object'},
                                   'instruction_id': {'type': 'string'}, 'text': {'type': 'string'}, 'expected_turn_id': {'type': 'string'}, 'human_request_id': {'type': 'string'}, 'reply_id': {'type': 'string'}, 'response': {'type': 'object'}},
                                   'required': ['action', 'request_id'], 'additionalProperties': False}},
                       handler=task_operation, description='Single Issue execution and evidence')

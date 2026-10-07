@@ -41,6 +41,15 @@ class GitHubDeliverySource:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ManagementError('evidence_missing', 'GitHub evidence is unavailable; delivery remains pending.') from exc
 
+    def read_issue(self, url):
+        if not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', url):
+            raise ManagementError('evidence_missing', 'The original GitHub Issue URL is required.')
+        try:
+            value = json.loads(self._business('issue', 'view', url, '--json', 'url,title,body,updatedAt'))
+            return {'url': value['url'], 'title': value['title'], 'body': value['body'], 'updated_at': value['updatedAt']}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ManagementError('evidence_missing', 'The actual Issue source could not be verified.') from exc
+
     def read_pr(self, url):
         try:
             value = json.loads(self._business('pr', 'view', url, '--json', 'url,state,headRefOid,reviewDecision,mergedAt,mergeCommit,baseRefName'))

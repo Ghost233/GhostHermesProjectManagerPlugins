@@ -31,6 +31,15 @@ def execution_registration(repo):
     value['profile']['connection_refs']['codex'] = 'local:fixture-stdio'
     return value
 
+def prepare_fixture(manager, request_id, repo):
+    from ghost_hermes_pm.queue import workspace
+    repository = next(p['repo'] for p in manager.read_snapshot(OWNER)['projects'] if p['repo']['worktree'] == str(repo))
+    current = workspace(repository)
+    manager.prepare_task(OWNER, request_id, {'branch': current['branch'], 'commit': current['head'], 'dependencies': [],
+        'issue_updated_at': next(r['accepted_scope']['updated_at'] for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == request_id),
+        'workspace_digest': current['source_digest']})
+
+
 def accepted(manager, repo):
     manager.apply_directory_change(OWNER, 0, execution_registration(repo))
     request = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, ISSUE)['request']
@@ -38,6 +47,7 @@ def accepted(manager, repo):
     segment = manager.claim_delivery(OWNER, request['id'])
     manager.record_delivery(OWNER, request['id'], segment['uuid'],
                             {'status': 'delivered', 'chat_id': 'oc_project', 'message_id': 'om_ack'})
+    prepare_fixture(manager, request['id'], repo)
     return request['id']
 
 
@@ -263,6 +273,7 @@ def test_issue_requiring_merge_keeps_delivery_unmet_but_records_actual_pr_state(
         manager.publish_request_message(OWNER, request_id, 'confirmation', '已受理')
         segment = manager.claim_delivery(OWNER, request_id)
         manager.record_delivery(OWNER, request_id, segment['uuid'], {'status': 'delivered', 'chat_id': 'oc_project', 'message_id': 'om_ack'})
+        prepare_fixture(manager, request_id, repo)
         manager.start_task(OWNER, request_id)
         (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': '00000000-0000-7000-8000-000000000017',
             'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'pytest-1',
@@ -296,6 +307,7 @@ async def _feishu_start(tmp_path):
         intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda _: ISSUE)
         intake.attach_transport(adapter, transport)
         assert await intake.receive(event(), Gateway(adapter)) == {'action': 'skip'}
+        prepare_fixture(manager, manager.read_snapshot(OWNER)['requests'][0]['id'], tmp_path / 'repo')
         command = event('执行', 'om_execute')
         command.raw_message.event.message.parent_id = manager.read_snapshot(OWNER)['requests'][0]['task_start_anchor']['message_id']
         assert await intake.receive(command, Gateway(adapter)) == {'action': 'skip'}
