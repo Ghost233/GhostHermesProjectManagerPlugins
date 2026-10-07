@@ -404,3 +404,41 @@ def test_public_archive_read_can_finish_after_old_three_second_bridge_budget(tmp
         result=ManagementClient(tmp_path/'state','new').query_archive('old-hermes','slow-history','retry',['public'],True)
         assert result['status']=='complete'
         assert ManagementClient(tmp_path/'state','new').read_snapshot()['archive_queries'][0]['id']=='slow-history'
+
+
+def test_narrow_protection_and_legacy_schema_refuse_before_native_database_write(tmp_path,monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    manager,viewer,path=setup_archive(tmp_path)
+    native_calls=[]
+    def native_write(path):
+        native_calls.append(path)
+        raise AssertionError('This native write must never be entered.')
+    monkeypatch.setitem(sys.modules,'hermes_state',SimpleNamespace(SessionDB=native_write))
+    monkeypatch.setitem(sys.modules,'hermes_state_common',SimpleNamespace(SCHEMA_VERSION=31,SCHEMA_SQL='CREATE TABLE schema_version(version INTEGER);'))
+    with manager,ManagementServer(manager,{'owner':OWNER}):
+        client=ManagementClient(tmp_path/'state','owner')
+        with sqlite3.connect(path) as db:
+            db.execute('INSERT INTO sessions VALUES(?,?,?,?,?)',('private-sibling',None,'user_close',0,1))
+        before=path.read_bytes()
+        narrow=client.protect_archive('old-hermes','narrow-protect')
+        assert narrow['status']=='unverified' and 'all original sessions' in narrow['reason']
+        assert path.read_bytes()==before and native_calls==[]
+        with sqlite3.connect(path) as db:
+            db.execute('DELETE FROM sessions WHERE id=?',('private-sibling',))
+        registration=migration_registration();registration['id']='legacy-hermes'
+        client.register_archive_source(registration)
+        before=path.read_bytes()
+        legacy=client.protect_archive('legacy-hermes','legacy-protect')
+        assert legacy['status']=='unverified' and 'schema' in legacy['reason']
+        assert path.read_bytes()==before and native_calls==[]
+        with sqlite3.connect(path) as db:
+            db.executescript('CREATE TABLE schema_version(version INTEGER);INSERT INTO schema_version VALUES(31);')
+        monkeypatch.setitem(sys.modules,'hermes_state_common',SimpleNamespace(SCHEMA_VERSION=31,
+            SCHEMA_SQL='CREATE TABLE schema_version(version INTEGER);CREATE TABLE required_native_table(value TEXT NOT NULL);'))
+        registration=migration_registration();registration['id']='shape-drift'
+        client.register_archive_source(registration)
+        before=path.read_bytes()
+        drift=client.protect_archive('shape-drift','shape-protect')
+        assert drift['status']=='unverified' and 'schema shape' in drift['reason']
+        assert path.read_bytes()==before and native_calls==[]

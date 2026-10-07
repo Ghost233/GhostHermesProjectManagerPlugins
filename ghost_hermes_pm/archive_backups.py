@@ -213,11 +213,32 @@ def protect(manager,identity,source_id,protection_id):
         source['protection']=evidence
         with manager._db: manager._save(version,data)
         try:
-            import hermes_state
             provider=_provider(manager,source)
-            _,_,coverage,_=provider.read(source['scope_ids'])
+            _,_,coverage,all_ids=provider.read(source['scope_ids'])
             if not coverage['end_confirmed']:
                 raise ManagementError('archive_incomplete','Missing history cannot be protected or reconstructed by retention.')
+            if set(all_ids)!=set(coverage['session_ids']):
+                raise ManagementError('forbidden','Native protection requires explicit coverage of all original sessions before entering a database-wide native initializer.')
+            import hermes_state
+            from hermes_state_common import SCHEMA_VERSION,SCHEMA_SQL
+            # Native writable construction reconciles schema; it must never be our implicit migration entry.
+            with sqlite3.connect(provider.path.as_uri()+'?mode=ro',uri=True) as original, sqlite3.connect(':memory:') as expected:
+                original.execute('PRAGMA query_only=ON')
+                original.execute('BEGIN')
+                try:
+                    version_row=original.execute('SELECT version FROM schema_version LIMIT 1').fetchone()
+                    if version_row!=(SCHEMA_VERSION,):
+                        raise ManagementError('capability_unverified','The original native schema requires a separately approved migration; protection did not enter its writable initializer.')
+                    expected.executescript(SCHEMA_SQL)
+                    tables=[row[0] for row in expected.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+                    for table in tables:
+                        name=table.replace(chr(34),chr(34)+chr(34))
+                        wanted={tuple(row[i] for i in (1,2,3,5)) for row in expected.execute('PRAGMA table_info("'+name+'")')}
+                        actual={tuple(row[i] for i in (1,2,3,5)) for row in original.execute('PRAGMA table_info("'+name+'")')}
+                        if not wanted<=actual:
+                            raise ManagementError('capability_unverified','The original native schema shape requires reconciliation; protection refuses implicit migration.')
+                except sqlite3.Error as exc:
+                    raise ManagementError('capability_unverified','The original native schema is missing or unsupported; protection refuses implicit migration.') from exc
             native=hermes_state.SessionDB(provider.path)
             try:
                 for sid in coverage['session_ids']:
