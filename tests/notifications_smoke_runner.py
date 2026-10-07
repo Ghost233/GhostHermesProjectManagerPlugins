@@ -77,6 +77,10 @@ import ghost_hermes_pm.github as external_issue
 external_issue.GitHubDeliverySource.read_issue = lambda self, url: IssueSource().read_issue(url)
 import ghost_hermes_pm.codex as original_codex
 original_codex.configured_adapter = lambda config, directory: question_adapter(scratch)
+from native_fixture_boundary import install
+install(home / 'plugins' / 'ghost-hermes-pm', {
+    'github': lambda module: setattr(module.GitHubDeliverySource, 'read_issue', lambda self, url: IssueSource().read_issue(url)),
+    'codex': lambda module: setattr(module, 'configured_adapter', lambda config, directory: question_adapter(scratch))})
 plugins = get_plugin_manager()
 plugins.discover_and_load()
 
