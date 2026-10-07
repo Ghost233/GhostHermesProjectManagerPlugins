@@ -60,7 +60,7 @@ info = next(p for p in manager.list_plugins() if p['name'] == 'ghost-hermes-pm')
 assert info['enabled'] and info['error'] is None, info
 assert info['commands'] == 1 and info['hooks'] == 1, info
 from tools.registry import registry
-for tool_name in ('hermes_pm_snapshot', 'hermes_pm_task', 'hermes_pm_observe', 'hermes_pm_knowledge'):
+for tool_name in ('hermes_pm_snapshot', 'hermes_pm_task', 'hermes_pm_observe', 'hermes_pm_knowledge', 'hermes_pm_global_validation'):
     assert registry.get_entry(tool_name, scope=str(home)) is not None, tool_name
 assert not (state / 'manager.sock').exists(), 'Ordinary CLI discovery must not start authority.'
 assert not (state / 'manager.lock').exists(), 'Ordinary CLI discovery must not acquire the manager lease.'

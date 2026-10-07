@@ -98,10 +98,11 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
+        self.global_validation_host = global_validation_host
         self.knowledge_providers = dict(knowledge_providers or {})
         self.archive_providers = dict(archive_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
@@ -201,6 +202,13 @@ class Manager:
                 if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
                     segment['status'] = 'unknown'
                     segment['attempts'][-1]['status'] = 'unknown'
+        from .global_validation import reconcile_inputs
+        if reconcile_inputs(self, data):
+            already_in_transaction = self._db.in_transaction
+            self._save(version, data)
+            version += 1
+            if not already_in_transaction:
+                self._db.commit()
         from .queue import refresh
         refresh(data)
         return version, data
@@ -265,6 +273,7 @@ class Manager:
                     'original_interface_requests': original_interface_requests,
                     'control_grants': [g for g in data.get('control_grants', {}).values() if g['request_id'] in {r['id'] for r in requests}],
                     'collaboration': role_snapshot,
+                    'global_validations': [a for a in data.get('global_validations', {}).values() if a['profile_id'] in visible_ids],
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
@@ -301,6 +310,7 @@ class Manager:
                       'accepted_responsibility': {k: profile.get(k) for k in ('id', 'identity_ref', 'project_id', 'capability', 'role', 'parent_profile_id')},
                       'accepted_codex_ref': profile.get('connection_refs', {}).get('codex'),
                       'accepted_repository_fingerprint': hashlib.sha256(json.dumps(data['projects'][project_id]['repo'], sort_keys=True).encode()).hexdigest(),
+                      'accepted_actor': {'subject': identity.subject, 'source': identity.source},
                       'acceptance': 'accepted', 'accepted_at': datetime.now(timezone.utc).isoformat(),
                       'execution': 'waiting', 'unexecuted_reason': 'Codex execution is not enabled.',
                       'delivery': 'pending', 'messages': [], 'outbox': []}
@@ -323,6 +333,12 @@ class Manager:
         if principal and principal['role'] != 'steward' and record['profile_id'] not in self._visible_profile_ids(principal, data):
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
+
+    def global_validation(self, identity, action, details):
+        if action in {'start', 'prepare'}:
+            self.refresh_manual_sessions(identity)
+        from .global_validation import perform
+        return perform(self, identity, action, details)
 
     def take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id):
         from .takeover import take_over_session
