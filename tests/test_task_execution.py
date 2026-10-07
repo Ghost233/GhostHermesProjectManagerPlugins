@@ -325,7 +325,8 @@ def test_verified_feishu_execute_uses_same_single_task_entry_and_original_anchor
 
 def test_native_task_tool_cannot_borrow_owner_credential_alias(tmp_path, monkeypatch):
     from types import ModuleType
-    from test_plugin_entry import Context, load_entry
+    from test_plugin_entry import Context, load_entry, fixture_native_home
+    fixture_native_home(monkeypatch, tmp_path / 'native-home')
     secrets = ModuleType('agent.secret_scope')
     secrets.get_secret = lambda ref: 'fixture-owner-token'
     monkeypatch.setitem(sys.modules, 'agent.secret_scope', secrets)

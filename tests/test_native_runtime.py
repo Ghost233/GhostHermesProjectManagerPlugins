@@ -10,7 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('manual_control_smoke_runner.py', False, ''), ('knowledge_smoke_runner.py', False, ''), ('manual_observation_smoke_runner.py', False, ''), ('repository_queue_smoke_runner.py', False, ''), ('questions_smoke_runner.py', False, ''), ('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
+@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('collaboration_smoke_runner.py', False, ''), ('manual_control_smoke_runner.py', False, ''), ('knowledge_smoke_runner.py', False, ''), ('manual_observation_smoke_runner.py', False, ''), ('repository_queue_smoke_runner.py', False, ''), ('questions_smoke_runner.py', False, ''), ('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
 def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(runner, artifact_mismatch, unload_stage):
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     sdk = Path(configured) if configured else ROOT / 'tests' / 'fixtures' / 'hermes-sdk'
@@ -35,6 +35,11 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
             fixtures = scratch / ('takeover-fixtures' if runner == 'manual_control_smoke_runner.py' else 'manual-fixtures' if runner == 'manual_observation_smoke_runner.py' else 'queue-fixtures' if runner == 'repository_queue_smoke_runner.py' else 'control-fixtures')
             fixtures.mkdir()
             for name in ('test_task_control.py', 'test_task_execution.py', 'test_directory.py', 'test_requests.py', 'codex_fixture_server.py', 'test_repository_queue.py', 'queue_fixture_server.py', 'test_manual_observation.py', 'manual_fixture_server.py', 'test_questions.py', 'questions_fixture_server.py', 'test_manual_control.py', 'takeover_fixture_server.py', 'test_knowledge.py', 'test_feishu_entry.py'):
+                shutil.copy2(ROOT / 'tests' / name, fixtures / name)
+        if runner == 'collaboration_smoke_runner.py':
+            fixtures = scratch / 'collaboration-fixtures'
+            fixtures.mkdir()
+            for name in ('test_collaboration.py', 'test_directory.py', 'test_requests.py', 'test_task_execution.py', 'test_task_control.py', 'codex_fixture_server.py'):
                 shutil.copy2(ROOT / 'tests' / name, fixtures / name)
         env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HERMES_HOME': str(home),
                'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'), 'PYTHONDONTWRITEBYTECODE': '1',

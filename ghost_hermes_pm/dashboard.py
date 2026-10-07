@@ -42,6 +42,11 @@ class KnowledgeOperation(BaseModel):
     auto_supplement: bool = False
     material_ids: list[str] | None = None
 
+class CollaborationOperation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: str
+    details: dict
+
 class ObservationOperation(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: str
@@ -75,6 +80,14 @@ def create_router(authenticated_client):
         client = authenticated_client(request)
         try:
             return client.apply_directory_change(body.expected_version, body.change)
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
+    @router.post('/collaboration')
+    def collaboration(body: CollaborationOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            return client.collaborate(body.action, body.details)
         except ManagementError as exc:
             raise failure(exc) from exc
 
