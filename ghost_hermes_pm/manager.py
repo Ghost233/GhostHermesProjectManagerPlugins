@@ -58,7 +58,7 @@ def _git(path, *args):
                                             'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'})
     if result.returncode:
         raise ManagementError('invalid_repository', 'The existing path must be a Git worktree.')
-    return result.stdout.strip()
+    return result.stdout if '-z' in args else result.stdout.strip()
 
 
 def _repository(value):

@@ -336,3 +336,29 @@ async def test_group_and_dashboard_share_preparation_queue_reason_and_frozen_sou
             assert any('仓库排队' in s['text'] for s in relevant)
             assert any('来源变化' in s['text'] for s in relevant)
             assert all(s['mention_open_id'] == 'ou_owner' for s in relevant)
+
+
+@pytest.mark.parametrize('filename', ['source.py', ' leading.py'])
+def test_preservation_acknowledgment_identifies_first_modified_file_without_trimming_git_status(tmp_path, filename):
+    import hashlib
+    repo, head = commit_repo(tmp_path / 'repo')
+    if filename != 'source.py':
+        subprocess.run(['git', '-C', str(repo), 'mv', 'source.py', filename], check=True)
+        subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'leading filename baseline'], check=True)
+        head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+    (repo / filename).write_text('pre-existing user content\n')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+        manager.apply_directory_change(OWNER, 0, {**registration(repo), 'profile': {**registration(repo)['profile'], 'connection_refs': {'codex': 'local:fixture-stdio'}}})
+        request_id = acknowledge(manager, suffix='dirty-intake')
+        with ManagementServer(manager, {'queue-owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'queue-owner')
+            plan = {'branch': 'main', 'commit': head, 'dependencies': [], 'issue_updated_at': ISSUE['updated_at']}
+            with pytest.raises(ManagementError) as blocked:
+                client.prepare_task(request_id, plan)
+            assert blocked.value.code == 'handoff_blocked'
+            task = client.read_snapshot()['requests'][0]
+            assert task['preparation']['workspace']['dirty_paths'] == [filename]
+            ready = client.prepare_task(request_id, {**plan, 'workspace_digest': task['preparation']['workspace']['source_digest']})
+            assert ready['preparation']['preserved_files'] == {filename: hashlib.sha256((repo / filename).read_bytes()).hexdigest()}
+            client.start_task(request_id)
+            assert (repo / filename).read_text() == 'pre-existing user content\n'
