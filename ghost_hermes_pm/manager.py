@@ -98,8 +98,9 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=()):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None):
         self.owner_identity_ref = owner_identity_ref
+        self.codex_adapter = codex_adapter
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +114,8 @@ class Manager:
 
     def close(self):
         with self._lock:
+            if self.codex_adapter is not None:
+                self.codex_adapter.close()
             self._db.close()
 
     def __enter__(self):
@@ -210,6 +213,10 @@ class Manager:
         if principal and principal['role'] != 'steward' and record['profile_id'] not in self._visible_profile_ids(principal, data):
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
+
+    def start_task(self, identity, request_id):
+        from .execution import start_task
+        return start_task(self, identity, request_id)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',

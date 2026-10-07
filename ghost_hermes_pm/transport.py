@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -68,6 +68,8 @@ class ManagementServer:
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
                         elif payload.get('operation') == 'apply_directory_change':
                             result = bridge.manager.apply_directory_change(identity, payload.get('expected_version'), payload.get('change'))
+                        elif payload.get('operation') == 'start_task':
+                            result = bridge.manager.start_task(identity, payload.get('request_id'))
                         else:
                             raise ManagementError('unsupported', 'This management operation is not enabled.')
                         response = {'result': result}
@@ -141,3 +143,6 @@ class ManagementClient:
 
     def apply_directory_change(self, expected_version, change):
         return self._call('apply_directory_change', expected_version=expected_version, change=change)
+
+    def start_task(self, request_id):
+        return self._call('start_task', request_id=request_id)

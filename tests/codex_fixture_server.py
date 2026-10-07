@@ -1,0 +1,54 @@
+"""Synthetic 0.160.1 JSONL peer, never a real service acceptance result."""
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+thread_id = '00000000-0000-7000-8000-000000000016'
+turn_id = '00000000-0000-7000-8000-000000000017'
+thread = None
+for line in sys.stdin:
+    request = json.loads(line)
+    with (root / 'wire.jsonl').open('a') as log:
+        log.write(json.dumps(request) + '\n')
+    method = request['method']
+    params = request.get('params', {})
+    if method == 'initialized':
+        continue
+    if method == 'initialize':
+        value = {'userAgent': 'codex-cli/0.160.1', 'codexHome': str(root / 'codex-home'),
+                 'platformFamily': 'unix', 'platformOs': 'fixture'}
+        print(json.dumps({'method': 'remoteControl/status/changed', 'params': {'status': 'disabled'}}), flush=True)
+    elif method == 'permissionProfile/list':
+        value = {'data': [{'id': 'fixture-boundary', 'description': 'Synthetic verified policy', 'allowed': True}], 'nextCursor': None}
+    elif method == 'thread/loaded/list':
+        value = {'data': [], 'nextCursor': None}
+    elif method == 'thread/list':
+        value = {'data': [], 'nextCursor': None, 'backwardsCursor': None}
+    elif method == 'thread/start':
+        thread = {'id': thread_id, 'cwd': params['cwd'], 'cliVersion': '0.160.1',
+                  'status': {'type': 'idle'}, 'canAcceptDirectInput': True, 'turns': []}
+        value = {'thread': thread, 'model': 'fixture-model', 'cwd': params['cwd'],
+                 'activePermissionProfile': {'id': params['permissions'], 'extends': ':read-only'},
+                 'runtimeWorkspaceRoots': params['runtimeWorkspaceRoots']}
+    elif method == 'turn/start':
+        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
+            payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
+        assert any(r.get('session', {}).get('thread_id') == thread_id for r in payload['requests'].values()), 'thread must be durable before turn/start'
+        value = {'turn': {'id': turn_id, 'status': 'inProgress', 'items': []}}
+        thread['status'] = {'type': 'active', 'activeFlags': []}
+        thread['turns'] = [value['turn']]
+    elif method == 'thread/read':
+        state = json.loads((root / 'observed.json').read_text()) if (root / 'observed.json').exists() else {}
+        thread.update(state)
+        value = {'thread': thread}
+    else:
+        print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported fixture method'}}), flush=True)
+        continue
+    response = json.dumps({'id': request['id'], 'result': value})
+    # Fragment the envelope: reader must frame by newline, not one read == one response.
+    midpoint = len(response) // 2
+    sys.stdout.write(response[:midpoint]); sys.stdout.flush()
+    sys.stdout.write(response[midpoint:] + '\n'); sys.stdout.flush()
