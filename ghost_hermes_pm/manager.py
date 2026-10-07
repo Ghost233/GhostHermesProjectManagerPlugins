@@ -145,6 +145,8 @@ class Manager:
                         if segment['attempts']:
                             segment['attempts'][-1]['status'] = 'unknown'
             record['delivery'] = _delivery_status(record)
+        from .queue import refresh
+        refresh(data)
         return version, data
 
     def _principal(self, identity, data):
@@ -221,6 +223,8 @@ class Manager:
                       'execution': 'waiting', 'unexecuted_reason': 'Codex execution is not enabled.',
                       'delivery': 'pending', 'messages': [], 'outbox': []}
             data['requests'][key] = record
+            from .queue import enroll
+            enroll(data, record, data['projects'][project_id]['repo'])
             self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
             return {'status': 'accepted', 'duplicate': False, 'request': record}
 

@@ -43,6 +43,8 @@ def start_task(manager, identity, request_id):
             raise ManagementError('capability_unverified', 'Public acceptance has not been confirmed on the original request.')
         project = data['projects'][record['project_id']]
         repository = project['repo']
+        from .queue import require_turn
+        require_turn(manager, identity, record, version, data)
         if any(r['id'] != request_id and r.get('session', {}).get('logical_repository') == repository['logical_id'] and not r.get('repository_released') for r in data['requests'].values()):
             raise ManagementError('repository_busy', 'Another unfinished task owns this logical repository.')
         actual = _repository({'repo_path': repository['worktree'], 'test_artifact_paths': repository['test_artifact_paths']})
