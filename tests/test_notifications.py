@@ -570,6 +570,9 @@ def test_idle_and_unchanged_active_sampling_do_not_expire_owner_scope_versions(t
         assert manager.read_snapshot(OWNER)['notifications']['health']['supervision'] == 'running'
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
+        waiting_version = manager.read_snapshot(OWNER)['version']
+        manager.run_notifications(OWNER)
+        assert manager.read_snapshot(OWNER)['version'] == waiting_version
         manager.start_task(OWNER, task_id)
         manager.run_notifications(OWNER)
         stable = manager.read_snapshot(OWNER)['version']
@@ -577,3 +580,75 @@ def test_idle_and_unchanged_active_sampling_do_not_expire_owner_scope_versions(t
         manager.run_notifications(OWNER)
         assert manager.read_snapshot(OWNER)['version'] == stable
         assert manager.read_snapshot(OWNER)['notifications']['health']['sources'][task_id]['checked_at'] == clock.now
+
+
+def test_public_archive_only_notifies_after_all_scoped_entries_are_verified_and_restart_does_not_repeat(tmp_path):
+    from test_lifecycle import ProfileHost, tree, scope_approval
+    clock, host = Clock(), ProfileHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host, notification_clock=clock) as manager:
+        host.manager = manager
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        tree(manager, tmp_path)
+        register_entry(manager)
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            approval = scope_approval(client.read_snapshot(), 'archive', {'profile_id': 'mono-lead', 'operation_id': 'notify-archive'})
+            client.run_notifications()
+            assert client.read_snapshot()['version'] == approval['expected_version']
+            host.pending.add(('child-lead', 'bot'))
+            operation = client.lifecycle('archive', approval)
+            assert operation['status'] == 'processing'
+            assert not any(e['kind'] == 'archive_completed' for e in client.run_notifications()['notifications'])
+            host.pending.clear()
+            done = client.lifecycle('check', {'operation_id': 'notify-archive'})
+            assert done['status'] == 'completed' and done['approved_scope'] == {k: approval[k] for k in ('expected_version', 'expected_profile_ids')}
+            first = [e for e in client.run_notifications()['notifications'] if e['kind'] == 'archive_completed']
+            assert len(first) == 1 and first[0]['mention_owner'] is False
+            assert first[0]['lifecycle_event_id'] == client.read_snapshot()['lifecycle_events'][0]['id']
+            assert len([e for e in client.run_notifications()['notifications'] if e['kind'] == 'archive_completed']) == 1
+    clock.advance(10000)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=ProfileHost(), notification_clock=clock) as manager:
+        events = [e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'archive_completed']
+        assert len(events) == 1
+        assert next(p for p in manager.read_snapshot(OWNER)['profiles'] if p['id'] == 'mono-lead')['lifecycle'] == 'archived'
+
+
+def test_explicit_stop_intent_disables_pending_owner_reminders_before_actual_stop_is_confirmed(tmp_path):
+    from test_questions import question_adapter, emit, user_question
+    from test_task_control import TURN
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question())
+        first = next(e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request')
+        manager.control_task(OWNER, task_id, 'stop', 'stop-instead-of-answer', expected_turn_id=TURN)
+        clock.advance(1800)
+        notices = [e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request']
+        assert len(notices) == 1
+        assert manager.manage_notifications(OWNER, 'claim', {'event_id': first['id']}) is None
+        assert manager.read_snapshot(OWNER)['requests'][0]['stop']['status'] == 'processing'
+
+
+def test_partial_unknown_notification_delivery_is_durable_and_never_replayed_after_request_expires(tmp_path):
+    from test_questions import question_adapter, emit, user_question
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question(questions=[{'id': 'long-question', 'header': 'Long', 'question': 'bounded public question ' * 200, 'isSecret': False, 'isOther': True, 'options': None}]))
+        alert = next(e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request')
+        first = manager.manage_notifications(OWNER, 'claim', {'event_id': alert['id']})
+        manager.manage_notifications(OWNER, 'receipt', {'event_id': alert['id'], 'uuid': first['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_partial', 'chat_id': 'oc_entry'}})
+        second = manager.manage_notifications(OWNER, 'claim', {'event_id': alert['id']})
+        assert second['reply_to'] == 'om_partial'
+        manager.manage_notifications(OWNER, 'receipt', {'event_id': alert['id'], 'uuid': second['uuid'], 'receipt': {'status': 'unknown'}})
+        assert manager.manage_notifications(OWNER, 'claim', {'event_id': alert['id']}) is None
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, notification_clock=clock) as manager:
+        assert manager.manage_notifications(OWNER, 'claim', {'event_id': alert['id']}) is None
+        saved = next(e for e in manager.read_snapshot(OWNER)['notifications']['events'] if e['id'] == alert['id'])
+        assert saved['delivery'] == 'unknown'
+        assert saved['segments'][0]['status'] == 'delivered' and saved['segments'][1]['status'] == 'unknown'
+        assert saved['segments'][2]['status'] == 'pending'

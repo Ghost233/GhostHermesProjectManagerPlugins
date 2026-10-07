@@ -24,7 +24,7 @@ def snapshot(manager, data, project_ids):
         try:
             external = json.loads(path.read_text())
             if external.get('generation') == manager._notification_generation:
-                health.update(external)
+                health.update({key: value for key, value in external.items() if key != 'runtime'})
         except (OSError, ValueError):
             health.update(supervision='unverified', delivery='unverified')
     if saved.get('generation') and saved['generation'] != manager._notification_generation:
@@ -136,7 +136,14 @@ def run(manager, identity):
             raise ManagementError('forbidden', 'Only the manager supervision entry schedules global notifications.')
         now = manager.notification_clock()
         saved = state(data)
-        before_notifications = json.dumps({key: value for key, value in saved.items() if key != 'health'}, sort_keys=True)
+        health_path = manager.state_dir / 'notification-health.json'
+        if health_path.exists():
+            cached = json.loads(health_path.read_text())
+            if cached.get('generation') == manager._notification_generation:
+                for key, value in cached.get('runtime', {}).items():
+                    if key in {'projects', 'tasks', 'human_requests', 'generation'}:
+                        saved[key] = value
+        before_notifications = json.dumps(saved['events'], sort_keys=True)
         for task_id, failure in refresh_failures.items():
             task = data['requests'][task_id]
             if task['execution'] not in {'unverified', 'stopping'}:
@@ -160,6 +167,20 @@ def run(manager, identity):
                 if event['kind'] == 'summary' and event['delivery'] == 'pending':
                     event['delivery'] = 'expired'
             saved['generation'] = manager._notification_generation
+        for lifecycle_event in data.get('lifecycle_events', {}).values():
+            operation = data.get('lifecycle_operations', {}).get(lifecycle_event['operation_id'], {})
+            if lifecycle_event['kind'] != 'archive_completed' or operation.get('status') != 'completed' or operation.get('event') != lifecycle_event:
+                continue
+            project_id = data['profiles'][lifecycle_event['profile_id']]['project_id']
+            tasks = [t for t in data['requests'].values() if t['profile_id'] in lifecycle_event['profile_ids']]
+            event = emit(saved, 'archive_completed', project_id, tasks,
+                '封存已完成；原执行、Profile、机器人和定时入口停止均已核实。\n操作：' + lifecycle_event['operation_id'], now, key=lifecycle_event['id'])
+            event['lifecycle_event_id'] = lifecycle_event['id']
+        for operation in data.get('lifecycle_operations', {}).values():
+            if operation['status'] == 'blocked' and operation.get('needs_human'):
+                project_id = data['profiles'][operation['profile_id']]['project_id']
+                tasks = [t for t in data['requests'].values() if t['profile_id'] in operation['profile_ids']]
+                emit(saved, 'needs_owner', project_id, tasks, '生命周期处理受阻，需要本人处理。\n操作：' + operation['id'] + '\n' + '\n'.join(operation['needs_human']), now, mention_owner=True, key='lifecycle-blocked:' + operation['id'])
         active = {}
         for task in data['requests'].values():
             if not task.get('repository_released') and task.get('outer_task_status') != 'stopped':
@@ -216,7 +237,7 @@ def run(manager, identity):
                     elif coverage == 'explained_related_execution':
                         tracker.update(progress_at=now, stall_sent=False)
             for question in task.get('human_requests', []):
-                if question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled') or not (question.get('blocking') is True or question['category'] == 'approval'):
+                if task['execution'] in {'unverified', 'stopping', 'stopped'} or task['id'] in refresh_failures or question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled') or not (question.get('blocking') is True or question['category'] == 'approval'):
                     continue
                 previous = saved['human_requests'].get(question['id'])
                 if previous is not None and now - previous < 1800:
@@ -258,9 +279,9 @@ def run(manager, identity):
             if target is None:
                 event['delivery'] = 'blocked'
         saved['health'].update(supervision='running', last_checked_at=now)
-        if before_notifications != json.dumps({key: value for key, value in saved.items() if key != 'health'}, sort_keys=True) and (data['requests'] or saved['events']):
+        if before_notifications != json.dumps(saved['events'], sort_keys=True):
             manager._save(version, data)
-        persist_health(manager, saved['health'])
+        persist_health(manager, {**saved['health'], 'runtime': {key: saved[key] for key in ('projects', 'tasks', 'human_requests', 'generation')}})
         return {'status': 'completed', 'notifications': list(saved['events'].values()), 'health': saved['health']}
 
 
@@ -281,6 +302,8 @@ def manage(manager, identity, action, details):
         event = saved['events'].get(details['event_id'])
         if event is None:
             raise ManagementError('invalid_change', 'Unknown notification.')
+        if action == 'claim' and event['delivery'] not in {'pending', 'sending'}:
+            return None
         from .collaboration import _channel
         frozen = event.get('target_channel')
         if not frozen or _channel(data, frozen['id']) != frozen:
@@ -298,7 +321,7 @@ def manage(manager, identity, action, details):
                     return None
             if event.get('human_request_id'):
                 question = next((q for task_id in event['request_ids'] for q in data['requests'][task_id].get('human_requests', []) if q['id'] == event['human_request_id']), None)
-                if not question or question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled'):
+                if not question or question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled') or any(data['requests'][task_id]['execution'] in {'unverified', 'stopping', 'stopped'} for task_id in event['request_ids']):
                     event['delivery'] = 'expired'
                     manager._save(version, data)
                     return None
