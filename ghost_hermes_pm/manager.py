@@ -98,11 +98,12 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, archive_providers=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
         self.knowledge_providers = dict(knowledge_providers or {})
+        self.archive_providers = dict(archive_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
@@ -220,7 +221,8 @@ class Manager:
                     'thread_id': None, 'url': None, 'answerable': False, 'resolution': r['state'],
                     'availability': 'original_client_required'} for r in self.codex_adapter.server_requests(None)]
             from .knowledge import snapshot_knowledge
-            return {**snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
+            from .archives import snapshot_archives
+            return {**snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
@@ -400,6 +402,14 @@ class Manager:
     def receive_direct_knowledge_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor):
         from .knowledge import receive_direct_query
         return receive_direct_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor)
+
+    def register_archive_source(self, identity, registration):
+        from .archives import register_source
+        return register_source(self, identity, registration)
+
+    def query_archive(self, identity, source_id, query_id, question, scope_ids, complete=False):
+        from .archives import query_archive
+        return query_archive(self, identity, source_id, query_id, question, scope_ids, complete)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',
