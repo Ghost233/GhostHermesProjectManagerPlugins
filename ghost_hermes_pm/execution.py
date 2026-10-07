@@ -43,19 +43,35 @@ def start_task(manager, identity, request_id):
             raise ManagementError('capability_unverified', 'Public acceptance has not been confirmed on the original request.')
         project = data['projects'][record['project_id']]
         repository = project['repo']
+        from .queue import require_turn, require_preparation
+        require_turn(manager, identity, record, version, data)
         if any(r['id'] != request_id and r.get('session', {}).get('logical_repository') == repository['logical_id'] and not r.get('repository_released') for r in data['requests'].values()):
             raise ManagementError('repository_busy', 'Another unfinished task owns this logical repository.')
         actual = _repository({'repo_path': repository['worktree'], 'test_artifact_paths': repository['test_artifact_paths']})
         if repository_fingerprint(actual) != repository_fingerprint(repository):
             raise ManagementError('capability_unverified', 'The registered repository layout changed; execution evidence is invalid.')
-        proof = adapter.verify_start(repository)
-        from .delivery import source_state
-        baseline = source_state(repository)
+        baseline = require_preparation(manager, identity, record, version, data)
+        occupation = record['queue'].get('external_occupancy')
+        if occupation and occupation.get('generation') != adapter.generation:
+            raise ManagementError('capability_unverified', 'The original external occupancy generation is unavailable; reconciliation is required.')
+        try:
+            proof = adapter.verify_start(repository)
+        except ManagementError as exc:
+            if exc.code == 'repository_busy':
+                record['queue']['external_occupancy'] = {**(getattr(adapter, 'last_start_occupancy', None) or {}),
+                    'status': 'unknown', 'generation': adapter.generation, 'connection': adapter.connection, 'reason': str(exc),
+                    'observed_at': datetime.now(timezone.utc).isoformat()}
+            record['unexecuted_reason'] = str(exc)
+            with manager._db:
+                manager._save(version, data)
+            manager.publish_request_message(identity, request_id, 'progress', '仓库执行待核对；未开启新任务：' + str(exc))
+            raise
+        record['queue'].pop('external_occupancy', None)
         record['session'] = {**adapter.connection, 'thread_id': None, 'turn_id': None,
                              'logical_repository': repository['logical_id'], 'start_phase': 'thread_start_intent',
                              'control': 'assigned_task', 'capability': proof, 'baseline': baseline, 'repository': repository}
         record.update(execution='unverified', unexecuted_reason='Thread creation needs confirmation.',
-                      task_delivery='unmet', pr_status='none', repository_released=False)
+                      task_delivery='unmet', pr_status='none', repository_released=False, outer_task_status='execution_pending')
         with manager._db:
             manager._save(version, data)
         try:
@@ -76,6 +92,9 @@ def start_task(manager, identity, request_id):
                       'Goal and acceptance:\n' + record['accepted_scope']['title'] + '\n' + record['accepted_scope']['body'] +
                       '\nIssue: ' + record['accepted_scope']['url'] + '\nAccepted Issue version: ' + record['accepted_scope']['updated_at'] +
                       '\nRepository boundary: ' + str(repository) +
+                      '\nConfirmed task baseline and dependencies: ' + str(record['preparation']['plan']) +
+                      '\nPreserved user paths and digests: ' + str(record['preparation']['preserved_files']) +
+                      '\nDo not modify preserved user paths; report any conflict before proceeding. ' +
                       '\nOnly modify this repository own source and Git metadata; nested repositories remain read-only. '
                       'Tests may write only registered artifacts. Do not expand permissions or use full access. '
                       'GitHub authentication must switch to Ghost233 and verify the actual login before every authenticated business command. '
@@ -86,7 +105,7 @@ def start_task(manager, identity, request_id):
             if not isinstance(turn.get('id'), str) or not turn['id']:
                 raise ManagementError('outcome_unknown', 'The turn identity was not confirmed.')
             record['session'].update(turn_id=turn['id'], start_phase='turn_registered')
-            record.update(execution='running', unexecuted_reason=None, last_execution_verified_at=datetime.now(timezone.utc).isoformat(),
+            record.update(execution='running', outer_task_status='running', unexecuted_reason=None, last_execution_verified_at=datetime.now(timezone.utc).isoformat(),
                           execution_capability={'status': 'verified', 'enabled': True, 'connection': adapter.connection, 'proof': proof})
             with manager._db:
                 manager._save(version + 3, data)

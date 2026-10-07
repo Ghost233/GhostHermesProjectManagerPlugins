@@ -149,6 +149,7 @@ class CodexStdioAdapter:
         connection = self.connect()
         if self.verifier is None:
             raise ManagementError('capability_unverified', 'Platform filesystem and tool enforcement evidence is missing; task start remains disabled.')
+        self.last_start_occupancy = None
         proof = self.verifier(dict(connection), json.loads(json.dumps(repository)))
         required = ('permission_profile', 'policy_digest', 'platform_enforcement', 'tool_paths', 'task_start', 'manual_execution_coverage', 'model')
         if not isinstance(proof, dict) or any(not isinstance(proof.get(k), str) or not proof[k] for k in required) or proof.get('generation') != self.generation or proof.get('service_id') != connection['service_id'] or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']]:
@@ -163,8 +164,12 @@ class CodexStdioAdapter:
         loaded = self._pages('thread/loaded/list', {'limit': 100})
         for thread_id in loaded:
             thread = self.read_thread(thread_id)
-            if thread.get('cwd') == repository['worktree'] and thread.get('status', {}).get('type') != 'idle':
-                raise ManagementError('repository_busy', 'The registered service has unfinished execution in this repository.')
+            from .queue import logical_repository
+            if logical_repository(thread.get('cwd')) != repository['logical_id']:
+                continue
+            if thread.get('status', {}).get('type') != 'idle' or any(t.get('status') not in {'completed', 'failed', 'interrupted'} or t.get('itemsView') != 'full' for t in thread.get('turns', [])) or self.background_terminals(thread_id):
+                self.last_start_occupancy = {'thread_id': thread_id, 'cwd': thread['cwd'], 'logical_repository': repository['logical_id']}
+                raise ManagementError('repository_busy', 'The registered service has unfinished or unknown execution in this logical repository.')
         return dict(proof)
 
     def start_thread(self, repository, proof):

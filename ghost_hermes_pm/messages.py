@@ -218,9 +218,10 @@ class FeishuEntry:
                     receipt = {'status': 'unknown'}
                 self.manager().record_clarification_delivery(identity, result['id'], receipt)
         elif result['status'] == 'associated':
-            operations = {'执行': 'start_task', '核对执行': 'refresh_task', '核验执行能力': 'verify_task_execution'}
+            operations = {'执行': 'start_task', '核对执行': 'refresh_task', '核验执行能力': 'verify_task_execution', '核对Issue来源': 'refresh_task_source'}
             operation = operations.get(text)
             control = None
+            preparation = re.fullmatch(r'确认基线[：:]\s*(\S+)\s+([a-f0-9]{40}|unborn)(?:\s+依赖[：:]([a-f0-9,]+))?(?:\s+保留[：:]([a-f0-9]{64}))?', text)
             explicit = re.fullmatch(r'(追加|继续)[：:]\s*(.*)', text, re.DOTALL)
             if text in {'停止', '结束当前任务'}:
                 control = ('stop', None)
@@ -228,10 +229,15 @@ class FeishuEntry:
                 control = ('continue', 'Continue the original accepted Issue within the existing scope.')
             elif explicit:
                 control = ('append' if explicit.group(1) == '追加' else 'continue', explicit.group(2))
-            if operation or control:
+            if operation or control or preparation:
                 def call_if_active():
                     with self.lifecycle_lock:
                         self.require_active(generation)
+                        if preparation:
+                            record = next(r for r in self.manager().read_snapshot(identity)['requests'] if r['id'] == result['request_id'])
+                            return self.manager().prepare_task(identity, result['request_id'], {'branch': preparation.group(1),
+                                'commit': None if preparation.group(2) == 'unborn' else preparation.group(2), 'dependencies': preparation.group(3).split(',') if preparation.group(3) else [],
+                                'issue_updated_at': record['accepted_scope']['updated_at'], 'workspace_digest': preparation.group(4)})
                         if control:
                             record = next(r for r in self.manager().read_snapshot(identity)['requests'] if r['id'] == result['request_id'])
                             previous = next((c for c in record.get('controls', []) if c['id'] == result['id']), None)
