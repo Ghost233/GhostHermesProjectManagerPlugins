@@ -98,11 +98,12 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
         self.global_validation_host = global_validation_host
+        self.lifecycle_host = lifecycle_host
         self.knowledge_providers = dict(knowledge_providers or {})
         self.archive_providers = dict(archive_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
@@ -274,6 +275,8 @@ class Manager:
                     'control_grants': [g for g in data.get('control_grants', {}).values() if g['request_id'] in {r['id'] for r in requests}],
                     'collaboration': role_snapshot,
                     'global_validations': [a for a in data.get('global_validations', {}).values() if a['profile_id'] in visible_ids],
+                    'lifecycle_operations': [a for a in data.get('lifecycle_operations', {}).values() if a['profile_id'] in visible_ids],
+                    'lifecycle_events': [a for a in data.get('lifecycle_events', {}).values() if a['profile_id'] in visible_ids],
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
@@ -300,6 +303,8 @@ class Manager:
             existing = next((r for r in data['requests'].values() if all(r['source_anchor'].get(k) == message[k] for k in required)), None)
             if existing:
                 return {'status': 'accepted', 'duplicate': True, 'request': existing}
+            from .lifecycle import require_active
+            require_active(data, profile_id, project_id)
             if not isinstance(issue, dict) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', issue.get('url', '')) or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
                 raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
             _public_text(issue['title'], self._sensitive_values())
@@ -339,6 +344,10 @@ class Manager:
             self.refresh_manual_sessions(identity)
         from .global_validation import perform
         return perform(self, identity, action, details)
+
+    def lifecycle(self, identity, action, details):
+        from .lifecycle import operate
+        return operate(self, identity, action, details)
 
     def take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id):
         from .takeover import take_over_session
@@ -842,6 +851,8 @@ class Manager:
                 value = change['project']
                 self._validate_project(value)
                 candidate = {'id': value['id'], 'name': value['name'], 'repo': _repository(value)}
+                existing = data['projects'].get(value['id'], {})
+                candidate.update({k: existing[k] for k in ('lifecycle', 'archive_intent') if k in existing})
                 self._authorize_change(principal, 'project', candidate, data)
                 audit_changes.append({'kind': 'project', 'id': candidate['id'], 'before': data['projects'].get(candidate['id']), 'after': candidate})
                 data['projects'][value['id']] = candidate
@@ -856,6 +867,8 @@ class Manager:
                     raise ManagementError('binding_conflict', 'Profile has a long-term project binding; create a new Profile.')
                 value.update(lifecycle='configuring', can_execute=False,
                              capabilities={'execution': {'enabled': False, 'reason': 'Not verified by an execution adapter.'}})
+                if existing:
+                    value.update({k: existing[k] for k in ('lifecycle', 'archive_intent') if k in existing})
                 self._authorize_change(principal, 'profile', value, data)
                 from .collaboration import _binding
                 audit_changes.append({'kind': 'profile', 'id': value['id'], 'before': _binding(existing) if existing else None, 'after': _binding(value)})

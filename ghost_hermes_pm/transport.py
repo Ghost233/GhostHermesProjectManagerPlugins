@@ -69,6 +69,8 @@ class ManagementServer:
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
                         elif payload.get('operation') == 'global_validation':
                             result = bridge.manager.global_validation(identity, payload.get('action'), payload.get('details'))
+                        elif payload.get('operation') == 'lifecycle':
+                            result = bridge.manager.lifecycle(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'take_over_session':
                             result = bridge.manager.take_over_session(identity, payload.get('request_id'), payload.get('manual_session_id'), payload.get('grant_id'), payload.get('expected_turn_id'))
                         elif payload.get('operation') == 'return_session_control':
@@ -210,6 +212,9 @@ class ManagementClient:
 
     def global_validation(self, action, details):
         return self._call('global_validation', action=action, details=details)
+
+    def lifecycle(self, action, details):
+        return self._call('lifecycle', action=action, details=details)
 
     def collaborate(self, action, details):
         return self._call('collaborate', action=action, details=details)
