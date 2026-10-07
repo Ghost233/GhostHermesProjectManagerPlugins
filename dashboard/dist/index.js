@@ -252,7 +252,7 @@
         })),
         h('details', null, h('summary', null, '提交一条明确验证操作'),
           h('select', { value: validationForm.action, onChange: function (e) { setValidationForm(Object.assign({}, validationForm, { action: e.target.value })); setValidationReview(null); } },
-            ['plan', 'prepare', 'start', 'finish', 'check', 'rework', 'complete'].map(function (action) { return h('option', { key: action, value: action }, action); })),
+            ['plan', 'prepare', 'start', 'finish', 'reconcile', 'check', 'rework', 'complete'].map(function (action) { return h('option', { key: action, value: action }, action); })),
           h('textarea', { value: validationForm.details, 'aria-label': '本轮验证操作 JSON', style: { width: '100%' }, onChange: function (e) { setValidationForm(Object.assign({}, validationForm, { details: e.target.value })); setValidationReview(null); } }),
           h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: previewValidation }, '核对本轮操作'),
           validationReview && h('div', null, h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(validationReview, null, 2)),

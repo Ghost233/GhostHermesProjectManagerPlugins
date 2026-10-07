@@ -295,7 +295,7 @@ def register_native(ctx):
         description='Public scoped role collaboration')
     def validation_operation(args):
         try:
-            allowed = {'plan', 'start', 'finish', 'check', 'rework', 'complete'}
+            allowed = {'plan', 'start', 'finish', 'reconcile', 'check', 'rework', 'complete'}
             if not isinstance(args, dict) or set(args) != {'action', 'details'} or args['action'] not in allowed:
                 raise ManagementError('invalid_change', 'The participant may validate its mono task; independent child materialization requires the original Owner entry.')
             token = _credential(ctx.get_config('participant_credential_ref'))
@@ -309,7 +309,7 @@ def register_native(ctx):
 
     ctx.register_tool(name='hermes_pm_global_validation', toolset='hermes_pm',
         schema={'name': 'hermes_pm_global_validation', 'description': 'Freeze related child deliveries, validate an actual stable mono combination, and return concrete repair Issues.',
-            'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['plan', 'start', 'finish', 'check', 'rework', 'complete']}, 'details': {'type': 'object'}},
+            'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['plan', 'start', 'finish', 'reconcile', 'check', 'rework', 'complete']}, 'details': {'type': 'object'}},
                 'required': ['action', 'details'], 'additionalProperties': False}}, handler=validation_operation,
         description='Stable mono global validation and Issue rework')
     def knowledge_operation(args):

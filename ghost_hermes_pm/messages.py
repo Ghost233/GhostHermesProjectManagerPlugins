@@ -291,7 +291,7 @@ class FeishuEntry:
             operations = {'执行': 'start_task', '核对执行': 'refresh_task', '核验执行能力': 'verify_task_execution', '核对Issue来源': 'refresh_task_source', '核对手动会话': 'refresh_task_manual'}
             operation = operations.get(text)
             control = None
-            validation = re.fullmatch(r'全局验证\s+(plan|prepare|start|finish|check|rework|complete)[：:]\s*(\{.*\})', text, re.DOTALL)
+            validation = re.fullmatch(r'全局验证\s+(plan|prepare|start|finish|reconcile|check|rework|complete)[：:]\s*(\{.*\})', text, re.DOTALL)
             preparation = re.fullmatch(r'确认基线[：:]\s*(\S+)\s+([a-f0-9]{40}|unborn)(?:\s+依赖[：:]([a-f0-9,]+))?(?:\s+保留[：:]([a-f0-9]{64}))?', text)
             explicit = re.fullmatch(r'(追加|继续)[：:]\s*(.*)', text, re.DOTALL)
             if text in {'停止', '结束当前任务'}:

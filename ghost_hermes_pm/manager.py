@@ -299,6 +299,8 @@ class Manager:
         return record
 
     def global_validation(self, identity, action, details):
+        if action in {'start', 'prepare'}:
+            self.refresh_manual_sessions(identity)
         from .global_validation import perform
         return perform(self, identity, action, details)
 

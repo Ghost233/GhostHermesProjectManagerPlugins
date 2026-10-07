@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import uuid
 
 from .manager import ManagementError, _git, _repository
 from .queue import workspace
@@ -30,10 +29,10 @@ def _task(manager, identity, request_id, data):
 
 def _inputs(attempt, data):
     result = []
-    for item in [{'request_id': attempt['request_id'], 'repository': attempt['repository'], 'commit': attempt['mono_commit']}] + attempt['children']:
+    for item in [{'request_id': attempt['request_id'], 'repository': attempt['repository'], 'commit': attempt['mono_commit']}] + attempt['children'] + attempt.get('unassigned', []):
         repo = item['repository']
         actual = _repository({'repo_path': repo['worktree'], 'test_artifact_paths': repo['test_artifact_paths']})
-        if actual != repo or data['projects'][data['requests'][item['request_id']]['project_id']]['repo'] != repo:
+        if actual != repo or item['request_id'] is not None and data['projects'][data['requests'][item['request_id']]['project_id']]['repo'] != repo:
             raise ManagementError('handoff_blocked', 'A registered source/Git/artifact boundary changed.')
         current = workspace(repo)
         metadata = hashlib.sha256()
@@ -42,10 +41,10 @@ def _inputs(attempt, data):
                 if path.is_symlink() or path.is_file():
                     metadata.update(str(path).encode())
                     metadata.update(str(path.readlink()).encode() if path.is_symlink() else path.read_bytes())
-        task = data['requests'][item['request_id']]
+        task = data['requests'][item['request_id']] if item['request_id'] is not None else {}
         result.append({'request_id': item['request_id'], 'repository': repo, 'workspace': current,
                        'tree': _git(repo['worktree'], 'rev-parse', 'HEAD^{tree}'), 'git_metadata_digest': metadata.hexdigest(),
-                       'accepted_scope': task['accepted_scope'], 'responsibility': task['accepted_responsibility'],
+                       'accepted_scope': task.get('accepted_scope'), 'responsibility': task.get('accepted_responsibility'),
                        'delivery_evidence': task.get('delivery_evidence') if item['request_id'] != attempt['request_id'] else None,
                        'pr_status': task.get('pr_status') if item['request_id'] != attempt['request_id'] else None,
                        'all_source_digest': _source_digest(repo)})
@@ -72,15 +71,19 @@ def _boundary(manager, attempt):
     proof = verifier(attempt) if callable(verifier) else None
     expected = {'validation_id': attempt['id'], 'input_digest': attempt['input_digest'], 'source_access': 'read-only',
                 'git_access': 'read-only', 'artifact_roots': attempt['repository']['test_artifact_paths']}
-    checks = ('platform_enforcement', 'tool_paths', 'preexisting_hardlink', 'process_paths', 'evidence_ref')
-    if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in expected.items()) or any(not isinstance(proof.get(k), str) or not proof[k] for k in checks) or proof.get('scope') not in {'synthetic-fixture', 'verified-original-host'}:
+    checks = ('host_id', 'generation', 'platform_enforcement', 'tool_paths', 'preexisting_hardlink', 'process_paths', 'evidence_ref')
+    if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in expected.items()) or any(not isinstance(proof.get(k), str) or not proof[k] for k in checks) or not re.fullmatch(r'[a-f0-9]{64}', str(proof.get('runner_configuration_digest'))) or proof.get('scope') not in {'synthetic-fixture', 'verified-original-host'}:
         raise ManagementError('capability_unverified', 'Actual source, Git metadata, artifacts, hardlinks and all process/tool paths need independent host boundary evidence.')
     if proof['scope'] == 'verified-original-host':
         ref = proof.get('receipt')
         path = Path(ref.get('path', '')) if isinstance(ref, dict) else Path('.')
         if not path.is_absolute() or path.resolve() != path or not path.is_relative_to(manager.state_dir / 'validation-evidence') or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != ref.get('sha256'):
             raise ManagementError('capability_unverified', 'Original-host enforcement receipt is absent or changed.')
-        receipt = json.loads(path.read_text())
+        try:
+            receipt = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            raise ManagementError('capability_unverified', 'Original boundary receipt is unreadable.') from exc
+        expected.update({k: proof[k] for k in ('host_id', 'generation', 'runner_configuration_digest')})
         required = {'source_write_denied', 'child_source_write_denied', 'parent_git_write_denied', 'child_git_write_denied', 'artifact_write_allowed', 'artifact_escape_denied', 'preexisting_hardlink_write_denied', 'tool_paths_confined', 'process_paths_confined'}
         if any(receipt.get(k) != v for k, v in expected.items()) or set(receipt.get('checks', {})) != required or any(v != 'PASS' for v in receipt['checks'].values()):
             raise ManagementError('capability_unverified', 'The original-host enforcement matrix is incomplete for this exact combination.')
@@ -112,8 +115,16 @@ def _finish(manager, identity, version, data, attempt):
         _save(manager, version, data, attempt)
         return attempt
     try:
+        proof = _boundary(manager, attempt)
+        if any(proof[k] != attempt['boundary'][k] for k in ('host_id', 'generation')):
+            raise ManagementError('capability_unverified', 'The original validation host identity/generation is unavailable.')
+    except ManagementError as exc:
+        attempt.update(status='unverified', reason=str(exc), whole_project_complete=False)
+        _save(manager, version, data, attempt)
+        return attempt
+    try:
         current = _inputs(attempt, data)
-        changed = _digest(current) != attempt['input_digest']
+        changed = _digest(current) != attempt['input_digest'] or proof['runner_configuration_digest'] != attempt['boundary']['runner_configuration_digest']
     except (ManagementError, OSError):
         current, changed = [], True
     if changed:
@@ -122,7 +133,7 @@ def _finish(manager, identity, version, data, attempt):
         result = host.read_result(attempt['run']['run_id'])
     except (ManagementError, OSError):
         result = None
-    expected = {'run_id': attempt['run']['run_id'], 'validation_id': attempt['id'], 'input_digest': attempt['input_digest']}
+    expected = {'host_id': attempt['boundary']['host_id'], 'generation': attempt['boundary']['generation'], 'run_id': attempt['run']['run_id'], 'validation_id': attempt['id'], 'input_digest': attempt['input_digest']}
     if not isinstance(result, dict) or any(result.get(k) != v for k, v in expected.items()) or result.get('related_execution') != 'ended':
         attempt.update(status='invalidating' if changed else 'unverified', reason='Original test and related execution termination are not yet verified; occupancy retained.')
         _save(manager, version, data, attempt)
@@ -164,10 +175,17 @@ def _end(manager, identity, version, data, attempt, status, reason=None):
 
 
 def _plan(manager, identity, details, version, data):
-    if set(details) != {'request_id', 'mono_commit', 'children', 'test_ids'} or not re.fullmatch(r'[a-f0-9]{40}', str(details.get('mono_commit'))) or not isinstance(details['children'], list) or not isinstance(details['test_ids'], list) or not details['test_ids'] or any(not isinstance(t, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', t) for t in details['test_ids']):
+    if not {'request_id', 'mono_commit', 'children', 'test_ids'} <= set(details) or set(details) - {'request_id', 'mono_commit', 'children', 'test_ids', 'retry_of'} or not re.fullmatch(r'[a-f0-9]{40}', str(details.get('mono_commit'))) or not isinstance(details['children'], list) or not isinstance(details['test_ids'], list) or not details['test_ids'] or any(not isinstance(t, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', t) for t in details['test_ids']):
         raise ManagementError('invalid_change', 'Name this mono task, a fixed parent commit, explicit related child deliveries and configured test IDs.')
     task = _task(manager, identity, details['request_id'], data)
     repo = task['accepted_repository']
+    key = _digest(details)
+    if key in data.get('global_validations', {}):
+        return {**data['global_validations'][key], 'duplicate': True}
+    if details.get('retry_of') is not None:
+        previous = data.get('global_validations', {}).get(details['retry_of'], {})
+        if previous.get('request_id') != task['id'] or previous.get('status') not in {'passed', 'failed', 'blocked', 'invalidated', 'complete'} or not previous['occupancy']['released']:
+            raise ManagementError('binding_conflict', 'Explicit retry must refer to an ended round of this same original mono task.')
     if _git(repo['worktree'], 'rev-parse', details['mono_commit'] + '^{commit}') != details['mono_commit']:
         raise ManagementError('evidence_missing', 'The fixed mono commit is not locally available.')
     children, seen = [], set()
@@ -193,10 +211,21 @@ def _plan(manager, identity, details, version, data):
         children.append({**supplied, 'profile_id': child['profile_id'], 'project_id': child['project_id'], 'repository': child_repo,
                          'commit': commit, 'issue': child['accepted_scope'], 'tests': child.get('test_evidence', []),
                          'criteria': evidence['criteria'], 'leftover_changes': evidence['leftover_changes'], 'pr_status': child.get('pr_status')})
-    attempt = {'id': str(uuid.uuid4()), 'request_id': task['id'], 'profile_id': task['profile_id'], 'repository': repo,
-               'mono_commit': details['mono_commit'], 'children': children, 'test_ids': details['test_ids'], 'status': 'planned',
+    unassigned = []
+    for entry in _git(repo['worktree'], 'ls-tree', '-rz', details['mono_commit']).split('\0'):
+        if not entry.startswith('160000 commit '):
+            continue
+        info, path = entry.split('\t', 1)
+        if path in seen:
+            continue
+        materialized = Path(repo['worktree']) / path
+        if materialized.resolve() != materialized:
+            raise ManagementError('handoff_blocked', 'An unassigned submodule has an aliased materialization.')
+        unassigned.append({'request_id': None, 'path': path, 'commit': info.split(' ')[2], 'repository': _repository({'repo_path': str(materialized)})})
+    attempt = {'id': key, 'retry_of': details.get('retry_of'), 'request_id': task['id'], 'profile_id': task['profile_id'], 'repository': repo,
+               'mono_commit': details['mono_commit'], 'children': children, 'unassigned': unassigned, 'test_ids': details['test_ids'], 'status': 'planned',
                'created_at': _now(), 'planned_by': identity.subject, 'whole_project_complete': False,
-               'occupancy': {'logical_repositories': sorted({repo['logical_id']} | {c['repository']['logical_id'] for c in children}), 'released': True}, 'rework': []}
+               'occupancy': {'logical_repositories': sorted({repo['logical_id']} | {c['repository']['logical_id'] for c in children + unassigned}), 'released': True}, 'rework': []}
     data.setdefault('global_validations', {})[attempt['id']] = attempt
     _save(manager, version, data, attempt)
     return attempt
@@ -226,6 +255,7 @@ def _prepare(manager, identity, details, version, data, attempt):
         result = materializer(attempt, authorization)
         if not isinstance(result, dict) or result.get('validation_id') != attempt['id'] or result.get('authorization_digest') != authorization['digest'] or result.get('status') != 'ended' or result.get('related_execution') != 'ended' or result.get('operations') != scope:
             raise ManagementError('outcome_unknown', 'The original materialization action termination is unverified; do not replay or run tests.')
+        attempt['preparation'].update(status='ended', receipt=result, ended_at=_now())
         after = _inputs(attempt, data)
         if after[0]['workspace']['head'] != before[0]['workspace']['head'] or after[0]['all_source_digest'] != before[0]['all_source_digest'] or any(i['workspace']['head'] != c['commit'] or i['workspace']['dirty_paths'] for i, c in zip(after[1:], attempt['children'])):
             raise ManagementError('handoff_blocked', 'Materialization changed mono source or did not provide the exact clean child versions.')
@@ -240,6 +270,24 @@ def _prepare(manager, identity, details, version, data, attempt):
         else:
             _end(manager, identity, version, data, attempt, 'blocked', str(exc))
         raise
+
+
+def _reconcile(manager, identity, version, data, attempt):
+    host = manager.global_validation_host
+    finder = getattr(host, 'find_run', None)
+    if attempt.get('run'):
+        return _finish(manager, identity, version, data, attempt)
+    if attempt['status'] != 'unverified' or not callable(finder):
+        raise ManagementError('capability_unverified', 'Original-run lookup is unavailable; unknown validation occupancy is retained without replay.')
+    proof = _boundary(manager, attempt)
+    if any(proof[k] != attempt['boundary'][k] for k in ('host_id', 'generation')):
+        raise ManagementError('capability_unverified', 'A replacement executor cannot reconcile the original validation start.')
+    run = finder(attempt)
+    expected = {k: attempt['boundary'][k] for k in ('host_id', 'generation')} | {'validation_id': attempt['id'], 'input_digest': attempt['input_digest']}
+    if not isinstance(run, dict) or any(run.get(k) != v for k, v in expected.items()) or not isinstance(run.get('run_id'), str) or not run['run_id']:
+        raise ManagementError('capability_unverified', 'The original exact validation run is still unverified; no test start was replayed.')
+    attempt['run'] = run
+    return _finish(manager, identity, version, data, attempt)
 
 
 def reconcile_inputs(data):
@@ -366,6 +414,8 @@ def perform(manager, identity, action, details):
         if not attempt:
             raise ManagementError('invalid_change', 'Unknown global validation attempt.')
         _task(manager, identity, attempt['request_id'], data)
+        if action == 'reconcile':
+            return _reconcile(manager, identity, version, data, attempt)
         if action == 'check':
             return _check(manager, identity, version, data, attempt)
         if action == 'complete':
@@ -384,7 +434,7 @@ def perform(manager, identity, action, details):
         version += 1
         try:
             inputs = _inputs(attempt, data)
-            expected_commits = [attempt['mono_commit']] + [c['commit'] for c in attempt['children']]
+            expected_commits = [attempt['mono_commit']] + [c['commit'] for c in attempt['children'] + attempt.get('unassigned', [])]
             if any(i['workspace']['head'] != commit or i['workspace']['dirty_paths'] for i, commit in zip(inputs, expected_commits)):
                 raise ManagementError('handoff_blocked', 'Actual materialized parent/child commits and preserved worktrees need approved preparation before testing.')
             attempt.update(inputs=inputs, input_digest=_digest(inputs))
@@ -397,7 +447,7 @@ def perform(manager, identity, action, details):
             _save(manager, version, data, attempt)
             version += 1
             run = manager.global_validation_host.start(attempt)
-            if not isinstance(run, dict) or run.get('validation_id') != attempt['id'] or run.get('input_digest') != attempt['input_digest'] or not isinstance(run.get('run_id'), str) or not run['run_id']:
+            if not isinstance(run, dict) or run.get('validation_id') != attempt['id'] or run.get('input_digest') != attempt['input_digest'] or any(run.get(k) != attempt['boundary'][k] for k in ('host_id', 'generation')) or not isinstance(run.get('run_id'), str) or not run['run_id']:
                 raise ManagementError('outcome_unknown', 'Original validation test start was not confirmed; do not replay.')
             attempt.update(run=run, status='running', started_at=_now())
             _save(manager, version, data, attempt)

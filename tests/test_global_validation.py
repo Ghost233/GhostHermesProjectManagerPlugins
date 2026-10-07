@@ -19,20 +19,47 @@ def git(repo, *args):
     return subprocess.check_output(['git', '-C', str(repo), *args], text=True).strip()
 
 
-def combination(manager, root):
+def combination(manager, root, *, unassigned=False, public_goal=False):
     mono, _ = commit_repo(root / 'mono')
     child, child_head = commit_repo(mono / 'child')
     (mono / '.gitmodules').write_text('[submodule "child"]\n\tpath = child\n\turl = ./child\n')
     subprocess.run(['git', '-C', str(mono), 'add', '.gitmodules'], check=True)
     subprocess.run(['git', '-C', str(mono), 'update-index', '--add', '--cacheinfo', '160000,' + child_head + ',child'], check=True)
     subprocess.run(['git', '-C', str(mono), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixed child'], check=True)
+    if unassigned:
+        leaf, leaf_head = commit_repo(mono / 'unassigned')
+        subprocess.run(['git', '-C', str(mono), 'update-index', '--add', '--cacheinfo', '160000,' + leaf_head + ',unassigned'], check=True)
+        subprocess.run(['git', '-C', str(mono), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'unassigned module'], check=True)
     value = registration(mono)
     value['profile']['connection_refs']['codex'] = 'local:fixture-stdio'
     manager.apply_directory_change(OWNER, 0, value)
     value = registration(child, 'child-project', 'child-lead')
     value['profile'].update(identity_ref='fixture:child', role='subproject_lead', parent_profile_id='mono-lead', connection_refs={'codex': 'local:fixture-stdio'})
     manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], value)
-    parent = acknowledge(manager, suffix='mono')
+    if public_goal:
+        from test_collaboration import channel, source, STEWARD
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': {'id': 'steward', 'native_profile': 'steward', 'identity_ref': STEWARD.subject,
+            'role': 'steward', 'capability': 'non_development', 'project_id': None, 'parent_profile_id': None, 'connection_refs': {}}})
+        channels = [channel('steward', 'entry'), channel('steward'), channel('mono-lead'), channel('child-lead')]
+        for c in channels:
+            c['bot_sources'] = [{'profile_id': other, 'open_id': other + '-seen-' + c['profile_id'], 'tenant_key': tenant, 'native_ids': [other + '-native']}
+                for other, tenant in [('steward', 'steward-tenant'), ('mono-lead', 'lead-tenant'), ('child-lead', 'child-tenant')] if other != c['profile_id']]
+        manager.collaborate(OWNER, 'register_channels', {'channels': channels})
+        h = manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(channels[0]), 'issue_url': ISSUE['url']})
+        ingress = VerifiedIdentity(LEAD.subject, 'native-collaboration-ingress')
+        while True:
+            part = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': h['id']})
+            if not part: break
+            manager.collaborate(STEWARD, 'record_delivery', {'handoff_id': h['id'], 'uuid': part['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_goal_' + str(part['number']), 'chat_id': 'oc_project'}})
+            observed = source(channels[2], 'bot', 'om_goal_' + str(part['number']))
+            manager.collaborate(ingress, 'ingest', {'channel_id': channels[2]['id'], 'source_anchor': observed, 'text': part['text']})
+        accepted_handoff = next(a for a in manager.read_snapshot(OWNER)['collaboration']['handoffs'] if a['id'] == h['id'])
+        parent = accepted_handoff['task_request_id']
+        manager.collaborate(ingress, 'publish_ack', {'handoff_id': h['id']})
+        ack = manager.collaborate(ingress, 'claim_ack', {'handoff_id': h['id']})
+        manager.collaborate(ingress, 'record_ack', {'handoff_id': h['id'], 'uuid': ack['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_ack_mono', 'chat_id': 'oc_project'}})
+    else:
+        parent = acknowledge(manager, suffix='mono')
     kid = acknowledge(manager, 'child-project', 'child-lead', 'child')
     prepare_fixture(manager, kid, child)
     session = manager.start_task(OWNER, kid)['session']
@@ -71,7 +98,8 @@ class FixtureHost:
         self.expected = 'baseline\n'
 
     def verify_boundary(self, context):
-        return {'validation_id': context['id'], 'input_digest': context['input_digest'], 'source_access': 'read-only',
+        import hashlib
+        return {'host_id': 'fixture:global-host', 'generation': 'fixture-generation', 'runner_configuration_digest': hashlib.sha256(self.expected.encode()).hexdigest(), 'validation_id': context['id'], 'input_digest': context['input_digest'], 'source_access': 'read-only',
                 'git_access': 'read-only', 'artifact_roots': context['repository']['test_artifact_paths'],
                 'scope': 'synthetic-fixture', 'platform_enforcement': 'fixture-only', 'tool_paths': 'fixture-only',
                 'preexisting_hardlink': 'fixture-only', 'process_paths': 'fixture-only', 'evidence_ref': 'fixture:approved-synthetic-repository'}
@@ -81,10 +109,10 @@ class FixtureHost:
         import sys
         result = subprocess.run([sys.executable, '-c', 'from pathlib import Path; import sys; assert Path("child/source.py").read_text() == sys.argv[1]; print("1 test passed")', self.expected], cwd=context['repository']['worktree'], capture_output=True)
         run_id = 'run-' + context['id']
-        self.runs[run_id] = {'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest'], 'status': 'ended',
+        self.runs[run_id] = {'host_id': context['boundary']['host_id'], 'generation': context['boundary']['generation'], 'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest'], 'status': 'ended',
             'related_execution': 'ended', 'tests': [{'id': 'unit', 'argv': ['python', '-m', 'unittest'], 'cwd': context['repository']['worktree'],
                 'exit_code': result.returncode, 'output_digest': hashlib.sha256(result.stdout + result.stderr).hexdigest(), 'artifact_refs': []}], 'defects': []}
-        return {'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest']}
+        return {'host_id': context['boundary']['host_id'], 'generation': context['boundary']['generation'], 'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest']}
 
     def read_result(self, run_id):
         return self.runs[run_id]
@@ -184,6 +212,8 @@ def test_preparation_preserves_user_changes_and_never_calls_materializer_when_di
 
 class IssueReadSource:
     def read_issue(self, url):
+        if url == ISSUE['url']:
+            return dict(ISSUE)
         return {**ISSUE, 'url': url, 'title': 'Repair integration contract', 'body': '- [ ] Child supports mono integration'}
 
 
@@ -276,3 +306,202 @@ async def test_dashboard_and_native_group_share_versions_evidence_and_round_hold
                 (child / 'source.py').write_text('manual invalidation\n')
                 changed = browser.get('/snapshot').json()['global_validations'][0]
                 assert changed['status'] == 'invalidated' and changed['whole_project_complete'] is False
+
+
+def test_unassigned_materialized_module_is_checked_without_creating_an_owner(tmp_path):
+    host = FailedHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host, delivery_source=IssueReadSource()) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path, unassigned=True)
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        assert plan['unassigned'][0]['path'] == 'unassigned' and plan['unassigned'][0]['commit'] == git(mono / 'unassigned', 'rev-parse', 'HEAD')
+        manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        run = host.runs['run-' + plan['id']]
+        run['defects'] = [{'target': 'unassigned', 'description': 'Unassigned child contract', 'test_ids': ['unit']}]
+        failed = manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
+        assert failed['status'] == 'failed'
+        returned = manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'unassigned', 'issue_url': 'https://github.com/Ghost233/fixture/issues/29'})
+        assert returned['rework'][0]['route'] == 'owner_decision' and returned['rework'][0]['status'] == 'needs_owner'
+        assert len(manager.read_snapshot(OWNER)['profiles']) == 2
+        assert returned['occupancy']['released'] is True
+
+
+def test_current_manual_activity_blocks_global_validation_without_any_control(tmp_path):
+    from test_manual_observation import observer, manual_state, READ_ONLY
+    peer = tmp_path / 'manual-peer'
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=FixtureHost(), observation_adapters={'local:manual-daemon': observer(peer)}) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        manual_state(peer, child, 'idle')
+        manager.register_observation_source(OWNER, {'id': 'manual-child', 'kind': 'daemon', 'project_ids': ['child-project'], 'adapter_ref': 'local:manual-daemon'})
+        manager.refresh_manual_sessions(OWNER, 'child-project')
+        manual_state(peer, child, 'active')
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        with pytest.raises(ManagementError) as active:
+            manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        assert active.value.code == 'repository_busy'
+        assert all(json.loads(line).get('method') in READ_ONLY for line in (peer / 'manual-wire.jsonl').read_text().splitlines())
+        assert manager.read_snapshot(OWNER)['global_validations'][0]['occupancy']['released'] is True
+
+
+class RunnerIssueSource(IssueReadSource):
+    """Controlled original runner receipts; no GitHub requests or real accounts."""
+    def __init__(self):
+        self.receipts = {}
+
+    def run(self, root, session, item_id):
+        import hashlib
+        import os
+        import sys
+        repo = Path(session['repository']['worktree'])
+        names = subprocess.check_output(['git', '-C', str(repo), 'ls-files', '-z'], text=True).split('\0')
+        digest = hashlib.sha256()
+        for name in sorted(n for n in names if n):
+            digest.update(name.encode())
+            if (repo / name).is_file():
+                digest.update((repo / name).read_bytes())
+        fixed = digest.hexdigest()
+        result = subprocess.run([sys.executable, '-m', 'unittest', 'discover'], cwd=repo, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True)
+        assert result.returncode == 0, result.stdout + result.stderr
+        output = result.stdout + result.stderr
+        self.receipts[item_id] = {'service_id': session['service_id'], 'generation': session['generation'], 'turn_id': session['turn_id'], 'item_id': item_id,
+            'command_sha256': hashlib.sha256(b'python -m unittest discover').hexdigest(), 'output_digest': hashlib.sha256(output.encode()).hexdigest(), 'exit_code': 0,
+            'before_source_digest': fixed, 'after_source_digest': fixed, 'source_access': 'read-only', 'git_access': 'read-only', 'artifact_roots': session['repository']['test_artifact_paths']}
+        observed = root / 'queue-observed.json'
+        patches = json.loads(observed.read_text())
+        patches[session['thread_id']] = {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full',
+            'items': [{'type': 'commandExecution', 'id': item_id, 'command': 'python -m unittest discover', 'cwd': str(repo), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': output}]}]}
+        observed.write_text(json.dumps(patches))
+
+    def read_test_version(self, session, item_id):
+        return self.receipts[item_id]
+
+
+@pytest.mark.asyncio
+async def test_approved_repository_delivery_failure_issue_repair_revalidation_and_completion(tmp_path):
+    from test_collaboration import channel, source, STEWARD
+    from lark_oapi import Client
+    from lark_oapi.api.im.v1 import CreateMessageResponse, ReplyMessageResponse
+    from types import SimpleNamespace as NS
+    from ghost_hermes_pm.feishu import NativeFeishuTransport
+    issue_source, host = RunnerIssueSource(), FailedHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host, delivery_source=issue_source) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path, public_goal=True)
+        channels = [channel('steward', 'entry'), channel('steward'), channel('mono-lead'), channel('child-lead')]
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': {'id': 'steward', 'native_profile': 'steward', 'identity_ref': STEWARD.subject,
+            'role': 'steward', 'capability': 'non_development', 'project_id': None, 'parent_profile_id': None, 'connection_refs': {}}})
+        for c in channels:
+            c['bot_sources'] = []
+            for other, tenant in [('steward', 'steward-tenant'), ('mono-lead', 'lead-tenant'), ('child-lead', 'child-tenant')]:
+                if other != c['profile_id']:
+                    c['bot_sources'].append({'profile_id': other, 'open_id': other + '-seen-' + c['profile_id'], 'tenant_key': tenant, 'native_ids': [other + '-native']})
+        manager.collaborate(OWNER, 'register_channels', {'channels': channels})
+        sent = []
+        async def deliver(actor, handoff_id, receiving=None):
+            while True:
+                packet = manager.collaborate(actor, 'claim_delivery', {'handoff_id': handoff_id})
+                if not packet:
+                    break
+                binding = packet['sender_binding']
+                native = Client.builder().app_id(binding['app_id']).app_secret('fixture-unused-credential').build()
+                native.request = lambda request: NS(code=0, raw=NS(content=json.dumps({'code': 0, 'bot': {'open_id': binding['recipient_open_id'], 'activate_status': 2}}).encode()))
+                message_id = 'om_full_' + str(len(sent))
+                native.im.v1.message.create = lambda request: CreateMessageResponse({'code': 0, 'data': {'message_id': message_id, 'chat_id': packet['chat_id']}})
+                native.im.v1.message.reply = lambda request: ReplyMessageResponse({'code': 0, 'data': {'message_id': message_id, 'chat_id': packet['chat_id']}})
+                transport = NativeFeishuTransport(native)
+                await transport.verify_identity(binding)
+                receipt = await transport.send(packet)
+                manager.collaborate(actor, 'record_delivery', {'handoff_id': handoff_id, 'uuid': packet['uuid'], 'receipt': receipt})
+                sent.append(packet)
+                if receiving:
+                    receiver, c = receiving
+                    observed = source(c, 'bot', message_id)
+                    observed.update(tenant_key=next(b['tenant_key'] for b in c['bot_sources'] if b['profile_id'] == binding['profile_id']), sender_open_id=binding['profile_id'] + '-seen-' + c['profile_id'])
+                    manager.collaborate(receiver, 'ingest', {'channel_id': c['id'], 'source_anchor': observed, 'text': packet['text']})
+        first = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        manager.global_validation(LEAD, 'start', {'validation_id': first['id']})
+        assert manager.global_validation(LEAD, 'finish', {'validation_id': first['id']})['status'] == 'failed'
+        returned = manager.global_validation(LEAD, 'rework', {'validation_id': first['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})
+        handoff_id = returned['rework'][0]['handoff_id']
+        child_ingress = VerifiedIdentity('fixture:child', 'native-collaboration-ingress')
+        await deliver(LEAD, handoff_id, (child_ingress, channels[3]))
+        h = next(h for h in manager.read_snapshot(OWNER)['collaboration']['handoffs'] if h['id'] == handoff_id)
+        repair_id = h['task_request_id']
+        manager.collaborate(child_ingress, 'publish_ack', {'handoff_id': handoff_id})
+        ack = manager.collaborate(child_ingress, 'claim_ack', {'handoff_id': handoff_id})
+        manager.collaborate(child_ingress, 'record_ack', {'handoff_id': handoff_id, 'uuid': ack['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_repair_ack', 'chat_id': 'oc_project'}})
+        prepare_fixture(manager, repair_id, child)
+        repair_session = manager.start_task(VerifiedIdentity('fixture:child', 'participant'), repair_id)['session']
+        (child / 'source.py').write_text('repaired integration\n')
+        (child / 'test_child.py').write_text('import unittest\nfrom pathlib import Path\nclass Child(unittest.TestCase):\n def test_contract(self): self.assertEqual(Path("source.py").read_text(), "repaired integration\\n")\n')
+        subprocess.run(['git', '-C', str(child), 'add', 'source.py', 'test_child.py'], check=True)
+        subprocess.run(['git', '-C', str(child), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'repair child contract'], check=True)
+        issue_source.run(tmp_path, repair_session, 'repair-test')
+        manager.record_task_delivery(OWNER, repair_id, {'source_commit': git(child, 'rev-parse', 'HEAD'), 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': 'Child supports mono integration', 'test_item_ids': ['repair-test']}]})
+        (mono / 'test_mono.py').write_text('import unittest\nfrom pathlib import Path\nclass Mono(unittest.TestCase):\n def test_contract(self): self.assertEqual(Path("child/source.py").read_text(), "repaired integration\\n")\n')
+        subprocess.run(['git', '-C', str(mono), 'add', 'child', 'test_mono.py'], check=True)
+        subprocess.run(['git', '-C', str(mono), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'integrate fixed child'], check=True)
+        task = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == parent)
+        issue_source.run(tmp_path, task['session'], 'mono-final')
+        manager.record_task_delivery(LEAD, parent, {'source_commit': git(mono, 'rev-parse', 'HEAD'), 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['mono-final']}]})
+        second = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': repair_id, 'path': 'child'}], 'test_ids': ['unit']})
+        manager.global_validation(LEAD, 'start', {'validation_id': second['id']})
+        assert manager.global_validation(LEAD, 'finish', {'validation_id': second['id']})['status'] == 'passed'
+        completed = manager.global_validation(LEAD, 'complete', {'validation_id': second['id']})
+        assert completed['whole_project_complete'] is True
+        rounds = manager.read_snapshot(OWNER)['global_validations']
+        previous = next(r for r in rounds if r['id'] == first['id'])
+        assert previous['rework'][0]['status'] == 'resolved' and previous['rework'][0]['revalidated_by'] == second['id']
+        assert all(r['occupancy']['released'] for r in rounds)
+        assert any('issues/28' in p['text'] and p['mention_open_id'] == 'child-lead-seen-mono-lead' for p in sent)
+
+        child_result = manager.collaborate(VerifiedIdentity('fixture:child', 'participant'), 'report_result', {'handoff_id': handoff_id})
+        await deliver(VerifiedIdentity('fixture:child', 'participant'), child_result['id'], (VerifiedIdentity(LEAD.subject, 'native-collaboration-ingress'), channels[2]))
+        original = next(h for h in manager.read_snapshot(OWNER)['collaboration']['handoffs'] if h.get('task_request_id') == parent)
+        summary = manager.collaborate(LEAD, 'report_summary', {'handoff_id': original['id']})
+        assert summary['whole_project_complete'] is True and summary['global_validation_id'] == second['id']
+        await deliver(LEAD, summary['id'], (VerifiedIdentity(STEWARD.subject, 'native-collaboration-ingress'), channels[1]))
+        owner_summary = manager.collaborate(STEWARD, 'publish_owner_summary', {'handoff_id': summary['id']})
+        assert owner_summary['whole_project_complete'] is True
+        await deliver(STEWARD, owner_summary['id'])
+        assert any(p['path'] == 'reply' and '整体完成' in p['text'] for p in sent)
+
+
+class UnknownStartHost(FixtureHost):
+    def start(self, context):
+        super().start(context)
+        raise ManagementError('outcome_unknown', 'Fixture response lost after actual test start.')
+
+    def find_run(self, context):
+        run_id = 'run-' + context['id']
+        return {k: self.runs[run_id][k] for k in ('run_id', 'validation_id', 'input_digest', 'host_id', 'generation')}
+
+
+def test_unknown_test_start_is_not_replayed_and_reconciles_the_original_run_after_restart(tmp_path):
+    host = UnknownStartHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        with pytest.raises(ManagementError) as unknown:
+            manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        assert unknown.value.code == 'outcome_unknown'
+        with pytest.raises(ManagementError):
+            manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        assert len(host.runs) == 1
+        assert manager.read_snapshot(OWNER)['global_validations'][0]['occupancy']['released'] is False
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, global_validation_host=host) as restored:
+        reconciled = restored.global_validation(LEAD, 'reconcile', {'validation_id': plan['id']})
+        assert reconciled['status'] == 'passed' and reconciled['occupancy']['released'] is True
+        assert len(host.runs) == 1
+        assert next(r for r in restored.read_snapshot(OWNER)['requests'] if r['id'] == parent)['repository_released'] is False
+
+
+def test_duplicate_plan_is_one_round_and_explicit_retry_is_a_new_related_round(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        details = {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']}
+        first = manager.global_validation(LEAD, 'plan', details)
+        assert manager.global_validation(LEAD, 'plan', details)['id'] == first['id']
+        with pytest.raises(ManagementError):
+            manager.global_validation(LEAD, 'start', {'validation_id': first['id']})
+        retry = manager.global_validation(LEAD, 'plan', {**details, 'retry_of': first['id']})
+        assert retry['id'] != first['id'] and retry['retry_of'] == first['id']
+        assert len(manager.read_snapshot(OWNER)['global_validations']) == 2
