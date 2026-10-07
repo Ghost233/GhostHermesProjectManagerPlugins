@@ -26,6 +26,11 @@ def refresh(data):
         blockers = [r['id'] for r in records if r['id'] != record['id'] and (not r.get('repository_released') or r['queue'].get('pending_continuation')) and
                     r['queue']['logical_repository'] == queue['logical_repository'] and
                     ((r.get('session') and not r.get('repository_released')) or r['queue']['sequence'] < queue['sequence'])]
+        validation_blockers = [a['id'] for a in data.get('global_validations', {}).values() if not a['occupancy']['released'] and a['request_id'] != record['id'] and queue['logical_repository'] in a['occupancy']['logical_repositories']]
+        queue['validation_blockers'] = validation_blockers
+        if validation_blockers:
+            queue.update(status='validation_waiting', blocked_by=blockers, reason='Waiting for related global validation occupancy to end.')
+            continue
         if queue.get('manual_blockers') or queue.get('observation_blockers'):
             queue.update(status='manual_waiting', blocked_by=blockers, reason=record.get('unexecuted_reason'))
             continue
@@ -46,14 +51,14 @@ def require_turn(manager, identity, record, version, data):
         queue['requested_by'] = identity.subject
     from .observation import guard_repository
     guard_repository(manager, identity, record, version, data)
-    if queue and queue['blocked_by']:
+    if queue and (queue['blocked_by'] or queue.get('validation_blockers')):
         record.update(unexecuted_reason=queue['reason'])
         if not queue.get('pending_continuation'):
             record['execution'] = 'waiting'
         with manager._db:
             manager._save(version, data)
         manager.publish_request_message(identity, record['id'], 'progress',
-            '仓库排队：' + queue['reason'] + '\n前项：' + ', '.join(queue['blocked_by']))
+            '仓库排队：' + queue['reason'] + '\n前项：' + ', '.join(queue['blocked_by'] + queue.get('validation_blockers', [])))
         raise ManagementError('repository_busy', queue['reason'])
 
 
