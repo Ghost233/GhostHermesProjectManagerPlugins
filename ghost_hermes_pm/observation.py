@@ -223,7 +223,9 @@ def refresh_manual_sessions(manager, identity, scope=None):
 
 def guard_repository(manager, identity, record, version, data):
     logical = record.get('session', {}).get('logical_repository') or record.get('queue', {}).get('logical_repository')
-    blockers = [s['id'] for s in data.get('manual_sessions', {}).values() if s['logical_repository'] == logical and s['blocks_repository']]
+    grant = data.get('control_grants', {}).get(record.get('control_grant_id'), {})
+    own_manual = grant.get('manual_session_id') if grant.get('status') == 'active' else None
+    blockers = [s['id'] for s in data.get('manual_sessions', {}).values() if s['logical_repository'] == logical and s['blocks_repository'] and s['id'] != own_manual]
     unknown = [s['id'] for s in data.get('manual_sources', {}).values() if logical in s.get('logical_repositories', {}).values() and s['status'] != 'verified']
     if blockers or unknown:
         reason = '手动执行或原服务观察范围待核对；同仓库新任务等待。'

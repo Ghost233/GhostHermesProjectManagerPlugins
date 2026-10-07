@@ -14,6 +14,8 @@ def _now():
 def _authorize(manager, identity, request_id, data):
     record = _responsible(manager, identity, request_id, data)
     session = record.get('session')
+    if session and session.get('origin') == 'manual_takeover' and data.get('control_grants', {}).get(record.get('control_grant_id'), {}).get('status') != 'active':
+        raise ManagementError('forbidden', 'This current-work manual grant is inactive; the original session is observe-only.')
     if not session or not session.get('thread_id') or session.get('control') != 'assigned_task' or record.get('task_delivery') == 'delivered':
         raise ManagementError('forbidden', 'No effective original-task control authorization is available.')
     if manager._principal(identity, data) is not None:
@@ -26,7 +28,8 @@ def _authorize(manager, identity, request_id, data):
 
 def _binding(manager, identity, request_id, data, action):
     record, session = _authorize(manager, identity, request_id, data)
-    adapter = manager.codex_adapter
+    from .takeover import executor_for
+    adapter = executor_for(manager, record)
     if adapter is None or adapter.generation != session['generation'] or not adapter.connection or adapter.connection['service_id'] != session['service_id']:
         raise ManagementError('capability_unverified', 'The original executor generation is unavailable; history is not control.')
     repository = session['repository']
