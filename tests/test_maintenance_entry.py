@@ -1,5 +1,6 @@
 """Maintenance through authenticated public HTTP and original Owner group entry."""
 import json
+import tempfile
 
 import pytest
 
@@ -107,3 +108,68 @@ async def test_owner_group_deactivation_waits_for_explicit_manual_handling_and_k
         snapshot = manager.read_snapshot(OWNER)
         assert (snapshot['maintenance']['mode'], snapshot['maintenance']['plans'][0]['status']) == ('disabled', 'deactivated')
         assert all(json.loads(line)['method'] in READ_ONLY for line in (peer / 'manual-wire.jsonl').read_text().splitlines())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['missing_scope', 'stale_version', 'incomplete_scope', 'missing_mention', 'bot', 'wrong_sender', 'project_entry', 'unauthorized', 'body_identity'])
+async def test_unverified_or_unreviewed_group_decisions_never_create_maintenance_intent(tmp_path, case):
+    host = MaintenanceHost(tmp_path / 'host')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, maintenance_host=host) as manager:
+        register(manager, make_repo(tmp_path / 'repo'))
+        entry, gateway, transport = group_entry(manager)
+        details = approval(manager, 'unreviewed', expected_release=host.release)
+        if case == 'missing_scope': details.pop('expected_profile_ids')
+        if case == 'stale_version': details['expected_version'] = 1
+        if case == 'incomplete_scope': details['expected_profile_ids'] = ['steward']
+        if case == 'body_identity': details['owner_origin'] = {'subject': OWNER.subject, 'source': 'owner'}
+        incoming = event('@_user_1 进入维护 ' + json.dumps(details))
+        if case == 'missing_mention': incoming.raw_message.event.message.mentions = []
+        if case == 'bot': incoming.source.is_bot = True
+        if case == 'wrong_sender': incoming.raw_message.event.sender.sender_id.open_id = 'ou_stranger'
+        if case == 'project_entry': entry.settings = CONFIG
+        if case == 'unauthorized': gateway.authorized = False
+        assert await entry.receive(incoming, gateway) is None
+        snapshot = manager.read_snapshot(OWNER)
+        assert (snapshot['version'], snapshot['maintenance']['mode'], snapshot['maintenance']['plans'], transport.sent) == (2, 'active', [], [])
+
+
+def test_http_maintenance_uses_authenticated_owner_and_current_complete_scope_then_preserves_offline_evidence(tmp_path):
+    from fastapi import FastAPI, HTTPException
+    from fastapi.testclient import TestClient
+    from ghost_hermes_pm import VerifiedIdentity
+    from ghost_hermes_pm.dashboard import create_router
+    from ghost_hermes_pm.transport import ManagementClient, ManagementServer
+    host = MaintenanceHost(tmp_path / 'host')
+    host.pending = True
+    with tempfile.TemporaryDirectory(prefix='hpm-m31-', dir='/tmp') as state, Manager(state, owner_identity_ref=OWNER.subject, maintenance_host=host) as manager:
+        register(manager, make_repo(tmp_path / 'repo'))
+        credentials = {'owner': OWNER, 'reader': VerifiedIdentity('fixture:lead', 'verified-profile-entry')}
+        with ManagementServer(manager, credentials):
+            clients = {key: ManagementClient(state, key) for key in credentials}
+            def authenticated(request):
+                key = request.headers.get('x-fixture-identity')
+                if key not in clients:
+                    raise HTTPException(403, 'Unverified original identity')
+                return clients[key]
+            app = FastAPI()
+            app.include_router(create_router(authenticated))
+            browser = TestClient(app)
+            owner, reader = {'x-fixture-identity': 'owner'}, {'x-fixture-identity': 'reader'}
+            details = approval(manager, 'http-plan', expected_release=host.release)
+            body = {'action': 'enter', 'details': details}
+            assert browser.post('/maintenance', json=body).status_code == 403
+            assert browser.post('/maintenance', json=body, headers=reader).status_code == 403
+            assert browser.post('/maintenance', json={**body, 'actor': OWNER.subject}, headers=owner).status_code == 422
+            assert browser.post('/maintenance', json={**body, 'details': {**details, 'expected_version': 1}}, headers=owner).status_code == 409
+            assert browser.post('/maintenance', json={**body, 'details': {**details, 'expected_profile_ids': ['steward']}}, headers=owner).status_code == 409
+            assert browser.post('/maintenance', json=body, headers=owner).json()['id'] == 'http-plan'
+            checkpoint = browser.post('/maintenance', json={'action': 'checkpoint', 'details': {'operation_id': 'http-plan'}}, headers=owner).json()
+            assert checkpoint['status'] == 'blocked'
+            assert checkpoint.get('checkpoint') is None
+            current = browser.get('/snapshot', headers=owner).json()
+            assert current['maintenance']['plans'][0]['checks']['native']['inflight_requests'] == ['native-unknown']
+        offline = browser.get('/snapshot', headers=owner).json()
+        assert (offline['status'], offline['maintenance']['runtime']['status'], offline['maintenance']['runtime']['release_verified']) == ('unverified', 'unverified', False)
+        assert offline['maintenance']['plans'] == current['maintenance']['plans']
+        unknown = browser.post('/maintenance', json={'action': 'check', 'details': {'operation_id': 'http-plan'}}, headers=owner)
+        assert (unknown.status_code, unknown.json()['detail']['code']) == (422, 'outcome_unknown')
