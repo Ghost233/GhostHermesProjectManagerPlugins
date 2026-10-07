@@ -31,7 +31,7 @@ from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from ghost_hermes_pm.dashboard import create_router
 from ghost_hermes_pm.native_lifecycle import NativeMultiplexLifecycleHost, configured_lifecycle_host
 from test_directory import OWNER, make_repo, registration
-from test_lifecycle import ProfileHost, tree
+from test_lifecycle import tree
 from hermes_cli.plugins import get_plugin_manager
 from hermes_cli.profiles import get_profile_dir, parked_marker_path, profiles_to_serve
 from gateway.control_socket import GatewayControlServer
@@ -41,9 +41,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
-class IsolatedHost(ProfileHost):
+class OwnedProfileProcesses:
     def __init__(self):
-        super().__init__()
         self.children = {}
         for profile in ('mono-lead', 'child-lead', 'wiki', 'ghost'):
             directory = get_profile_dir(profile)
@@ -55,32 +54,6 @@ class IsolatedHost(ProfileHost):
     def spawn(self):
         return subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'], env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    def request(self, profile, component, desired, operation_id):
-        super().request(profile, component, desired, operation_id)
-        child = self.children[profile['native_profile'], component]
-        if desired == 'stopped':
-            child.terminate(); child.wait(timeout=5)
-            if component == 'profile_service':
-                parked_marker_path(get_profile_dir(profile['native_profile'])).write_text(operation_id)
-        else:
-            assert child.poll() is not None
-            self.children[profile['native_profile'], component] = self.spawn()
-            if component == 'profile_service':
-                parked_marker_path(get_profile_dir(profile['native_profile'])).unlink()
-        return {'status': 'accepted'}
-
-    def inspect(self, profile, component, desired, operation_id):
-        fact = super().inspect(profile, component, desired, operation_id)
-        if component != 'manual_execution':
-            child = self.children[profile['native_profile'], component]
-            assert (child.poll() is not None) == (desired == 'stopped')
-            if component == 'profile_service':
-                served = {name for name, _ in profiles_to_serve(True)}
-                assert (profile['native_profile'] in served) == (desired == 'ready')
-                assert {'default', 'wiki', 'ghost'} <= served
-            fact['evidence'] = 'isolated-owned-process:' + str(child.pid) + ':pristine-sdk-profile-scope'
-        return fact
-
     def close(self):
         for child in self.children.values():
             if child.poll() is None:
@@ -88,7 +61,7 @@ class IsolatedHost(ProfileHost):
             child.wait(timeout=5)
 
 
-processes = IsolatedHost()
+processes = OwnedProfileProcesses()
 class ControlledMultiplexer:
     """Actual SDK scoped verbs, with owned artificial adapter/process effects only."""
     _running = True
