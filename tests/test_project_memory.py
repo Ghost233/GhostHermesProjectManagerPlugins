@@ -140,3 +140,117 @@ def test_only_explicit_owner_scope_updates_preferences_and_corrections_keep_old_
             assert 'include evidence' in loaded['text'] and 'choose blue' not in loaded['text'].lower()
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as restarted:
         assert len(restarted.read_project_memory(LEAD, 'mono-lead', True)['entries']) == 3
+
+
+@pytest.mark.parametrize('text', [
+    'Which retry delivery policy should we choose?', 'What is your preferred retry delivery policy?',
+    'What is the retry delivery policy? Add a new transport.', 'Owner, what is the retry delivery policy?',
+    'Can we authorize running retry delivery commands?', 'What is the missing delivery date?',
+])
+def test_decisions_new_work_owner_only_and_unverifiable_questions_stay_with_owner(tmp_path, text):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path),
+                 knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
+            query = prepared_facts(manager, owner, lead, request_id)
+            emit(tmp_path, user_question(questions=[{'id': 'ask', 'header': 'Original request', 'question': text,
+                'isOther': True, 'isSecret': False, 'options': None}]))
+            question = owner.refresh_task(request_id)['human_requests'][0]
+            result = lead.answer_from_knowledge(request_id, question['id'], query, ['retry:3'])
+            assert result['status'] == 'owner_required'
+            assert owner.read_snapshot()['requests'][0]['human_requests'][0]['reply'] is None
+        assert replies(tmp_path) == []
+
+
+def test_expired_idle_fact_cannot_start_execution_and_original_owner_decision_can_be_curated(tmp_path):
+    from test_questions import TURN
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path),
+                 knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
+            query = prepared_facts(manager, owner, lead, request_id)
+            emit(tmp_path, user_question())
+            choice = owner.refresh_task(request_id)['human_requests'][0]
+            owner.answer_human_request(request_id, choice['id'], 'explicit-choice', {'answers': {'colour': ['Blue for this task.']}})
+            assert owner.refresh_task(request_id)['human_requests'][0]['resolution'] == 'resolved'
+            completed_delivery(tmp_path, owner, request_id)
+            entry = lead.curate_project_memory('mono-lead', 'confirmed-choice', request_id,
+                {'facts': [], 'decisions': [choice['id']], 'include_delivery': True})
+            assert entry['decisions'][0]['owner'] == OWNER.subject
+            assert entry['decisions'][0]['answers'] == {'colour': ['Blue for this task.']}
+            assert entry['kind'] == 'accepted_result' and 'scope' not in entry
+            with pytest.raises(ManagementError):
+                lead.answer_from_knowledge(request_id, choice['id'], query, ['retry:3'])
+        assert len([r for r in map(json.loads, (tmp_path / 'wire.jsonl').read_text().splitlines()) if r.get('method') == 'turn/start']) == 1
+
+
+def test_role_memories_remain_separate_and_superiors_keep_only_necessary_result_indexes(tmp_path):
+    from test_directory import registration
+    child = VerifiedIdentity('fixture:child', 'synthetic-child')
+    steward = VerifiedIdentity('fixture:steward', 'synthetic-steward')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+        change = registration(make_repo(tmp_path / 'child'), 'child', 'child-lead')
+        change['profile'].update(identity_ref=child.subject, role='subproject_lead', parent_profile_id='mono-lead')
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], change)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': {
+            'id': 'steward', 'native_profile': 'steward', 'identity_ref': steward.subject, 'role': 'steward',
+            'capability': 'non_development', 'project_id': None, 'parent_profile_id': None, 'connection_refs': {}}})
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD, 'child': child, 'steward': steward}):
+            owner, lead, child_client, global_client = [ManagementClient(tmp_path / 'state', token) for token in ('owner', 'lead', 'child', 'steward')]
+            owner.record_memory_preference('child-lead', 'child-rule', 'For the child project, show source indexes.', {'kind': 'project', 'id': 'child'})
+            assert child_client.read_project_memory('child-lead')['entries'][0]['project_id'] == 'child'
+            with pytest.raises(ManagementError):
+                lead.read_project_memory('child-lead')
+            with pytest.raises(ManagementError):
+                global_client.read_project_memory('child-lead')
+            completed_delivery(tmp_path, owner, request_id)
+            selection = {'facts': [], 'decisions': [], 'include_delivery': True}
+            own = lead.curate_project_memory('mono-lead', 'mono-result', request_id, selection)
+            summary = global_client.curate_project_memory('steward', 'necessary-result-index', request_id, selection)
+            assert summary['project_id'] is None and summary['role'] == 'steward'
+            assert summary['facts'] == summary['decisions'] == [] and summary['delivery']['issue_url'] == own['delivery']['issue_url']
+            with pytest.raises(ManagementError):
+                child_client.curate_project_memory('child-lead', 'foreign-result', request_id, selection)
+            with pytest.raises(ManagementError):
+                global_client.curate_project_memory('mono-lead', 'overwrite-mono', request_id, selection)
+            assert len(lead.read_project_memory('mono-lead')['entries']) == 1
+            assert len(child_client.read_project_memory('child-lead')['entries']) == 1
+
+
+def test_unrelated_returned_fact_and_source_grant_revocation_cannot_answer_or_load(tmp_path):
+    from test_repository_queue import acknowledge
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path),
+                 knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
+            unknown = 'What is the missing delivery date?'
+            query = prepared_facts(manager, owner, lead, request_id, query_id='unrelated-source-result', question=unknown)
+            emit(tmp_path, user_question(questions=[{'id': 'unknown', 'header': 'Known fact?', 'question': unknown,
+                'isOther': True, 'isSecret': False, 'options': None}]))
+            q = owner.refresh_task(request_id)['human_requests'][0]
+            assert lead.answer_from_knowledge(request_id, q['id'], query, ['retry:3'])['status'] == 'owner_required'
+            assert replies(tmp_path) == []
+            proper = prepared_facts(manager, owner, lead, request_id, query_id='proper-source-result')
+            completed_delivery(tmp_path, owner, request_id)
+            lead.curate_project_memory('mono-lead', 'accepted-facts', request_id,
+                {'facts': [{'query_id': proper, 'material_ids': ['retry:3']}], 'decisions': [], 'include_delivery': True})
+            next_id = acknowledge(manager, suffix='revoke-before-start')
+            lead.load_project_memory(next_id, ['accepted-facts'])
+            changed = public_grant()
+            changed['query_subjects'] = {OWNER.subject: ['public']}
+            owner.register_knowledge_source(owner.read_snapshot()['version'], changed)
+            with pytest.raises(ManagementError):
+                lead.read_project_memory('mono-lead')
+            with pytest.raises(ManagementError):
+                lead.load_project_memory(next_id, ['accepted-facts'])

@@ -233,6 +233,9 @@ def answer_human_request(manager, identity, request_id, human_request_id, reply_
         question = next((q for q in record.get('human_requests', []) if q['id'] == human_request_id), None)
         if not question:
             raise ManagementError('invalid_change', 'Unknown original human request.')
+        if factual_evidence is not None:
+            from .memory import validate_factual_response
+            validate_factual_response(manager, identity, record, question, factual_evidence, response, data)
         if any(q['id'] != human_request_id and q.get('reply', {}).get('id') == reply_id for r in data['requests'].values() for q in r.get('human_requests', []) if q.get('reply')):
             raise ManagementError('binding_conflict', 'This reply ID is already bound to another human request.')
         previous = question.get('reply')
