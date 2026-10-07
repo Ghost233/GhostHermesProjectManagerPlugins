@@ -34,8 +34,10 @@ def _describe(manager, envelope):
     if not all(isinstance(params.get(k), str) and params[k] for k in ('threadId', 'turnId', 'itemId')):
         return description
     if method in APPROVAL_METHODS:
-        operation = {k: params[k] for k in ('kind', 'command', 'cwd', 'reason', 'networkApprovalContext', 'permissions', 'grantRoot', 'commandActions', 'additionalPermissions', 'availableDecisions') if k in params}
-        return {'category': 'approval', 'blocking': True, 'answerable': not params.get('additionalPermissions') and not params.get('availableDecisions'), 'operation': operation,
+        operation = {k: params[k] for k in ('kind', 'command', 'cwd', 'environmentId', 'reason', 'networkApprovalContext', 'permissions', 'grantRoot', 'commandActions', 'additionalPermissions', 'availableDecisions') if k in params}
+        if method == 'item/commandExecution/requestApproval':
+            operation.setdefault('kind', 'command')
+        return {'category': 'approval', 'blocking': True, 'answerable': (method != 'item/commandExecution/requestApproval' or operation.get('kind') == 'command' and bool(params.get('command') or params.get('networkApprovalContext'))) and not params.get('additionalPermissions') and not params.get('availableDecisions') and not params.get('grantRoot'), 'operation': operation,
             'operation_id': hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest(), 'scope': 'turn'}
     questions = params.get('questions')
     if type(params.get('isBlocking')) is not bool or not isinstance(questions, list) or not questions or any(not isinstance(q, dict) or not isinstance(q.get('id'), str) or not q['id'] or not isinstance(q.get('question'), str) or type(q.get('isSecret', False)) is not bool for q in questions) or len({q['id'] for q in questions}) != len(questions):
@@ -53,11 +55,16 @@ def sync_human_requests(manager, record, adapter, thread=None):
         params = envelope.get('params', {})
         key = hashlib.sha256(json.dumps([session['service_id'], session['generation'], type(envelope['id']).__name__, envelope['id']], sort_keys=True).encode()).hexdigest()
         question = next((q for q in requests if q['id'] == key), None)
+        description = _describe(manager, envelope)
+        if envelope['method'] == 'item/fileChange/requestApproval' and description['category'] == 'approval':
+            description = _file_operation(manager, record, envelope, description, thread)
+        if question is not None and question.get('operation_id') != description.get('operation_id'):
+            question['resolution'] = 'expired'
         if question is None:
             question = {'id': key, 'rpc_id': envelope['id'], 'method': envelope['method'], 'service_id': session['service_id'],
                 'generation': session['generation'], 'thread_id': session['thread_id'], 'turn_id': params.get('turnId'),
                 'item_id': params.get('itemId'), 'approval_id': params.get('approvalId'), 'received_at': _now(), 'reply': None,
-                'resolution': 'pending', 'execution_result': 'unverified', **_describe(manager, envelope),
+                'resolution': 'pending', 'execution_result': 'unverified', **description,
                 'original_interface': {'service_ref': adapter.service_ref, 'thread_id': session['thread_id'],
                     'item_id': params.get('itemId'), 'url': None, 'availability': 'original_client_required'}}
             requests.append(question)
@@ -88,6 +95,53 @@ def sync_human_requests(manager, record, adapter, thread=None):
             question['control_enabled'] = session.get('control') == 'assigned_task' and not record.get('repository_released') and record.get('task_delivery') != 'delivered' and record.get('execution') not in {'stopping', 'stopped'}
         except ManagementError:
             question['control_enabled'] = False
+
+
+def _file_operation(manager, record, envelope, description, thread):
+    params, session = envelope['params'], record['session']
+    turn = next((t for t in (thread or {}).get('turns', []) if t.get('id') == params['turnId']), None)
+    item = next((i for i in (turn or {}).get('items', []) if i.get('id') == params['itemId'] and i.get('type') == 'fileChange'), None)
+    changes = (item or {}).get('changes')
+    if not isinstance(changes, list) or not changes or any(not isinstance(c, dict) or not isinstance(c.get('path'), str) or not isinstance(c.get('diff'), str) for c in changes):
+        return {**description, 'answerable': False}
+    try:
+        _public_text(json.dumps(changes), manager._sensitive_values())
+        for change in changes:
+            _within_repository(session, change['path'], write=True)
+    except ManagementError:
+        return {'category': 'sensitive', 'answerable': False, 'blocking': True}
+    return {**description, 'operation': {**description['operation'], 'changes': changes},
+        'operation_id': hashlib.sha256(json.dumps([params, changes], sort_keys=True).encode()).hexdigest()}
+
+
+def _within_repository(session, supplied, write=False):
+    from pathlib import Path
+    repo = session['repository']
+    if not isinstance(supplied, str) or not supplied or len(supplied) > 4096 or not Path(supplied).is_absolute():
+        raise ManagementError('invalid_change', 'Permission paths require a bounded absolute original repository location.')
+    try:
+        path = Path(supplied).resolve()
+    except OSError as exc:
+        raise ManagementError('invalid_change', 'The permission path could not be resolved safely.') from exc
+    if not path.is_relative_to(Path(repo['worktree'])) or write and any(path.is_relative_to(Path(child['worktree'])) or Path(child['worktree']).is_relative_to(path) for child in repo['nested_repositories']):
+        raise ManagementError('forbidden', 'Additional permission cannot expand the original repository or its read-only child boundary.')
+
+
+def _permission_boundary(session, granted):
+    if set(granted) - {'network', 'fileSystem'} or 'network' in granted and not isinstance(granted['network'], dict):
+        raise ManagementError('invalid_change', 'Only explicit supported granted permission fields are accepted.')
+    if granted.get('network', {}).get('enabled') is True:
+        raise ManagementError('capability_unverified', 'The original task has no verified network expansion authority; use its original interface.')
+    filesystem = granted.get('fileSystem', {})
+    if not isinstance(filesystem, dict) or set(filesystem) - {'read', 'write'}:
+        raise ManagementError('capability_unverified', 'Additional filesystem entry/glob semantics require original-interface verification.')
+    for access, paths in filesystem.items():
+        if paths is None:
+            continue
+        if not isinstance(paths, list):
+            raise ManagementError('invalid_change', 'Permission paths must be an explicit list.')
+        for path in paths:
+            _within_repository(session, path, write=access == 'write')
 
 
 def _natural_question(manager, record, thread):
@@ -122,7 +176,7 @@ def _subset(granted, requested):
     return type(granted) is type(requested) and granted == requested
 
 
-def _response(manager, question, response):
+def _response(manager, question, response, session):
     _public_text(json.dumps(response), manager._sensitive_values())
     if question['method'] in APPROVAL_METHODS:
         allowed = {'decision', 'operation_id', 'scope'}
@@ -136,7 +190,10 @@ def _response(manager, question, response):
             requested = question['operation'].get('permissions')
             if not isinstance(granted, dict) or not _subset(granted, requested) or (response['decision'] != 'accept' and granted):
                 raise ManagementError('invalid_change', 'Only an explicitly approved requested permission subset can be granted.')
+            _permission_boundary(session, granted)
             return {'permissions': granted, 'scope': 'turn'}
+        if question['method'] == 'item/commandExecution/requestApproval' and question['operation'].get('cwd') is not None:
+            _within_repository(session, question['operation']['cwd'])
         return {'decision': response['decision']}
     if set(response) != {'answers'} or not isinstance(response['answers'], dict) or set(response['answers']) != {q['id'] for q in question['questions']}:
         raise ManagementError('invalid_change', 'Answers must correspond to every original question ID.')
@@ -178,7 +235,7 @@ def answer_human_request(manager, identity, request_id, human_request_id, reply_
             raise ManagementError('binding_conflict', 'The original request is expired or belongs to another turn.')
         if not question['answerable']:
             raise ManagementError('forbidden', 'Use the original private interface for this request; no answer is recorded here.')
-        result = _response(manager, question, response)
+        result = _response(manager, question, response, session)
         incoming = next((r['envelope'] for r in adapter.server_requests(session['thread_id']) if type(r['envelope']['id']) is type(question.get('rpc_id')) and r['envelope']['id'] == question.get('rpc_id')), None)
         question['reply'] = {'id': reply_id, 'actor': identity.subject, 'response': response, 'received': True, 'received_at': _now(), 'sent': 'intent'}
         if source_anchor is not None:
@@ -253,7 +310,7 @@ def associate_human_reply(manager, identity, project_id, profile_id, message, te
         version, data = manager._load()
         if manager._principal(identity, data) is not None:
             raise ManagementError('forbidden', 'Only the verified owner entry can answer a human request.')
-        _message_anchor(message)
+        required = _message_anchor(message)
         _public_text(text, manager._sensitive_values())
         target_id = decision.group(2) if decision else match.group(1)
         candidates = []
@@ -278,7 +335,7 @@ def associate_human_reply(manager, identity, project_id, profile_id, message, te
         if not candidates:
             raise ManagementError('binding_conflict', 'No uniquely bound original human request exists; quote its request ID.')
         if len(candidates) > 1:
-            key = hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
+            key = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
             clarification = data['clarifications'].get(key)
             if clarification is None:
                 clarification = {'id': key, 'status': 'needs_clarification', 'project_id': project_id, 'profile_id': profile_id,
@@ -300,6 +357,39 @@ def associate_human_reply(manager, identity, project_id, profile_id, message, te
             if q['category'] not in {'question', 'nonblocking'} or len(q.get('questions', [])) != 1:
                 raise ManagementError('invalid_change', 'Use explicit operation approval or answer multiple questions in Dashboard.')
             response = {'answers': {q['questions'][0]['id']: [match.group(2)]}}
-        reply_id = hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
+        reply_id = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
         answered = answer_human_request(manager, identity, record['id'], q['id'], reply_id, response, message)
         return {'status': 'answered', 'request_id': record['id'], 'human_request': answered}
+
+
+def claim_reply_feedback(manager, identity, message, text):
+    import uuid
+    from .manager import _message_anchor
+    with manager._lock, manager._db:
+        version, data = manager._load()
+        if manager._principal(identity, data) is not None:
+            raise ManagementError('forbidden', 'Only the owner entry may claim human reply feedback.')
+        required = _message_anchor(message)
+        _public_text(text, manager._sensitive_values())
+        key = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
+        ledger = data.setdefault('human_reply_feedback', {})
+        if key in ledger:
+            return None
+        record = {'id': key, 'uuid': str(uuid.uuid4()), 'source_anchor': dict(message), 'text': text, 'status': 'unknown'}
+        ledger[key] = record
+        manager._save(version, data)
+        return {'id': key, 'uuid': record['uuid'], 'text': text, 'chat_id': message['chat_id'],
+            'reply_to': message['message_id'], 'thread_id': message.get('thread_id'), 'mention_open_id': message['sender_open_id']}
+
+
+def record_reply_feedback(manager, identity, feedback_id, receipt):
+    with manager._lock, manager._db:
+        version, data = manager._load()
+        if manager._principal(identity, data) is not None:
+            raise ManagementError('forbidden', 'Only the owner entry may record human reply feedback.')
+        record = data['human_reply_feedback'][feedback_id]
+        safe = {k: receipt.get(k) for k in ('status', 'message_id', 'chat_id')}
+        if safe['status'] not in {'delivered', 'failed', 'unknown'} or safe['status'] == 'delivered' and (safe['chat_id'] != record['source_anchor']['chat_id'] or not isinstance(safe['message_id'], str) or not safe['message_id']):
+            safe['status'] = 'unknown'
+        record.update(safe)
+        manager._save(version, data)

@@ -25,6 +25,15 @@ def question_adapter(root):
 
 
 def emit(root, *events):
+    events = json.loads(json.dumps(events))
+    for event in events:
+        params = event.get('params', {})
+        if event.get('method') in {'item/commandExecution/requestApproval', 'item/permissions/requestApproval'}:
+            params['cwd'] = str(root / 'repo')
+        if event.get('method') == 'item/fileChange/requestApproval':
+            observed = {'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': [{'type': 'fileChange', 'id': params['itemId'], 'status': 'inProgress',
+                'changes': [{'path': str(root / 'repo' / 'fixture.txt'), 'kind': {'type': 'add'}, 'diff': '+safe fixture change'}]}]}]}
+            (root / 'observed.json').write_text(json.dumps(observed))
     (root / 'requests.json').write_text(json.dumps(events))
 
 
@@ -64,8 +73,12 @@ from ghost_hermes_pm import ManagementError, VerifiedIdentity
 
 
 def approval(method='item/commandExecution/requestApproval', rpc_id='8', **changes):
-    return {'id': rpc_id, 'method': method, 'params': {'threadId': THREAD, 'turnId': TURN,
-        'itemId': 'operation-item', 'startedAtMs': 1, 'command': 'git status', 'cwd': '/fixture/repo', **changes}}
+    params = {'threadId': THREAD, 'turnId': TURN, 'itemId': 'operation-item', 'startedAtMs': 1}
+    if method == 'item/commandExecution/requestApproval':
+        params.update(command='git status', cwd='/fixture/repo', environmentId=None)
+    elif method == 'item/permissions/requestApproval':
+        params.update(cwd='/fixture/repo', environmentId=None, reason=None)
+    return {'id': rpc_id, 'method': method, 'params': {**params, **changes}}
 
 
 @pytest.mark.parametrize('envelope,category,answerable', [
@@ -106,6 +119,9 @@ def test_explicit_owner_approval_binds_operation_and_turn_scope(tmp_path, method
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, task_id)
+        if method == 'item/permissions/requestApproval':
+            extra = {'permissions': {'network': None, 'fileSystem': {'read': [str(tmp_path / 'repo')], 'write': []}}}
+            result = {'permissions': {'fileSystem': {'read': [str(tmp_path / 'repo')]}}, 'scope': 'turn'}
         emit(tmp_path, approval(method, **extra))
         q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
         response = {'decision': decision, 'operation_id': q['operation_id'], 'scope': 'turn'}
@@ -151,7 +167,12 @@ def test_invalid_or_racing_request_never_receives_a_new_answer(tmp_path, case):
             return
         q = task['human_requests'][0]
         actor = VerifiedIdentity('fixture:lead', 'participant') if case == 'participant' else OWNER
-        if case in {'returned', 'stopped'}:
+        if case == 'stopped':
+            from test_task_control import terminal_state
+            manager.control_task(OWNER, task_id, 'stop', 'public-stop', expected_turn_id=TURN)
+            terminal_state(tmp_path)
+            assert manager.refresh_task(OWNER, task_id)['outer_task_status'] == 'stopped'
+        if case == 'returned':
             with manager._lock, manager._db:
                 version, data = manager._load()
                 record = data['requests'][task_id]
@@ -297,3 +318,217 @@ def test_wire_defaults_and_operation_or_sensitive_content_are_respected(tmp_path
             manager.answer_human_request(OWNER, task_id, q['id'], 'default-wire', {'answers': {'colour': ['Blue']}})
         else:
             assert q['answerable'] is False and replies(tmp_path) == []
+
+
+def test_configured_response_requires_separate_current_hashed_host_receipt(tmp_path):
+    import hashlib
+    from ghost_hermes_pm.codex import configured_adapter
+    from test_task_control import write_host_receipts
+    config = {'command': [sys.executable, str(Path(__file__).with_name('questions_fixture_server.py')), str(tmp_path)],
+        'cwd': str(tmp_path), 'environment': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(tmp_path / 'codex-home')},
+        'service_ref': 'local:fixture-stdio'}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=configured_adapter(config, tmp_path / 'state')) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        connection = manager.verify_task_execution(OWNER, task_id)['connection']
+        repo = manager.read_snapshot(OWNER)['projects'][0]['repo']
+        write_host_receipts(tmp_path, config, connection, repo, include_control=True)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question())
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        assert q['control_enabled'] is False
+        with pytest.raises(ManagementError) as absent:
+            manager.answer_human_request(OWNER, task_id, q['id'], 'missing-proof', {'answers': {'colour': ['Blue']}})
+        assert absent.value.code == 'capability_unverified' and replies(tmp_path) == []
+        report_path = tmp_path / 'state' / 'codex-validation.json'
+        report = json.loads(report_path.read_text())
+        control = json.loads((tmp_path / 'state' / 'validation-evidence' / 'task_control.json').read_text())
+        document = {k: v for k, v in control.items() if k not in {'actual_methods', 'checks', 'new_turn_id', 'unregistered_process_paths'}}
+        document.update(kind='human_response', original_connection_responses=True,
+            actual_methods=['thread/read', 'item/tool/requestUserInput', 'item/commandExecution/requestApproval',
+                'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'serverRequest/resolved'],
+            checks={k: 'PASS' for k in ['question', 'nonblocking', 'command_approval', 'file_approval', 'permission_approval',
+                'owner_only', 'wrong_request', 'duplicate', 'resolved_race', 'disconnect', 'secret', 'unknown_no_replay']})
+        path = tmp_path / 'state' / 'validation-evidence' / 'human_response.json'
+        def save_receipt():
+            raw = json.dumps(document).encode()
+            path.write_bytes(raw)
+            report['receipts']['human_response'] = {'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
+            report_path.write_text(json.dumps(report))
+        save_receipt()
+        document['generation'] = 'foreign-generation'
+        save_receipt()
+        with pytest.raises(ManagementError):
+            manager.answer_human_request(OWNER, task_id, q['id'], 'foreign-proof', {'answers': {'colour': ['Blue']}})
+        document['generation'] = connection['generation']
+        document['checks'].pop('resolved_race')
+        save_receipt()
+        with pytest.raises(ManagementError):
+            manager.answer_human_request(OWNER, task_id, q['id'], 'incomplete-proof', {'answers': {'colour': ['Blue']}})
+        document['checks']['resolved_race'] = 'PASS'
+        save_receipt()
+        path.write_text(path.read_text() + '\n')
+        with pytest.raises(ManagementError):
+            manager.answer_human_request(OWNER, task_id, q['id'], 'tampered-proof', {'answers': {'colour': ['Blue']}})
+        save_receipt()
+        answered = manager.answer_human_request(OWNER, task_id, q['id'], 'verified-proof', {'answers': {'colour': ['Blue']}})
+        assert answered['reply']['sent'] == 'sent'
+        manager.refresh_task(OWNER, task_id)
+        assert len(replies(tmp_path)) == 1
+
+
+@pytest.mark.parametrize('case', ['outside', 'nested', 'network', 'entries', 'grant_root', 'missing_patch', 'changed_patch'])
+def test_approval_cannot_expand_original_task_or_approve_unknown_file_change(tmp_path, case):
+    repo_path = make_repo(tmp_path / 'repo')
+    if case == 'nested':
+        make_repo(repo_path / 'child')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, repo_path)
+        manager.start_task(OWNER, task_id)
+        if case in {'grant_root', 'missing_patch', 'changed_patch'}:
+            event = approval('item/fileChange/requestApproval', **({'grantRoot': str(repo_path)} if case == 'grant_root' else {}))
+            emit(tmp_path, event)
+            if case == 'missing_patch':
+                (tmp_path / 'observed.json').write_text(json.dumps({'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}))
+        else:
+            path = str(tmp_path / 'outside') if case == 'outside' else str(repo_path / 'child' / 'source')
+            permissions = {'network': None, 'fileSystem': {'read': [], 'write': [path]}}
+            granted = {'fileSystem': {'write': [path]}}
+            if case == 'network':
+                permissions = {'network': {'enabled': True}, 'fileSystem': None}
+                granted = {'network': {'enabled': True}}
+            if case == 'entries':
+                permissions = {'network': None, 'fileSystem': {'read': [], 'write': [], 'entries': [{'path': {'type': 'glob', 'glob': '**'}, 'access': 'write'}]}}
+                granted = {'fileSystem': permissions['fileSystem']}
+            emit(tmp_path, approval('item/permissions/requestApproval', permissions=permissions))
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        if case == 'changed_patch':
+            observed = json.loads((tmp_path / 'observed.json').read_text())
+            observed['turns'][0]['items'][0]['changes'][0]['diff'] = '+different operation'
+            (tmp_path / 'observed.json').write_text(json.dumps(observed))
+        response = {'decision': 'accept', 'operation_id': q['operation_id'], 'scope': 'turn'}
+        if case not in {'grant_root', 'missing_patch', 'changed_patch'}:
+            response['permissions'] = granted
+        with pytest.raises(ManagementError):
+            manager.answer_human_request(OWNER, task_id, q['id'], 'no-expansion', response)
+        assert replies(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_group_reply_feedback_is_not_replayed_by_duplicate_source(tmp_path):
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import CONFIG, event, Gateway, Transport
+    class UnknownFeedback(Transport):
+        async def send(self, segment):
+            self.sent.append(segment)
+            return {'status': 'unknown'}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question())
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        transport, native = UnknownFeedback(), object()
+        intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda url: None)
+        intake.attach_transport(native, transport)
+        original = event('@_user_1 回答 ' + q['id'] + '：Blue', 'om_unknown_feedback')
+        assert await intake.receive(original, Gateway(native)) == {'action': 'skip'}
+        first_count = len(transport.sent)
+        assert await intake.receive(original, Gateway(native)) == {'action': 'skip'}
+        assert len(transport.sent) == first_count
+        manager.refresh_task(OWNER, task_id)
+        assert len(replies(tmp_path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_real_feishu_sdk_builder_preserves_owner_approval_source_and_mention(tmp_path):
+    from lark_oapi import Client
+    from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse
+    from types import SimpleNamespace as NS
+    from ghost_hermes_pm.feishu import NativeFeishuTransport
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import CONFIG, event, Gateway
+    native = Client.builder().app_id('cli_fixture').app_secret('synthetic-unused-secret').build()
+    native.request = lambda request: NS(code=0, raw=NS(content=json.dumps({'code': 0, 'bot': {'open_id': 'ou_lead', 'activate_status': 2}}).encode()))
+    sent = []
+    def reply(request):
+        sent.append(request)
+        return ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_sdk_' + str(len(sent)), 'chat_id': 'oc_project', 'parent_id': request.message_id}})
+    native.im.v1.message.reply = reply
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, approval())
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        adapter = object()
+        intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda url: None)
+        intake.attach_transport(adapter, NativeFeishuTransport(native))
+        source = event('@_user_1 批准 ' + q['id'] + ' 操作 ' + q['operation_id'] + ' 范围 turn', 'om_explicit_approval')
+        source.raw_message = P2ImMessageReceiveV1(json.loads(json.dumps(source.raw_message, default=lambda value: vars(value))))
+        assert await intake.receive(source, Gateway(adapter)) == {'action': 'skip'}
+        manager.refresh_task(OWNER, task_id)
+        assert replies(tmp_path) == [{'id': '8', 'result': {'decision': 'accept'}}]
+        assert sent[-1].message_id == 'om_explicit_approval'
+        content = json.loads(sent[-1].request_body.content)['zh_cn']['content'][0]
+        assert content[0] == {'tag': 'at', 'user_id': 'ou_owner'}
+
+
+def test_concurrent_answers_send_at_most_one_original_result(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question())
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        with ManagementServer(manager, {'owner': OWNER}):
+            def send(index):
+                try:
+                    return ManagementClient(tmp_path / 'state', 'owner').answer_human_request(task_id, q['id'], str(index), {'answers': {'colour': ['Blue']}})['reply']['sent']
+                except ManagementError as exc:
+                    return exc.code
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                outcomes = list(workers.map(send, [1, 2]))
+            assert sorted(outcomes) == ['binding_conflict', 'sent']
+        manager.refresh_task(OWNER, task_id)
+        assert len(replies(tmp_path)) == 1
+
+
+def test_unanswered_deprecated_timeout_never_creates_a_decision_or_stop(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question(autoResolutionMs=0), approval(rpc_id=85, approvalId='callback-1'), approval(rpc_id=86, approvalId='callback-2'))
+        manager.refresh_task(OWNER, task_id)
+        task = manager.refresh_task(OWNER, task_id)
+        assert len(task['human_requests']) == 3
+        assert {q.get('approval_id') for q in task['human_requests']} == {None, 'callback-1', 'callback-2'}
+        assert all(q['reply'] is None and q['resolution'] == 'pending' for q in task['human_requests'])
+        assert replies(tmp_path) == []
+        assert all(r.get('method') != 'turn/interrupt' for r in map(json.loads, (tmp_path / 'wire.jsonl').read_text().splitlines()))
+
+
+def test_changed_natural_question_cannot_receive_an_old_answer(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        state = {'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': [{'type': 'agentMessage', 'id': 'original-question', 'text': 'Which colour?'}]}]}
+        (tmp_path / 'observed.json').write_text(json.dumps(state))
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        state['turns'][0]['items'][0]['text'] = 'Which font?'
+        (tmp_path / 'observed.json').write_text(json.dumps(state))
+        with pytest.raises(ManagementError):
+            manager.answer_human_request(OWNER, task_id, q['id'], 'old-answer', {'answers': {'answer': ['Blue']}})
+        assert not any(r.get('method') == 'turn/steer' for r in map(json.loads, (tmp_path / 'wire.jsonl').read_text().splitlines()))
+
+
+def test_unbound_unsupported_request_only_exposes_original_service_locator(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, {'id': 'auth-callback', 'method': 'account/chatgptAuthTokens/refresh', 'params': {'refreshReason': 'synthetic-sensitive-placeholder'}})
+        manager.refresh_task(OWNER, task_id)
+        snapshot = manager.read_snapshot(OWNER)
+        request = snapshot['original_interface_requests'][0]
+        assert request['rpc_id'] == 'auth-callback' and request['thread_id'] is None and request['url'] is None
+        assert request['answerable'] is False and request['service_id'] == snapshot['requests'][0]['session']['service_id']
+        assert 'synthetic-sensitive-placeholder' not in json.dumps(snapshot)
+        assert b'synthetic-sensitive-placeholder' not in (tmp_path / 'state' / 'manager.sqlite3').read_bytes()
+        assert replies(tmp_path) == []

@@ -10,7 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
+@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('questions_smoke_runner.py', False, ''), ('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
 def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(runner, artifact_mismatch, unload_stage):
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     sdk = Path(configured) if configured else ROOT / 'tests' / 'fixtures' / 'hermes-sdk'
@@ -31,10 +31,10 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
                 shutil.copytree(source, plugin / name, ignore=shutil.ignore_patterns('__pycache__'))
             else:
                 shutil.copy2(source, plugin / name)
-        if runner == 'task_control_smoke_runner.py':
+        if runner in {'task_control_smoke_runner.py', 'questions_smoke_runner.py'}:
             fixtures = scratch / 'control-fixtures'
             fixtures.mkdir()
-            for name in ('test_task_control.py', 'test_task_execution.py', 'test_directory.py', 'test_requests.py', 'codex_fixture_server.py'):
+            for name in ('test_task_control.py', 'test_task_execution.py', 'test_directory.py', 'test_requests.py', 'codex_fixture_server.py', 'test_questions.py', 'questions_fixture_server.py'):
                 shutil.copy2(ROOT / 'tests' / name, fixtures / name)
         env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HERMES_HOME': str(home),
                'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'), 'PYTHONDONTWRITEBYTECODE': '1',

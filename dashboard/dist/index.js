@@ -146,6 +146,12 @@
             h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：配置中 · 执行：未启用'),
             h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
         })),
+        (snapshot.original_interface_requests || []).length > 0 && h('section', null, h('h2', null, '原服务需人工处理'),
+          h('ul', null, snapshot.original_interface_requests.map(function (request) {
+            return h('li', { key: request.generation + ':' + String(request.rpc_id) }, request.method + ' · 服务：' + request.service_id +
+              ' · 请求：' + String(request.rpc_id) + ' · 状态：' + request.resolution,
+              h('p', null, '该请求没有核实的任务对应。请在实际原客户端界面处理；安全链接尚不可用，勿在群中输入秘密。'));
+          }))),
         h('h2', null, '已受理请求'),
         h('p', null, '任务与原群消息共用管理实例。执行能力按当前连接和权限证据核验；轮次结束、验收交付与 PR 状态分别显示。'),
         !(snapshot.requests || []).length && h('p', null, '尚无核实的受理记录。'),

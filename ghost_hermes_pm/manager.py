@@ -191,8 +191,15 @@ class Manager:
                         _current_assignment(self, request, data)
                     except ManagementError as exc:
                         capability.update(enabled=False, status='blocked', reason=str(exc))
+            original_interface_requests = []
+            if principal is None and self.codex_adapter and self.codex_adapter.connection:
+                original_interface_requests = [{'rpc_id': r['envelope']['id'], 'method': r['envelope']['method'],
+                    'service_id': self.codex_adapter.connection['service_id'], 'generation': self.codex_adapter.generation,
+                    'thread_id': None, 'url': None, 'answerable': False, 'resolution': r['state'],
+                    'availability': 'original_client_required'} for r in self.codex_adapter.server_requests(None)]
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'original_interface_requests': original_interface_requests,
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',

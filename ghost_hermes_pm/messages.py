@@ -216,21 +216,24 @@ class FeishuEntry:
                     feedback = '人工答复已收到；送回：' + reply['sent'] + '；已处理与执行结果请核对原请求。'
                 else:
                     feedback = '存在多个人工请求，请引用具体人工请求 ID 后回答。'
-                    self.manager().record_clarification_delivery(identity, result['id'], {'status': 'unknown'})
+                    if result['delivery'] == 'pending':
+                        self.manager().record_clarification_delivery(identity, result['id'], {'status': 'unknown'})
             except ManagementError as exc:
                 feedback = '人工答复未执行：' + str(exc)
                 result = None
             self.require_active(generation)
-            try:
-                receipt = await transport.send({'uuid': __import__('uuid').uuid4().hex, 'text': feedback,
-                    'chat_id': envelope['chat_id'], 'reply_to': envelope['message_id'],
-                    'thread_id': envelope['thread_id'], 'mention_open_id': envelope['sender_open_id']})
-                self.require_active(generation)
-            except Exception:
-                self.require_active(generation)
-                receipt = {'status': 'unknown'}
-            if result and result['status'] == 'needs_clarification':
-                self.manager().record_clarification_delivery(identity, result['id'], receipt)
+            from .questions import claim_reply_feedback, record_reply_feedback
+            segment = claim_reply_feedback(self.manager(), identity, envelope, feedback)
+            if segment is not None:
+                try:
+                    receipt = await transport.send(segment)
+                    self.require_active(generation)
+                except Exception:
+                    self.require_active(generation)
+                    receipt = {'status': 'unknown'}
+                record_reply_feedback(self.manager(), identity, segment['id'], receipt)
+                if result and result['status'] == 'needs_clarification':
+                    self.manager().record_clarification_delivery(identity, result['id'], receipt)
             return {'action': 'skip'}
         result = self.manager().associate_message(identity, binding['project_id'], binding['profile_id'], envelope, text)
         if result['status'] == 'unassociated':
