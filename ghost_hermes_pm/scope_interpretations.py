@@ -21,8 +21,35 @@ def _authorization(record, data):
         'control_grant_id': record.get('control_grant_id')})
 
 
+def _merge_decision(text):
+    from .delivery import OPTIONAL_MERGE, delivery_requirements
+    # Materials and quotations do not express a new decision by the current Owner.
+    text = re.sub(r'“[^”]*”|‘[^’]*’|「[^」]*」|"[^"]*"|\'[^\']*\'', '<quoted material>', text)
+    target = r'(?:(?:此|本|该)?\s*(?:PR|拉取请求|代码|变更|提交)|(?:(?:a|the)\s+)?(?:PR|pull request|code|changes))'
+    action = r'(?:合并|merg(?:e|ed|ing))\s*(?:' + target + r')?(?:\s*(?:到|至|into)\s*[\w./-]+)?'
+    decisions = []
+    for clause in re.split(r'[,，;；。\n]+', text):
+        clause = re.sub(r'^\s*(?:本人明确[：:]\s*)?(?:(?:本任务|当前任务|此任务|this task|current task)\s*)?(?:本人|我|I)?\s*', '', clause, flags=re.IGNORECASE).strip()
+        if re.fullmatch(r'(?:不批准|不同意|不允许|拒绝|do not approve|deny|refuse)\s*' + action, clause, re.IGNORECASE):
+            decisions.append((False, True))
+        elif re.fullmatch(r'(?:批准|同意|允许|approve|authorize|consent to)\s*' + action, clause, re.IGNORECASE):
+            decisions.append((True, False))
+        else:
+            optional = OPTIONAL_MERGE.search(clause)
+            if optional and re.fullmatch(r'\s*(?:' + target + r')?\s*', clause[:optional.start()], re.IGNORECASE) and re.fullmatch(r'\s*(?:' + target + r')?\s*', clause[optional.end():], re.IGNORECASE):
+                decisions.append((False, False))
+            elif re.fullmatch(r'(?:(?:' + target + r')\s*)?(?:(?:必须|务必|须|应当|需要|要求|禁止|不得|不要|不能|勿|must|shall|has to|have to|needs to|is required to|must not|shall not|do not|never)\s*(?:be\s+)?)?' + action, clause, re.IGNORECASE):
+                policy = delivery_requirements(clause)
+                if not policy['clarification_criteria'] and (policy['merge_required'] or policy['merge_forbidden']):
+                    decisions.append((policy['merge_required'], policy['merge_forbidden']))
+    if not decisions or any(required for required, _ in decisions) and any(not required for required, _ in decisions):
+        return
+    return {'merge_required': any(required for required, _ in decisions),
+            'merge_forbidden': any(forbidden for _, forbidden in decisions), 'clarification_criteria': []}
+
+
 def owner_scope_answer(record, text):
-    from .delivery import delivery_requirements, frozen_delivery_requirements
+    from .delivery import frozen_delivery_requirements
     criteria = frozen_delivery_requirements(record)['clarification_criteria']
     if not criteria or not re.search(r'本任务|当前任务|此任务|\b(?:this|current) task\b', text, re.IGNORECASE) or re.search(r'建议|或许|可能|\b(?:suggest|perhaps|maybe)\b|[?？]', text, re.IGNORECASE):
         return
@@ -31,17 +58,12 @@ def owner_scope_answer(record, text):
         targets = criteria
     if len(targets) != 1:
         return {'status': 'needs_clarification', 'reason': 'Name the exact original acceptance item before its interpretation is applied.'}
-    decision_text = text.replace(targets[0], '')
-    # An explanation must explicitly decide merging; unrelated Owner input is insufficient.
-    refused = re.search(r'(?:不(?:批准|同意|允许)|拒绝)\s*合并|\b(?:do not approve|deny|refuse)\s+(?:(?:a|the)\s+)?merg(?:e|ing)\b', decision_text, re.IGNORECASE)
-    approved = not refused and re.search(r'(?:批准|同意|允许)\s*合并|\b(?:approve|authorize|consent to)\s+(?:(?:a|the)\s+)?merg(?:e|ing)\b', decision_text, re.IGNORECASE)
-    policy = delivery_requirements(decision_text)
-    if refused:
-        policy = {'merge_required': False, 'merge_forbidden': True, 'clarification_criteria': []}
-    elif approved:
-        policy = {'merge_required': True, 'merge_forbidden': False, 'clarification_criteria': []}
-    optional = re.search(r'(?:无需|不需要|不要求|可选|酌情|可以).{0,30}合并|合并.{0,20}(?:可选|不作要求|不作为交付条件)|\b(?:not required|not necessary|does not need|no|without|optional|may|can|could)\b.{0,40}\bmerg(?:e|ed|ing)\b|\bmerg(?:e|ed|ing)\b.{0,40}\b(?:not required|optional)\b', decision_text, re.IGNORECASE)
-    if policy['clarification_criteria'] or not (policy['merge_required'] or policy['merge_forbidden'] or optional):
+    decision_text = text
+    for left, right in [('“', '”'), ('‘', '’'), ('「', '」'), ('"', '"'), ("'", "'")]:
+        decision_text = decision_text.replace(left + targets[0] + right, '')
+    decision_text = decision_text.replace(targets[0], '')
+    policy = _merge_decision(decision_text)
+    if policy is None:
         return
     return {'status': 'resolved', 'criterion': targets[0], 'policy': policy}
 
