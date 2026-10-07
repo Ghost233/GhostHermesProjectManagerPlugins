@@ -98,7 +98,7 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None, migration_host=None, notification_clock=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None, migration_host=None, maintenance_host=None, notification_clock=None):
         import time
         self.notification_clock = notification_clock or time.time
         self._notification_generation = str(uuid.uuid4())
@@ -108,6 +108,7 @@ class Manager:
         self.global_validation_host = global_validation_host
         self.lifecycle_host = lifecycle_host
         self.migration_host = migration_host
+        self.maintenance_host = maintenance_host
         self.knowledge_providers = dict(knowledge_providers or {})
         self.archive_providers = dict(archive_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
