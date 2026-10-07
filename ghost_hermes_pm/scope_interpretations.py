@@ -21,6 +21,22 @@ def _authorization(record, data):
         'control_grant_id': record.get('control_grant_id')})
 
 
+def _without_fenced_material(text):
+    lines, fence = [], None
+    for line in text.splitlines():
+        opening = re.match(r'^[ \t]*(`{3,}|~{3,})', line)
+        if fence is not None:
+            if re.fullmatch(r'[ \t]*' + re.escape(fence[0]) + '{' + str(len(fence)) + r',}[ \t]*', line):
+                fence = None
+            lines.append('<markdown material>')
+        elif opening:
+            fence = opening.group(1)
+            lines.append('<markdown material>')
+        else:
+            lines.append(line)
+    return '\n'.join(lines)
+
+
 def _merge_decision(text):
     from .delivery import OPTIONAL_MERGE, delivery_requirements
     # Materials and quotations do not express a new decision by the current Owner.
@@ -51,14 +67,14 @@ def _merge_decision(text):
 def owner_scope_answer(record, text):
     from .delivery import frozen_delivery_requirements
     criteria = frozen_delivery_requirements(record)['clarification_criteria']
-    if not criteria or not re.search(r'本任务|当前任务|此任务|\b(?:this|current) task\b', text, re.IGNORECASE) or re.search(r'建议|或许|可能|\b(?:suggest|perhaps|maybe)\b|[?？]', text, re.IGNORECASE):
+    decision_text = _without_fenced_material(text)
+    if not criteria or not re.search(r'本任务|当前任务|此任务|\b(?:this|current) task\b', decision_text, re.IGNORECASE) or re.search(r'建议|或许|可能|\b(?:suggest|perhaps|maybe)\b|[?？]', decision_text, re.IGNORECASE):
         return
     targets = [criterion for criterion in criteria if criterion in text]
     if not targets and len(criteria) == 1:
         targets = criteria
     if len(targets) != 1:
         return {'status': 'needs_clarification', 'reason': 'Name the exact original acceptance item before its interpretation is applied.'}
-    decision_text = text
     for left, right in [('“', '”'), ('‘', '’'), ('「', '」'), ('"', '"'), ("'", "'")]:
         decision_text = decision_text.replace(left + targets[0] + right, '')
     decision_text = decision_text.replace(targets[0], '')
