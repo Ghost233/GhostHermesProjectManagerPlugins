@@ -29,7 +29,14 @@ def snapshot(manager, data, project_ids):
             health.update(supervision='unverified', delivery='unverified')
     if saved.get('generation') and saved['generation'] != manager._notification_generation:
         health.update(supervision='unavailable', delivery='unverified')
-    return {'events': [e for e in saved['events'].values() if e['project_id'] in project_ids],
+    events = []
+    for event in saved['events'].values():
+        if event['project_id'] not in project_ids:
+            continue
+        handoff = data.get('collaboration', {}).get('handoffs', {}).get(event.get('role_handoff_id'))
+        events.append({**event, 'delivery': handoff['delivery']} if handoff else event)
+    health['sources'] = {key: value for key, value in health.get('sources', {}).items() if data['requests'].get(key, {}).get('project_id') in project_ids}
+    return {'events': events,
             'health': health}
 
 
@@ -128,7 +135,21 @@ def run(manager, identity):
             if not task.get('repository_released') and task.get('outer_task_status') != 'stopped':
                 active.setdefault(task['project_id'], []).append(task)
         for task in data['requests'].values():
-            observation = task.get('supervision_observation')
+            validation_id = task.get('global_validation_id')
+            validation = data.get('global_validations', {}).get(validation_id, {})
+            completion_key = 'project-complete:' + task['id'] + ':' + str(validation_id)
+            if task.get('whole_project_complete') and task.get('task_delivery') == 'delivered' and validation.get('status') == 'complete' and validation.get('whole_project_complete'):
+                completed = emit(saved, 'project_completed', task['project_id'], [task], '项目完成：本 Issue 验收和当前稳定组合全局验证均已核实。\nIssue：' + task['accepted_scope']['url'] + '\n验证：' + validation_id, now, key=completion_key)
+                completed['validation_id'] = validation_id
+            elif completion_key in saved['events'] and validation.get('status') in {'invalidating', 'invalidated', 'unverified'}:
+                original = saved['events'][completion_key]
+                if original['delivery'] in {'pending', 'blocked'}:
+                    original['delivery'] = 'expired'
+                emit(saved, 'needs_owner', task['project_id'], [task], '项目完成依据已失效或待核实；原输入或监督覆盖变化，需要处理当前验证。\nIssue：' + task['accepted_scope']['url'], now, mention_owner=True, key='invalidated:' + completion_key)
+            stop = task.get('stop', {})
+            if stop.get('status') == 'confirmed' and task['execution'] == 'stopped' and task.get('repository_released'):
+                emit(saved, 'stop_confirmed', task['project_id'], [task], '停止已核实；保留已有改动与原会话。\nIssue：' + task['accepted_scope']['url'], now, key='stop:' + task['id'] + ':' + stop['instruction_id'])
+            observation = task.get('supervision_observation') if not task.get('repository_released') and task.get('outer_task_status') != 'stopped' else None
             if observation:
                 tracker = saved['tasks'].setdefault(task['id'], {'progress_at': now, 'digest': observation['progress_digest'], 'stall_sent': False})
                 saved['health']['sources'][task['id']] = {'status': 'verified' if observation['verified'] else 'unverified',
@@ -227,6 +248,12 @@ def manage(manager, identity, action, details):
         if not frozen or _channel(data, frozen['id']) != frozen:
             raise ManagementError('binding_conflict', 'The original notification entry channel changed or was unavailable.')
         if action == 'claim':
+            if event.get('validation_id'):
+                validation = data.get('global_validations', {}).get(event['validation_id'], {})
+                if validation.get('status') != 'complete' or not validation.get('whole_project_complete'):
+                    event['delivery'] = 'expired'
+                    manager._save(version, data)
+                    return None
             if event.get('human_request_id'):
                 question = next((q for task_id in event['request_ids'] for q in data['requests'][task_id].get('human_requests', []) if q['id'] == event['human_request_id']), None)
                 if not question or question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled'):
@@ -286,7 +313,7 @@ async def deliver(intake, identity, generation):
             return intake.manager().run_notifications(identity)
     result = await asyncio.to_thread(poll_if_active)
     for event in result['notifications']:
-        if event['delivery'] not in {'pending', 'sending'} or not event.get('target_channel'):
+        if event.get('role_handoff_id') or event['delivery'] not in {'pending', 'sending'} or not event.get('target_channel'):
             continue
         matches = []
         for _, transport in tuple(intake.transports):
@@ -339,3 +366,43 @@ def shutdown(manager):
 def component_unavailable(manager):
     persist_health(manager, {'supervision': 'unavailable', 'delivery': 'unverified',
         'checked_at': manager.notification_clock(), 'reason': 'supervision_component_unavailable'})
+
+
+def on_delivery(manager, task):
+    from .manager import VerifiedIdentity
+    with manager._lock:
+        _, data = manager._load()
+        profile = data['profiles'][task['profile_id']]
+        if profile['role'] != 'subproject_lead' or task.get('task_delivery') != 'delivered':
+            return
+        actor = VerifiedIdentity(profile['identity_ref'], 'manager-notification-result-route')
+        delegation = task.get('actor_provenance', {}).get('delegation_id')
+        details = {'handoff_id': delegation} if delegation else {'request_id': task['id']}
+        try:
+            handoff = manager.collaborate(actor, 'report_result', details)
+        except ManagementError:
+            handoff = None
+        with manager._db:
+            version, data = manager._load()
+            event = emit(state(data), 'child_delivery', task['project_id'], [task],
+                '子 Issue 交付证据已核实；公开回传仍按父负责人原请求关联核对。\nIssue：' + task['accepted_scope']['url'], manager.notification_clock(), key='child-delivery:' + task['id'])
+            event.update(role_handoff_id=handoff['id'] if handoff else None,
+                delivery=handoff['delivery'] if handoff else 'blocked', segments=[], target_channel=None)
+            manager._save(version, data)
+
+
+def on_rework(manager, attempt):
+    with manager._lock, manager._db:
+        version, data = manager._load()
+        task = data['requests'][attempt['request_id']]
+        saved = state(data)
+        for repair in attempt.get('rework', []):
+            needs_owner = repair['status'] in {'blocked', 'needs_owner'}
+            event = emit(saved, 'needs_owner' if needs_owner else 'rework', task['project_id'], [task],
+                '全局验证返工：' + repair['target'] + '\n明确 Issue：' + repair['issue']['url'] + '\n处理：' + repair['route'],
+                manager.notification_clock(), mention_owner=needs_owner,
+                key='rework:' + attempt['id'] + ':' + repair['target'] + ':' + repair['issue']['url'])
+            if repair.get('handoff_id'):
+                handoff = data['collaboration']['handoffs'][repair['handoff_id']]
+                event.update(role_handoff_id=handoff['id'], delivery=handoff['delivery'], segments=[], target_channel=None)
+        manager._save(version, data)

@@ -355,7 +355,11 @@ class Manager:
         if action in {'start', 'prepare'}:
             self.refresh_manual_sessions(identity)
         from .global_validation import perform
-        return perform(self, identity, action, details)
+        result = perform(self, identity, action, details)
+        if action == 'rework':
+            from .notifications import on_rework
+            on_rework(self, result)
+        return result
 
     def take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id):
         from .takeover import take_over_session
@@ -469,7 +473,10 @@ class Manager:
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
         try:
-            return record_task_delivery(self, identity, request_id, report)
+            result = record_task_delivery(self, identity, request_id, report)
+            from .notifications import on_delivery
+            on_delivery(self, result)
+            return result
         except ManagementError as exc:
             with self._lock, self._db:
                 version, data = self._load()
