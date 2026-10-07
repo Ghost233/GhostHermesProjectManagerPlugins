@@ -98,10 +98,11 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
+        self.knowledge_providers = dict(knowledge_providers or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +134,8 @@ class Manager:
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
         data.setdefault('intake_failures', {})
+        data.setdefault('knowledge_sources', {})
+        data.setdefault('knowledge_queries', {})
         for record in data['requests'].values():
             session = record.get('session')
             if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
@@ -183,7 +186,8 @@ class Manager:
                         _current_assignment(self, request, data)
                     except ManagementError as exc:
                         capability.update(enabled=False, status='blocked', reason=str(exc))
-            return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
+            from .knowledge import snapshot_knowledge
+            return {**snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
@@ -252,6 +256,14 @@ class Manager:
     def verify_task_execution(self, identity, request_id):
         from .execution import verify_task_execution
         return verify_task_execution(self, identity, request_id)
+
+    def register_knowledge_source(self, identity, expected_version, source):
+        from .knowledge import register_source
+        return register_source(self, identity, expected_version, source)
+
+    def query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id=None, channel_id=None, auto_supplement=False):
+        from .knowledge import query_knowledge
+        return query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id, channel_id, auto_supplement)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',
