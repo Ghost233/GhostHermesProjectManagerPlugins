@@ -206,7 +206,7 @@ def query_knowledge(manager, identity, source_id, query_id, question, scope_ids,
             session = task.get('session')
             query.update(status='awaiting_wiki', source_anchor=dict(anchor), dispatcher_profile_id=task['profile_id'],
                 target_session={k: session.get(k) for k in ('thread_id', 'turn_id', 'generation', 'service_id', 'control')} if session else None,
-                target_arrangement_id=task.get('current_arrangement_id'))
+                target_arrangement_id=task.get('current_arrangement_id'), target_control_grant_id=task.get('control_grant_id'))
             _publication(query, 'query', '资料查询 ' + query_id + '\n来源：' + source_id + '\n原提问者：' + identity.subject +
                          '\n范围：' + ', '.join(scope_ids) + '\n问题：' + question,
                          public, anchor, public['wiki_mention_open_id'])
@@ -446,11 +446,12 @@ def supplement_knowledge(manager, identity, query_id, material_ids=None):
             reason = 'No original active task target or unambiguous necessary facts; materials were retained for review.'
         elif task['profile_id'] not in source['task_profiles']:
             reason = 'These facts were not explicitly allowed for the responsible task Profile.'
-        elif not task.get('session') or any(task['session'].get(k) != v for k, v in target.items()) or task.get('current_arrangement_id') != query.get('target_arrangement_id') or task['session'].get('control') != 'assigned_task' or task.get('repository_released') or task.get('task_delivery') == 'delivered' or task.get('outer_task_status') in {'stopped', 'stopping', 'execution_pending'} or task.get('stop', {}).get('status') == 'processing':
+        elif not task.get('session') or any(task['session'].get(k) != v for k, v in target.items()) or task.get('current_arrangement_id') != query.get('target_arrangement_id') or task.get('control_grant_id') != query.get('target_control_grant_id') or task['session'].get('control') != 'assigned_task' or task.get('repository_released') or task.get('task_delivery') == 'delivered' or task.get('outer_task_status') in {'stopped', 'stopping', 'execution_pending'} or task.get('stop', {}).get('status') == 'processing':
             reason = 'The original work ended, changed turn/arrangement, or no longer has control; late material cannot start or steer it.'
         else:
             try:
-                adapter = manager.codex_adapter
+                from .takeover import bind_executor
+                adapter = bind_executor(manager, task)
                 if adapter is None or adapter.generation != target['generation']:
                     raise ManagementError('capability_unverified', 'The original execution connection is unavailable.')
                 thread = adapter.read_thread(target['thread_id'])

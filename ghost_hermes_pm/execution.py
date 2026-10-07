@@ -20,6 +20,10 @@ def _current_assignment(manager, record, data):
     accepted = record.get('accepted_responsibility')
     if not profile or not isinstance(accepted, dict) or any(profile.get(k) != v for k, v in accepted.items()) or profile.get('project_id') != record['project_id'] or profile.get('capability') != 'development' or profile.get('role') not in {'project_lead', 'subproject_lead'}:
         raise ManagementError('forbidden', 'The current Profile no longer has the accepted responsibility; original work requires reconciliation.')
+    if record.get('session', {}).get('origin') == 'manual_takeover':
+        from .takeover import _assignment
+        _assignment(record, data)
+        return
     service_ref = profile.get('connection_refs', {}).get('codex')
     if service_ref != manager.codex_adapter.service_ref or (record.get('accepted_codex_ref') is not None and record['accepted_codex_ref'] != service_ref):
         raise ManagementError('capability_unverified', 'The actual executor does not match the responsible Profile local Codex binding.')
@@ -138,7 +142,8 @@ def refresh_task(manager, identity, request_id):
         if record.get('outer_task_status') == 'stopped':
             return record
         session = record.get('session')
-        adapter = manager.codex_adapter
+        from .takeover import bind_executor
+        adapter = bind_executor(manager, record)
         if not session or not session.get('thread_id'):
             raise ManagementError('binding_conflict', 'No confirmed original thread is available for observation.')
         if adapter is None or adapter.generation != session['generation']:
