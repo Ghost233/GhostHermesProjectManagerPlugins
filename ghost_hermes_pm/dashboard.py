@@ -22,6 +22,12 @@ class TaskOperation(BaseModel):
     text: str | None = None
     expected_turn_id: str | None = None
 
+class ObservationOperation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: str
+    scope: str | None = None
+    registration: dict | None = None
+
 def create_router(authenticated_client):
     router = APIRouter()
     last_snapshot = None
@@ -49,6 +55,18 @@ def create_router(authenticated_client):
         client = authenticated_client(request)
         try:
             return client.apply_directory_change(body.expected_version, body.change)
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
+    @router.post('/observations')
+    def observations(body: ObservationOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            if body.action == 'register' and body.scope is None:
+                return client.register_observation_source(body.registration)
+            if body.action == 'refresh' and body.registration is None:
+                return client.refresh_manual_sessions(body.scope)
+            raise ManagementError('invalid_change', 'Select an explicit source registration or read-only scope refresh.')
         except ManagementError as exc:
             raise failure(exc) from exc
 

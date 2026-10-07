@@ -141,6 +141,8 @@ class Manager:
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
         data.setdefault('intake_failures', {})
+        from .observation import reconcile_connections
+        reconcile_connections(self, data)
         for record in data['requests'].values():
             session = record.get('session')
             if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
@@ -195,8 +197,9 @@ class Manager:
                         capability.update(enabled=False, status='blocked', reason=str(exc))
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
-                    'manual_sources': [s for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
-                    'manual_sessions': [s for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
+                    'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
+                    'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
+                    'manual_capabilities': [{'kind': kind, 'status': 'verified' if any(s['kind'] == kind and s['status'] == 'verified' and set(s['project_ids']) & {p['id'] for p in projects} for s in data.get('manual_sources', {}).values()) else 'unknown'} for kind in ('daemon', 'independent_cli', 'desktop')],
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
@@ -255,6 +258,13 @@ class Manager:
         from .observation import refresh_manual_sessions
         return refresh_manual_sessions(self, identity, scope)
 
+    def refresh_task_manual(self, identity, request_id):
+        with self._lock:
+            _, data = self._load()
+            from .execution import _responsible
+            record = _responsible(self, identity, request_id, data)
+            return self.refresh_manual_sessions(identity, record['project_id'])
+
     def refresh_task_source(self, identity, request_id):
         from .queue import refresh_task_source
         return refresh_task_source(self, identity, request_id)
@@ -267,7 +277,17 @@ class Manager:
         from .queue import prepare_task
         return prepare_task(self, identity, request_id, plan)
 
+    def _refresh_observations_for_task(self, identity, request_id):
+        with self._lock:
+            _, data = self._load()
+            from .execution import _responsible
+            record = _responsible(self, identity, request_id, data)
+            logical = record.get('session', {}).get('logical_repository') or record['queue']['logical_repository']
+            if any(logical in s.get('logical_repositories', {}).values() for s in data.get('manual_sources', {}).values()):
+                self.refresh_manual_sessions(identity)
+
     def start_task(self, identity, request_id):
+        self._refresh_observations_for_task(identity, request_id)
         from .execution import start_task
         return start_task(self, identity, request_id)
 
@@ -276,6 +296,8 @@ class Manager:
         return refresh_task(self, identity, request_id)
 
     def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
+        if action in {'append', 'continue'}:
+            self._refresh_observations_for_task(identity, request_id)
         from .control import control_task
         return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
 
