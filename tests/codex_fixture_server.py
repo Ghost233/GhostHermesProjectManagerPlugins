@@ -9,6 +9,7 @@ root = Path(sys.argv[1])
 thread_id = '00000000-0000-7000-8000-000000000016'
 turn_id = '00000000-0000-7000-8000-000000000017'
 thread = None
+turn_sequence = 17
 for line in sys.stdin:
     request = json.loads(line)
     with (root / 'wire.jsonl').open('a') as log:
@@ -24,7 +25,7 @@ for line in sys.stdin:
     elif method == 'permissionProfile/list':
         value = {'data': [{'id': 'fixture-boundary', 'description': 'Synthetic verified policy', 'allowed': True}], 'nextCursor': None}
     elif method == 'thread/loaded/list':
-        value = {'data': [], 'nextCursor': None}
+        value = json.loads((root / 'loaded.json').read_text()) if (root / 'loaded.json').exists() else {'data': [], 'nextCursor': None}
     elif method == 'thread/list':
         value = {'data': [], 'nextCursor': None, 'backwardsCursor': None}
     elif method == 'thread/start':
@@ -37,6 +38,10 @@ for line in sys.stdin:
         with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
             payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
         assert any(r.get('session', {}).get('thread_id') == thread_id for r in payload['requests'].values()), 'thread must be durable before turn/start'
+        if params.get('clientUserMessageId'):
+            assert any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in payload['requests'].values() for c in r.get('controls', []))
+            turn_sequence += 1
+            turn_id = '00000000-0000-7000-8000-' + str(turn_sequence).zfill(12)
         value = {'turn': {'id': turn_id, 'status': 'inProgress', 'items': [], 'itemsView': 'full'}}
         thread['status'] = {'type': 'active', 'activeFlags': []}
         thread['turns'] = [value['turn']]
@@ -48,10 +53,19 @@ for line in sys.stdin:
             print(json.dumps({'id': request['id'], 'error': {'code': -32000, 'message': 'Wrong active turn'}}), flush=True)
             continue
         value = {'turnId': turn_id}
+    elif method == 'turn/interrupt':
+        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
+            payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
+        assert any(r.get('stop', {}).get('status') == 'processing' for r in payload['requests'].values())
+        value = {}
+    elif method == 'thread/backgroundTerminals/list':
+        pages = json.loads((root / 'background.json').read_text()) if (root / 'background.json').exists() else {'': {'data': [], 'nextCursor': None}}
+        value = pages[params.get('cursor', '')]
     elif method == 'thread/read':
         state = json.loads((root / 'observed.json').read_text()) if (root / 'observed.json').exists() else {}
         thread.update(state)
-        value = {'thread': thread}
+        others = json.loads((root / 'threads.json').read_text()) if (root / 'threads.json').exists() else {}
+        value = {'thread': thread if params['threadId'] == thread_id else others.get(params['threadId'])}
     else:
         print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported fixture method'}}), flush=True)
         continue

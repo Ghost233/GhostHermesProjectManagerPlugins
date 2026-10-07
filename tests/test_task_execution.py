@@ -9,14 +9,17 @@ from test_directory import OWNER, make_repo, registration
 from test_requests import MESSAGE, ISSUE
 
 
-def adapter_for(root):
+def adapter_for(root, control_proof=None):
     def verifier(connection, repository):
-        return {'generation': connection['generation'], 'service_id': connection['service_id'],
+        proof = {'generation': connection['generation'], 'service_id': connection['service_id'],
                 'repository_fingerprint': repository_fingerprint(repository), 'permission_profile': 'fixture-boundary',
                 'runtime_roots': [repository['worktree']], 'policy_digest': 'fixture-policy',
+                'process_coverage': {'kind': 'no_unregistered_process_paths', 'evidence': 'synthetic-peer-only'},
                 'platform_enforcement': 'synthetic-peer-only', 'tool_paths': 'synthetic-peer-only',
-                'task_control': {'append': 'synthetic-peer-only', 'stop': 'synthetic-peer-only', 'continue': 'synthetic-peer-only', 'related_execution': 'synthetic-peer-only'},
+                'task_control': {'append': 'synthetic-peer-only', 'stop': 'synthetic-peer-only', 'continue': 'synthetic-peer-only', 'related_execution': 'synthetic-peer-only', 'idle_input': 'synthetic-peer-only'},
                 'task_start': 'synthetic-peer-only', 'manual_execution_coverage': 'synthetic-peer-only', 'model': 'fixture-model'}
+        proof.update(control_proof or {})
+        return proof
     return CodexStdioAdapter([sys.executable, str(Path(__file__).with_name('codex_fixture_server.py')), str(root)],
                             cwd=root, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(root / 'codex-home')},
                             service_ref='local:fixture-stdio', verifier=verifier, timeout=2)

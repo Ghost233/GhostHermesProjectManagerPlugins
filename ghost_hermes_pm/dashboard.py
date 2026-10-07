@@ -17,6 +17,9 @@ class TaskOperation(BaseModel):
     action: str
     request_id: str
     report: dict | None = None
+    instruction_id: str | None = None
+    text: str | None = None
+    expected_turn_id: str | None = None
 
 def create_router(authenticated_client):
     router = APIRouter()
@@ -52,6 +55,12 @@ def create_router(authenticated_client):
     def task(body: TaskOperation, request: Request):
         client = authenticated_client(request)
         try:
+            if body.action in {'append', 'stop', 'continue'}:
+                if body.report is not None:
+                    raise ManagementError('invalid_change', 'Control requests cannot assert delivery evidence.')
+                return client.control_task(body.request_id, body.action, body.instruction_id, body.text, body.expected_turn_id)
+            if any(v is not None for v in (body.instruction_id, body.text, body.expected_turn_id)):
+                raise ManagementError('invalid_change', 'Control fields require a control action.')
             if body.action == 'delivery':
                 return client.record_task_delivery(body.request_id, body.report)
             operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task'}.get(body.action)

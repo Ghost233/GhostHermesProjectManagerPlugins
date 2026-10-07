@@ -136,7 +136,7 @@ class Manager:
         for record in data['requests'].values():
             session = record.get('session')
             if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
-                record['execution'] = 'unverified'
+                record['execution'] = 'stopping' if record.get('stop', {}).get('status') == 'processing' else 'unverified'
                 record['unexecuted_reason'] = 'Original executor generation unavailable; reconciliation required.'
             for publication in record['outbox']:
                 for segment in publication['segments']:
