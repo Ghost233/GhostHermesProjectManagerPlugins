@@ -532,3 +532,53 @@ def test_unbound_unsupported_request_only_exposes_original_service_locator(tmp_p
         assert 'synthetic-sensitive-placeholder' not in json.dumps(snapshot)
         assert b'synthetic-sensitive-placeholder' not in (tmp_path / 'state' / 'manager.sqlite3').read_bytes()
         assert replies(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_registered_steward_entry_group_routes_owner_answer_to_original_project(tmp_path):
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import CONFIG, event, Gateway, Transport
+    import copy
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question())
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        version = manager.read_snapshot(OWNER)['version']
+        manager.apply_directory_change(OWNER, version, {'profile': {'id': 'steward', 'native_profile': 'steward', 'identity_ref': 'fixture:steward',
+            'role': 'steward', 'capability': 'non_development', 'project_id': None, 'parent_profile_id': None, 'connection_refs': {}}})
+        config = copy.deepcopy(CONFIG)
+        config['bindings'][0].update(chat_id='oc_entry', profile_id='steward', project_id=None, app_id='cli_steward', recipient_open_id='ou_steward')
+        class StewardTransport(Transport):
+            async def verify_identity(self, binding):
+                return {'app_id': 'cli_steward', 'open_id': 'ou_steward'}
+        transport, native = StewardTransport(), object()
+        intake = FeishuEntry(lambda: manager, OWNER.subject, config, lambda url: None)
+        intake.attach_transport(native, transport)
+        source = event('@_user_1 回答 ' + q['id'] + '：Blue', 'om_steward_answer')
+        source.raw_message.header.app_id = 'cli_steward'
+        source.raw_message.event.message.mentions[0].id.open_id = 'ou_steward'
+        source.source.chat_id = source.raw_message.event.message.chat_id = 'oc_entry'
+        prepared = intake.prepare(source, native)
+        assert prepared is not None and intake.in_scope(prepared, 'steward') is True
+        assert intake.in_scope(prepared, 'some-other-profile') is False
+        assert await intake.receive(source, Gateway(native)) == {'action': 'skip'}
+        manager.refresh_task(OWNER, task_id)
+        assert len(replies(tmp_path)) == 1
+        assert all(segment['chat_id'] == 'oc_entry' for segment in transport.sent)
+        assert manager.read_snapshot(OWNER)['requests'][0]['profile_id'] == 'mono-lead'
+        assert manager.read_snapshot(OWNER)['requests'][0]['human_requests'][0]['reply']['source_anchor']['chat_id'] == 'oc_entry'
+
+
+def test_structured_reply_requires_one_current_active_turn(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question())
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'active', 'activeFlags': ['waitingOnUserInput']},
+            'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': []},
+                      {'id': 'unregistered-active-turn', 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}))
+        with pytest.raises(ManagementError):
+            manager.answer_human_request(OWNER, task_id, q['id'], 'ambiguous-active', {'answers': {'colour': ['Blue']}})
+        assert replies(tmp_path) == []

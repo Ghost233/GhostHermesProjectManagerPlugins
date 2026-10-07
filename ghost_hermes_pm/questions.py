@@ -233,6 +233,8 @@ def answer_human_request(manager, identity, request_id, human_request_id, reply_
         sync_human_requests(manager, record, adapter, thread)
         if question['resolution'] != 'pending' or question['turn_id'] != session['turn_id'] or not any(t.get('id') == question['turn_id'] and (t.get('status') == 'inProgress' or question['method'] == 'natural_language' and t.get('status') in {'completed', 'failed', 'interrupted'}) for t in thread.get('turns', [])):
             raise ManagementError('binding_conflict', 'The original request is expired or belongs to another turn.')
+        if question['method'] != 'natural_language' and (thread.get('status', {}).get('type') != 'active' or [t.get('id') for t in thread.get('turns', []) if t.get('status') == 'inProgress'] != [question['turn_id']]):
+            raise ManagementError('binding_conflict', 'The original request does not have one verified current active turn.')
         if not question['answerable']:
             raise ManagementError('forbidden', 'Use the original private interface for this request; no answer is recorded here.')
         result = _response(manager, question, response, session)
@@ -312,13 +314,17 @@ def associate_human_reply(manager, identity, project_id, profile_id, message, te
             raise ManagementError('forbidden', 'Only the verified owner entry can answer a human request.')
         required = _message_anchor(message)
         _public_text(text, manager._sensitive_values())
+        entry_profile = data['profiles'].get(profile_id)
+        steward = entry_profile and entry_profile['role'] == 'steward' and entry_profile['project_id'] is None and project_id is None
+        if not entry_profile or not (steward or entry_profile['project_id'] == project_id and entry_profile['capability'] == 'development'):
+            raise ManagementError('forbidden', 'Human reply entry is outside its registered routing scope.')
         target_id = decision.group(2) if decision else match.group(1)
         candidates = []
         for record in data['requests'].values():
-            if record['project_id'] != project_id or record['profile_id'] != profile_id:
+            if not steward and (record['project_id'] != project_id or record['profile_id'] != profile_id):
                 continue
             same_namespace = all(record['source_anchor'].get(k) == message.get(k) for k in _MESSAGE_NAMESPACE)
-            if not same_namespace and not target_id:
+            if not same_namespace and not target_id and not steward:
                 continue
             for q in record.get('human_requests', []):
                 if target_id and q['id'] != target_id:
