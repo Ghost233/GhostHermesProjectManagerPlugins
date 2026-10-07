@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -68,7 +68,9 @@ class ManagementServer:
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
                         elif payload.get('operation') == 'apply_directory_change':
                             result = bridge.manager.apply_directory_change(identity, payload.get('expected_version'), payload.get('change'))
-                        elif payload.get('operation') in {'start_task', 'refresh_task', 'verify_task_execution'}:
+                        elif payload.get('operation') == 'prepare_task':
+                            result = bridge.manager.prepare_task(identity, payload.get('request_id'), payload.get('plan'))
+                        elif payload.get('operation') in {'start_task', 'refresh_task', 'verify_task_execution', 'refresh_task_source'}:
                             result = getattr(bridge.manager, payload['operation'])(identity, payload.get('request_id'))
                         elif payload.get('operation') == 'control_task':
                             result = bridge.manager.control_task(identity, payload.get('request_id'), payload.get('action'),
@@ -136,7 +138,7 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'prepare_task', 'refresh_task_source'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
@@ -157,6 +159,12 @@ class ManagementClient:
 
     def apply_directory_change(self, expected_version, change):
         return self._call('apply_directory_change', expected_version=expected_version, change=change)
+
+    def refresh_task_source(self, request_id):
+        return self._call('refresh_task_source', request_id=request_id)
+
+    def prepare_task(self, request_id, plan):
+        return self._call('prepare_task', request_id=request_id, plan=plan)
 
     def start_task(self, request_id):
         return self._call('start_task', request_id=request_id)
