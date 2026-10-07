@@ -98,7 +98,7 @@ def _report(manager, identity, request_id, recovery):
             version, data = manager._load()
             data['requests'][request_id]['recovery_report_key'] = recovery['report_key']
             manager._save(version, data)
-    return manager.read_snapshot(identity)['requests'][next(i for i, r in enumerate(manager.read_snapshot(identity)['requests']) if r['id'] == request_id)]
+    return next(r for r in manager.read_snapshot(identity)['requests'] if r['id'] == request_id)
 
 
 def reconcile_task(manager, identity, request_id):
@@ -110,17 +110,18 @@ def reconcile_task(manager, identity, request_id):
         session = record.get('session')
         recovery = {'status': 'blocked', 'checked_at': _now(), 'last_confirmed_execution': record.get('last_confirmed_execution', record.get('execution')),
             'last_confirmed_at': record.get('last_execution_verified_at'), 'needs_human': []}
+        _assignment(record, data)
+        if session:
+            repository = session['repository']
+            actual = _repository({'repo_path': repository['worktree'], 'test_artifact_paths': repository['test_artifact_paths']})
+            if repository_fingerprint(actual) != session['capability']['repository_fingerprint']:
+                raise ManagementError('binding_conflict', 'The original repository boundary changed; no recovery write or dispatch is permitted.')
         try:
-            _assignment(record, data)
             if not session or not session.get('thread_id') or not session.get('turn_id'):
                 raise ManagementError('outcome_unknown', 'Original startup identity is incomplete; inspect the original interface without replaying start.')
             if record.get('repository_released'):
                 recovery['status'] = 'explicit_stop_preserved' if record.get('outer_task_status') == 'stopped' else 'completed_work_preserved'
             else:
-                repository = session['repository']
-                actual = _repository({'repo_path': repository['worktree'], 'test_artifact_paths': repository['test_artifact_paths']})
-                if repository_fingerprint(actual) != session['capability']['repository_fingerprint']:
-                    raise ManagementError('binding_conflict', 'The original repository boundary changed; no recovery write or dispatch is permitted.')
                 adapter = executor_for(manager, record)
                 if adapter is None or adapter._closed or adapter.generation != session['generation']:
                     adapter = manager.recovery_adapters.get(session['service_ref'])
@@ -146,9 +147,50 @@ def reconcile_task(manager, identity, request_id):
                 task = manager.refresh_task(identity, request_id)
                 recovery.update(status='explicit_stop_preserved' if task.get('outer_task_status') == 'stopped' else 'monitoring_restored' if task['execution'] in {'running', 'waiting_approval', 'waiting_input', 'related_execution'} else 'awaiting_reconciliation',
                     last_confirmed_execution=task.get('execution'), last_confirmed_at=task.get('last_execution_verified_at'))
+                if task['execution'] == 'turn_ended':
+                    recovery['status'], reason = _continue_if_safe(manager, identity, request_id)
+                    if reason:
+                        recovery['needs_human'].append(reason)
+                if any(q.get('resolution') in {'unverified', 'outcome_unknown'} for q in task.get('human_requests', [])):
+                    recovery['needs_human'].append('Resolve unverified historical human requests in the original interface; old answers and approvals are not reused.')
                 if task['execution'] in {'stopping', 'unverified'}:
                     recovery['needs_human'].append(task.get('unexecuted_reason') or 'Original execution remains unverified; repository occupancy is retained.')
         except ManagementError as exc:
+            if exc.code == 'binding_conflict':
+                raise
             recovery.update(status='blocked', code=exc.code, needs_human=[str(exc)])
         recovery['report_key'] = json.dumps([recovery['status'], recovery['last_confirmed_execution'], recovery['needs_human']], sort_keys=True)
         return _report(manager, identity, request_id, recovery)
+
+
+def _continue_if_safe(manager, identity, request_id):
+    from .control import terminal_evidence, _binding, _thread
+    version, data = manager._load()
+    record = data['requests'][request_id]
+    session = record['session']
+    explicit_stop = record.get('stop', {}).get('turn_id') == session['turn_id']
+    profile = data['profiles'][record['profile_id']]
+    project = data['projects'][record['project_id']]
+    inactive = {'archiving', 'archived', 'disabled', 'deactivating', 'maintenance', 'restoring'}
+    if explicit_stop or profile.get('lifecycle') in inactive or project.get('lifecycle') in inactive or profile.get('archive_intent') or project.get('archive_intent') or data.get('maintenance_mode'):
+        return 'explicit_intent_preserved', 'Explicit stop, archive or maintenance intent requires a new human arrangement.'
+    if session.get('control') != 'assigned_task' or record.get('task_delivery') == 'delivered':
+        return 'observe_only_preserved', 'Use the original interface; recovered observation does not renew returned or expired control.'
+    if any(c.get('phase') in {'rpc_intent', 'outcome_unknown'} for c in record.get('controls', [])) or session.get('start_phase') not in {None, 'turn_registered'} or any(q.get('reply', {}).get('sent') in {'intent', 'outcome_unknown'} for q in record.get('human_requests', []) if q.get('reply')):
+        return 'outcome_unknown_preserved', 'An original start, append or answer outcome is unknown; inspect the original interface without replay.'
+    _, session, adapter = _binding(manager, identity, request_id, data, 'related_execution')
+    thread = _thread(adapter, session, require_input=False)
+    turn = next((t for t in thread['turns'] if t.get('id') == session['turn_id']), None)
+    incomplete = adapter.verify_control(session['repository'], 'related_execution', session['capability']).get('work_incomplete', {})
+    if not turn or turn.get('status') not in {'interrupted', 'failed'} or incomplete.get('thread_id') != session['thread_id'] or incomplete.get('turn_id') != session['turn_id'] or incomplete.get('status') != 'verified_incomplete' or not isinstance(incomplete.get('evidence'), str) or not incomplete['evidence']:
+        return 'awaiting_reconciliation', 'Task stop and unfinished accepted work need fresh evidence; a historical turn end is insufficient.'
+    related, evidence = terminal_evidence(adapter, session, thread, session['turn_id'])
+    if related:
+        return 'awaiting_reconciliation', 'Related execution remains active or unverified; repository occupancy is retained.'
+    record['recovery_terminal_evidence'] = evidence
+    with manager._db:
+        manager._save(version, data)
+    instruction_id = 'recovery:' + hashlib.sha256(json.dumps([session['service_id'], session['thread_id'], session['turn_id']]).encode()).hexdigest()
+    manager.control_task(identity, request_id, 'append', instruction_id,
+        'Continue only the unfinished original accepted task after verified execution stop.\n' + record['accepted_scope']['title'] + '\n' + record['accepted_scope']['body'], session['turn_id'])
+    return 'continued_original_task', None

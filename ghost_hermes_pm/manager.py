@@ -179,6 +179,7 @@ class Manager:
                     question['control_enabled'] = False
                 if question.get('resolution') == 'pending' and (executor is None or executor.generation != question['generation'] or executor._closed):
                     question['resolution'] = 'unverified'
+                    question['control_enabled'] = False
                     if question.get('reply', {}) and question['reply'].get('sent') == 'intent':
                         question['reply']['sent'] = 'outcome_unknown'
             if session and not record.get('repository_released') and (executor is None or executor.generation != session['generation'] or executor._closed):

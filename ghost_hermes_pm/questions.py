@@ -103,7 +103,7 @@ def sync_human_requests(manager, record, adapter, thread=None):
                 question['resolution'] = 'expired'
         try:
             adapter.verify_control(session['repository'], 'human_response', session['capability'])
-            question['control_enabled'] = session.get('control') == 'assigned_task' and not record.get('repository_released') and record.get('task_delivery') != 'delivered' and record.get('execution') not in {'stopping', 'stopped'}
+            question['control_enabled'] = question['resolution'] == 'pending' and session.get('control') == 'assigned_task' and not record.get('repository_released') and record.get('task_delivery') != 'delivered' and record.get('execution') not in {'stopping', 'stopped'}
         except ManagementError:
             question['control_enabled'] = False
 
@@ -157,6 +157,8 @@ def _permission_boundary(session, granted):
 
 def _natural_question(manager, record, thread):
     session = record['session']
+    if session.get('recovery_ref'):
+        return  # Recovered history does not establish a newly pending input request.
     turn = next((t for t in thread.get('turns', []) if t.get('id') == session['turn_id']), None)
     if not turn or turn.get('itemsView') != 'full':
         return

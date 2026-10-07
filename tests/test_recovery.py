@@ -16,7 +16,7 @@ def recovery_adapter(root, service_id, **changes):
     peer = root / 'original'
     peer.mkdir(exist_ok=True)
     def verifier(binding, repository, context):
-        return {**binding, 'recovery_binding': context,
+        return {**binding, 'service_id': service_id, 'recovery_binding': context,
             'repository_fingerprint': repository_fingerprint(repository), 'runtime_roots': [repository['worktree']],
             'permission_profile': 'fixture-boundary', 'policy_digest': 'fixture-policy',
             'platform_enforcement': 'synthetic-original-only', 'tool_paths': 'synthetic-original-only',
@@ -74,3 +74,68 @@ def test_restart_recovers_original_running_monitor_and_stop_intent_without_doubl
     assert not {'thread/start', 'thread/resume', 'thread/fork', 'turn/start', 'turn/steer'} & set(methods(tmp_path))
     assert methods(tmp_path).count('turn/interrupt') == 1
     assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+
+
+def test_restart_only_continues_verified_incomplete_stopped_original_work_once(tmp_path):
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        service_id = manager.start_task(OWNER, request_id)['session']['service_id']
+    original_state(tmp_path, repo, status='interrupted')
+    proof = {'work_incomplete': {'thread_id': THREAD, 'turn_id': TURN, 'status': 'verified_incomplete', 'evidence': 'controlled-interrupted-unfinished-work'}}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                 recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id, **proof)}) as manager:
+        with ManagementServer(manager, {'recovery-owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'recovery-owner')
+            resumed = client.reconcile_task(request_id)
+            assert resumed['recovery']['status'] == 'continued_original_task'
+            assert resumed['execution'] == 'running'
+            assert resumed['session']['thread_id'] == THREAD
+            assert resumed['session']['turn_id'] == 'continued-original-turn'
+            assert resumed['repository_released'] is False
+            client.reconcile_task(request_id)
+    assert methods(tmp_path).count('turn/start') == 1
+    state = json.loads((tmp_path / 'original' / 'original-state.json').read_text())
+    assert state['thread']['turns'][0]['id'] == TURN
+    assert not {'thread/start', 'thread/resume', 'thread/fork', 'turn/steer'} & set(methods(tmp_path))
+
+
+def test_reconnect_old_human_request_points_to_original_interface_and_never_reuses_approval(tmp_path):
+    import pytest
+    from test_questions import question_adapter, emit, user_question, replies
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        service_id = manager.start_task(OWNER, request_id)['session']['service_id']
+        emit(tmp_path, user_question())
+        old = manager.refresh_task(OWNER, request_id)['human_requests'][0]
+        assert old['control_enabled'] is True
+    original_state(tmp_path, repo)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                 recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id)}) as manager:
+        with ManagementServer(manager, {'recovery-owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'recovery-owner')
+            task = client.reconcile_task(request_id)
+            question = task['human_requests'][0]
+            assert question['resolution'] == 'unverified'
+            assert question['control_enabled'] is False
+            assert question['original_interface']['availability'] == 'original_client_required'
+            assert any('original interface' in reason for reason in task['recovery']['needs_human'])
+            with pytest.raises(ManagementError):
+                client.answer_human_request(request_id, old['id'], 'old-answer', {'answers': {'colour': ['Blue']}})
+    assert replies(tmp_path) == []
+    assert json.loads((tmp_path / 'original' / 'original-state.json').read_text()).get('responses', []) == []
+
+
+def test_corrupt_durable_directory_blocks_restart_without_starting_any_service(tmp_path):
+    import pytest
+    state = tmp_path / 'state'
+    state.mkdir()
+    database = state / 'manager.sqlite3'
+    database.write_bytes(b'broken original directory; preserve for recovery')
+    before = database.read_bytes()
+    with pytest.raises(ManagementError) as failure:
+        Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path))
+    assert failure.value.code == 'unavailable'
+    assert database.read_bytes() == before
+    assert not (tmp_path / 'wire.jsonl').exists()
