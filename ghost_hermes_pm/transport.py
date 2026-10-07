@@ -46,8 +46,9 @@ class ManagementServer:
         self._lease = open(self.manager.state_dir / 'manager.lock', 'a')
         try:
             fcntl.flock(self._lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if self.path.exists():
-                raise ManagementError('unavailable', 'An existing manager socket requires reconciliation; it was preserved.')
+            if self.path.exists() or self.path.is_symlink():
+                from .recovery import reclaim_manager_socket
+                reclaim_manager_socket(self.path)
             bridge = self
 
             class Handler(socketserver.StreamRequestHandler):
@@ -80,7 +81,7 @@ class ManagementServer:
                             result = bridge.manager.apply_directory_change(identity, payload.get('expected_version'), payload.get('change'))
                         elif payload.get('operation') == 'prepare_task':
                             result = bridge.manager.prepare_task(identity, payload.get('request_id'), payload.get('plan'))
-                        elif payload.get('operation') in {'start_task', 'refresh_task', 'verify_task_execution', 'refresh_task_source'}:
+                        elif payload.get('operation') in {'start_task', 'refresh_task', 'reconcile_task', 'verify_task_execution', 'refresh_task_source'}:
                             result = getattr(bridge.manager, payload['operation'])(identity, payload.get('request_id'))
                         elif payload.get('operation') == 'control_task':
                             result = bridge.manager.control_task(identity, payload.get('request_id'), payload.get('action'),
@@ -125,7 +126,13 @@ class ManagementServer:
 
             self._server = Server(str(self.path), Handler)
             os.chmod(self.path, 0o600)
-            self._inode = self.path.stat().st_ino
+            actual = self.path.stat()
+            self._inode = actual.st_ino
+            receipt_path = self.path.with_name('manager-runtime.json')
+            if receipt_path.is_symlink():
+                raise ManagementError('unavailable', 'Manager runtime receipt is an unknown alias; it was preserved.')
+            receipt_path.write_text(json.dumps({'pid': os.getpid(), 'inode': actual.st_ino, 'device': actual.st_dev, 'uid': actual.st_uid}))
+            os.chmod(receipt_path, 0o600)
             self._thread = threading.Thread(target=self._server.serve_forever,
                                             kwargs={'poll_interval': 0.05}, name='hermes-pm-directory', daemon=True)
             self._thread.start()
@@ -164,7 +171,7 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'reconcile_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
@@ -172,7 +179,7 @@ class ManagementClient:
         except (OSError, ValueError) as exc:
             if operation in {'query_archive', 'protect_archive', 'backup_archive', 'restore_archive'}:
                 raise ManagementError('outcome_unknown', 'The archive operation response was not confirmed; inspect the same durable query/protection/backup/restore ID before retrying. Original entries remain inactive.') from exc
-            if operation in {'start_task', 'control_task', 'answer_human_request'}:
+            if operation in {'start_task', 'control_task', 'answer_human_request', 'reconcile_task'}:
                 raise ManagementError('outcome_unknown', 'Task start response was not confirmed; read the same durable request before retrying. Repository occupancy is retained.') from exc
             raise ManagementError('unavailable', 'The management instance is unavailable; no operation was confirmed.') from exc
         if 'error' in response:
@@ -218,6 +225,9 @@ class ManagementClient:
 
     def answer_human_request(self, request_id, human_request_id, reply_id, response):
         return self._call('answer_human_request', request_id=request_id, human_request_id=human_request_id, reply_id=reply_id, response=response)
+
+    def reconcile_task(self, request_id):
+        return self._call('reconcile_task', request_id=request_id)
 
     def refresh_task(self, request_id):
         return self._call('refresh_task', request_id=request_id)

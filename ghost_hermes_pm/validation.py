@@ -20,7 +20,7 @@ TOOLS = {'model_files', 'shell_git', 'test_process', 'code_mode', 'local_mcp', '
 
 
 def validate_receipts(report, connection, repository, command, env, state_dir, *, startup_kind='task_start'):
-    if startup_kind not in {'task_start', 'manual_takeover'}:
+    if startup_kind not in {'task_start', 'manual_takeover', 'recovery'}:
         raise ManagementError('capability_unverified', 'Unknown execution evidence kind.')
     kinds = tuple(startup_kind if k == 'task_start' else k for k in KINDS)
     receipts = report.get('receipts') if isinstance(report, dict) else None
@@ -72,6 +72,13 @@ def validate_receipts(report, connection, repository, command, env, state_dir, *
             binding = {k: v for k, v in context.items() if k != 'current_turn_id'}
             if receipt.get('actual_methods') != ['initialize', 'initialized', 'thread/loaded/list', 'thread/read'] or receipt.get('grant_binding') != binding or receipt.get('thread_id') != context.get('thread_id') or receipt.get('turn_id') != context.get('original_turn_id') or receipt.get('runtime_roots') != report.get('runtime_roots') or receipt.get('permission_profile') != report.get('permission_profile') or receipt.get('control_access') != 'verified-original-input-path' or not isinstance(receipt.get('checks'), dict) or set(receipt['checks']) != checks or any(v != 'PASS' for v in receipt['checks'].values()):
                 raise ManagementError('capability_unverified', 'Actual original current-work takeover, return, scope and no-replay evidence is incomplete.')
+        elif kind == 'recovery':
+            context = report.get('recovery_binding', {})
+            checks = {'durable_intent_first', 'original_executor', 'same_thread', 'occupancy_preserved', 'running_observation_only',
+                'incomplete_only', 'explicit_stop', 'archive_intent', 'unknown_start', 'unknown_append', 'unknown_answer',
+                'live_rpc_only', 'manual_return', 'disconnect', 'persistent_restart', 'no_duplicate_execution', 'no_duplicate_reply'}
+            if receipt.get('actual_methods') != ['initialize', 'initialized', 'thread/loaded/list', 'thread/read'] or receipt.get('recovery_binding') != context or receipt.get('thread_id') != context.get('thread_id') or receipt.get('turn_id') != context.get('turn_id') or receipt.get('original_executor_id') != connection['service_id'] or receipt.get('endpoint_ref') != report.get('endpoint_ref') or receipt.get('runtime_roots') != report.get('runtime_roots') or receipt.get('permission_profile') != report.get('permission_profile') or receipt.get('control_access') != 'verified-original-input-path' or not isinstance(receipt.get('checks'), dict) or set(receipt['checks']) != checks or any(v != 'PASS' for v in receipt['checks'].values()):
+                raise ManagementError('capability_unverified', 'Original-service restart, stop intent, no-replay, manual return and occupancy evidence is incomplete.')
         elif kind == 'task_control':
             methods, checks = receipt.get('actual_methods'), receipt.get('checks')
             if not isinstance(methods, list) or any(not isinstance(m, str) for m in methods) or set(methods) != CONTROL_METHODS or not isinstance(checks, dict) or set(checks) != CONTROL_CHECKS or any(v != 'PASS' for v in checks.values()) or not receipt.get('thread_id') or not receipt.get('turn_id') or not receipt.get('new_turn_id') or receipt['turn_id'] == receipt['new_turn_id']:

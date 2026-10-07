@@ -92,11 +92,13 @@ def register_native(ctx):
             observation_adapters = configured_observation_adapters(ctx.get_config('codex_observation', []), state_dir)
             from .takeover import configured_control_adapters
             control_adapters = configured_control_adapters(ctx.get_config('codex_manual_control', []), state_dir)
+            from .recovery import configured_recovery_adapters
+            recovery_adapters = configured_recovery_adapters(ctx.get_config('codex_recovery', []), state_dir)
             codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
                               codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters, control_adapters=control_adapters,
                               knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {})),
-                              archive_providers=configured_archives(ctx.get_config('archive_providers', {})))
+                              archive_providers=configured_archives(ctx.get_config('archive_providers', {})), recovery_adapters=recovery_adapters)
             for registration in ctx.get_config('manual_sources', []):
                 manager.register_observation_source(VerifiedIdentity(owner, 'trusted-native-source-registration'), registration)
             server = ManagementServer(manager, credentials)
@@ -117,7 +119,7 @@ def register_native(ctx):
 
             ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
 
-            if codex_adapter is not None or observation_adapters or manager.knowledge_providers or control_adapters or manager.archive_providers or intake.collaboration_entry:
+            if codex_adapter is not None or recovery_adapters or observation_adapters or manager.knowledge_providers or control_adapters or manager.archive_providers or intake.collaboration_entry:
                 async def supervise_single_issue():
                     import asyncio
                     identity = VerifiedIdentity(owner, 'verified-manager-supervision')
@@ -128,6 +130,12 @@ def register_native(ctx):
                             with intake.lifecycle_lock:
                                 intake.require_active(generation)
                                 manager.refresh_manual_sessions(identity)
+                                for saved in manager.read_snapshot(identity)['requests']:
+                                    if saved.get('session') and not saved.get('repository_released'):
+                                        try:
+                                            manager.reconcile_task(identity, saved['id'])
+                                        except ManagementError:
+                                            continue
                                 manager.dispatch_tasks()
                         await asyncio.to_thread(poll_if_active)
                         tasks = manager.read_snapshot(identity)['requests']
@@ -293,7 +301,7 @@ def register_native(ctx):
             elif action == 'delivery':
                 result = client.record_task_delivery(args.get('request_id'), args.get('report'))
             else:
-                operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task', 'source': 'refresh_task_source'}.get(action)
+                operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task', 'reconcile': 'reconcile_task', 'source': 'refresh_task_source'}.get(action)
                 if operation is None or args.get('report') is not None:
                     raise ManagementError('invalid_change', 'Unsupported task operation.')
                 result = getattr(client, operation)(args.get('request_id'))
@@ -303,7 +311,7 @@ def register_native(ctx):
 
     ctx.register_tool(name='hermes_pm_task', toolset='hermes_pm',
                       schema={'name': 'hermes_pm_task', 'description': 'Verify, start, observe or record evidence for one accepted Issue.',
-                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery', 'append', 'stop', 'continue', 'answer', 'prepare', 'source', 'takeover', 'return']},
+                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'reconcile', 'delivery', 'append', 'stop', 'continue', 'answer', 'prepare', 'source', 'takeover', 'return']},
                                   'request_id': {'type': 'string'}, 'report': {'type': 'object'}, 'plan': {'type': 'object'},
                                   'instruction_id': {'type': 'string'}, 'text': {'type': 'string'}, 'expected_turn_id': {'type': 'string'}, 'human_request_id': {'type': 'string'}, 'reply_id': {'type': 'string'}, 'response': {'type': 'object'}, 'manual_session_id': {'type': 'string'}, 'grant_id': {'type': 'string'}},
                                   'required': ['action', 'request_id'], 'additionalProperties': False}},

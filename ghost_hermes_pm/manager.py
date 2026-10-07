@@ -98,7 +98,7 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
@@ -106,11 +106,14 @@ class Manager:
         self.archive_providers = dict(archive_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
         self.control_adapters = dict(control_adapters or {})
+        self.recovery_adapters = dict(recovery_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._inflight = set()
+        from .recovery import verify_directory
+        verify_directory(self.state_dir / 'manager.sqlite3')
         self._db = sqlite3.connect(self.state_dir / 'manager.sqlite3', check_same_thread=False)
         self._db.execute('CREATE TABLE IF NOT EXISTS directory (id INTEGER PRIMARY KEY CHECK(id=1), schema_version INTEGER NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL)')
         self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 1, 0, ?)',
@@ -126,7 +129,7 @@ class Manager:
         with self._lock:
             if self.codex_adapter is not None:
                 self.codex_adapter.close()
-            for adapter in (*self.observation_adapters.values(), *self.control_adapters.values()):
+            for adapter in (*self.observation_adapters.values(), *self.control_adapters.values(), *self.recovery_adapters.values()):
                 adapter.close()
             from .archive_sources import CodexArchiveProvider
             for provider in self.archive_providers.values():
@@ -178,9 +181,12 @@ class Manager:
                     question['control_enabled'] = False
                 if question.get('resolution') == 'pending' and (executor is None or executor.generation != question['generation'] or executor._closed):
                     question['resolution'] = 'unverified'
+                    question['control_enabled'] = False
                     if question.get('reply', {}) and question['reply'].get('sent') == 'intent':
                         question['reply']['sent'] = 'outcome_unknown'
             if session and not record.get('repository_released') and (executor is None or executor.generation != session['generation'] or executor._closed):
+                if record['execution'] not in {'unverified', 'stopping'}:
+                    record['last_confirmed_execution'] = record['execution']
                 record['execution'] = 'stopping' if record.get('stop', {}).get('status') == 'processing' else 'unverified'
                 record['unexecuted_reason'] = 'Original executor generation unavailable; reconciliation required.'
             for publication in record['outbox']:
@@ -370,6 +376,10 @@ class Manager:
         self._refresh_observations_for_task(identity, request_id)
         from .execution import start_task
         return start_task(self, identity, request_id)
+
+    def reconcile_task(self, identity, request_id):
+        from .recovery import reconcile_task
+        return reconcile_task(self, identity, request_id)
 
     def refresh_task(self, identity, request_id):
         from .execution import refresh_task

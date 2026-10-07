@@ -25,7 +25,9 @@ def _current_assignment(manager, record, data):
         _assignment(record, data)
         return
     service_ref = profile.get('connection_refs', {}).get('codex')
-    if service_ref != manager.codex_adapter.service_ref or (record.get('accepted_codex_ref') is not None and record['accepted_codex_ref'] != service_ref):
+    from .takeover import executor_for
+    adapter = executor_for(manager, record)
+    if adapter is None or service_ref != adapter.service_ref or (record.get('accepted_codex_ref') is not None and record['accepted_codex_ref'] != service_ref):
         raise ManagementError('capability_unverified', 'The actual executor does not match the responsible Profile local Codex binding.')
     if record.get('accepted_repository_fingerprint') != repository_fingerprint(data['projects'][record['project_id']]['repo']):
         raise ManagementError('capability_unverified', 'The repository boundary differs from the accepted task scope.')
@@ -150,8 +152,8 @@ def refresh_task(manager, identity, request_id):
                 if thread.get('id') != session['thread_id'] or thread.get('cwd') != repository['worktree']:
                     raise ManagementError('capability_unverified', 'The observation does not identify the original task and boundary.')
                 from .questions import sync_human_requests
-                sync_human_requests(manager, record, adapter, thread)
                 events = adapter.take_events(session['thread_id'])
+                sync_human_requests(manager, record, adapter, thread, live_events=events)
                 record.setdefault('service_events', []).extend({'method': e['method'], 'turn_id': e.get('params', {}).get('turnId'),
                                                               'request_id': e.get('id'), 'generation': adapter.generation}
                                                              for e in events[-100:])
