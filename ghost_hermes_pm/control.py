@@ -77,6 +77,9 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
         elif record.get('stop', {}).get('status') == 'processing' or record.get('outer_task_status') == 'stopped':
             raise ManagementError('binding_conflict', 'Stopped work requires an explicit new execution arrangement.')
         record, session, adapter = _binding(manager, identity, request_id, data, action)
+        if action == 'append':
+            from .observation import guard_repository
+            guard_repository(manager, identity, record, version, data)
         if action == 'continue':
             _current_assignment(manager, record, data)
             if expected_turn_id != session['turn_id']:

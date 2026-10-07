@@ -26,6 +26,9 @@ def refresh(data):
         blockers = [r['id'] for r in records if r['id'] != record['id'] and (not r.get('repository_released') or r['queue'].get('pending_continuation')) and
                     r['queue']['logical_repository'] == queue['logical_repository'] and
                     ((r.get('session') and not r.get('repository_released')) or r['queue']['sequence'] < queue['sequence'])]
+        if queue.get('manual_blockers') or queue.get('observation_blockers'):
+            queue.update(status='manual_waiting', blocked_by=blockers, reason=record.get('unexecuted_reason'))
+            continue
         if not blockers and queue.get('external_occupancy'):
             queue.update(status='external_unknown', blocked_by=[], reason=queue['external_occupancy']['reason'])
             continue
@@ -41,6 +44,8 @@ def require_turn(manager, identity, record, version, data):
     queue = record.get('queue')
     if queue:
         queue['requested_by'] = identity.subject
+    from .observation import guard_repository
+    guard_repository(manager, identity, record, version, data)
     if queue and queue['blocked_by']:
         record.update(unexecuted_reason=queue['reason'])
         if not queue.get('pending_continuation'):
