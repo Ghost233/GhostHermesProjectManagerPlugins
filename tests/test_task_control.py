@@ -175,6 +175,8 @@ async def feishu_controls(root):
         intake.attach_transport(surface, transport)
         await intake.receive(event(), Gateway(surface))
         task = manager.read_snapshot(OWNER)['requests'][0]
+        from test_task_execution import prepare_fixture
+        prepare_fixture(manager, task['id'], root / 'repo')
         manager.start_task(OWNER, task['id'])
         for text, message_id in [('追加：Add the requested check.', 'om_append'), ('停止', 'om_stop')]:
             incoming = event(text, message_id)
@@ -424,13 +426,15 @@ def test_continue_obeys_current_repository_occupancy_and_never_auto_restarts(tmp
             manager.publish_request_message(OWNER, second, 'confirmation', '已受理后续任务')
             segment = manager.claim_delivery(OWNER, second)
             manager.record_delivery(OWNER, second, segment['uuid'], {'status': 'delivered', 'chat_id': 'oc_project', 'message_id': 'om_next_ack'})
+            from test_task_execution import prepare_fixture
+            prepare_fixture(manager, second, tmp_path / 'repo')
             client.start_task(second)
             with pytest.raises(ManagementError) as busy:
                 client.control_task(request_id, 'continue', 'continue-busy', text='Continue the original work.', expected_turn_id=TURN)
             assert busy.value.code == 'repository_busy'
             original = next(r for r in client.read_snapshot()['requests'] if r['id'] == request_id)
             assert original['stop_records'][0]['status'] == 'confirmed'
-            assert original.get('execution_arrangements', []) == []
+            assert original['execution_arrangements'][-1]['phase'] == 'queued'
 
 
 def test_idle_status_does_not_hide_an_unfinished_other_turn_in_original_thread(tmp_path):

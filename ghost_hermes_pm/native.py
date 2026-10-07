@@ -100,6 +100,7 @@ def register_native(ctx):
                     identity = VerifiedIdentity(owner, 'verified-manager-supervision')
                     generation = intake.generation
                     while resources is not None and not intake.closed:
+                        await asyncio.to_thread(manager.dispatch_tasks)
                         tasks = manager.read_snapshot(identity)['requests']
                         for record in tasks:
                             session = record.get('session')
@@ -165,7 +166,7 @@ def register_native(ctx):
                       handler=snapshot, description='Project directory and verified capability status')
     def task_operation(args):
         try:
-            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report', 'instruction_id', 'text', 'expected_turn_id'}:
+            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report', 'instruction_id', 'text', 'expected_turn_id', 'plan'}:
                 raise ManagementError('invalid_change', 'Task input cannot assert actor, permission or capability.')
             reference = ctx.get_config('participant_credential_ref')
             token = _credential(reference) if reference else None
@@ -174,7 +175,13 @@ def register_native(ctx):
             client = ManagementClient(state_dir, token)
             client.read_participant_snapshot()  # Reject owner aliases at the authoritative bridge.
             action = args.get('action')
-            if action in {'append', 'stop', 'continue'}:
+            if action == 'prepare':
+                if args.get('report') is not None or any(args.get(k) is not None for k in ('instruction_id', 'text', 'expected_turn_id')):
+                    raise ManagementError('invalid_change', 'Preparation accepts only the explicit baseline plan.')
+                result = client.prepare_task(args.get('request_id'), args.get('plan'))
+            elif args.get('plan') is not None:
+                raise ManagementError('invalid_change', 'Baseline plan requires preparation.')
+            elif action in {'append', 'stop', 'continue'}:
                 if args.get('report') is not None:
                     raise ManagementError('invalid_change', 'Control cannot assert delivery evidence.')
                 result = client.control_task(args.get('request_id'), action, args.get('instruction_id'), args.get('text'), args.get('expected_turn_id'))
@@ -183,7 +190,7 @@ def register_native(ctx):
             elif action == 'delivery':
                 result = client.record_task_delivery(args.get('request_id'), args.get('report'))
             else:
-                operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task'}.get(action)
+                operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task', 'source': 'refresh_task_source'}.get(action)
                 if operation is None or args.get('report') is not None:
                     raise ManagementError('invalid_change', 'Unsupported task operation.')
                 result = getattr(client, operation)(args.get('request_id'))
@@ -193,8 +200,8 @@ def register_native(ctx):
 
     ctx.register_tool(name='hermes_pm_task', toolset='hermes_pm',
                       schema={'name': 'hermes_pm_task', 'description': 'Verify, start, observe or record evidence for one accepted Issue.',
-                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery', 'append', 'stop', 'continue']},
-                                  'request_id': {'type': 'string'}, 'report': {'type': 'object'},
+                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery', 'append', 'stop', 'continue', 'prepare', 'source']},
+                                  'request_id': {'type': 'string'}, 'report': {'type': 'object'}, 'plan': {'type': 'object'},
                                   'instruction_id': {'type': 'string'}, 'text': {'type': 'string'}, 'expected_turn_id': {'type': 'string'}},
                                   'required': ['action', 'request_id'], 'additionalProperties': False}},
                       handler=task_operation, description='Single Issue execution and evidence')

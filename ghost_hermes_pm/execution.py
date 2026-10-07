@@ -43,16 +43,30 @@ def start_task(manager, identity, request_id):
             raise ManagementError('capability_unverified', 'Public acceptance has not been confirmed on the original request.')
         project = data['projects'][record['project_id']]
         repository = project['repo']
-        from .queue import require_turn
+        from .queue import require_turn, require_preparation
         require_turn(manager, identity, record, version, data)
         if any(r['id'] != request_id and r.get('session', {}).get('logical_repository') == repository['logical_id'] and not r.get('repository_released') for r in data['requests'].values()):
             raise ManagementError('repository_busy', 'Another unfinished task owns this logical repository.')
         actual = _repository({'repo_path': repository['worktree'], 'test_artifact_paths': repository['test_artifact_paths']})
         if repository_fingerprint(actual) != repository_fingerprint(repository):
             raise ManagementError('capability_unverified', 'The registered repository layout changed; execution evidence is invalid.')
-        proof = adapter.verify_start(repository)
-        from .delivery import source_state
-        baseline = source_state(repository)
+        baseline = require_preparation(manager, identity, record, version, data)
+        occupation = record['queue'].get('external_occupancy')
+        if occupation and occupation.get('generation') != adapter.generation:
+            raise ManagementError('capability_unverified', 'The original external occupancy generation is unavailable; reconciliation is required.')
+        try:
+            proof = adapter.verify_start(repository)
+        except ManagementError as exc:
+            if exc.code == 'repository_busy':
+                record['queue']['external_occupancy'] = {**(getattr(adapter, 'last_start_occupancy', None) or {}),
+                    'status': 'unknown', 'generation': adapter.generation, 'connection': adapter.connection, 'reason': str(exc),
+                    'observed_at': datetime.now(timezone.utc).isoformat()}
+            record['unexecuted_reason'] = str(exc)
+            with manager._db:
+                manager._save(version, data)
+            manager.publish_request_message(identity, request_id, 'progress', '仓库执行待核对；未开启新任务：' + str(exc))
+            raise
+        record['queue'].pop('external_occupancy', None)
         record['session'] = {**adapter.connection, 'thread_id': None, 'turn_id': None,
                              'logical_repository': repository['logical_id'], 'start_phase': 'thread_start_intent',
                              'control': 'assigned_task', 'capability': proof, 'baseline': baseline, 'repository': repository}

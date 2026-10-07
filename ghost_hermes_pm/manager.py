@@ -237,6 +237,18 @@ class Manager:
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
 
+    def refresh_task_source(self, identity, request_id):
+        from .queue import refresh_task_source
+        return refresh_task_source(self, identity, request_id)
+
+    def dispatch_tasks(self):
+        from .queue import dispatch_tasks
+        return dispatch_tasks(self)
+
+    def prepare_task(self, identity, request_id, plan):
+        from .queue import prepare_task
+        return prepare_task(self, identity, request_id, plan)
+
     def start_task(self, identity, request_id):
         from .execution import start_task
         return start_task(self, identity, request_id)

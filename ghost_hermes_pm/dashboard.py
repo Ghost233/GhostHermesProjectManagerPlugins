@@ -17,6 +17,7 @@ class TaskOperation(BaseModel):
     action: str
     request_id: str
     report: dict | None = None
+    plan: dict | None = None
     instruction_id: str | None = None
     text: str | None = None
     expected_turn_id: str | None = None
@@ -27,7 +28,7 @@ def create_router(authenticated_client):
 
     def failure(exc):
         status = {'unauthorized': 403, 'forbidden': 403, 'version_conflict': 409,
-                  'binding_conflict': 409, 'repository_busy': 409, 'unavailable': 503}.get(exc.code, 422)
+                  'binding_conflict': 409, 'repository_busy': 409, 'handoff_blocked': 409, 'unavailable': 503}.get(exc.code, 422)
         return HTTPException(status, {'code': exc.code, 'message': str(exc)})
 
     @router.get('/snapshot')
@@ -55,6 +56,12 @@ def create_router(authenticated_client):
     def task(body: TaskOperation, request: Request):
         client = authenticated_client(request)
         try:
+            if body.action == 'prepare':
+                if body.report is not None or any(v is not None for v in (body.instruction_id, body.text, body.expected_turn_id)):
+                    raise ManagementError('invalid_change', 'Preparation accepts only the explicit baseline plan.')
+                return client.prepare_task(body.request_id, body.plan)
+            if body.plan is not None:
+                raise ManagementError('invalid_change', 'Baseline plan requires preparation.')
             if body.action in {'append', 'stop', 'continue'}:
                 if body.report is not None:
                     raise ManagementError('invalid_change', 'Control requests cannot assert delivery evidence.')
@@ -63,7 +70,7 @@ def create_router(authenticated_client):
                 raise ManagementError('invalid_change', 'Control fields require a control action.')
             if body.action == 'delivery':
                 return client.record_task_delivery(body.request_id, body.report)
-            operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task'}.get(body.action)
+            operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task', 'source': 'refresh_task_source'}.get(body.action)
             if operation is None or body.report is not None:
                 raise ManagementError('invalid_change', 'Select verify, start, refresh or evidence-based delivery.')
             return getattr(client, operation)(body.request_id)

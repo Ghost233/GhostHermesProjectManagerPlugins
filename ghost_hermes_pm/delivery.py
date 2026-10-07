@@ -63,6 +63,14 @@ def record_task_delivery(manager, identity, request_id, report):
         record = _responsible(manager, identity, request_id, data)
         if record['execution'] != 'turn_ended' or record.get('turn_status') != 'completed' or not record.get('history_complete'):
             raise ManagementError('evidence_missing', 'Original execution and complete terminal history must be verified before delivery.')
+        from .control import terminal_evidence, _thread
+        session = record['session']
+        related, execution_end = terminal_evidence(manager.codex_adapter, session, _thread(manager.codex_adapter, session, require_input=False), session['turn_id'])
+        if related:
+            record.update(related_execution=related, handoff_reason='Related original execution has not finished.')
+            with manager._db:
+                manager._save(version, data)
+            raise ManagementError('evidence_missing', record['handoff_reason'])
         scope = record['accepted_scope']
         expected = acceptance_criteria(scope['body'])
         criteria = report.get('criteria')
@@ -101,6 +109,9 @@ def record_task_delivery(manager, identity, request_id, report):
                 artifacts.append({**reference, 'source': 'local_file_read'})
         current = source_state(repository)
         baseline = record['session']['baseline']
+        preserved = record.get('preparation', {}).get('preserved_files', {})
+        if any(current['file_digests'].get(name) != digest for name, digest in preserved.items()):
+            raise ManagementError('evidence_missing', 'Preserved user files changed; workspace handoff requires reconciliation.')
         source_changed = current['source_digest'] != baseline['source_digest'] or current['head'] != baseline['head']
         commit = report.get('source_commit')
         if source_changed and (not isinstance(commit, str) or not re.fullmatch(r'[a-f0-9]{40}', commit) or commit != current['head'] or current['workspace_status'] != baseline['workspace_status']):
@@ -174,11 +185,12 @@ def record_task_delivery(manager, identity, request_id, report):
         pr_status = 'merged' if pr and pr['state'] == 'merged' else 'awaiting_merge' if pr and pr.get('review') == 'approved' else 'awaiting_review' if pr else 'none'
         record.update(task_delivery='delivered', pr_status=pr_status, repository_released=True,
                       test_evidence=list(tests.values()), delivery_evidence={'issue_updated_at': scope['updated_at'], 'criteria': criteria,
-                      'source_commit': commit, 'source_changed': source_changed, 'workspace': current, 'artifacts': artifacts,
+                      'source_commit': commit or current['head'], 'source_changed': source_changed, 'execution_end': execution_end, 'leftover_changes': current['workspace_status'], 'workspace': current, 'artifacts': artifacts,
                       'pr': pr, 'sync': sync, 'verified_at': datetime.now(timezone.utc).isoformat()})
         with manager._db:
             manager._save(version, data)
         manager.publish_request_message(identity, request_id, 'result', '已按冻结 Issue 验收交付：' + scope['url'] +
                                         '\n运行测试证据：' + str(len(tests)) + ' 项；PR：' + pr_status +
                                         '\n原会话：' + record['session']['thread_id'] + '\n源码版本：' + (commit or '无源码变更'))
+        manager.dispatch_tasks()
         return record

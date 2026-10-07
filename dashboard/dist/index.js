@@ -15,6 +15,7 @@
     const [saving, setSaving] = React.useState(false);
     const [controlTexts, setControlTexts] = React.useState({});
     const [controlIntents, setControlIntents] = React.useState({});
+    const [preparationPlans, setPreparationPlans] = React.useState({});
     async function refresh() {
       try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
       catch (e) { setError(String(e.message || e)); }
@@ -52,8 +53,25 @@
     async function taskAction(action, requestId) {
       setSaving(true);
       try { await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify({ action: action, request_id: requestId }) }); await refresh(); }
-      catch (e) { setError(String(e.message || e)); }
+      catch (e) { await refresh(); setError(String(e.message || e)); }
       finally { setSaving(false); }
+    }
+    async function prepareAction(record) {
+      const selected = preparationPlans[record.id] || {};
+      const plan = { branch: String(selected.branch || '').trim(), commit: selected.commit === 'unborn' ? null : String(selected.commit || '').trim(),
+        dependencies: String(selected.dependencies || '').split(',').map(function (id) { return id.trim(); }).filter(Boolean),
+        issue_updated_at: record.accepted_scope.updated_at };
+      if (selected.workspace_digest) plan.workspace_digest = selected.workspace_digest.trim();
+      setSaving(true);
+      try { await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify({ action: 'prepare', request_id: record.id, plan: plan }) }); await refresh(); }
+      catch (e) { await refresh(); setError(String(e.message || e)); }
+      finally { setSaving(false); }
+    }
+    function preparationField(record, key, label) {
+      const selected = preparationPlans[record.id] || {};
+      return h('label', { style: { display: 'block' } }, label, h('input', { value: selected[key] || '',
+        onChange: function (e) { setPreparationPlans(Object.assign({}, preparationPlans, { [record.id]: Object.assign({}, selected, { [key]: e.target.value }) })); },
+        style: { margin: '6px', padding: '7px', color: 'inherit', background: 'transparent', border: '1px solid #8886' } }));
     }
     async function controlAction(action, record) {
       const key = record.id + ':' + action;
@@ -65,7 +83,9 @@
       try {
         const result = await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify(body) });
         await refresh();
-        if (result.status === 'outcome_unknown' || result.instruction.phase === 'rpc_intent') {
+        if (result.status === 'queued') {
+          setError('明确继续已排队，保留指令 ID：' + body.instruction_id);
+        } else if (result.status === 'outcome_unknown' || (result.instruction && result.instruction.phase === 'rpc_intent')) {
           setError('控制结果待核对，保留指令 ID：' + body.instruction_id);
         } else {
           setControlIntents(Object.assign({}, controlIntents, { [key]: null }));
@@ -75,7 +95,7 @@
         const observed = await refresh();
         const task = observed && observed.requests.find(function (r) { return r.id === record.id; });
         const instruction = task && (task.controls || []).find(function (c) { return c.id === body.instruction_id; });
-        if (task && (!instruction || instruction.phase === 'rejected')) {
+        if (task && !(task.queue && task.queue.pending_continuation) && (!instruction || instruction.phase === 'rejected')) {
           setControlIntents(Object.assign({}, controlIntents, { [key]: null }));
         }
         setError(String(e.message || e) + ' · 指令 ID：' + body.instruction_id);
@@ -125,12 +145,20 @@
           const controlled = r.session && r.session.control === 'assigned_task' && r.task_delivery !== 'delivered';
           const inputOpen = controlled && !r.repository_released && !['stopping', 'stopped'].includes(r.execution);
           const continueOpen = controlled && r.execution === 'stopped' && r.outer_task_status === 'stopped' &&
-            r.stop && r.stop.status === 'confirmed' && r.repository_released;
+            r.stop && r.stop.status === 'confirmed' && r.repository_released && !(r.queue && r.queue.pending_continuation);
           return h('li', { key: r.id, style: { marginBottom: '18px' } },
             h('strong', null, r.project_id + ' · 负责人：' + r.profile_id),
             h('div', null, h('a', { href: r.accepted_scope.url, target: '_blank', rel: 'noreferrer' }, r.accepted_scope.title)),
             h('div', null, '受理：' + r.acceptance + ' · 消息送达：' + r.delivery + ' · 执行：' + r.execution),
             r.unexecuted_reason && h('div', null, '待核对原因：' + r.unexecuted_reason),
+            r.queue && h('div', null, '仓库队列：' + r.queue.status + ' · 顺序：' + r.queue.sequence + ' · 安排时间：' + r.queue.arranged_at + (r.queue.reason ? ' · ' + r.queue.reason : '')),
+            r.queue && r.queue.blocked_by.length > 0 && h('div', null, '等待前项：' + r.queue.blocked_by.join(', ')),
+            (!r.session || r.repository_released) && h('details', null, h('summary', null, '确认本任务基线与工作区交接'),
+              h('p', null, '由负责人按本 Issue、明确依赖及仓库约定填写。插件只核对现有工作区，遗留内容需按显示摘要确认保留。'),
+              preparationField(r, 'branch', '已有本地分支'), preparationField(r, 'commit', '完整提交 SHA（空仓库填 unborn）'),
+              preparationField(r, 'dependencies', '依赖请求 ID（逗号分隔）'), preparationField(r, 'workspace_digest', '遗留内容保留摘要（有未提交内容时填写）'),
+              h('button', { style: button, onClick: function () { prepareAction(r); }, disabled: saving || snapshot.status !== 'completed' }, '确认基线'),
+              r.preparation && h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(r.preparation, null, 2))),
             h('div', null, '交付：' + (r.task_delivery || 'unmet') + ' · PR：' + (r.pr_status || 'none')),
             r.session && h('div', null, '原 Codex 会话：' + (r.session.thread_id || '创建待核对') + ' · 轮次：' + (r.session.turn_id || '启动待核对') + ' · 控制：' + r.session.control),
             r.last_execution_verified_at && h('div', null, '执行最后核实：' + r.last_execution_verified_at),
@@ -153,6 +181,9 @@
                 h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ stops: r.stop_records,
                   arrangements: r.execution_arrangements || [], controls: r.controls || [] }, null, 2)))),
             r.execution_capability && h('div', null, '启动能力：' + r.execution_capability.status + (r.execution_capability.reason ? ' · ' + r.execution_capability.reason : '')),
+            h('button', { style: button, onClick: function () { taskAction('source', r.id); }, disabled: saving || snapshot.status !== 'completed' }, '核对 Issue 来源'),
+            r.issue_source && h('details', null, h('summary', null, 'Issue 来源：' + r.issue_source.status + ' · 已受理版本保留'),
+              h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(r.issue_source, null, 2))),
             r.delivery_evidence && h('details', null, h('summary', null, '验收与测试／Git／PR 证据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(r.delivery_evidence, null, 2))),
             h('div', null, '请求 ID：' + r.id),
             h('div', null, '来源群 / 消息：' + source.chat_id + ' / ' + source.message_id),
