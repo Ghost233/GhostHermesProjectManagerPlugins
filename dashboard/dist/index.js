@@ -30,8 +30,13 @@
     const [migrationForm, setMigrationForm] = React.useState({ action: 'plan', details: '' });
     const [migrationReview, setMigrationReview] = React.useState(null);
     const [migrationResult, setMigrationResult] = React.useState(null);
+    const [maintenanceForm, setMaintenanceForm] = React.useState({ action: 'enter', operationId: '', target: '', manual: '' });
+    const [maintenanceReview, setMaintenanceReview] = React.useState(null);
+    const [maintenanceResult, setMaintenanceResult] = React.useState(null);
+    const [maintenanceIntent, setMaintenanceIntent] = React.useState(null);
     const [observerForm, setObserverForm] = React.useState({ id: '', kind: 'daemon', projects: '', adapter_ref: '' });
     async function refresh() {
+      setMaintenanceReview(null);
       try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError('');
         setLifecycleReview(function (current) { return current && current.details.expected_version !== undefined && current.details.expected_version !== value.version ? null : current; });
         setMigrationReview(function (current) { return current && current.details.expected_version !== undefined && current.details.expected_version !== value.version ? null : current; });
@@ -39,6 +44,46 @@
       catch (e) { setError(String(e.message || e)); }
     }
     React.useEffect(function () { refresh(); }, []);
+    function previewMaintenance(e) {
+      e.preventDefault();
+      try {
+        const operationId = maintenanceForm.operationId.trim();
+        if (!operationId) throw new Error('请填写稳定的原维护操作 ID。');
+        const action = maintenanceForm.action;
+        const details = { operation_id: operationId };
+        if (['check', 'checkpoint'].includes(action)) {
+          const handled = maintenanceForm.manual.split(',').map(function (id) { return id.trim(); }).filter(Boolean);
+          if (handled.length) details.handled_manual_session_ids = handled;
+        } else {
+          details.expected_version = snapshot.version;
+          details.expected_profile_ids = snapshot.profiles.map(function (p) { return p.id; }).sort();
+        }
+        if (['enter', 'deactivate'].includes(action)) {
+          const runtime = snapshot.maintenance.runtime;
+          details.expected_release = { plugin_version: runtime.plugin_version, source_digest: runtime.source_digest,
+            sdk_version: runtime.sdk_version, sdk_source_digest: runtime.sdk_source_digest };
+          if (action === 'enter' && maintenanceForm.target.trim()) details.target_release = JSON.parse(maintenanceForm.target);
+        }
+        setMaintenanceReview({ action: action, details: details }); setError('');
+      } catch (e) { setError('维护参数：' + String(e.message || e)); }
+    }
+    async function submitMaintenance() {
+      const body = maintenanceReview;
+      setSaving(true);
+      setMaintenanceIntent({ operation_id: body.details.operation_id, action: body.action, status: 'awaiting_verification' });
+      setMaintenanceResult(null);
+      try {
+        const result = await sdk.fetchJSON(api + '/maintenance', { method: 'POST', body: JSON.stringify(body) });
+        setMaintenanceResult(result); setMaintenanceReview(null); await refresh();
+      } catch (e) { setMaintenanceReview(null); await refresh(); setError(String(e.message || e) + ' · 原维护操作 ID：' + body.details.operation_id + ' · 读取原计划或显式核对维护，不重发控制。'); }
+      finally { setSaving(false); }
+    }
+    function maintenanceField(key, label, multiline) {
+      return h('label', { style: { display: 'block', margin: '8px 0' } }, label,
+        h(multiline ? 'textarea' : 'input', { value: maintenanceForm[key], 'aria-label': label, rows: multiline ? 3 : undefined,
+          onChange: function (e) { setMaintenanceForm(Object.assign({}, maintenanceForm, { [key]: e.target.value })); setMaintenanceReview(null); },
+          style: { width: '100%', padding: '7px', color: 'inherit', background: 'transparent', border: '1px solid #8886' } }));
+    }
     function field(key, label, options) {
       const props = { value: form[key], onChange: function (e) {
         setForm(Object.assign({}, form, { [key]: e.target.value })); setReview(null);
@@ -259,6 +304,42 @@
             h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：' + p.lifecycle + ' · 执行：' + (p.can_execute ? '已验证' : '未启用')),
             h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
         })),
+        snapshot.maintenance && h('section', null, h('h2', null, '维护、停用与恢复'),
+          h('p', null, '运行安排：' + snapshot.maintenance.mode + ' · 实际插件版本：' + (snapshot.maintenance.runtime.plugin_version || 'unknown') +
+            ' · SDK 版本：' + (snapshot.maintenance.runtime.sdk_version || 'unknown') + ' · 加载核实：' + snapshot.maintenance.runtime.status),
+          h('p', null, '发布能力：' + (snapshot.status === 'completed' && snapshot.maintenance.runtime.status === 'verified' && snapshot.maintenance.runtime.loaded === true && snapshot.maintenance.runtime.release_verified === true ? '已通过全部真实验收' : '尚未通过全部真实验收，未启用发布')),
+          h('p', null, '维护暂停新执行与队列派发，已有监督在可用时继续。检查点前核对原回合、相关执行、手动会话和在途请求；手动只观察由本人在原界面处理。'),
+          h('p', null, '版本或 ACK 不代表切换完成。回退保留当前授权、队列、任务停止意图和仓库改动；重新启用先对账，旧任务不会自动续跑。'),
+          h('details', null, h('summary', null, '实际来源、能力核实时间与通知可用情况'),
+            h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ runtime: snapshot.maintenance.runtime,
+              execution: snapshot.execution, manual_capabilities: snapshot.manual_capabilities,
+              notification_health: snapshot.notifications && snapshot.notifications.health }, null, 2))),
+          h('ul', null, (snapshot.maintenance.plans || []).map(function (plan) {
+            return h('li', { key: plan.id, style: { margin: '12px 0', overflowWrap: 'anywhere' } },
+              h('strong', null, plan.id + ' · ' + plan.intent + ' · ' + plan.status),
+              h('div', null, '本人待办／受阻原因：' + (plan.needs_human || []).join('；')),
+              h('details', null, h('summary', null, '原计划、交接核对、备份／恢复证据与请求受理结果'),
+                h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(plan, null, 2))));
+          })),
+          h('details', null, h('summary', null, '原生卸载／停机事件：执行状态仍需核实'),
+            h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(snapshot.maintenance.events || [], null, 2))),
+          h('form', { onSubmit: previewMaintenance },
+            h('select', { value: maintenanceForm.action, 'aria-label': '维护动作', onChange: function (e) {
+              setMaintenanceForm(Object.assign({}, maintenanceForm, { action: e.target.value })); setMaintenanceReview(null);
+            } }, [['enter', '进入维护'], ['check', '核对维护'], ['checkpoint', '建立维护检查点'], ['switch', '切换维护版本'],
+              ['rollback', '回退维护'], ['deactivate', '主动停用'], ['reenable', '重新启用']].map(function (a) { return h('option', { key: a[0], value: a[0] }, a[1]); })),
+            maintenanceField('operationId', '维护操作 ID'),
+            maintenanceForm.action === 'enter' && maintenanceField('target', '目标版本 JSON（已登记 id、plugin_version、source_digest；不切换时留空）', true),
+            ['check', 'checkpoint'].includes(maintenanceForm.action) && maintenanceField('manual', '本人已处理的手动会话 ID（逗号分隔，仍需独立核实）'),
+            h('button', { style: button, disabled: saving || snapshot.status !== 'completed' }, '预览维护操作')),
+          maintenanceReview && h('div', null,
+            h('p', null, '核对原操作 ID、目录版本、完整 Profile 范围及实际版本后批准这条操作。'),
+            h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(maintenanceReview, null, 2)),
+            h('button', { style: button, disabled: saving || snapshot.status !== 'completed', onClick: submitMaintenance }, '本人确认维护操作')),
+          maintenanceIntent && h('p', null, '最近提交的原维护操作 ID：' + maintenanceIntent.operation_id + ' · 动作：' + maintenanceIntent.action +
+            ' · ' + (maintenanceResult ? maintenanceResult.status : '结果待核实；读取原计划或显式核对维护')),
+          maintenanceResult && h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(maintenanceResult, null, 2))),
+
         h('section', null, h('h2', null, '项目封存与逐个恢复'),
           h('p', null, '封存父负责人和显式下属，分别核实原执行、Profile 服务、机器人与定时入口。恢复只启用指定负责人；旧工作需要新的明确安排。'),
           h('ul', null, (snapshot.lifecycle_operations || []).map(function (operation) {
