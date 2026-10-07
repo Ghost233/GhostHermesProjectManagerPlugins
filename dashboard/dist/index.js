@@ -27,10 +27,14 @@
     const [validationReview, setValidationReview] = React.useState(null);
     const [lifecycleForm, setLifecycleForm] = React.useState({ action: 'archive', target: '', manual: '' });
     const [lifecycleReview, setLifecycleReview] = React.useState(null);
+    const [migrationForm, setMigrationForm] = React.useState({ action: 'plan', details: '' });
+    const [migrationReview, setMigrationReview] = React.useState(null);
+    const [migrationResult, setMigrationResult] = React.useState(null);
     const [observerForm, setObserverForm] = React.useState({ id: '', kind: 'daemon', projects: '', adapter_ref: '' });
     async function refresh() {
       try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError('');
         setLifecycleReview(function (current) { return current && current.details.expected_version !== undefined && current.details.expected_version !== value.version ? null : current; });
+        setMigrationReview(function (current) { return current && current.details.expected_version !== undefined && current.details.expected_version !== value.version ? null : current; });
         return value; }
       catch (e) { setError(String(e.message || e)); }
     }
@@ -270,6 +274,33 @@
               catch (e) { await refresh(); setError(String(e.message || e) + ' · 操作 ID：' + lifecycleReview.details.operation_id); }
               finally { setSaving(false); }
             } }, '本人确认执行'))),
+        h('section', null, h('h2', null, '选择性迁移到新 Profile'),
+          h('p', null, '本人审定独立新身份、新机器人、选择资料、明确偏好范围和重建的模型工具。准备期间停放；计划、原生落盘、新会话、旧入口停止与实际切换分别核实。'),
+          h('ul', null, (snapshot.migration_plans || []).map(function (plan) {
+            return h('li', { key: plan.id }, plan.id + ' · ' + plan.status + ' · 目标：' + plan.plan.target_profile_id,
+              h('div', null, '审定摘要：' + plan.digest + ' · 新入口：' + (plan.switch_state || 'not_switched')),
+              h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ selection: plan.plan.selection, preferences: plan.plan.preferences,
+                execution: plan.plan.execution, sources: plan.archive_bindings, checkpoint: plan.checkpoint, native_checkpoint: plan.native_checkpoint,
+                native_state: plan.native_state, ledger: plan.selection_ledger, session: plan.session_receipt, switch_receipt: plan.switch_receipt, rollback: plan.rollback }, null, 2)),
+              h('div', null, '人工待办／受阻原因：' + (plan.needs_human || []).join('；')));
+          })),
+          h('form', { onSubmit: function (e) { e.preventDefault(); try {
+            const details = JSON.parse(migrationForm.details);
+            if (['plan', 'activate'].includes(migrationForm.action) && details.expected_version === undefined) details.expected_version = snapshot.version;
+            setMigrationReview({ action: migrationForm.action, details: details });
+          } catch (e) { setError('迁移参数：' + String(e.message || e)); } } },
+            h('select', { value: migrationForm.action, onChange: function (e) { setMigrationForm(Object.assign({}, migrationForm, { action: e.target.value })); setMigrationReview(null); } },
+              ['preview', 'plan', 'prepare', 'check', 'activate', 'rollback'].map(function (action) { return h('option', { key: action, value: action }, action); })),
+            h('label', null, '本人审定的迁移参数 JSON（原始选择／计划 ID 与摘要／切换版本、范围、封存和新会话 ID）',
+              h('textarea', { value: migrationForm.details, rows: 7, onChange: function (e) { setMigrationForm(Object.assign({}, migrationForm, { details: e.target.value })); setMigrationReview(null); } })),
+            h('button', { style: button, disabled: saving || snapshot.status === 'unverified' }, '预览迁移操作')),
+          migrationReview && h('div', null, h('pre', null, JSON.stringify(migrationReview, null, 2)),
+            h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: async function () { setSaving(true); try {
+              const result = await sdk.fetchJSON(api + '/migration', { method: 'POST', body: JSON.stringify(migrationReview) });
+              setMigrationResult(result); setMigrationReview(null); await refresh();
+            } catch (e) { await refresh(); setError(String(e.message || e) + ' · 迁移计划：' + (migrationReview.details.plan_id || 'preview')); }
+            finally { setSaving(false); } } }, '本人确认迁移操作')),
+          migrationResult && h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(migrationResult, null, 2))),
         h('section', null, h('h2', null, '公开协作与任务关系'),
           h('p', null, '三层项目明确登记子负责人；合并两层由项目根负责人直接承接。发送、独立受理与执行分别核对。真实群验收：' + ((snapshot.collaboration || {}).real_group_acceptance || 'unverified')),
           h('ul', null, ((snapshot.collaboration || {}).handoffs || []).map(function (link) {

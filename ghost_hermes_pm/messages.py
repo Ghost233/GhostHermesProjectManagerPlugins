@@ -121,6 +121,12 @@ class FeishuEntry:
                         'root_id': getattr(message, 'root_id', None), 'thread_id': getattr(message, 'thread_id', None)}
             if not work:
                 manager = self.manager()
+                from .migration_entry import parse as parse_migration, reviewed as reviewed_migration, PreparedMigrationMessage
+                if parse_migration(command):
+                    if manager is None:
+                        return None
+                    details = reviewed_migration(manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry')), binding, command)
+                    return PreparedMigrationMessage(event, adapter, transport, binding, envelope, command, None, details)
                 from .lifecycle_entry import parse as parse_lifecycle, allowed as lifecycle_allowed
                 lifecycle = parse_lifecycle(command)
                 if lifecycle:
@@ -159,6 +165,8 @@ class FeishuEntry:
         if manager is None:
             return False
         snapshot = manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))
+        if getattr(prepared, 'migration_details', None):
+            return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile for p in snapshot['profiles'])
         from .lifecycle_entry import parse as parse_lifecycle
         if parse_lifecycle(prepared.command):
             return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile for p in snapshot['profiles'])
@@ -188,6 +196,9 @@ class FeishuEntry:
         async with self.lock:
             self.require_active(generation)
             if not prepared.issue_url:
+                if getattr(prepared, 'migration_details', None):
+                    from .migration_entry import process as process_migration
+                    return await process_migration(self, identity, prepared, generation)
                 from .lifecycle_entry import parse as parse_lifecycle, process as process_lifecycle
                 if parse_lifecycle(prepared.command):
                     return await process_lifecycle(self, identity, prepared, generation)

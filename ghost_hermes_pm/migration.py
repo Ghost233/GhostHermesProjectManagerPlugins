@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import shutil
 
 from .manager import ManagementError, VerifiedIdentity, _public_text
 
@@ -58,6 +59,56 @@ def _archives(manager, operation, data):
         result[source_id] = {k: source[k] for k in ('grant_source_id', 'new_identity_ref', 'provider_binding', 'scope_ids', 'authorization_ref')}
         result[source_id]['grant_revision'] = grant['revision']
     return result
+
+
+def _old_stopped(manager, operation, data, archive_id):
+    from .lifecycle import COMPONENTS, _verified_fact
+    source = data['profiles'][operation['plan']['source_profile_id']]
+    archived = data.get('lifecycle_operations', {}).get(archive_id)
+    if not archived or archived['action'] != 'archive' or archived['status'] != 'completed' or source['id'] not in archived['profile_ids'] or source.get('lifecycle') != 'archived' or not manager.lifecycle_host:
+        raise ManagementError('capability_unverified', 'Original Profile/task/bot/scheduled entry stop is not independently verified.')
+    facts = {}
+    for component in (*COMPONENTS, 'manual_execution'):
+        expected = {'profile_id': source['id'], 'native_profile': source['native_profile'], 'project_id': source['project_id'],
+                    'component': component, 'operation_id': archive_id, 'scope': 'profile', 'status': 'verified'}
+        fact = _verified_fact(manager, manager.lifecycle_host.inspect(source, component, 'stopped', archive_id), expected)
+        if fact.get('state') != 'stopped':
+            raise ManagementError('capability_unverified', 'Old entry is no longer verified stopped.')
+        if component == 'manual_execution' and fact.get('execution_coverage') != 'complete':
+            raise ManagementError('capability_unverified', 'Old related chat/cron/manual execution coverage is incomplete.')
+        facts[component] = fact
+    return facts
+
+
+def _rollback(manager, operation):
+    checkpoint = operation.get('checkpoint')
+    if not checkpoint:
+        raise ManagementError('capability_unverified', 'The original pre-change checkpoint is unavailable.')
+    artifact = manager.state_dir / checkpoint['artifact_ref']
+    if artifact != artifact.resolve() or hashlib.sha256(artifact.read_bytes()).hexdigest() != checkpoint['sha256']:
+        raise ManagementError('capability_unverified', 'Original migration checkpoint bytes are unverified.')
+    directory = manager.state_dir / 'migration-restored'
+    if directory != directory.resolve():
+        raise ManagementError('capability_unverified', 'Restored migration artifact directory is an unknown alias.')
+    directory.mkdir(exist_ok=True)
+    restored = directory / (digest(operation['id']) + '.sqlite3')
+    if restored.is_symlink() or restored.exists() and hashlib.sha256(restored.read_bytes()).hexdigest() != checkpoint['sha256']:
+        raise ManagementError('capability_unverified', 'An unrelated restore artifact was preserved.')
+    if not restored.exists():
+        shutil.copyfile(artifact, restored)
+    with sqlite3.connect(f'file:{restored}?mode=ro', uri=True) as db:
+        if db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+            raise ManagementError('capability_unverified', 'Restored directory artifact integrity failed.')
+        payload = json.loads(db.execute('SELECT payload FROM directory WHERE id=1').fetchone()[0])
+        if payload['migration_plans'][operation['id']]['digest'] != operation['digest']:
+            raise ManagementError('binding_conflict', 'Restored artifact does not contain this reviewed plan.')
+    native = manager.migration_host.rollback(operation) if manager.migration_host else {'target_control': 'not_created', 'external_services': 'unverified'}
+    operation['rollback'] = {**operation['rollback'], **native, 'checkpoint_data': 'verified_restored_artifact',
+        'artifact_ref': str(restored.relative_to(manager.state_dir)), 'sha256': checkpoint['sha256'], 'directory': 'current_grants_and_health_not_rewound'}
+    operation.update(status='rolled_back' if operation.get('switch_state') not in {'verified_native_served', 'outcome_unknown'} else 'blocked',
+        switch_state='not_switched' if operation.get('switch_state') not in {'verified_native_served', 'outcome_unknown'} else 'rollback_execution_unverified',
+        needs_human=['Checkpoint data and parked control were verified; external services and any running executions remain independently unverified.'])
+    return operation
 
 
 def _plan(manager, identity, details, version, data):
@@ -131,13 +182,20 @@ def operate(manager, identity, action, details):
             if set(details) != {'source_profile_id'} or details['source_profile_id'] not in data['profiles'] or manager.migration_host is None:
                 raise ManagementError('capability_unverified', 'Select a registered source on the configured native migration host.')
             return manager.migration_host.preview(data['profiles'][details['source_profile_id']])
-        if set(details) - {'plan_id', 'digest', 'session_id'} or not {'plan_id', 'digest'} <= set(details) or action != 'check' and 'session_id' in details:
+        allowed = {'plan_id', 'digest', 'session_id', 'expected_version', 'expected_profile_ids', 'archive_operation_id'} if action == 'activate' else {'plan_id', 'digest', 'session_id'} if action == 'check' else {'plan_id', 'digest'}
+        if set(details) - allowed or not {'plan_id', 'digest'} <= set(details):
             raise ManagementError('invalid_change', 'Use the originally reviewed immutable plan ID and digest.')
         operation = data.get('migration_plans', {}).get(details['plan_id'])
         if not operation or operation['digest'] != details['digest']:
             raise ManagementError('binding_conflict', 'Original migration plan digest does not match.')
         if operation['bindings'] != {i: _binding(data['profiles'][i]) for i in operation['bindings']} or operation['archive_bindings'] != _archives(manager, operation, data):
             raise ManagementError('binding_conflict', 'Original Profile or source authorization binding changed; review a new plan.')
+        if operation['status'] == 'switched' and action in {'prepare', 'check', 'activate'}:
+            if action == 'activate' and {k: details.get(k) for k in ('expected_version', 'expected_profile_ids', 'archive_operation_id', 'session_id')} != operation['switch_approval']:
+                raise ManagementError('binding_conflict', 'Confirmed migration already names its original exact Owner switch approval.')
+            return operation  # Durable completed fact; no fresh native action or changed confirmation version.
+        if action == 'prepare' and operation.get('switch_state') in {'intent', 'outcome_unknown', 'rollback_execution_unverified'}:
+            raise ManagementError('capability_unverified', 'Original native switch/control outcome needs reconciliation before any preparation retry.')
         if action == 'prepare':
             if not operation.get('checkpoint'):
                 operation['checkpoint'] = _checkpoint(manager, operation)
@@ -150,8 +208,10 @@ def operate(manager, identity, action, details):
                 try:
                     result = manager.migration_host.prepare(operation)
                     operation.update(result)
+                    if result['status'] == 'prepared' and not operation.get('native_checkpoint'):
+                        operation['native_checkpoint'] = manager.migration_host.checkpoint(operation)
                 except (ManagementError, OSError) as exc:
-                    operation.update(status='blocked', needs_human=[str(exc)])
+                    operation.update(status='blocked', native_state='unverified', needs_human=[str(exc)])
             _save(manager, operation)
             return operation
         if action == 'check':
@@ -160,10 +220,54 @@ def operate(manager, identity, action, details):
             else:
                 try:
                     operation.update(manager.migration_host.check(operation, details.get('session_id')))
+                    if operation['status'] == 'prepared' and not operation.get('native_checkpoint'):
+                        operation['native_checkpoint'] = manager.migration_host.checkpoint(operation)
                     if operation['status'] == 'prepared':
                         operation['needs_human'] = operation['plan']['human_steps'] + ['Verify new bot/channel identity, original entry/task/bot/scheduler stop, and actual new-session prompt before explicit switch.']
                 except (ManagementError, OSError) as exc:
-                    operation.update(status='blocked', switch_state='not_switched', needs_human=[str(exc)])
+                    operation.update(status='blocked', switch_state='outcome_unknown' if operation.get('switch_state') in {'intent', 'outcome_unknown', 'rollback_execution_unverified'} else 'not_switched', needs_human=[str(exc)])
+            _save(manager, operation)
+            return operation
+        if action == 'activate':
+            if set(details) != allowed or type(details['expected_version']) is not int or details['expected_version'] != version:
+                raise ManagementError('version_conflict', 'Switch requires the originally reviewed current version and exact target scope.')
+            if sorted(details['expected_profile_ids']) != operation['approved_scope']['expected_profile_ids']:
+                raise ManagementError('binding_conflict', 'Switch Profile scope differs from the reviewed migration.')
+            approval = {k: details[k] for k in ('expected_version', 'expected_profile_ids', 'archive_operation_id', 'session_id')}
+            operation['switch_approval'] = approval
+            operation.update(status='switching', switch_state='intent')
+            _save(manager, operation)
+            try:
+                operation['old_control_receipts'] = _old_stopped(manager, operation, data, details['archive_operation_id'])
+                operation.update(manager.migration_host.check(operation, details['session_id']))
+                if operation['status'] != 'prepared' or not operation.get('session_receipt'):
+                    raise ManagementError('capability_unverified', 'Every selected native write and actual new-session prompt must be verified.')
+                operation.update(manager.migration_host.activate(operation))
+                operation['verified_at'] = _now()
+                if operation['status'] == 'switched':
+                    version, current = manager._load()
+                    target = current['profiles'][operation['plan']['target_profile_id']]
+                    target.pop('migration_gate', None)
+                    target.update(lifecycle='active', can_execute=False)
+                    if target['project_id']:
+                        current['projects'][target['project_id']].update(lifecycle='active', archive_intent=False)
+                    current['migration_plans'][operation['id']] = operation
+                    with manager._db:
+                        manager._save(version, current)
+                    return operation
+            except (ManagementError, OSError) as exc:
+                operation.update(status='blocked', switch_state='outcome_unknown' if getattr(exc, 'code', None) == 'outcome_unknown' else 'not_switched', needs_human=[str(exc)])
+            _save(manager, operation)
+            return operation
+        if action == 'rollback':
+            target = data['profiles'][operation['plan']['target_profile_id']]
+            target.update(migration_gate={'plan_id': operation['id'], 'state': 'rolling_back'}, can_execute=False)
+            with manager._db:
+                manager._save(version, data)
+            try:
+                operation = _rollback(manager, operation)
+            except (ManagementError, OSError, sqlite3.Error) as exc:
+                operation.update(status='blocked', needs_human=[str(exc)])
             _save(manager, operation)
             return operation
         raise ManagementError('capability_unverified', 'The prepared native state requires current cutover and rollback evidence.')
