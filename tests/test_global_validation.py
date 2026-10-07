@@ -505,3 +505,31 @@ def test_duplicate_plan_is_one_round_and_explicit_retry_is_a_new_related_round(t
         retry = manager.global_validation(LEAD, 'plan', {**details, 'retry_of': first['id']})
         assert retry['id'] != first['id'] and retry['retry_of'] == first['id']
         assert len(manager.read_snapshot(OWNER)['global_validations']) == 2
+
+
+def test_detected_invalidation_is_durable_and_restoring_bytes_cannot_revive_old_pass(tmp_path):
+    host = FixtureHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        (child / '.git' / 'info' / 'exclude').write_text('hidden.py\n')
+        (child / 'hidden.py').write_text('original ignored input\n')
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
+        (child / 'hidden.py').write_text('manual ignored input\n')
+        assert manager.read_snapshot(OWNER)['global_validations'][0]['status'] == 'invalidated'
+        (child / 'hidden.py').write_text('original ignored input\n')
+        assert manager.read_snapshot(OWNER)['global_validations'][0]['status'] == 'invalidated'
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, global_validation_host=host) as restored:
+        assert restored.read_snapshot(OWNER)['global_validations'][0]['status'] == 'invalidated'
+
+
+def test_runner_configuration_change_withdraws_a_previously_passed_combination(tmp_path):
+    host = FixtureHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
+        host.expected = 'changed test contract\n'
+        assert manager.read_snapshot(OWNER)['global_validations'][0]['status'] == 'invalidated'

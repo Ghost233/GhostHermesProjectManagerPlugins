@@ -180,7 +180,12 @@ class Manager:
                     segment['status'] = 'unknown'
                     segment['attempts'][-1]['status'] = 'unknown'
         from .global_validation import reconcile_inputs
-        reconcile_inputs(data)
+        if reconcile_inputs(self, data):
+            already_in_transaction = self._db.in_transaction
+            self._save(version, data)
+            version += 1
+            if not already_in_transaction:
+                self._db.commit()
         from .queue import refresh
         refresh(data)
         return version, data

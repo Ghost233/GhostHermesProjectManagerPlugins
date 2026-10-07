@@ -290,16 +290,21 @@ def _reconcile(manager, identity, version, data, attempt):
     return _finish(manager, identity, version, data, attempt)
 
 
-def reconcile_inputs(data):
+def reconcile_inputs(manager, data):
     """Every public read withdraws stale completion, without controlling manual execution."""
+    changed = False
     for attempt in data.get('global_validations', {}).values():
         if attempt['status'] not in {'passed', 'complete'}:
             continue
         try:
             unchanged = _digest(_inputs(attempt, data)) == attempt['input_digest']
+            if unchanged and manager.global_validation_host is not None:
+                proof = _boundary(manager, attempt)
+                unchanged = all(proof[k] == attempt['boundary'][k] for k in ('host_id', 'generation', 'runner_configuration_digest'))
         except (ManagementError, OSError):
             unchanged = False
         if not unchanged:
+            changed = True
             attempt.update(status='invalidated', whole_project_complete=False, reason='Actual validation input changed after its verified test run.')
             task = data['requests'][attempt['request_id']]
             if task.get('global_validation_id') == attempt['id']:
@@ -307,6 +312,7 @@ def reconcile_inputs(data):
             for handoff in data.get('collaboration', {}).get('handoffs', {}).values():
                 if handoff.get('global_validation_id') == attempt['id']:
                     handoff.update(whole_project_complete=False, integration_status='invalidated')
+    return changed
 
 
 def _check(manager, identity, version, data, attempt):

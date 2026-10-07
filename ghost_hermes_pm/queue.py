@@ -171,7 +171,7 @@ def dispatch_tasks(manager):
     with manager._lock:
         _, data = manager._load()
         candidates = [r for r in data['requests'].values() if r.get('queue', {}).get('requested_by') and (not r.get('session') or r['queue'].get('pending_continuation'))
-                      and not r['queue']['blocked_by'] and not r['queue'].get('external_occupancy') and r.get('preparation', {}).get('status') == 'ready']
+                      and not r['queue']['blocked_by'] and not r['queue'].get('external_occupancy') and not r['queue'].get('validation_blockers') and r.get('preparation', {}).get('status') == 'ready']
     results = []
     for record in sorted(candidates, key=lambda r: r['queue']['sequence']):
         try:
