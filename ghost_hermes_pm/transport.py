@@ -56,7 +56,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'manual_session_id', 'grant_id', 'complete', 'backup_id', 'restore_id', 'protection_id', 'kind', 'details'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'details', 'profile_id', 'entry_id', 'selection', 'supersedes', 'include_superseded', 'entry_ids', 'statement', 'manual_session_id', 'grant_id', 'complete', 'backup_id', 'restore_id', 'protection_id', 'kind'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -90,6 +90,20 @@ class ManagementServer:
                                 payload.get('instruction_id'), payload.get('text'), payload.get('expected_turn_id'))
                         elif payload.get('operation') == 'answer_human_request':
                             result = bridge.manager.answer_human_request(identity, payload.get('request_id'), payload.get('human_request_id'), payload.get('reply_id'), payload.get('response'))
+                        elif payload.get('operation') == 'answer_from_knowledge':
+                            result = bridge.manager.answer_from_knowledge(identity, payload.get('request_id'), payload.get('human_request_id'), payload.get('query_id'), payload.get('material_ids'))
+                        elif payload.get('operation') == 'curate_project_memory':
+                            result = bridge.manager.curate_project_memory(identity, payload.get('profile_id'), payload.get('entry_id'), payload.get('request_id'), payload.get('selection'), payload.get('supersedes'))
+                        elif payload.get('operation') == 'read_project_memory':
+                            result = bridge.manager.read_project_memory(identity, payload.get('profile_id'), payload.get('include_superseded', False))
+                        elif payload.get('operation') == 'load_project_memory':
+                            result = bridge.manager.load_project_memory(identity, payload.get('request_id'), payload.get('entry_ids'))
+                        elif payload.get('operation') == 'record_memory_preference':
+                            result = bridge.manager.record_memory_preference(identity, payload.get('profile_id'), payload.get('entry_id'), payload.get('statement'), payload.get('scope'), payload.get('supersedes'))
+                        elif payload.get('operation') == 'supplement_project_memory':
+                            result = bridge.manager.supplement_project_memory(identity, payload.get('request_id'), payload.get('entry_ids'), payload.get('expected_turn_id'))
+                        elif payload.get('operation') == 'manage_memory':
+                            result = bridge.manager.manage_memory(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'record_task_delivery':
                             result = bridge.manager.record_task_delivery(identity, payload.get('request_id'), payload.get('report'))
                         elif payload.get('operation') == 'register_knowledge_source':
@@ -173,7 +187,7 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'reconcile_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate', 'global_validation'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'reconcile_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate', 'answer_from_knowledge', 'supplement_project_memory', 'manage_memory', 'global_validation'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
@@ -181,7 +195,7 @@ class ManagementClient:
         except (OSError, ValueError) as exc:
             if operation in {'query_archive', 'protect_archive', 'backup_archive', 'restore_archive'}:
                 raise ManagementError('outcome_unknown', 'The archive operation response was not confirmed; inspect the same durable query/protection/backup/restore ID before retrying. Original entries remain inactive.') from exc
-            if operation in {'start_task', 'control_task', 'answer_human_request', 'reconcile_task', 'global_validation'}:
+            if operation in {'start_task', 'control_task', 'answer_human_request', 'reconcile_task', 'answer_from_knowledge', 'supplement_project_memory', 'manage_memory', 'global_validation'}:
                 raise ManagementError('outcome_unknown', 'Task start response was not confirmed; read the same durable request before retrying. Repository occupancy is retained.') from exc
             raise ManagementError('unavailable', 'The management instance is unavailable; no operation was confirmed.') from exc
         if 'error' in response:
@@ -256,6 +270,22 @@ class ManagementClient:
     def supplement_knowledge(self, query_id, material_ids=None):
         return self._call('supplement_knowledge', query_id=query_id, material_ids=material_ids)
 
+    def answer_from_knowledge(self, request_id, human_request_id, query_id, material_ids):
+        return self._call('answer_from_knowledge', request_id=request_id, human_request_id=human_request_id,
+                          query_id=query_id, material_ids=material_ids)
+
+    def curate_project_memory(self, profile_id, entry_id, request_id, selection, supersedes=None):
+        return self._call('curate_project_memory', profile_id=profile_id, entry_id=entry_id, request_id=request_id, selection=selection, supersedes=supersedes)
+
+    def read_project_memory(self, profile_id, include_superseded=False):
+        return self._call('read_project_memory', profile_id=profile_id, include_superseded=include_superseded)
+
+    def load_project_memory(self, request_id, entry_ids):
+        return self._call('load_project_memory', request_id=request_id, entry_ids=entry_ids)
+
+    def record_memory_preference(self, profile_id, entry_id, statement, scope, supersedes=None):
+        return self._call('record_memory_preference', profile_id=profile_id, entry_id=entry_id, statement=statement, scope=scope, supersedes=supersedes)
+
     def register_archive_source(self, registration):
         return self._call('register_archive_source', registration=registration)
 
@@ -270,3 +300,9 @@ class ManagementClient:
 
     def protect_archive(self, source_id, protection_id):
         return self._call('protect_archive', source_id=source_id, protection_id=protection_id)
+
+    def supplement_project_memory(self, request_id, entry_ids, expected_turn_id):
+        return self._call('supplement_project_memory', request_id=request_id, entry_ids=entry_ids, expected_turn_id=expected_turn_id)
+
+    def manage_memory(self, action, details):
+        return self._call('manage_memory', action=action, details=details)

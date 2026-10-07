@@ -61,6 +61,11 @@ class CollaborationOperation(BaseModel):
     action: str
     details: dict
 
+class MemoryOperation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: str
+    details: dict
+
 class ObservationOperation(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: str
@@ -196,6 +201,14 @@ def create_router(authenticated_client):
             if body.action == 'supplement':
                 return client.supplement_knowledge(body.query_id, body.material_ids)
             raise ManagementError('invalid_change', 'Select source registration, scoped query or original-task fact supplement.')
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
+    @router.post('/memory')
+    def memory(body: MemoryOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            return client.manage_memory(body.action, body.details)
         except ManagementError as exc:
             raise failure(exc) from exc
 

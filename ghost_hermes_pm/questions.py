@@ -224,12 +224,12 @@ def _response(manager, question, response, session):
     return {'answers': {key: {'answers': value} for key, value in response['answers'].items()}}
 
 
-def answer_human_request(manager, identity, request_id, human_request_id, reply_id, response, source_anchor=None):
+def answer_human_request(manager, identity, request_id, human_request_id, reply_id, response, source_anchor=None, *, factual_evidence=None):
     if not isinstance(reply_id, str) or not reply_id or len(reply_id) > 256 or not isinstance(response, dict):
         raise ManagementError('invalid_change', 'A stable reply ID and structured response are required.')
     with manager._lock:
         version, data = manager._load()
-        if manager._principal(identity, data) is not None:
+        if manager._principal(identity, data) is not None and factual_evidence is None:
             raise ManagementError('forbidden', 'Only the verified owner can decide a human request.')
         record, session, adapter = _binding(manager, identity, request_id, data, 'human_response')
         if record.get('repository_released') or record.get('outer_task_status') == 'stopped' or record.get('stop', {}).get('status') == 'processing':
@@ -237,6 +237,9 @@ def answer_human_request(manager, identity, request_id, human_request_id, reply_
         question = next((q for q in record.get('human_requests', []) if q['id'] == human_request_id), None)
         if not question:
             raise ManagementError('invalid_change', 'Unknown original human request.')
+        if factual_evidence is not None:
+            from .memory import validate_factual_response
+            validate_factual_response(manager, identity, record, question, factual_evidence, response, data)
         if any(q['id'] != human_request_id and q.get('reply', {}).get('id') == reply_id for r in data['requests'].values() for q in r.get('human_requests', []) if q.get('reply')):
             raise ManagementError('binding_conflict', 'This reply ID is already bound to another human request.')
         previous = question.get('reply')
@@ -255,6 +258,8 @@ def answer_human_request(manager, identity, request_id, human_request_id, reply_
         result = _response(manager, question, response, session)
         incoming = next((r['envelope'] for r in adapter.server_requests(session['thread_id']) if type(r['envelope']['id']) is type(question.get('rpc_id')) and r['envelope']['id'] == question.get('rpc_id')), None)
         question['reply'] = {'id': reply_id, 'actor': identity.subject, 'response': response, 'received': True, 'received_at': _now(), 'sent': 'intent'}
+        if factual_evidence is not None:
+            question['reply']['factual_evidence'] = factual_evidence
         if source_anchor is not None:
             question['reply']['source_anchor'] = dict(source_anchor)
         with manager._db:

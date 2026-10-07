@@ -197,7 +197,7 @@
     async function submitValidation() {
       setSaving(true);
       try { await sdk.fetchJSON(api + '/global-validation', { method: 'POST', body: JSON.stringify(validationReview) }); setValidationReview(null); await refresh(); }
-      catch (e) { setError(String(e.message || e)); await refresh(); }
+      catch (e) { await refresh(); setError(String(e.message || e)); }
       finally { setSaving(false); }
     }
     function editProject(project) {
@@ -269,7 +269,7 @@
             h('div', null, '本轮占用：' + (round.occupancy.released ? '已释放' : '保持') + ' · 项目整体：' + (round.whole_project_complete ? '已完成' : '待核对')),
             round.reason && h('div', null, round.reason),
             h('details', null, h('summary', null, '固定子交付、实际输入、Git 元数据、测试与返工证据'),
-              h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ children: round.children, inputs: round.inputs, occupancy: round.occupancy, tests: round.tests, rework: round.rework }, null, 2))));
+              h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ children: round.children, unassigned: round.unassigned, preparation: round.preparation, inputs: round.inputs, occupancy: round.occupancy, tests: round.tests, rework: round.rework }, null, 2))));
         })),
         h('details', null, h('summary', null, '提交一条明确验证操作'),
           h('select', { value: validationForm.action, onChange: function (e) { setValidationForm(Object.assign({}, validationForm, { action: e.target.value })); setValidationReview(null); } },

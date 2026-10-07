@@ -57,6 +57,10 @@ def start_task(manager, identity, request_id):
         if repository_fingerprint(actual) != repository_fingerprint(repository):
             raise ManagementError('capability_unverified', 'The registered repository layout changed; execution evidence is invalid.')
         baseline = require_preparation(manager, identity, record, version, data)
+        from .memory import start_context
+        memory_text = start_context(manager, identity, record, data)
+        version, data = manager._load()
+        record = _responsible(manager, identity, request_id, data)
         occupation = record['queue'].get('external_occupancy')
         if occupation and occupation.get('generation') != adapter.generation:
             raise ManagementError('capability_unverified', 'The original external occupancy generation is unavailable; reconciliation is required.')
@@ -106,11 +110,17 @@ def start_task(manager, identity, request_id):
                       'GitHub authentication must switch to Ghost233 and verify the actual login before every authenticated business command. '
                       'After remote writes sync affected local branches only by fast-forward. Protect user changes. '
                       'Report executed tests and fixed delivery evidence; do not call a turn end delivery or require a PR for test-only work.')
+            prompt += memory_text
             result = adapter.start_turn(thread['id'], prompt)
             turn = result.get('turn') if isinstance(result.get('turn'), dict) else {}
             if not isinstance(turn.get('id'), str) or not turn['id']:
                 raise ManagementError('outcome_unknown', 'The turn identity was not confirmed.')
             record['session'].update(turn_id=turn['id'], start_phase='turn_registered')
+            if record.get('memory_context'):
+                import hashlib
+                record['memory_context'].update(status='loaded', thread_id=thread['id'], turn_id=turn['id'],
+                    generation=adapter.generation, loaded_at=datetime.now(timezone.utc).isoformat(),
+                    input_digest=hashlib.sha256(prompt.encode()).hexdigest(), verification='original_turn_start_receipt')
             record.update(execution='running', outer_task_status='running', unexecuted_reason=None, last_execution_verified_at=datetime.now(timezone.utc).isoformat(),
                           execution_capability={'status': 'verified', 'enabled': True, 'connection': adapter.connection, 'proof': proof})
             with manager._db:

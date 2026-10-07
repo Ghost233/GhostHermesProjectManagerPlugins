@@ -421,6 +421,34 @@ class Manager:
         from .questions import answer_human_request
         return answer_human_request(self, identity, request_id, human_request_id, reply_id, response)
 
+    def answer_from_knowledge(self, identity, request_id, human_request_id, query_id, material_ids):
+        from .memory import answer_from_knowledge
+        return answer_from_knowledge(self, identity, request_id, human_request_id, query_id, material_ids)
+
+    def curate_project_memory(self, identity, profile_id, entry_id, request_id, selection, supersedes=None):
+        from .memory import curate_project_memory
+        return curate_project_memory(self, identity, profile_id, entry_id, request_id, selection, supersedes)
+
+    def read_project_memory(self, identity, profile_id, include_superseded=False):
+        from .memory import read_project_memory
+        return read_project_memory(self, identity, profile_id, include_superseded)
+
+    def load_project_memory(self, identity, request_id, entry_ids):
+        from .memory import load_project_memory
+        return load_project_memory(self, identity, request_id, entry_ids)
+
+    def record_memory_preference(self, identity, profile_id, entry_id, statement, scope, supersedes=None):
+        from .memory import record_memory_preference
+        return record_memory_preference(self, identity, profile_id, entry_id, statement, scope, supersedes)
+
+    def supplement_project_memory(self, identity, request_id, entry_ids, expected_turn_id):
+        from .memory import supplement_project_memory
+        return supplement_project_memory(self, identity, request_id, entry_ids, expected_turn_id)
+
+    def manage_memory(self, identity, action, details):
+        from .memory import perform
+        return perform(self, identity, action, details)
+
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
         try:

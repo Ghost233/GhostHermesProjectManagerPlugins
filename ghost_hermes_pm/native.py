@@ -403,6 +403,24 @@ def register_native(ctx):
                 'question': {'type': 'string'}, 'scope_ids': {'type': 'array', 'items': {'type': 'string'}}, 'complete': {'type': 'boolean'}},
                 'required': ['source_id', 'query_id', 'question', 'scope_ids'], 'additionalProperties': False}},
         handler=archive_operation, description='Read explicitly registered migration archive data')
+    def memory_operation(args):
+        try:
+            if not isinstance(args, dict) or set(args) != {'action', 'details'}:
+                raise ManagementError('invalid_change', 'Memory input requires an explicit action and scoped references; caller authority is not a body field.')
+            token = _credential(ctx.get_config('participant_credential_ref'))
+            if not state_dir or not token:
+                raise ManagementError('unauthorized', 'A distinct registered participant bridge is required.')
+            client = ManagementClient(state_dir, token)
+            client.read_participant_snapshot()
+            return json.dumps(client.manage_memory(args['action'], args['details']))
+        except ManagementError as exc:
+            return json.dumps({'status': 'rejected', 'code': exc.code, 'message': str(exc)})
+
+    ctx.register_tool(name='hermes_pm_memory', toolset='hermes_pm',
+        schema={'name': 'hermes_pm_memory', 'description': 'Answer supported original fact requests, curate accepted own-role results, and explicitly load selected context.',
+            'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['answer', 'curate', 'read', 'load', 'supplement', 'preference']},
+                'details': {'type': 'object'}}, 'required': ['action', 'details'], 'additionalProperties': False}},
+        handler=memory_operation, description='Selected own-project memory with actual requester and original control boundaries')
     ctx.register_command('hermes-pm', lambda raw_args: snapshot({} if not raw_args.strip() else {'unsupported': True}),
                          description='Read project directory and runtime status')
 
