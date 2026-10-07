@@ -135,3 +135,52 @@ def test_failed_switch_restores_checkpoint_data_but_preserves_live_authority_sto
             assert after['notifications']['health']['supervision'] != 'running'
             assert preserved.read_text() == 'Do not reset or clean me\n'
             assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+
+
+def test_observed_manual_execution_requires_owner_handling_without_automatic_interrupt(tmp_path):
+    from maintenance_fixture_host import MaintenanceHost
+    from test_manual_observation import manual_state, observer, source, READ_ONLY
+    host = MaintenanceHost(tmp_path / 'host')
+    repo, peer = make_repo(tmp_path / 'repo'), tmp_path / 'manual'
+    manual_state(peer, repo)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-daemon': observer(peer)}, maintenance_host=host) as manager:
+        from test_directory import registration
+        manager.apply_directory_change(OWNER, 0, registration(repo))
+        manager.register_observation_source(OWNER, source())
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            blocked = client.maintenance('deactivate', approval(client, 'manual-disable', expected_release=host.release))
+            assert blocked['status'] == 'blocked'
+            assert blocked['checks']['manual'][0]['control'] == 'observe_only'
+            manual_state(peer, repo, 'idle')
+            session_id = blocked['checks']['manual'][0]['session_id']
+            still = client.maintenance('check', {'operation_id': 'manual-disable'})
+            assert still['status'] == 'blocked'
+            done = client.maintenance('check', {'operation_id': 'manual-disable', 'handled_manual_session_ids': [session_id]})
+            assert done['status'] == 'deactivated'
+            assert all(json.loads(line)['method'] in READ_ONLY for line in (peer / 'manual-wire.jsonl').read_text().splitlines())
+
+
+def test_dashboard_shows_actual_version_unknown_capabilities_and_runtime_loss_as_pending_verification(tmp_path):
+    from maintenance_fixture_host import MaintenanceHost
+    from ghost_hermes_pm.dashboard import create_router
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    host = MaintenanceHost(tmp_path / 'host')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, maintenance_host=host) as manager:
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            app = FastAPI()
+            app.include_router(create_router(lambda request: client))
+            browser = TestClient(app)
+            snapshot = browser.get('/snapshot').json()
+            assert snapshot['maintenance']['runtime']['plugin_version'] == '0.1.0'
+            assert snapshot['maintenance']['runtime']['release_verified'] is False
+            assert browser.post('/maintenance', json={'action': 'enter', 'details': approval(client, 'dashboard-maintenance')}).status_code == 200
+            manager.record_runtime_loss('forced-native-unload')
+            loss = browser.get('/snapshot').json()['maintenance']
+            assert loss['events'][-1]['status'] == 'pending_verification'
+            assert loss['events'][-1]['execution_stopped'] is False
+        offline = browser.get('/snapshot').json()['maintenance']
+        assert offline['runtime']['status'] == 'unverified'
+        assert offline['runtime']['release_verified'] is False

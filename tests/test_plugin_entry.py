@@ -43,6 +43,8 @@ def fixture_native_home(monkeypatch, home):
 def load_entry():
     spec = importlib.util.spec_from_file_location('fixture_plugin', ROOT / '__init__.py', submodule_search_locations=[str(ROOT)])
     module = importlib.util.module_from_spec(spec)
+    import sys
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

@@ -370,6 +370,10 @@ class Manager:
             on_rework(self, result)
         return result
 
+    def record_runtime_loss(self, reason):
+        from .maintenance import runtime_loss
+        runtime_loss(self, reason)
+
     def maintenance(self, identity, action, details):
         from .maintenance import operate
         return operate(self, identity, action, details)

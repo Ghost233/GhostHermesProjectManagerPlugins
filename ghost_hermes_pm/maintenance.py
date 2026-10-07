@@ -15,26 +15,36 @@ def _now():
 
 
 def snapshot(manager, data, principal):
+    try:
+        runtime = {**_runtime(manager), 'release_verified': False, 'capability_release': 'requires_all_approved_real_acceptance'}
+    except (ManagementError, OSError) as exc:
+        runtime = {**data.get('maintenance_runtime', {}), 'status': 'unverified', 'loaded': False, 'release_verified': False,
+                   'reason': str(exc), 'plugin_version': data.get('maintenance_runtime', {}).get('plugin_version', 'unknown')}
     return {'mode': data.get('maintenance_mode', {}).get('intent', 'active') if isinstance(data.get('maintenance_mode'), dict) else 'active',
             'plans': list(data.get('maintenance_plans', {}).values()) if principal is None else [],
-            'runtime': data.get('maintenance_runtime', {'status': 'unverified', 'release_verified': False}),
+            'runtime': runtime,
             'events': list(data.get('maintenance_events', {}).values()) if principal is None else []}
 
 
 def operate(manager, identity, action, details):
-    if action not in {'enter', 'deactivate', 'check', 'checkpoint', 'reenable', 'switch', 'rollback'} or not isinstance(details, dict) or set(details) - {'operation_id', 'expected_version', 'expected_profile_ids', 'expected_release', 'target_release'} or not isinstance(details.get('operation_id'), str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}', details['operation_id']):
+    if action not in {'enter', 'deactivate', 'check', 'checkpoint', 'reenable', 'switch', 'rollback'} or not isinstance(details, dict) or set(details) - {'operation_id', 'expected_version', 'expected_profile_ids', 'expected_release', 'target_release', 'handled_manual_session_ids'} or not isinstance(details.get('operation_id'), str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}', details['operation_id']):
         raise ManagementError('invalid_change', 'Select a stable maintenance operation ID and reviewed current scope.')
     with manager._lock, manager._db:
         version, data = manager._load()
         if manager._principal(identity, data) is not None:
             raise ManagementError('forbidden', 'Maintenance requires the verified Owner entry.')
         if action not in {'enter', 'deactivate'}:
-            if action not in {'reenable', 'switch', 'rollback'} and set(details) != {'operation_id'}:
+            if action not in {'reenable', 'switch', 'rollback'} and set(details) - {'operation_id', 'handled_manual_session_ids'}:
+
 
                 raise ManagementError('invalid_change', 'Check the original immutable maintenance plan by ID.')
             plan = data.get('maintenance_plans', {}).get(details['operation_id'])
             if not plan or data.get('maintenance_mode', {}).get('operation_id') != plan['id']:
                 raise ManagementError('binding_conflict', 'No active original maintenance plan matches this ID.')
+            handled = details.get('handled_manual_session_ids', [])
+            if not isinstance(handled, list) or any(not isinstance(i, str) for i in handled) or set(handled) - set(plan.get('manual_required', [])):
+                raise ManagementError('invalid_change', 'Manual handling must name actual observed sessions requiring Owner action.')
+            plan['manual_handled'] = sorted(set(plan.get('manual_handled', [])) | set(handled))
             if action in {'switch', 'rollback'}:
                 _confirmation(plan, details, version, data)
                 return _switch_or_restore(manager, identity, plan, action)
@@ -158,6 +168,10 @@ def _handoff(manager, identity, plan, expected=None):
     _, data = manager._load()
     manual = [{'session_id': s['id'], 'state': s['state'], 'control': 'observe_only',
                'status': 'verified' if s['state'] == 'inactive_verified' else 'blocked'} for s in data.get('manual_sessions', {}).values()]
+    plan['manual_required'] = sorted(set(plan.get('manual_required', [])) | {s['session_id'] for s in manual if s['status'] != 'verified'})
+    for session in manual:
+        if session['session_id'] in plan['manual_required'] and session['session_id'] not in plan.get('manual_handled', []):
+            session.update(status='blocked', needs_human='Owner must explicitly handle and identify this observed manual session; inactivity is independently rechecked.')
     native = _proof(manager, plan, manager.maintenance_host.inspect(plan), 'handoff')
     inflight = _inflight(manager, data)
     plan['checks'] = {'tasks': tasks, 'manual': manual, 'inflight_requests': inflight, 'native': native}
@@ -383,3 +397,19 @@ def _verify_restore(manager, identity, plan):
         plan.update(status='rollback_pending', needs_human=[str(exc)])
     _save(manager, plan)
     return plan
+
+
+
+def runtime_loss(manager, reason):
+    """Trusted native teardown notice: disappearance never asserts executor termination."""
+    with manager._lock, manager._db:
+        version, data = manager._load()
+        event = {'id': 'native-loss:' + manager._notification_generation, 'reason': reason,
+                 'status': 'pending_verification', 'recorded_at': _now(), 'execution_stopped': False,
+                 'operation_id': (data.get('maintenance_mode') or {}).get('operation_id'),
+                 'last_confirmed_tasks': [{'request_id': r['id'], 'execution': r.get('last_confirmed_execution', r['execution']),
+                                           'confirmed_at': r.get('last_execution_verified_at')} for r in data['requests'].values() if r.get('session')]}
+        data.setdefault('maintenance_events', {})[event['id']] = event
+        data['maintenance_runtime'] = {**data.get('maintenance_runtime', {}), 'status': 'unverified', 'loaded': False, 'release_verified': False,
+                                        'reason': 'Native manager unavailable; original execution remains pending verification.'}
+        manager._save(version, data)
