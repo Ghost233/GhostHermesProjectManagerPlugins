@@ -338,15 +338,17 @@ def reconcile_inputs(manager, data):
                     unchanged = False
         except (ManagementError, OSError):
             unchanged = False
-        if not unchanged:
+        missing_watch = unchanged and manager.global_validation_host is None
+        if not unchanged or missing_watch:
             changed = True
-            attempt.update(status='invalidated', whole_project_complete=False, reason='Actual validation input changed after its verified test run.')
+            attempt.update(status='unverified' if missing_watch else 'invalidated', whole_project_complete=False,
+                reason='Original ongoing input-watch coverage is unavailable; historical completion cannot be advertised as current.' if missing_watch else 'Actual validation input or original input-watch evidence changed after its verified test run.')
             task = data['requests'][attempt['request_id']]
             if task.get('global_validation_id') == attempt['id']:
                 task['whole_project_complete'] = False
             for handoff in data.get('collaboration', {}).get('handoffs', {}).values():
                 if handoff.get('global_validation_id') == attempt['id']:
-                    handoff.update(whole_project_complete=False, integration_status='invalidated')
+                    handoff.update(whole_project_complete=False, integration_status=attempt['status'])
     return changed
 
 
