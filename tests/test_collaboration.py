@@ -91,3 +91,89 @@ async def test_owner_goal_is_publicly_sent_by_steward_and_independently_accepted
             assert task['source_anchor']['chat_id'] == 'oc_project'
             assert handoff['source_anchor']['chat_id'] == 'oc_entry'
             assert task['task_start_anchor'] is None and task['execution'] == 'waiting'
+
+
+@pytest.mark.parametrize('case', ['wrong_sender', 'wrong_app', 'wrong_tenant', 'wrong_recipient', 'wrong_group', 'wrong_content', 'participant_receipt'])
+def test_public_delivery_or_forged_source_does_not_create_a_new_task(tmp_path, case):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        register_roles(manager, tmp_path)
+        with ManagementServer(manager, {'owner': OWNER, 'steward': STEWARD, 'lead': LEAD, 'lead-ingress': INGRESS}):
+            owner, steward, lead, ingress = [ManagementClient(tmp_path / 'state', t) for t in ('owner', 'steward', 'lead', 'lead-ingress')]
+            entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+            sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+            owner.collaborate('register_channels', {'channels': [entry, sending, receiving]})
+            h = owner.collaborate('project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': ISSUE['url']})
+            p = steward.collaborate('claim_delivery', {'handoff_id': h['id']})
+            steward.collaborate('record_delivery', {'handoff_id': h['id'], 'uuid': p['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_project', 'chat_id': 'oc_project'}})
+            event = {'channel_id': receiving['id'], 'source_anchor': source(receiving, 'bot', 'om_project'), 'text': p['text']}
+            field = {'wrong_sender': 'sender_open_id', 'wrong_app': 'app_id', 'wrong_tenant': 'transport_tenant_key', 'wrong_recipient': 'recipient_open_id', 'wrong_group': 'chat_id'}.get(case)
+            if field:
+                event['source_anchor'][field] = 'foreign'
+            if case == 'wrong_content':
+                event['text'] += '\nNew scope invented by a bot.'
+            with pytest.raises(Exception):
+                (lead if case == 'participant_receipt' else ingress).collaborate('ingest', event)
+            snapshot = owner.read_snapshot()
+            assert snapshot['requests'] == [] and snapshot['collaboration']['handoffs'][0]['acceptance'] == 'awaiting_receiver'
+
+
+def test_unknown_cross_group_send_is_never_replayed_after_restart(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        register_roles(manager, tmp_path)
+        entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+        sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving]})
+        h = manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': ISSUE['url']})
+        p = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': h['id']})
+        manager.collaborate(STEWARD, 'record_delivery', {'handoff_id': h['id'], 'uuid': p['uuid'], 'receipt': {'status': 'unknown'}})
+        assert manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': h['id']}) is None
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        assert manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': h['id']}) is None
+        assert manager.read_snapshot(OWNER)['requests'] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('authorized,budget', [(True, True), (False, True), (True, False)])
+async def test_real_sdk_owner_goal_entry_preserves_original_source_auth_and_budget(tmp_path, authorized, budget):
+    from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+    from ghost_hermes_pm.messages import FeishuEntry
+    entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+    sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        register_roles(manager, tmp_path)
+        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving]})
+        raw = P2ImMessageReceiveV1({'schema': '2.0', 'header': {'event_type': 'im.message.receive_v1', 'app_id': entry['app_id'], 'tenant_key': entry['transport_tenant_key']},
+            'event': {'sender': {'sender_type': 'user', 'tenant_key': entry['owner_tenant_key'], 'sender_id': {'open_id': entry['owner_open_id'], 'user_id': 'owner-native'}},
+                'message': {'message_id': 'om_native_owner_goal', 'chat_id': entry['chat_id'], 'chat_type': 'group', 'message_type': 'text',
+                    'content': json.dumps({'text': '@_user_1 项目 mono ' + ISSUE['url']}),
+                    'mentions': [{'key': '@_user_1', 'mentioned_type': 'bot', 'tenant_key': entry['recipient_tenant_key'], 'id': {'open_id': entry['recipient_open_id']}}]}}})
+        original = NS(platform='feishu', user_id='owner-native', user_id_alt=None, chat_id='oc_entry', is_bot=False, message_id='om_native_owner_goal')
+        event = NS(source=original, raw_message=raw, message_id=original.message_id)
+        native = Client.builder().app_id('cli_steward').app_secret('synthetic-unused-secret').build()
+        native.request = lambda request: NS(code=0, raw=NS(content=b'{"code":0,"bot":{"open_id":"ou_steward","activate_status":2}}'))
+        sent = []
+        def create(request):
+            sent.append(request)
+            return CreateMessageResponse({'code': 0, 'data': {'message_id': 'om_created_' + str(len(sent)), 'chat_id': 'oc_project'}})
+        native.im.v1.message.create = create
+        adapter = object()
+        class Gateway:
+            def __init__(self): self.auth_sources, self.budget_sources = [], []
+            def _intake_adapter_for(self, source): return adapter
+            def _is_user_authorized_for_source(self, source): self.auth_sources.append(source); return authorized
+            def _admit_bot_message_for_source(self, source): self.budget_sources.append(source); return budget
+        gateway = Gateway()
+        intake = FeishuEntry(lambda: manager, OWNER.subject, {'enabled': True, 'verification_ref': 'fixture:entry'}, lambda url: None,
+            collaboration_identity_ref=STEWARD.subject)
+        intake.attach_transport(adapter, NativeFeishuTransport(native))
+        result = await intake.receive(event, gateway)
+        assert gateway.auth_sources == [original]
+        assert gateway.budget_sources == ([original] if authorized else [])
+        handoffs = manager.read_snapshot(OWNER)['collaboration']['handoffs']
+        if not authorized or not budget:
+            assert result is None and handoffs == [] and sent == []
+        else:
+            assert result == {'action': 'skip'} and len(sent) == 1
+            assert handoffs[0]['owner_origin']['subject'] == OWNER.subject
+            assert handoffs[0]['owner_origin']['source'] == 'verified-native-collaboration-owner'
+            assert handoffs[0]['source_anchor']['message_id'] == original.message_id

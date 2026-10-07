@@ -23,7 +23,7 @@ class PreparedMessage:
 
 
 class FeishuEntry:
-    def __init__(self, manager, owner, settings, issue_reader, secret_values=()):
+    def __init__(self, manager, owner, settings, issue_reader, secret_values=(), *, collaboration_identity_ref=None, collaboration_client=None):
         self.manager = manager
         self.owner = owner
         self.settings = settings
@@ -34,6 +34,8 @@ class FeishuEntry:
         self.closed = False
         self.generation = 0
         self.lifecycle_lock = threading.RLock()
+        from .collaboration_entry import CollaborationEntry
+        self.collaboration_entry = CollaborationEntry(self, collaboration_identity_ref, collaboration_client) if collaboration_identity_ref or collaboration_client else None
 
     def deactivate(self):
         with self.lifecycle_lock:
@@ -62,6 +64,10 @@ class FeishuEntry:
 
     def prepare(self, event, adapter):
         """Inspect one original event without auth charges, writes or external requests."""
+        if self.collaboration_entry is not None:
+            prepared = self.collaboration_entry.prepare(event, adapter)
+            if prepared is not None:
+                return prepared
         if self.closed or self.settings.get('enabled') is not True or not self.settings.get('verification_ref'):
             return None
         try:
@@ -127,6 +133,8 @@ class FeishuEntry:
             return None
 
     def in_scope(self, prepared, runtime_profile):
+        if getattr(prepared, 'role_kind', None) and self.collaboration_entry is not None:
+            return self.collaboration_entry.in_scope(prepared, runtime_profile)
         manager = self.manager()
         if manager is None:
             return False
@@ -141,6 +149,10 @@ class FeishuEntry:
 
     async def process_prepared(self, prepared, generation=None):
         """Business processing after the owned driver has irrevocably consumed this original."""
+        if getattr(prepared, 'role_kind', None) and self.collaboration_entry is not None:
+            generation = self.generation if generation is None else generation
+            async with self.lock:
+                return await self.collaboration_entry.process(prepared, generation)
         identity = VerifiedIdentity(self.owner, 'verified-feishu-owner-entry')
         binding, envelope, transport = prepared.binding, prepared.envelope, prepared.transport
         generation = self.generation if generation is None else generation

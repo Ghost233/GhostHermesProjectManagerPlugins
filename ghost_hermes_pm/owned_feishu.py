@@ -133,7 +133,12 @@ class OwnedFeishuAdapter(FeishuAdapter):
             matching = [b for b in self.registered_bots if b['tenant_key'] == getattr(sender, 'tenant_key', None)
                         and b['open_id'] == getattr(ids, 'open_id', None) and native_ids & set(b['native_ids'])]
             manager = self.intake.manager()
-            if len(matching) != 1 or manager is None:
+            if len(matching) != 1:
+                return 'owned_bot_not_registered'
+            role_entry = self.intake.collaboration_entry
+            if role_entry is not None and role_entry.bot_source_in_scope(sender, message, self._app_id):
+                return super()._admit(sender, message)
+            if manager is None:
                 return 'owned_bot_not_registered'
             from .manager import VerifiedIdentity
             try:
@@ -182,7 +187,10 @@ class OwnedFeishuAdapter(FeishuAdapter):
                 logger.warning('Owned intake not accepted: registered runtime responsibility requires verification.')
                 return
             owner = VerifiedIdentity(self.intake.owner, 'verified-owned-feishu-owner-entry')
-            if self.intake.manager().read_intake_failure(owner, prepared.envelope) is not None:
+            role_message = bool(getattr(prepared, 'role_kind', None))
+            if role_message and self.intake.collaboration_entry.already_processed(prepared):
+                return
+            if not role_message and self.intake.manager().read_intake_failure(owner, prepared.envelope) is not None:
                 return
             key = tuple(prepared.envelope.get(k) for k in ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id', 'message_id'))
             if key in self._committed:
@@ -200,8 +208,9 @@ class OwnedFeishuAdapter(FeishuAdapter):
         try:
             self.intake.require_active(generation)
             owner = VerifiedIdentity(self.intake.owner, 'verified-owned-feishu-owner-entry')
-            self.intake.manager().record_intake_conditions(owner, {
-                'enabled': False, 'runtime_route': 'owned_prebatch', 'compatibility': 'pinned_seams_matched',
+            if self.intake.manager() is not None:
+                self.intake.manager().record_intake_conditions(owner, {
+                    'enabled': False, 'runtime_route': 'owned_prebatch', 'compatibility': 'pinned_seams_matched',
                 'sdk_revision': SDK_REVISION, 'lark_version': '1.6.8',
                 'allowed_users_policy': 'explicit_owner_and_registered_bot_ids',
                 'same_app_policy': 'configured_driver_conflict_and_native_lock', 'real_connect': 'unverified',

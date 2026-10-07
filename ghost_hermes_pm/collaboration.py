@@ -52,6 +52,11 @@ def perform(manager, identity, action, details):
         version, data = manager._load()
         principal = manager._principal(identity, data)
         state = _state(data)
+        if action == 'read_routes':
+            if details:
+                raise ManagementError('invalid_change', 'Role route reads accept no actor fields.')
+            visible = set(data['profiles']) if principal is None or principal['role'] == 'steward' else manager._visible_profile_ids(principal, data)
+            return {**snapshot(data, principal, visible), 'profiles': [p for p in data['profiles'].values() if p['id'] in visible]}
         if action == 'register_channels':
             if principal is not None or set(details) != {'channels'} or not isinstance(details['channels'], list):
                 raise ManagementError('forbidden', 'Only the Owner registers existing verified role/group namespaces.')
@@ -71,8 +76,9 @@ def perform(manager, identity, action, details):
                 _public_text(json.dumps(supplied), manager._sensitive_values())
                 state['channels'][supplied['id']] = {**supplied, 'profile_binding': _binding(profile)}
             result = {'status': 'registered', 'enabled': False}
-        elif action == 'project_goal':
-            if principal is not None or set(details) != {'sender_profile_id', 'target_profile_id', 'source_anchor', 'issue_url'}:
+        elif action in {'project_goal', 'owner_project_goal'}:
+            native_owner = action == 'owner_project_goal' and identity.source == 'native-collaboration-ingress' and principal is not None and principal['role'] == 'steward' and principal['id'] == details.get('sender_profile_id')
+            if (principal is not None and not native_owner) or set(details) != {'sender_profile_id', 'target_profile_id', 'source_anchor', 'issue_url'}:
                 raise ManagementError('forbidden', 'A new project goal requires the verified Owner.')
             sender = data['profiles'].get(details['sender_profile_id'], {})
             target = data['profiles'].get(details['target_profile_id'], {})
@@ -104,7 +110,7 @@ def perform(manager, identity, action, details):
             if not isinstance(issue, dict) or issue.get('url') != details['issue_url'] or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
                 raise ManagementError('invalid_change', 'The original Issue scope could not be verified.')
             _public_text(issue['title'] + '\n' + issue['body'], manager._sensitive_values())
-            origin = {'subject': identity.subject, 'source': identity.source, 'source_anchor': dict(message)}
+            origin = {'subject': manager.owner_identity_ref if native_owner else identity.subject, 'source': 'verified-native-collaboration-owner' if native_owner else identity.source, 'source_anchor': dict(message)}
             text = '项目工作交接：' + issue['title'] + '\nIssue：' + issue['url'] + '\n受理版本：' + issue['updated_at'] + '\n原本人目标：' + issue['body']
             chunks = [text[n:n + 1400] for n in range(0, len(text), 1400)]
             segments = [{'number': n + 1, 'uuid': str(uuid.uuid4()), 'status': 'pending', 'text': '[hermes-role-work ' + key + ' ' + str(n + 1) + '/' + str(len(chunks)) + ']\n' + chunk, 'attempts': []} for n, chunk in enumerate(chunks)]
@@ -145,6 +151,17 @@ def perform(manager, identity, action, details):
                 result = handoff
             statuses = [s['status'] for s in handoff['segments']]
             handoff['delivery'] = next((s for s in ('unknown', 'sending', 'failed', 'pending') if s in statuses), 'delivered')
+        elif action in {'publish_ack', 'claim_ack', 'record_ack'}:
+            expected = {'handoff_id', 'uuid', 'receipt'} if action == 'record_ack' else {'handoff_id'}
+            handoff = state['handoffs'].get(details.get('handoff_id'))
+            if set(details) != expected or identity.source != 'native-collaboration-ingress' or principal is None or not handoff or handoff['target_profile_id'] != principal['id'] or handoff['acceptance'] != 'accepted' or not handoff.get('task_request_id'):
+                raise ManagementError('forbidden', 'Only the independently accepted native receiver publishes task confirmation.')
+            request_id = handoff['task_request_id']
+            if action == 'publish_ack':
+                return manager.publish_request_message(identity, request_id, 'confirmation', '已受理原本人目标：' + handoff['issue']['title'] + '\nIssue：' + handoff['issue']['url'] + '\n负责人：' + principal['id'] + '；等待明确基线与执行核验。')
+            if action == 'claim_ack':
+                return manager.claim_delivery(identity, request_id)
+            return manager.record_delivery(identity, request_id, details['uuid'], details['receipt'])
         elif action == 'ingest':
             if identity.source != 'native-collaboration-ingress' or principal is None or set(details) != {'channel_id', 'source_anchor', 'text'}:
                 raise ManagementError('forbidden', 'Independent reception requires the separate native ingress credential.')

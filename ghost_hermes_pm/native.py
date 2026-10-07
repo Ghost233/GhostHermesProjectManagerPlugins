@@ -26,14 +26,22 @@ def register_native(ctx):
     registered_home = None
     runtime = 'configuring'
     resources = None
+    def collaboration_client():
+        token = _credential(ctx.get_config('collaboration_credential_ref'))
+        participant = _credential(ctx.get_config('participant_credential_ref'))
+        if not state_dir or not token or token == participant:
+            raise ManagementError('unauthorized', 'A distinct native collaboration ingress credential is required.')
+        return ManagementClient(state_dir, token)
+
     intake = FeishuEntry(lambda: resources[0] if resources else None, owner,
-                         ctx.get_config('feishu_intake', {}), read_github_issue)
+                         ctx.get_config('feishu_intake', {}), read_github_issue,
+                         collaboration_identity_ref=ctx.get_config('collaboration_identity_ref'),
+                         collaboration_client=collaboration_client if ctx.get_config('collaboration_credential_ref') else None)
     ctx.register_platform_handler(OWNED_PLATFORM, lambda native, adapter: intake.attach_transport(adapter, NativeFeishuTransport(native)))
     if state_dir and (ctx.get_config('participant_credential_ref') or (manager_profile and owner)):
         runtime = 'manager_unavailable'
-    if manager_profile == registered_profile:
-        from hermes_constants import get_hermes_home
-        registered_home = get_hermes_home().resolve()
+    from hermes_constants import get_hermes_home
+    registered_home = get_hermes_home().resolve()
 
     def close():
         nonlocal resources, runtime
@@ -70,6 +78,11 @@ def register_native(ctx):
                 if not participant_token or participant_token in credentials or entry.get('identity_ref') == owner:
                     raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
                 credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
+            for entry in ctx.get_config('collaboration_entries', []):
+                native_token = _credential(entry.get('credential_ref'))
+                if not native_token or native_token in credentials or entry.get('identity_ref') == owner:
+                    raise ManagementError('invalid_change', 'Native role ingress credentials must be distinct from Owner and model-facing credentials.')
+                credentials[native_token] = VerifiedIdentity(entry['identity_ref'], 'native-collaboration-ingress')
             intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, *credentials)))
             from .codex import configured_adapter
             from .github import GitHubDeliverySource
