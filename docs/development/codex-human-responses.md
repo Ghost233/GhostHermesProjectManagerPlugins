@@ -8,7 +8,7 @@
 
 普通 `item/tool/requestUserInput` 使用 `isBlocking` 区分普通阻塞与非阻塞问题；不使用已废弃的超时自动批准、拒绝或停止。`isSecret` 和 `isOther` 按固定 schema 的省略默认值 false 处理。任何秘密 metadata、敏感内容或配置中的已知秘密，使整个请求仅显示安全定位；问题内容与答案不进入群、任务记录或日志。不能为独立 stdio 服务编造桌面链接，目前定位是实际 service/thread/item 与“原客户端界面需人工打开”，URL 为 null。
 
-命令、文件及权限的正式请求归为审批。user-input 中涉及命令、执行、网络、权限或批准的内容也不能作普通事实答复；未支持的该类请求只定位原界面。动态工具、凭据刷新、attestation、旧审批和 MCP elicitation 同样不伪造方法。实验性 additionalPermissions/availableDecisions 出现时先定位原界面，本切片不假定它们的运行能力。普通自然语言问题仅从原当前回合最近 agentMessage 的实际内容观察，回答通过 #17 `append` 的 expected-turn/idle-input 控制语义；它不成为虚构 RPC，不允许以自然语言批准执行。
+命令、文件及权限的正式请求归为审批。user-input 的题干、header、选项标签及说明中涉及命令、执行、网络、权限或批准的内容也不能作普通事实答复；未支持的该类请求只定位原界面。动态工具、凭据刷新、attestation、旧审批和 MCP elicitation 同样不伪造方法。实验性 additionalPermissions/availableDecisions 出现时先定位原界面，本切片不假定它们的运行能力。普通自然语言问题仅从原当前回合最近 agentMessage 的实际内容观察，回答通过 #17 `append` 的 expected-turn/idle-input 控制语义；它不成为虚构 RPC，不允许以自然语言批准执行。
 
 普通结构化答复为 `{"answers":{"原题ID":["答案"]}}`，正式回送转为每题 `{answers:[...]}`。原题 ID 集合、选项及自由输入标记均须匹配。自然语言题固定答案 ID `answer`。
 

@@ -98,6 +98,8 @@ def test_content_classification_and_secret_material_never_enter_public_records(t
         task = manager.refresh_task(OWNER, task_id)
         q = task['human_requests'][0]
         assert q['category'] == category and q['answerable'] is answerable
+        if envelope['method'] == 'item/tool/requestUserInput':
+            assert q['blocking'] is envelope['params']['isBlocking']
         if not answerable:
             with pytest.raises(ManagementError):
                 manager.answer_human_request(OWNER, task_id, q['id'], 'no-secret', {'answers': {'secret': ['synthetic-private-answer']}})
@@ -581,4 +583,19 @@ def test_structured_reply_requires_one_current_active_turn(tmp_path):
                       {'id': 'unregistered-active-turn', 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}))
         with pytest.raises(ManagementError):
             manager.answer_human_request(OWNER, task_id, q['id'], 'ambiguous-active', {'answers': {'colour': ['Blue']}})
+        assert replies(tmp_path) == []
+
+
+@pytest.mark.parametrize('header,options,category', [
+    ('Password', None, 'sensitive'),
+    ('Choose', [{'label': 'Allow', 'description': 'Approve executing a shell command.'}], 'approval'),
+])
+def test_header_and_option_content_cannot_hide_secret_or_operation_approval(tmp_path, header, options, category):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question(questions=[{'id': 'value', 'header': header, 'question': 'Which value?',
+            'isSecret': False, 'isOther': True, 'options': options}]))
+        q = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        assert q['category'] == category and q['answerable'] is False
         assert replies(tmp_path) == []

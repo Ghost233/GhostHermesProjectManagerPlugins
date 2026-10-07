@@ -23,8 +23,19 @@ def _describe(manager, envelope):
         return description
     if method not in APPROVAL_METHODS | {'item/tool/requestUserInput'}:
         return description
+    description['blocking'] = True if method in APPROVAL_METHODS else params.get('isBlocking') if type(params.get('isBlocking')) is bool else None
     raw_questions = params.get('questions', [])
-    sensitive = isinstance(raw_questions, list) and any(q.get('isSecret') is True or re.search(r'(?i)password|api[ _-]?key|credential|private key|验证码|密码|密钥|私钥|凭据', q.get('question', '') if isinstance(q.get('question'), str) else '') for q in raw_questions if isinstance(q, dict))
+    content = []
+    if isinstance(raw_questions, list):
+        for question in raw_questions:
+            if not isinstance(question, dict):
+                continue
+            content.extend(question[k] for k in ('id', 'header', 'question') if isinstance(question.get(k), str))
+            if isinstance(question.get('options'), list):
+                for option in question['options']:
+                    if isinstance(option, dict):
+                        content.extend(option[k] for k in ('label', 'description') if isinstance(option.get(k), str))
+    sensitive = isinstance(raw_questions, list) and any(q.get('isSecret') is True for q in raw_questions if isinstance(q, dict)) or any(re.search(r'(?i)password|api[ _-]?key|credential|private key|secret|验证码|密码|密钥|私钥|凭据', text) for text in content)
     try:
         _public_text(json.dumps(params), manager._sensitive_values())
     except ManagementError:
@@ -40,9 +51,9 @@ def _describe(manager, envelope):
         return {'category': 'approval', 'blocking': True, 'answerable': (method != 'item/commandExecution/requestApproval' or operation.get('kind') == 'command' and bool(params.get('command') or params.get('networkApprovalContext'))) and not params.get('additionalPermissions') and not params.get('availableDecisions') and not params.get('grantRoot'), 'operation': operation,
             'operation_id': hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest(), 'scope': 'turn'}
     questions = params.get('questions')
-    if type(params.get('isBlocking')) is not bool or not isinstance(questions, list) or not questions or any(not isinstance(q, dict) or not isinstance(q.get('id'), str) or not q['id'] or not isinstance(q.get('question'), str) or type(q.get('isSecret', False)) is not bool for q in questions) or len({q['id'] for q in questions}) != len(questions):
+    if type(params.get('isBlocking')) is not bool or not isinstance(questions, list) or not questions or any(not isinstance(q, dict) or not isinstance(q.get('id'), str) or not q['id'] or not isinstance(q.get('question'), str) or not isinstance(q.get('header'), str) or type(q.get('isSecret', False)) is not bool or type(q.get('isOther', False)) is not bool or q.get('options') is not None and (not isinstance(q['options'], list) or any(not isinstance(o, dict) or not isinstance(o.get('label'), str) or not isinstance(o.get('description'), str) for o in q['options'])) for q in questions) or len({q['id'] for q in questions}) != len(questions):
         return description
-    approval_content = any(re.search(r'(?i)approv|authoriz|permission|grant access|command|shell|stdin|network|socket|execute|run.*script|allow (?:running|executing|access|network)|批准|授权|命令|权限|网络|执行|联网|允许.*(?:运行|访问)', q['question']) for q in questions)
+    approval_content = any(re.search(r'(?i)approv|authoriz|permission|grant access|command|shell|stdin|network|socket|execute|run.*script|allow (?:running|executing|access|network)|批准|授权|命令|权限|网络|执行|联网|允许.*(?:运行|访问)', text) for text in content)
     return {'category': 'approval' if approval_content else 'question' if params['isBlocking'] else 'nonblocking',
         'blocking': params['isBlocking'], 'answerable': not approval_content, 'questions': questions}
 
