@@ -198,11 +198,13 @@ def _stop(manager, identity, request_id, version, data, record, session, instruc
     return {'status': 'accepted', 'duplicate': False, 'instruction': instruction, 'execution': 'stopping', 'stop': stop}
 
 
-def refresh_stop(manager, identity, request_id):
+def refresh_stop(manager, identity, request_id, *, sampling=False):
     """A turn end is insufficient: every related thread and background page counts."""
     with manager._lock:
         version, data = manager._load()
         record = _responsible(manager, identity, request_id, data)
+        from .notifications import meaningful_observation
+        before = meaningful_observation(record)
         stop = next(s for s in record['stop_records'] if s['instruction_id'] == record['stop']['instruction_id'])
         record['stop'] = stop
         try:
@@ -231,8 +233,9 @@ def refresh_stop(manager, identity, request_id):
             stop.update(reason=str(exc), last_verification_attempt_at=_now())
         if stop['status'] != 'confirmed':
             record.update(execution='stopping', outer_task_status='stopping', repository_released=False, unexecuted_reason=stop.get('reason'))
-        with manager._db:
-            manager._save(version, data)
+        if not sampling or before != meaningful_observation(record):
+            with manager._db:
+                manager._save(version, data)
         report_state = (stop['status'], stop.get('rpc_status'), stop.get('reason'), str(stop.get('related_execution')))
         if tuple(record.get('stop_report_state', ())) != report_state:
             record['stop_report_state'] = report_state

@@ -393,7 +393,7 @@ async def test_group_dashboard_show_same_owner_grant_and_non_interrupting_return
             assert snapshot['requests'][0]['session']['control'] == 'observe_only'
             assert snapshot['requests'][0]['repository_released'] is False
             feedback = [s for s in transport.sent if '本次工作接管' in s['text'] or '控制已归还' in s['text']]
-            assert len(feedback) == 2 and all(s['reply_to'] == task['task_start_anchor']['message_id'] and s['mention_open_id'] == 'ou_owner' for s in feedback)
+            assert len(feedback) == 2 and all(s['reply_to'] == task['task_start_anchor']['message_id'] and s['mention_open_id'] is None for s in feedback)
     methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
     assert methods.count('turn/steer') == 1 and 'turn/interrupt' not in methods
 

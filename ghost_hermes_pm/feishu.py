@@ -40,9 +40,11 @@ class NativeFeishuTransport:
     async def send(self, segment):
         self.lifecycle_check()
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody, CreateMessageRequest, CreateMessageRequestBody
-        content = json.dumps({'zh_cn': {'content': [[
-            {'tag': 'at', 'user_id': segment['mention_open_id']},
-            {'tag': 'text', 'text': '\n' + segment['text']}]]}}, ensure_ascii=False)
+        items = []
+        if segment.get('mention_open_id'):
+            items.append({'tag': 'at', 'user_id': segment['mention_open_id']})
+        items.append({'tag': 'text', 'text': '\n' + segment['text']})
+        content = json.dumps({'zh_cn': {'content': [items]}}, ensure_ascii=False)
         if segment.get('path') == 'create':
             body = CreateMessageRequestBody.builder().receive_id(segment['chat_id']).msg_type('post').content(content).uuid(segment['uuid']).build()
             request = CreateMessageRequest.builder().receive_id_type('chat_id').request_body(body).build()

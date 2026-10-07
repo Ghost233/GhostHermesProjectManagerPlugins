@@ -295,6 +295,8 @@ def notify_human_requests(manager, identity, request_id):
         _, data = manager._load()
         record = manager._request(identity, request_id, data)
         for question in record.get('human_requests', []):
+            if question['category'] == 'nonblocking' and question['resolution'] == 'pending' and not question.get('reply'):
+                continue
             reply = question.get('reply') or {}
             state = [question['resolution'], reply.get('sent'), question['execution_result']]
             if question.get('notification_state') == state:
@@ -355,6 +357,11 @@ def associate_human_reply(manager, identity, project_id, profile_id, message, te
                 if parent and not target_id:
                     anchors = {a.get('message_id') for a in [record['source_anchor'], record['task_start_anchor'] or {}]}
                     anchors |= {attempt.get('message_id') for p in record['outbox'] if p['id'] in q.get('notification_ids', []) for segment in p['segments'] for attempt in segment['attempts'] if attempt['status'] == 'delivered'}
+                    for notice in data.get('notifications', {}).get('events', {}).values():
+                        channel = notice.get('target_channel') or {}
+                        if notice.get('human_request_id') != q['id'] or not all(channel.get(k) == message.get(k) for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')) or channel.get('owner_open_id') != message.get('sender_open_id') or channel.get('owner_tenant_key') != message.get('tenant_key'):
+                            continue
+                        anchors |= {attempt.get('message_id') for segment in notice.get('segments', []) for attempt in segment['attempts'] if attempt['status'] == 'delivered'}
                     if parent not in anchors:
                         continue
                 candidates.append((record, q))

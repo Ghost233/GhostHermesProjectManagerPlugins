@@ -403,6 +403,10 @@ class FeishuEntry:
             if receipt.get('status') != 'delivered':
                 break
 
+    async def deliver_notifications(self, identity, generation=None):
+        from .notifications import deliver
+        return await deliver(self, identity, self.generation if generation is None else generation)
+
     async def deliver_knowledge(self, identity, query_id, transport, generation=None):
         from .knowledge_entry import deliver_knowledge
         return await deliver_knowledge(self, identity, query_id, transport, generation)
