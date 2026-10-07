@@ -344,3 +344,37 @@ def test_unaccepted_classifications_and_sensitive_or_temporary_content_never_bec
                 lead.curate_project_memory('mono-lead', 'temporary-status', request_id,
                     {'facts': [], 'decisions': [], 'include_delivery': True, 'temporary_status': 'Codex claims complete'})
             assert lead.read_project_memory('mono-lead')['entries'] == []
+
+
+def test_factual_answer_uses_manual_original_service_and_returned_grant_cannot_answer_again(tmp_path):
+    from test_task_execution import adapter_for
+    from test_manual_control import original_state, adapters, setup, ORIGINAL_THREAD, ORIGINAL_TURN
+    repo = make_repo(tmp_path / 'repo')
+    peer = tmp_path / 'original'
+    original_state(peer, repo)
+    read, control = adapters(peer)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control},
+                 knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
+        request_id, observed = setup(manager, repo)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
+            owner.take_over_session(request_id, observed['id'], 'factual-original-grant', ORIGINAL_TURN)
+            query = prepared_facts(manager, owner, lead, request_id)
+            state = json.loads((peer / 'original-state.json').read_text())
+            state['server_requests'] = [user_question(61, threadId=ORIGINAL_THREAD, turnId=ORIGINAL_TURN,
+                questions=[{'id': 'policy', 'header': 'Known fact', 'question': QUESTION, 'isSecret': False, 'isOther': True, 'options': None}])]
+            (peer / 'original-state.json').write_text(json.dumps(state))
+            q = owner.refresh_task(request_id)['human_requests'][0]
+            answered = lead.answer_from_knowledge(request_id, q['id'], query, ['retry:3'])
+            assert answered['reply']['sent'] == 'sent' and answered['thread_id'] == ORIGINAL_THREAD
+            owner.return_session_control(request_id, 'factual-original-grant')
+            with pytest.raises(ManagementError):
+                lead.answer_from_knowledge(request_id, q['id'], query, ['retry:3'])
+            owner.refresh_task(request_id)
+        wire = list(map(json.loads, (peer / 'original-wire.jsonl').read_text().splitlines()))
+        sent = [r for r in wire if 'method' not in r]
+        assert len(sent) == 1 and sent[0]['id'] == 61 and 'retry.md#L3' in json.dumps(sent[0])
+        assert not any(r.get('method') in {'turn/start', 'thread/start', 'thread/resume', 'thread/fork'} for r in wire)
+        assert not (tmp_path / 'wire.jsonl').exists()
