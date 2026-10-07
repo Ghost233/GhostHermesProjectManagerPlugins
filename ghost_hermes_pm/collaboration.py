@@ -45,6 +45,62 @@ def authorize_accept(manager, identity, delegation_id, project_id, profile_id, m
         'forwarding_profile_id': handoff['sender_profile_id'], 'new_owner_decision': False}
 
 
+def _new_handoff(manager, data, sender, target, issue_url, owner_origin, source_anchor, parent_id):
+    state = _state(data)
+    targets = [c for c in state['channels'].values() if c['profile_id'] == target['id'] and c['group_kind'] == 'project']
+    if len(targets) != 1:
+        raise ManagementError('binding_conflict', 'The receiving project role channel must be unique.')
+    receiving = _channel(data, targets[0]['id'])
+    senders = [c for c in state['channels'].values() if c['profile_id'] == sender['id'] and c['chat_id'] == receiving['chat_id'] and c['group_kind'] == 'project']
+    if len(senders) != 1 or not isinstance(issue_url, str) or not re.fullmatch(r'https://github\.com/' + re.escape(receiving['repository']) + r'/issues/[1-9]\d*', issue_url):
+        raise ManagementError('binding_conflict', 'The sender group and explicit child Issue repository must match.')
+    sending = _channel(data, senders[0]['id'])
+    if len([b for b in sending['bot_sources'] if b['profile_id'] == target['id']]) != 1:
+        raise ManagementError('binding_conflict', 'The target bot must have an observed identity in the sending app namespace.')
+    key = hashlib.sha256(json.dumps(['work', sender['id'], target['id'], parent_id, issue_url]).encode()).hexdigest()
+    existing = state['handoffs'].get(key)
+    if existing:
+        return {**existing, 'duplicate': True}
+    issue = manager.delivery_source.read_issue(issue_url) if manager.delivery_source else None
+    if not isinstance(issue, dict) or issue.get('url') != issue_url or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
+        raise ManagementError('unavailable', 'The original child Issue source could not be verified.')
+    _public_text(issue['title'] + '\n' + issue['body'], manager._sensitive_values())
+    text = ('子 Issue 工作交接：' + issue['title'] + '\nIssue：' + issue['url'] + '\n受理版本：' + issue['updated_at'] +
+        '\n原本人目标关联：' + parent_id + '\n明确子范围：' + issue['body'])
+    chunks = [text[n:n + 1400] for n in range(0, len(text), 1400)]
+    segments = [{'number': n + 1, 'uuid': str(uuid.uuid4()), 'status': 'pending', 'text': '[hermes-role-work ' + key + ' ' + str(n + 1) + '/' + str(len(chunks)) + ']\n' + chunk, 'attempts': []} for n, chunk in enumerate(chunks)]
+    handoff = {'id': key, 'sender_profile_id': sender['id'], 'target_profile_id': target['id'], 'kind': 'work',
+        'source_anchor': dict(source_anchor), 'owner_origin': owner_origin, 'issue': issue,
+        'sender_channel_id': sending['id'], 'target_channel_id': receiving['id'], 'segments': segments,
+        'delivery': 'pending', 'acceptance': 'awaiting_receiver', 'received_parts': {}, 'task_request_id': None,
+        'parent_handoff_id': parent_id, 'created_at': _now(), 'whole_project_complete': False}
+    state['handoffs'][key] = handoff
+    return handoff
+
+
+def _result_handoff(manager, data, sender, target, original, text, kind='result'):
+    state = _state(data)
+    receiving = next(c for c in state['channels'].values() if c['profile_id'] == target['id'] and c['group_kind'] == 'project')
+    sending = next(c for c in state['channels'].values() if c['profile_id'] == sender['id'] and c['chat_id'] == receiving['chat_id'] and c['group_kind'] == 'project')
+    _channel(data, receiving['id']); _channel(data, sending['id'])
+    if len([b for b in sending['bot_sources'] if b['profile_id'] == target['id']]) != 1:
+        raise ManagementError('binding_conflict', 'The result target bot identity is not registered in this sending namespace.')
+    key = hashlib.sha256(json.dumps([kind, original['id'], sender['id'], target['id']]).encode()).hexdigest()
+    if key in state['handoffs']:
+        return {**state['handoffs'][key], 'duplicate': True}
+    _public_text(text, manager._sensitive_values())
+    chunks = [text[n:n + 1400] for n in range(0, len(text), 1400)]
+    segments = [{'number': n + 1, 'uuid': str(uuid.uuid4()), 'status': 'pending', 'text': '[hermes-role-' + kind + ' ' + key + ' ' + str(n + 1) + '/' + str(len(chunks)) + ']\n' + chunk, 'attempts': []} for n, chunk in enumerate(chunks)]
+    record = {'id': key, 'kind': kind, 'sender_profile_id': sender['id'], 'target_profile_id': target['id'],
+        'source_anchor': dict(original['received_anchor']), 'owner_origin': original['owner_origin'], 'issue': original['issue'],
+        'sender_channel_id': sending['id'], 'target_channel_id': receiving['id'], 'segments': segments,
+        'delivery': 'pending', 'acceptance': 'awaiting_receiver', 'received_parts': {}, 'task_request_id': None,
+        'result_task_id': original.get('task_request_id'), 'original_handoff_id': original['id'],
+        'parent_handoff_id': original.get('parent_handoff_id'), 'created_at': _now(), 'whole_project_complete': False}
+    state['handoffs'][key] = record
+    return record
+
+
 def perform(manager, identity, action, details):
     if not isinstance(details, dict):
         raise ManagementError('invalid_change', 'A bounded role operation is required.')
@@ -119,6 +175,28 @@ def perform(manager, identity, action, details):
                 'target_channel_id': receiving['id'], 'segments': segments, 'delivery': 'pending', 'acceptance': 'awaiting_receiver',
                 'received_parts': {}, 'task_request_id': None, 'created_at': _now(), 'whole_project_complete': False}
             state['handoffs'][key] = result
+        elif action == 'delegate_issue':
+            if principal is None or principal['role'] != 'project_lead' or set(details) != {'parent_handoff_id', 'target_profile_id', 'issue_url'}:
+                raise ManagementError('forbidden', 'Only the accepted project lead delegates a clear child Issue.')
+            parent = state['handoffs'].get(details['parent_handoff_id'])
+            target = data['profiles'].get(details['target_profile_id'])
+            if not parent or parent['acceptance'] != 'accepted' or parent['target_profile_id'] != principal['id'] or not target or target['role'] != 'subproject_lead' or target['parent_profile_id'] != principal['id']:
+                raise ManagementError('forbidden', 'The parent goal and explicitly registered child must belong to this lead.')
+            result = _new_handoff(manager, data, principal, target, details['issue_url'], parent['owner_origin'], parent['received_anchor'], parent['id'])
+        elif action == 'report_result':
+            if set(details) != {'handoff_id'} or principal is None:
+                raise ManagementError('forbidden', 'Only an assigned role reports its original Issue delivery.')
+            original = state['handoffs'].get(details['handoff_id'])
+            task = data['requests'].get((original or {}).get('task_request_id'))
+            if not original or original['target_profile_id'] != principal['id'] or original['acceptance'] != 'accepted' or not task or task.get('task_delivery') != 'delivered' or task['profile_id'] != principal['id']:
+                raise ManagementError('evidence_missing', 'The original assigned Issue has not been delivered with its own evidence.')
+            target_id = principal.get('parent_profile_id') if principal['role'] == 'subproject_lead' else original['sender_profile_id']
+            target = data['profiles'].get(target_id)
+            if not target:
+                raise ManagementError('binding_conflict', 'The registered result recipient is unavailable.')
+            status = '子 Issue 已交付，待集成；全局验证尚未核对。' if principal['role'] == 'subproject_lead' else 'mono Issue 已交付；项目整体状态仍待全局验证。'
+            text = status + '\nIssue：' + task['accepted_scope']['url'] + '\n交付版本：' + str(task.get('delivery_evidence', {}).get('source_commit')) + '\nPR：' + task.get('pr_status', 'none') + '\n原验收与测试证据：' + json.dumps(task.get('delivery_evidence', {}).get('criteria', []), ensure_ascii=False)
+            result = _result_handoff(manager, data, principal, target, original, text)
         elif action in {'claim_delivery', 'record_delivery'}:
             allowed = {'handoff_id'} if action == 'claim_delivery' else {'handoff_id', 'uuid', 'receipt'}
             if set(details) != allowed:
@@ -168,17 +246,17 @@ def perform(manager, identity, action, details):
             receiving = _channel(data, details['channel_id'])
             message = details['source_anchor']
             _message_anchor(message)
-            marker = re.match(r'^\[hermes-role-work ([a-f0-9]{64}) (\d+)/(\d+)\]\n', details['text'])
+            marker = re.match(r'^\[hermes-role-(?P<kind>work|result|summary|progress) (?P<id>[a-f0-9]{64}) (?P<part>\d+)/(?P<total>\d+)\]\n', details['text'])
             if not marker:
                 raise ManagementError('invalid_change', 'Only an explicit original work marker may create delegated work.')
-            handoff = state['handoffs'].get(marker.group(1))
+            handoff = state['handoffs'].get(marker.group('id'))
             if not handoff or principal['id'] != receiving['profile_id'] or receiving['id'] != handoff['target_channel_id'] or principal['id'] != handoff['target_profile_id']:
                 raise ManagementError('forbidden', 'The native receiver is outside this handoff responsibility.')
             if any(receiving.get(k) != message.get(k) for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')):
                 raise ManagementError('binding_conflict', 'The original receiver namespace does not match the registered destination.')
             senders = [b for b in receiving['bot_sources'] if b['profile_id'] == handoff['sender_profile_id'] and b['open_id'] == message['sender_open_id'] and b['tenant_key'] == message['tenant_key']]
-            number = int(marker.group(2))
-            if len(senders) != 1 or int(marker.group(3)) != len(handoff['segments']) or not 1 <= number <= len(handoff['segments']) or handoff['segments'][number - 1]['text'] != details['text']:
+            number = int(marker.group('part'))
+            if handoff['kind'] != marker.group('kind') or len(senders) != 1 or int(marker.group('total')) != len(handoff['segments']) or not 1 <= number <= len(handoff['segments']) or handoff['segments'][number - 1]['text'] != details['text']:
                 raise ManagementError('binding_conflict', 'The source bot or full original handoff content could not be matched.')
             if handoff['acceptance'] == 'accepted':
                 return {**handoff, 'duplicate': True}
@@ -189,13 +267,19 @@ def perform(manager, identity, action, details):
                 handoff['acceptance'] = 'source_received'
                 with manager._db:
                     manager._save(version, data)
-                if principal['capability'] == 'development':
+                if handoff['kind'] == 'work' and principal['capability'] == 'development':
                     task = manager.accept_request(identity, principal['project_id'], principal['id'], handoff['received_anchor'], handoff['issue'], delegation_id=handoff['id'])['request']
                 else:
                     task = None
                 version, data = manager._load()
                 handoff = _state(data)['handoffs'][handoff['id']]
                 handoff.update(acceptance='accepted', accepted_at=_now(), task_request_id=task['id'] if task else None)
+                if handoff['kind'] == 'result':
+                    parent = _state(data)['handoffs'].get(handoff.get('parent_handoff_id'))
+                    if parent:
+                        parent.setdefault('received_results', []).append(handoff['id'])
+                        parent['integration_status'] = 'awaiting_integration'
+                        parent['whole_project_complete'] = False
                 result = handoff
         else:
             raise ManagementError('unsupported', 'This role operation is not supported.')

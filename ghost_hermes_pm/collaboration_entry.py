@@ -73,7 +73,7 @@ class CollaborationEntry:
                     return None
                 details = {'sender_profile_id': channel['profile_id'], 'target_profile_id': targets[0]['id'], 'source_anchor': envelope, 'issue_url': goal.group(2)}
                 return PreparedRoleMessage(event, adapter, transport, channel, envelope, text, 'owner_goal', details)
-            if sender.sender_type not in {'bot', 'app'} or source.is_bot is not True or not re.match(r'^\[hermes-role-work [a-f0-9]{64} \d+/\d+\]\n', text):
+            if sender.sender_type not in {'bot', 'app'} or source.is_bot is not True or not re.match(r'^\[hermes-role-(?:work|result|summary|progress) [a-f0-9]{64} \d+/\d+\]\n', text):
                 return None
             native_ids = {getattr(sender.sender_id, k, None) for k in ('user_id', 'open_id', 'union_id')} - {None, ''}
             senders = [b for b in channel['bot_sources'] if b['open_id'] == sender.sender_id.open_id and b['tenant_key'] == sender.tenant_key and native_ids & set(b['native_ids'])]
@@ -91,7 +91,7 @@ class CollaborationEntry:
     def bot_source_in_scope(self, sender, message, app_id):
         try:
             text = json.loads(message.content)['text']
-            if '[hermes-role-work ' not in text:
+            if not re.search(r'\[hermes-role-(?:work|result|summary|progress) ', text):
                 return False
             routes = self.call('read_routes', {})
             return any(c['app_id'] == app_id and c['chat_id'] == message.chat_id and any(b['tenant_key'] == sender.tenant_key and b['open_id'] == sender.sender_id.open_id for b in c['bot_sources']) for c in routes['channels'])

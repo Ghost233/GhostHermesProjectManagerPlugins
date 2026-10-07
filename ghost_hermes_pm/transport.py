@@ -138,7 +138,7 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'collaborate'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:

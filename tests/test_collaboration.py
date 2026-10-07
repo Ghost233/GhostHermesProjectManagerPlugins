@@ -177,3 +177,96 @@ async def test_real_sdk_owner_goal_entry_preserves_original_source_auth_and_budg
             assert handoffs[0]['owner_origin']['subject'] == OWNER.subject
             assert handoffs[0]['owner_origin']['source'] == 'verified-native-collaboration-owner'
             assert handoffs[0]['source_anchor']['message_id'] == original.message_id
+
+
+CHILD = VerifiedIdentity('fixture:child', 'participant')
+CHILD_INGRESS = VerifiedIdentity('fixture:child', 'native-collaboration-ingress')
+
+
+def accepted_parent(manager, root):
+    register_roles(manager, root)
+    child_repo = make_repo(root / 'child')
+    manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'project': {'id': 'child-project', 'name': 'Explicit child', 'repo_path': str(child_repo)},
+        'profile': {'id': 'child', 'native_profile': 'child', 'identity_ref': CHILD.subject, 'role': 'subproject_lead', 'capability': 'development',
+                    'project_id': 'child-project', 'parent_profile_id': 'mono-lead', 'connection_refs': {}}})
+    entry, sending, receiving, child = channel('steward', 'entry'), channel('steward'), channel('mono-lead'), channel('child')
+    sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+    receiving['bot_sources'].append({'profile_id': 'child', 'open_id': 'child-seen-lead', 'tenant_key': 'child-tenant', 'native_ids': ['child-user-lead']})
+    child['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-child', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-child']})
+    manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving, child]})
+    h = manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': ISSUE['url']})
+    p = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': h['id']})
+    manager.collaborate(STEWARD, 'record_delivery', {'handoff_id': h['id'], 'uuid': p['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_parent_scope', 'chat_id': 'oc_project'}})
+    manager.collaborate(INGRESS, 'ingest', {'channel_id': receiving['id'], 'source_anchor': source(receiving, 'bot', 'om_parent_scope'), 'text': p['text']})
+    return h['id'], child
+
+
+def test_project_lead_delegates_a_clear_issue_only_to_explicit_own_child(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        parent_id, child = accepted_parent(manager, tmp_path)
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD, 'child': CHILD, 'child-ingress': CHILD_INGRESS}):
+            lead, kid = ManagementClient(tmp_path / 'state', 'lead'), ManagementClient(tmp_path / 'state', 'child')
+            request = {'parent_handoff_id': parent_id, 'target_profile_id': 'child', 'issue_url': ISSUE['url']}
+            delegated = lead.collaborate('delegate_issue', request)
+            assert delegated['sender_profile_id'] == 'mono-lead' and delegated['target_profile_id'] == 'child'
+            assert delegated['owner_origin']['subject'] == OWNER.subject and delegated['parent_handoff_id'] == parent_id
+            assert lead.collaborate('delegate_issue', request)['duplicate'] is True
+            with pytest.raises(Exception):
+                kid.collaborate('delegate_issue', request)
+            packet = lead.collaborate('claim_delivery', {'handoff_id': delegated['id']})
+            assert packet['mention_open_id'] == 'child-seen-lead'
+            lead.collaborate('record_delivery', {'handoff_id': delegated['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'chat_id': 'oc_project', 'message_id': 'om_child_scope'}})
+            observed = source(child, 'bot', 'om_child_scope')
+            observed.update(tenant_key='lead-tenant', sender_open_id='lead-seen-child')
+            received = ManagementClient(tmp_path / 'state', 'child-ingress').collaborate('ingest', {'channel_id': child['id'], 'source_anchor': observed, 'text': packet['text']})
+            child_task = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == received['task_request_id'])
+            assert child_task['profile_id'] == 'child' and child_task['project_id'] == 'child-project'
+            assert child_task['actor_provenance']['actor']['subject'] == CHILD.subject
+            assert child_task['actor_provenance']['forwarding_profile_id'] == 'mono-lead'
+            assert child_task['actor_provenance']['owner_origin']['subject'] == OWNER.subject
+            assert child_task['queue']['status'] == 'accepted' and child_task['execution'] == 'waiting'
+
+
+def test_child_result_uses_original_issue_delivery_and_parent_only_reports_pending_integration(tmp_path):
+    from test_task_execution import adapter_for, prepare_fixture
+    from test_task_control import THREAD, TURN
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource(), codex_adapter=adapter_for(tmp_path)) as manager:
+        parent_id, child_channel = accepted_parent(manager, tmp_path)
+        version = manager.read_snapshot(OWNER)['version']
+        profile = next(p for p in manager.read_snapshot(OWNER)['profiles'] if p['id'] == 'child')
+        manager.apply_directory_change(OWNER, version, {'profile': {k: profile[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id')} | {'connection_refs': {'codex': 'local:fixture-stdio'}}})
+        channels = [dict(c) for c in manager.read_snapshot(OWNER)['collaboration']['channels']]
+        for c in channels:
+            c.pop('profile_binding')
+        manager.collaborate(OWNER, 'register_channels', {'channels': channels})
+        h = manager.collaborate(LEAD, 'delegate_issue', {'parent_handoff_id': parent_id, 'target_profile_id': 'child', 'issue_url': ISSUE['url']})
+        p = manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': h['id']})
+        manager.collaborate(LEAD, 'record_delivery', {'handoff_id': h['id'], 'uuid': p['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_child_result_scope', 'chat_id': 'oc_project'}})
+        observed = source(child_channel, 'bot', 'om_child_result_scope')
+        observed.update(tenant_key='lead-tenant', sender_open_id='lead-seen-child')
+        accepted = manager.collaborate(CHILD_INGRESS, 'ingest', {'channel_id': child_channel['id'], 'source_anchor': observed, 'text': p['text']})
+        task_id = accepted['task_request_id']
+        manager.collaborate(CHILD_INGRESS, 'publish_ack', {'handoff_id': h['id']})
+        ack = manager.collaborate(CHILD_INGRESS, 'claim_ack', {'handoff_id': h['id']})
+        manager.collaborate(CHILD_INGRESS, 'record_ack', {'handoff_id': h['id'], 'uuid': ack['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_child_ack', 'chat_id': 'oc_project'}})
+        with pytest.raises(Exception):
+            manager.collaborate(CHILD, 'report_result', {'handoff_id': h['id']})
+        prepare_fixture(manager, task_id, tmp_path / 'child')
+        manager.start_task(CHILD, task_id)
+        (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full',
+            'items': [{'type': 'commandExecution', 'id': 'pytest-child', 'command': 'python -m pytest tests/test_fixture.py -q', 'cwd': str(tmp_path / 'child'), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed'}]}]}))
+        manager.record_task_delivery(CHILD, task_id, {'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['pytest-child']}], 'source_commit': None, 'pr_url': None, 'sync_branches': []})
+        result = manager.collaborate(CHILD, 'report_result', {'handoff_id': h['id']})
+        assert result['kind'] == 'result' and result['sender_profile_id'] == 'child' and result['target_profile_id'] == 'mono-lead'
+        packet = manager.collaborate(CHILD, 'claim_delivery', {'handoff_id': result['id']})
+        assert packet['mention_open_id'] == 'lead-seen-child'
+        assert '待集成' in packet['text'] and '项目全部完成' not in packet['text']
+        manager.collaborate(CHILD, 'record_delivery', {'handoff_id': result['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_child_result', 'chat_id': 'oc_project'}})
+        parent_channel = next(c for c in channels if c['profile_id'] == 'mono-lead')
+        received_source = source(parent_channel, 'bot', 'om_child_result')
+        received_source.update(tenant_key='child-tenant', sender_open_id='child-seen-lead')
+        before = len(manager.read_snapshot(OWNER)['requests'])
+        received = manager.collaborate(INGRESS, 'ingest', {'channel_id': parent_channel['id'], 'source_anchor': received_source, 'text': packet['text']})
+        assert received['acceptance'] == 'accepted' and len(manager.read_snapshot(OWNER)['requests']) == before
+        parent = next(x for x in manager.read_snapshot(OWNER)['collaboration']['handoffs'] if x['id'] == parent_id)
+        assert parent['integration_status'] == 'awaiting_integration' and parent['whole_project_complete'] is False
