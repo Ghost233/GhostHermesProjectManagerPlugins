@@ -248,3 +248,18 @@ def test_a_plan_id_cannot_change_owner_intent_or_fixed_target_after_confirmation
             with pytest.raises(ManagementError) as intent:
                 client.maintenance('deactivate', details)
             assert intent.value.code == 'binding_conflict'
+
+
+def test_snapshot_reports_actual_owner_and_reader_maintenance_permission_without_granting_body_authority(tmp_path):
+    from test_knowledge import WIKI
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        manager.apply_directory_change(OWNER, 0, {'profile': WIKI})
+        reader_identity = VerifiedIdentity(WIKI['identity_ref'], 'trusted-reader-entry')
+        with ManagementServer(manager, {'owner': OWNER, 'reader': reader_identity}):
+            owner = ManagementClient(tmp_path / 'state', 'owner')
+            reader = ManagementClient(tmp_path / 'state', 'reader')
+            assert owner.read_snapshot()['maintenance']['permissions'] == {'status': 'verified', 'can_manage': True}
+            assert reader.read_snapshot()['maintenance']['permissions'] == {'status': 'verified', 'can_manage': False}
+            with pytest.raises(ManagementError) as denied:
+                reader.maintenance('enter', approval(owner, 'forged-owner'))
+            assert denied.value.code == 'forbidden'

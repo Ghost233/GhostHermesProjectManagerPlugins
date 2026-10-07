@@ -18,7 +18,7 @@ def snapshot(manager, data, principal):
     except (ManagementError, OSError) as exc:
         runtime = {**data.get('maintenance_runtime', {}), 'status': 'unverified', 'loaded': False, 'release_verified': False,
                    'reason': str(exc), 'plugin_version': data.get('maintenance_runtime', {}).get('plugin_version', 'unknown')}
-    return {'mode': data.get('maintenance_mode', {}).get('intent', 'active') if isinstance(data.get('maintenance_mode'), dict) else 'active',
+    return {'permissions': {'status': 'verified', 'can_manage': principal is None}, 'mode': data.get('maintenance_mode', {}).get('intent', 'active') if isinstance(data.get('maintenance_mode'), dict) else 'active',
             'plans': list(data.get('maintenance_plans', {}).values()) if principal is None else [],
             'runtime': runtime,
             'events': list(data.get('maintenance_events', {}).values()) if principal is None else []}

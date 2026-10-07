@@ -44,8 +44,13 @@
       catch (e) { setError(String(e.message || e)); }
     }
     React.useEffect(function () { refresh(); }, []);
+    function canMaintain(value) {
+      const permission = value && value.maintenance && value.maintenance.permissions;
+      return value && value.status === 'completed' && permission && permission.status === 'verified' && permission.can_manage === true;
+    }
     function previewMaintenance(e) {
       e.preventDefault();
+      if (!canMaintain(snapshot)) { setMaintenanceReview(null); setError('当前维护入口只读或权限待核实。'); return; }
       try {
         const operationId = maintenanceForm.operationId.trim();
         if (!operationId) throw new Error('请填写稳定的原维护操作 ID。');
@@ -68,6 +73,7 @@
       } catch (e) { setError('维护参数：' + String(e.message || e)); }
     }
     async function submitMaintenance() {
+      if (!canMaintain(snapshot) || !maintenanceReview) { setMaintenanceReview(null); setError('当前维护入口只读或权限待核实。'); return; }
       const body = maintenanceReview;
       setSaving(true);
       setMaintenanceIntent({ operation_id: body.details.operation_id, action: body.action, status: 'awaiting_verification' });
@@ -323,7 +329,8 @@
           })),
           h('details', null, h('summary', null, '原生卸载／停机事件：执行状态仍需核实'),
             h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(snapshot.maintenance.events || [], null, 2))),
-          h('form', { onSubmit: previewMaintenance },
+          !canMaintain(snapshot) && h('p', null, '当前维护入口只读或权限待核实，维护操作不可用。'),
+          canMaintain(snapshot) && h('form', { onSubmit: previewMaintenance },
             h('select', { value: maintenanceForm.action, 'aria-label': '维护动作', onChange: function (e) {
               setMaintenanceForm(Object.assign({}, maintenanceForm, { action: e.target.value })); setMaintenanceReview(null);
             } }, [['enter', '进入维护'], ['check', '核对维护'], ['checkpoint', '建立维护检查点'], ['switch', '切换维护版本'],
@@ -332,7 +339,7 @@
             maintenanceForm.action === 'enter' && maintenanceField('target', '目标版本 JSON（已登记 id、plugin_version、source_digest；不切换时留空）', true),
             ['check', 'checkpoint'].includes(maintenanceForm.action) && maintenanceField('manual', '本人已处理的手动会话 ID（逗号分隔，仍需独立核实）'),
             h('button', { style: button, disabled: saving || snapshot.status !== 'completed' }, '预览维护操作')),
-          maintenanceReview && h('div', null,
+          canMaintain(snapshot) && maintenanceReview && h('div', null,
             h('p', null, '核对原操作 ID、目录版本、完整 Profile 范围及实际版本后批准这条操作。'),
             h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(maintenanceReview, null, 2)),
             h('button', { style: button, disabled: saving || snapshot.status !== 'completed', onClick: submitMaintenance }, '本人确认维护操作')),

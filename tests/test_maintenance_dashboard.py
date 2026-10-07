@@ -5,7 +5,7 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize('case', ['evidence', 'enter', 'unknown', 'stale_version', 'stale_scope', 'stale_release', 'stale_offline', 'action_check', 'action_checkpoint', 'action_switch', 'action_rollback', 'action_deactivate', 'action_reenable'])
+@pytest.mark.parametrize('case', ['reader', 'permission_absent', 'permission_unknown', 'stale_permission', 'evidence', 'enter', 'unknown', 'stale_version', 'stale_scope', 'stale_release', 'stale_offline', 'action_check', 'action_checkpoint', 'action_switch', 'action_rollback', 'action_deactivate', 'action_reenable'])
 def test_dashboard_maintenance_shows_actual_evidence_unknown_release_and_manual_handoff(case):
     node = shutil.which('node')
     assert node is not None

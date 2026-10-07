@@ -7,7 +7,7 @@ const snapshot = {status: 'completed', version: 4, runtime: 'directory_available
   profiles: [{id: 'steward', role: 'steward', capability: 'non_development', project_id: null, native_profile: 'steward', connection_refs: {}}],
   requests: [], execution: 'not_enabled', manual_capabilities: [{kind: 'desktop', status: 'unknown'}],
   notifications: {health: {supervision: 'unavailable', delivery: 'unverified', sources: {}}, events: []},
-  maintenance: {mode: 'maintenance', runtime: {status: 'verified', loaded: true, plugin_version: '0.1.0', sdk_version: '0.21.5',
+  maintenance: {permissions: {status: 'verified', can_manage: true}, mode: 'maintenance', runtime: {status: 'verified', loaded: true, plugin_version: '0.1.0', sdk_version: '0.21.5',
     source_digest: 'a'.repeat(64), sdk_source_digest: 'b'.repeat(64), service_id: 'original-native', generation: 'generation-1',
     verified_at: '2026-10-07T10:00:00+00:00', release_verified: false, evidence: 'original-loaded-proof'},
     plans: [{id: 'original-upgrade', intent: 'maintenance', status: 'switch_failed', approved_scope: {expected_version: 1, expected_profile_ids: ['steward']},
@@ -15,6 +15,9 @@ const snapshot = {status: 'completed', version: 4, runtime: 'directory_available
       switch_request: {status: 'accepted'}, checkpoint: {directory: {status: 'verified', sha256: 'c'.repeat(64)}, native: {artifacts: {archive: {sha256: 'd'.repeat(64)}}}},
       restore: {old_tasks_started: false, manager_authority: 'preserved_current'}, needs_human: ['Handle original manual execution.']}],
     events: [{id: 'forced-loss', status: 'pending_verification', reason: 'forced-native-unload', execution_stopped: false}]}};
+if (process.argv[3] === 'reader') snapshot.maintenance.permissions.can_manage = false;
+if (process.argv[3] === 'permission_absent') delete snapshot.maintenance.permissions;
+if (process.argv[3] === 'permission_unknown') snapshot.maintenance.permissions.status = 'unverified';
 const React = {Fragment: 'fragment', createElement(type, props, ...children) {return {type, props: props || {}, children};},
   useState(initial) {const i = cursor++; if (!(i in states)) states[i] = initial; return [states[i], value => {states[i] = typeof value === 'function' ? value(states[i]) : value;}];},
   useEffect(effect) {if (!initialized) effects.push(effect);}};
@@ -40,6 +43,10 @@ function section(tree) {return find(tree, node => node.type === 'section' && nod
     'switch_failed', 'accepted', 'original-inflight', 'manual-id', 'observe_only', 'Handle original manual execution.',
     'pending_verification', 'forced-native-unload', 'preserved_current', 'd'.repeat(64)]) assert.ok(content.includes(value), 'Missing original evidence: ' + value);
   assert.ok(!requests.some(r => r.options), 'Reading evidence must not execute any action');
+  if (['reader', 'permission_absent', 'permission_unknown'].includes(process.argv[3])) {
+    assert.ok(!nodes(section(tree)).some(n => n.type === 'form' || n.type === 'select' || n.type === 'input' || n.type === 'textarea' || n.type === 'button'), 'Read-only or unknown maintenance permission must expose no control form');
+    assert.equal(requests.filter(r => r.options).length, 0, 'Read-only maintenance must send zero control POSTs');
+  }
   if (process.argv[3] === 'enter') {
     find(section(tree), n => n.type === 'input' && n.props['aria-label'] === '维护操作 ID').props.onChange({target: {value: 'owner-reviewed-31'}}); tree = render();
     find(section(tree), n => n.type === 'textarea').props.onChange({target: {value: JSON.stringify({id: 'release-v2', plugin_version: '0.2.0', source_digest: 'e'.repeat(64)})}}); tree = render();
@@ -76,6 +83,7 @@ function section(tree) {return find(tree, node => node.type === 'section' && nod
     find(section(tree), n => n.props['aria-label'] === '维护操作 ID').props.onChange({target: {value: 'old-owner-preview'}}); tree = render();
     find(section(tree), n => n.type === 'form').props.onSubmit({preventDefault() {}}); tree = render();
     assert.ok(text(section(tree)).includes('"expected_version": 4'));
+    if (process.argv[3] === 'stale_permission') snapshot.maintenance.permissions.can_manage = false;
     if (process.argv[3] === 'stale_version') snapshot.version = 5;
     if (process.argv[3] === 'stale_scope') snapshot.profiles.push({id: 'new-profile', native_profile: 'new-profile', role: 'independent', connection_refs: {}});
     if (process.argv[3] === 'stale_release') snapshot.maintenance.runtime.source_digest = 'e'.repeat(64);
@@ -83,7 +91,7 @@ function section(tree) {return find(tree, node => node.type === 'section' && nod
     await find(tree, n => n.type === 'button' && text(n) === '刷新目录').props.onClick(); tree = render();
     assert.ok(!nodes(section(tree)).some(n => n.type === 'button' && text(n) === '本人确认维护操作'), 'Changed snapshot must invalidate original scope approval');
     assert.equal(requests.filter(r => r.options).length, 0);
-    if (process.argv[3] === 'stale_offline') assert.equal(find(section(tree), n => n.type === 'button' && text(n) === '预览维护操作').props.disabled, true);
+    if (process.argv[3] === 'stale_offline') assert.ok(!nodes(section(tree)).some(n => n.type === 'form' || n.type === 'button'), 'Offline permission must hide all maintenance controls');
   }
   if (process.argv[3].startsWith('action_')) {
     const action = process.argv[3].slice(7);
