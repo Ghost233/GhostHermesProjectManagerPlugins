@@ -457,3 +457,26 @@ def test_unloaded_running_history_cannot_restore_live_task_monitoring(tmp_path):
         assert task['recovery']['status'] == 'blocked'
         assert task['repository_released'] is False
         assert task['session'].get('recovery_ref') is None
+
+
+def test_sent_answer_without_original_resolution_prevents_automatic_continuation(tmp_path):
+    from test_questions import question_adapter, emit, user_question, replies
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        service_id = manager.start_task(OWNER, request_id)['session']['service_id']
+        emit(tmp_path, user_question())
+        question = manager.refresh_task(OWNER, request_id)['human_requests'][0]
+        (tmp_path / 'questions-behavior.json').write_text(json.dumps({'disconnect_after_reply': True}))
+        manager.answer_human_request(OWNER, request_id, question['id'], 'unresolved-answer', {'answers': {'colour': ['Blue']}})
+        manager.refresh_task(OWNER, request_id)
+    original_state(tmp_path, repo, status='interrupted')
+    incomplete = {'thread_id': THREAD, 'turn_id': TURN, 'status': 'verified_incomplete', 'evidence': 'unfinished'}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                 recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id, work_incomplete=incomplete)}) as manager:
+        task = manager.reconcile_task(OWNER, request_id)
+        assert task['recovery']['status'] == 'outcome_unknown_preserved'
+        assert task['repository_released'] is False
+        assert task['human_requests'][0]['resolution'] != 'resolved'
+    assert len(replies(tmp_path)) == 1
+    assert 'turn/start' not in methods(tmp_path)

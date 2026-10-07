@@ -181,15 +181,18 @@ def _continue_if_safe(manager, identity, request_id):
     version, data = manager._load()
     record = data['requests'][request_id]
     session = record['session']
-    explicit_stop = record.get('stop', {}).get('turn_id') == session['turn_id']
+    stop = record.get('stop') or {}
+    explicit_stop = bool(stop) and (stop.get('turn_id') == session['turn_id'] or stop.get('status') == 'processing' or not stop.get('turn_id'))
     profile = data['profiles'][record['profile_id']]
     project = data['projects'][record['project_id']]
     inactive = {'archiving', 'archived', 'disabled', 'deactivating', 'maintenance', 'restoring'}
-    if explicit_stop or profile.get('lifecycle') in inactive or project.get('lifecycle') in inactive or profile.get('archive_intent') or project.get('archive_intent') or data.get('maintenance_mode'):
+    if explicit_stop or profile.get('lifecycle') in inactive or project.get('lifecycle') in inactive or any(obj.get('archive_intent') not in (None, False) for obj in (profile, project)) or data.get('maintenance_mode') not in (None, False):
         return 'explicit_intent_preserved', 'Explicit stop, archive or maintenance intent requires a new human arrangement.'
+    if any(obj.get('lifecycle') not in {None, 'configuring', 'active'} for obj in (profile, project)):
+        return 'intent_unverified', 'Unknown lifecycle intent requires human reconciliation before automatic continuation.'
     if session.get('control') != 'assigned_task' or record.get('task_delivery') == 'delivered':
         return 'observe_only_preserved', 'Use the original interface; recovered observation does not renew returned or expired control.'
-    if any(c.get('phase') in {'rpc_intent', 'outcome_unknown'} for c in record.get('controls', [])) or session.get('start_phase') not in {None, 'turn_registered'} or any(q.get('reply', {}).get('sent') in {'intent', 'outcome_unknown'} for q in record.get('human_requests', []) if q.get('reply')):
+    if any(c.get('phase') in {'rpc_intent', 'outcome_unknown'} for c in record.get('controls', [])) or session.get('origin') != 'manual_takeover' and session.get('start_phase') != 'turn_registered' or any(q.get('reply') and q.get('resolution') != 'resolved' or q.get('resolution') in {'pending', 'unverified', 'outcome_unknown'} and q.get('blocking') is not False for q in record.get('human_requests', [])):
         return 'outcome_unknown_preserved', 'An original start, append or answer outcome is unknown; inspect the original interface without replay.'
     _, session, adapter = _binding(manager, identity, request_id, data, 'related_execution')
     thread = _thread(adapter, session, require_input=False)
