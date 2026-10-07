@@ -13,16 +13,17 @@ class PreparedMigrationMessage(PreparedMessage):
 
 
 def parse(command):
-    match = re.fullmatch(r'(准备迁移|核对迁移|回退迁移)\s+([A-Za-z0-9_.:-]+)\s+([a-f0-9]{64})(?:\s+会话\s+([A-Za-z0-9_.:-]+))?', command)
+    match = re.fullmatch(r'(准备迁移|核对迁移|回退迁移)\s+([A-Za-z0-9_.:-]+)\s+([a-f0-9]{64})(?:\s+会话\s+([A-Za-z0-9_.:-]+))?(?:\s+已处理\s+([A-Za-z0-9_,.:-]+))?', command)
     if match:
         action = {'准备迁移': 'prepare', '核对迁移': 'check', '回退迁移': 'rollback'}[match[1]]
-        if match[4] and action != 'check':
+        if (match[4] or match[5]) and action != 'check':
             return None
-        return action, {'plan_id': match[2], 'digest': match[3], **({'session_id': match[4]} if match[4] else {})}
-    match = re.fullmatch(r'切换迁移\s+([A-Za-z0-9_.:-]+)\s+([a-f0-9]{64})\s+版本\s+(\d+)\s+封存\s+([A-Za-z0-9_.:-]+)\s+会话\s+([A-Za-z0-9_.:-]+)', command)
+        return action, {'plan_id': match[2], 'digest': match[3], **({'session_id': match[4]} if match[4] else {}),
+            **({'handled_manual_execution_ids': match[5].split(',')} if match[5] else {})}
+    match = re.fullmatch(r'切换迁移\s+([A-Za-z0-9_.:-]+)\s+([a-f0-9]{64})\s+版本\s+(\d+)\s+封存\s+([A-Za-z0-9_.:-]+)\s+会话\s+([A-Za-z0-9_.:-]+)(?:\s+单入口\s+([A-Za-z0-9_.:-]+))?', command)
     if match:
         return 'activate', {'plan_id': match[1], 'digest': match[2], 'expected_version': int(match[3]),
-            'archive_operation_id': match[4], 'session_id': match[5]}
+            'archive_operation_id': match[4], 'session_id': match[5], **({'expected_old_profile_ids': [match[6]]} if match[6] else {})}
 
 
 def reviewed(snapshot, binding, command):

@@ -296,7 +296,7 @@
               h('div', null, '审定摘要：' + plan.digest + ' · 新入口：' + (plan.switch_state || 'not_switched')),
               h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ selection: plan.plan.selection, preferences: plan.plan.preferences,
                 execution: plan.plan.execution, sources: plan.archive_bindings, checkpoint: plan.checkpoint, native_checkpoint: plan.native_checkpoint,
-                native_state: plan.native_state, ledger: plan.selection_ledger, session: plan.session_receipt, switch_receipt: plan.switch_receipt, rollback: plan.rollback }, null, 2)),
+                native_state: plan.native_state, ledger: plan.selection_ledger, session: plan.session_receipt, old_entry: plan.old_entry, switch_receipt: plan.switch_receipt, rollback: plan.rollback }, null, 2)),
               h('div', null, '人工待办／受阻原因：' + (plan.needs_human || []).join('；')));
           })),
           h('form', { onSubmit: function (e) { e.preventDefault(); try {

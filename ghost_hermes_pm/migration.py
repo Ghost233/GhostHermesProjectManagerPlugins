@@ -62,11 +62,18 @@ def _archives(manager, operation, data):
     return result
 
 
-def _old_stopped(manager, operation, data, archive_id):
+def _old_stopped(manager, identity, operation, data, approval):
     from .lifecycle import COMPONENTS, _verified_fact
     source = data['profiles'][operation['plan']['source_profile_id']]
+    archive_id = approval['archive_operation_id']
     archived = data.get('lifecycle_operations', {}).get(archive_id)
-    if not archived or archived['action'] != 'archive' or archived['status'] != 'completed' or source['id'] not in archived['profile_ids'] or source.get('lifecycle') != 'archived' or not manager.lifecycle_host:
+    if not archived or 'expected_old_profile_ids' in approval:
+        from .migration_retirement import reconcile
+        retired = reconcile(manager, identity, operation, approval)
+        if retired['status'] != 'completed':
+            raise ManagementError('capability_unverified', '\n'.join(retired['needs_human']))
+        return {key: value for key, value in retired['checks'].items() if key.startswith(source['id'] + ':')}
+    if archived['action'] != 'archive' or archived['status'] != 'completed' or source['id'] not in archived['profile_ids'] or source.get('lifecycle') != 'archived' or not manager.lifecycle_host:
         raise ManagementError('capability_unverified', 'Original Profile/task/bot/scheduled entry stop is not independently verified.')
     facts = {}
     for component in (*COMPONENTS, 'manual_execution'):
@@ -200,7 +207,8 @@ def operate(manager, identity, action, details):
             if set(details) != {'source_profile_id'} or details['source_profile_id'] not in data['profiles'] or manager.migration_host is None:
                 raise ManagementError('capability_unverified', 'Select a registered source on the configured native migration host.')
             return manager.migration_host.preview(data['profiles'][details['source_profile_id']])
-        allowed = {'plan_id', 'digest', 'session_id', 'expected_version', 'expected_profile_ids', 'archive_operation_id'} if action == 'activate' else {'plan_id', 'digest', 'session_id'} if action == 'check' else {'plan_id', 'digest'}
+        required = {'plan_id', 'digest', 'session_id', 'expected_version', 'expected_profile_ids', 'archive_operation_id'}
+        allowed = required | {'expected_old_profile_ids'} if action == 'activate' else {'plan_id', 'digest', 'session_id', 'handled_manual_execution_ids'} if action == 'check' else {'plan_id', 'digest'}
         if set(details) - allowed or not {'plan_id', 'digest'} <= set(details):
             raise ManagementError('invalid_change', 'Use the originally reviewed immutable plan ID and digest.')
         operation = data.get('migration_plans', {}).get(details['plan_id'])
@@ -209,7 +217,7 @@ def operate(manager, identity, action, details):
         if operation['bindings'] != {i: _binding(data['profiles'][i], data) for i in operation['bindings']} or operation['archive_bindings'] != _archives(manager, operation, data):
             raise ManagementError('binding_conflict', 'Original Profile or source authorization binding changed; review a new plan.')
         if operation['status'] == 'switched' and action in {'prepare', 'check', 'activate'}:
-            if action == 'activate' and {k: details.get(k) for k in ('expected_version', 'expected_profile_ids', 'archive_operation_id', 'session_id')} != operation['switch_approval']:
+            if action == 'activate' and {k: details[k] for k in details if k not in {'plan_id', 'digest'}} != operation['switch_approval']:
                 raise ManagementError('binding_conflict', 'Confirmed migration already names its original exact Owner switch approval.')
             return operation  # Durable completed fact; no fresh native action or changed confirmation version.
         if action == 'prepare' and operation.get('switch_state') in {'intent', 'outcome_unknown', 'rollback_execution_unverified'}:
@@ -234,6 +242,12 @@ def operate(manager, identity, action, details):
             _save(manager, operation)
             return operation
         if action == 'check':
+            if 'handled_manual_execution_ids' in details and not operation.get('old_entry'):
+                raise ManagementError('invalid_change', 'Owner handling belongs to the original reviewed single-entry retirement.')
+            retired = None
+            if operation.get('old_entry'):
+                from .migration_retirement import reconcile
+                retired = reconcile(manager, identity, operation, operation['switch_approval'], details.get('handled_manual_execution_ids', []))
             if manager.migration_host is None or not operation.get('material_receipt'):
                 operation.update(status='blocked', switch_state='not_switched', needs_human=['Prepare the configured native target and independent bot first.'])
             else:
@@ -243,27 +257,34 @@ def operate(manager, identity, action, details):
                         operation['native_checkpoint'] = manager.migration_host.checkpoint(operation)
                     if operation['status'] == 'prepared':
                         operation['needs_human'] = operation['plan']['human_steps'] + ['Verify new bot/channel identity, original entry/task/bot/scheduler stop, and actual new-session prompt before explicit switch.']
+                    if retired and retired['status'] != 'completed':
+                        operation.update(status='blocked', needs_human=retired['needs_human'])
                 except (ManagementError, OSError) as exc:
                     operation.update(status='blocked', switch_state='outcome_unknown' if operation.get('switch_state') in {'intent', 'outcome_unknown', 'rollback_execution_unverified'} else 'not_switched', needs_human=[str(exc)])
             _save(manager, operation)
             return operation
         if action == 'activate':
-            if set(details) != allowed or type(details['expected_version']) is not int or details['expected_version'] != version:
+            if not required <= set(details) or type(details['expected_version']) is not int or details['expected_version'] != version:
                 raise ManagementError('version_conflict', 'Switch requires the originally reviewed current version and exact target scope.')
             if not isinstance(details['expected_profile_ids'], list) or any(not isinstance(i, str) for i in details['expected_profile_ids']) or sorted(details['expected_profile_ids']) != operation['approved_scope']['expected_profile_ids']:
                 raise ManagementError('binding_conflict', 'Switch Profile scope differs from the reviewed migration.')
-            approval = {k: details[k] for k in ('expected_version', 'expected_profile_ids', 'archive_operation_id', 'session_id')}
+            if not isinstance(details['archive_operation_id'], str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', details['archive_operation_id']):
+                raise ManagementError('invalid_change', 'Review a stable original archive or single-entry retirement ID.')
+            if 'expected_old_profile_ids' in details and details['expected_old_profile_ids'] != [operation['plan']['source_profile_id']]:
+                raise ManagementError('binding_conflict', 'Single-entry retirement cannot expand to other Profiles or descendants.')
+            approval = {k: details[k] for k in details if k not in {'plan_id', 'digest'}}
             operation['switch_approval'] = approval
             operation.update(status='switching', switch_state='intent')
             _save(manager, operation)
             try:
                 if not operation['plan']['archive_source_ids']:
                     raise ManagementError('capability_unverified', 'Final cutover needs explicit new-identity original archive grants and complete history/retention checkpoints; an empty source list is not migration acceptance.')
-                operation['old_control_receipts'] = _old_stopped(manager, operation, data, details['archive_operation_id'])
-                operation['switch_archive_checkpoints'] = _archive_checkpoints(manager, identity, operation, 'switch')
                 operation.update(manager.migration_host.check(operation, details['session_id']))
                 if operation['status'] != 'prepared' or not operation.get('session_receipt'):
                     raise ManagementError('capability_unverified', 'Every selected native write and actual new-session prompt must be verified.')
+                operation['identity_receipt'] = manager.migration_host.verify_identity(operation)
+                operation['old_control_receipts'] = _old_stopped(manager, identity, operation, data, approval)
+                operation['switch_archive_checkpoints'] = _archive_checkpoints(manager, identity, operation, 'switch')
                 operation.update(manager.migration_host.activate(operation))
                 operation['verified_at'] = _now()
                 if operation['status'] == 'switched':

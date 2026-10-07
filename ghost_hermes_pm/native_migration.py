@@ -59,12 +59,16 @@ class NativeMigrationHost:
         return self._run('rollback', operation=operation)
 
     def activate(self, operation):
+        verification = self.verify_identity(operation)
+        return self._run('activate', operation=operation, identity_receipt=verification)
+
+    def verify_identity(self, operation):
         if not callable(self.verifier):
             raise ManagementError('capability_unverified', 'Actual new bot identity, channel permission and credential ownership are unverified.')
         verification = self.verifier(operation)
         if not isinstance(verification, dict) or verification.get('status') != 'verified' or verification.get('plan_digest') != operation['digest'] or verification.get('target_identity_ref') != _target_identity(operation):
             raise ManagementError('capability_unverified', 'Current new bot and channel identity do not match the reviewed migration.')
-        return self._run('activate', operation=operation, identity_receipt=verification)
+        return verification
 
 
 def _target_identity(operation):

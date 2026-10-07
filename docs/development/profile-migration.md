@@ -2,7 +2,7 @@
 
 `Manager.migrate_profile(identity, action, details)` 由认证 Unix bridge 的 `ManagementClient.migrate_profile`、Dashboard `/migration` 和已核验本人群消息共用。原生 `hermes_pm_migration` 只读 participant 自己可见的计划和事实；工具参数不接受本人身份、宿主路径或迁移动作。迁移计划与实际原生落盘、外部身份验收、旧入口停止和切换分别记录。
 
-本实现支持明确命名、同一长期项目范围的独立目标 Profile。原 native Profile 名、identity、bot、native credential 和 Codex binding 不沿用；目标模型/provider/toolsets 按新职责重建。默认、standalone、外部 bank 和缺少原执行控制证据的作用域保持受阻。原有精选项目记忆的 project/role/identity、own-task 验收限制不变；迁移不会改写旧精选 ledger 的身份。
+本实现支持明确命名的 multiplexer satellite，包括项目负责人、总管和树外 Wiki/个人助手。原/目标保留各自已审定长期项目或独立范围。原 native Profile 名、identity、bot、native credential 和 Codex binding 不沿用；目标模型/provider/toolsets 按新职责重建。默认、launch、standalone、外部 bank 和缺少原执行控制证据的作用域保持受阻。原有精选项目记忆的 project/role/identity、own-task 验收限制不变；迁移不会改写旧精选 ledger 的身份。
 
 ## 本人审定的不可变计划
 
@@ -69,6 +69,10 @@ native_profile_migration:
 
 `activate` 需要原 plan ID/digest、本人切换预览的 `expected_version`、明确 `expected_profile_ids`、原完成封存 `archive_operation_id` 和实际新 `session_id`。目录变化或不同 scope 拒绝。先持久化 switching intent，再重新核对原 SourceGrant/身份绑定、原 Profile 服务/bot/定时入口/manual-related execution 的当前独立停止证据，并在旧入口停止后建立最终原档案 checkpoint。
 
+总管、独立 Wiki/个人助手及其他明确单入口迁移使用 `expected_old_profile_ids: [source_profile_id]`；`archive_operation_id` 为本人审定的稳定单入口停用 ID。它是 migration 自己的 single-entry retirement，不调用项目子树封存、不更改 projects/上下级、不扩大为其他 host。先验证新 native 材料、实际新会话和新 bot 身份，再保存原 Profile 的 `lifecycle=archiving` 与 durable gate；目录修正及 #22 重启都会保留抑制状态。随后只停止原 Profile 的受控 request/current executor/current grant，并逐项核对服务、bot、timer 和完整在途覆盖；unserved 受理不宣称 chat/cron 已终止。
+
+原生 scope capability 的独立证据可列出 `manual_execution_ids`；已有只观察会话同样保留。本人在原界面明确处理，`check` 传 `handled_manual_execution_ids`，并取得实际 terminal proof 才可完成；一句已处理不够，不创建 takeover/interrupt。外部动作前保存每项 intent；丢回执/restart 只沿原 ID/原宿主/原执行对账，不重放 unknown request。单入口停止完成后仍不自动 serve 新入口；本人重新查看当前版本、沿同一单入口范围明确 `activate`，原 stop approved_scope 的 version 始终保留。
+
 新的 Feishu identity 验收调用实际 `NativeFeishuTransport.verify_identity()`，核对独立新 app/open ID 与新的 native credentials；准确旧/新 namespace、群和本人范围来自 Owner 已登记配置。目标 `connection_refs.bot` 使用 `identity:<app_id>:<open_id>`。只登记引用或填写报告不能替代实际 bot-info 成功；目标未装配真实受控 transport 时阻塞。机器人开通、租户权限、凭据签发/撤销、群邀请和外部 bank 授权仍由明确人工步骤完成。
 
 只有上述资料、授权和控制证据都满足，才向同一已核验 multiplexer 发原生 `serve-profile`，重读准确宿主/target serving 状态后解除目标 Manager admission gate。旧 Profile/入口保持封存，原 children 不自动恢复，旧 Codex/手动任务不自动续跑。成功后的同一原确认、prepare/check 返回带核实时间的同一 durable completed fact，不更新确认 version 或再做宿主动作。它表示该次切换的历史事实，当前运行状态仍由正常监督入口核对。
@@ -80,8 +84,8 @@ native_profile_migration:
 群命令均需真实本人 @，并关联原消息反馈同一状态与 digest：
 
 - `准备迁移 <plan_id> <digest>`
-- `核对迁移 <plan_id> <digest> [会话 <session_id>]`
-- `切换迁移 <plan_id> <digest> 版本 <reviewed_version> 封存 <archive_operation_id> 会话 <session_id>`
+- `核对迁移 <plan_id> <digest> [会话 <session_id>] [已处理 <manual_execution_id,...>]`
+- `切换迁移 <plan_id> <digest> 版本 <reviewed_version> 封存 <archive_operation_id> 会话 <session_id> [单入口 <source_profile_id>]`
 - `回退迁移 <plan_id> <digest>`
 
 Dashboard 提供原材料 preview、不可变计划、selected ledger、人工待办、native/会话回执、原档案 checkpoints、切换和回退范围。本人先预览再确认；refresh 的 version 变化会撤销旧 plan/activate preview，确认时不会自动升级到新 version。
@@ -89,6 +93,8 @@ Dashboard 提供原材料 preview、不可变计划、selected ledger、人工�
 ## 本地验收与剩余实际步骤
 
 mandatory matrix 新增实际 migration case。真实固定 SDK fresh Profile、memory/USER/SOUL、审批批准/拒绝、原 SessionDB/archive保护/SQLite备份/完整查询、原 native gateway ControlSocket/serve/unserve 和普通插件 request hook 均执行。`AIAgent` 对自有 localhost OpenAI-compatible streaming peer 发真实请求并保存真实 prompt/messages/usage；Profile/bot/ticker 作用域使用已拥有的合成进程及当前退出事实，Feishu bot-info 为明确的外部服务响应 fixture。
+
+独立 named Wiki、Ghost 和 steward 三条 mandatory cases 逐个执行正常 SDK 的新会话、原 SourceGrant/完整历史查询、single-entry stop/manual等待/明确完成、切换及受阻回退；unrelated/default Profile 与 PID 保持运行。Wiki case 丢失实际宿主动作的 Manager receipt 后重启，原 scope/version/未知状态与原观察 PID 保留，实证无重复 RPC/自动恢复。developer case 的原独立 Codex 协议服务真实启动子进程，收到原 turn/interrupt 后打断确认连接；重启沿原 service/thread/turn 对账，未核实前保留占用及 source admission gate，terminal 后释放，只有一次 start/interrupt，无旧输入/审批/续跑。执行配置不复制旧 `codex-development.json` 的 GitHub user、token、container、provider/bank 或 PID；新 local executor 另行按新计划重建。当前业务 GitHub 必须实查 Ghost233，当前测试计划禁止 container/Docker；静态回执不会把此类账户/运行权限显示为已验证。
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 \

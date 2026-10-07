@@ -183,7 +183,10 @@ def _prepare(root, work, operation, approval):
     needs = list(plan['human_steps']) + ([] if state == 'prepared' else ['Review native pending or rejected memory writes; target remains parked.'])
     result = {'status': state, 'native_state': 'parked_created', 'selection_ledger': ledger, 'needs_human': needs,
         'material_receipt': {'profile': target['native_profile'], 'identity_ref': target['identity_ref'], 'plan_digest': operation['digest'],
-                             'execution_config': config, 'credentials': 'fresh_not_copied', 'external_bank': 'not_copied', 'session': 'not_yet_verified'}}
+                             'execution_config': config, 'credentials': 'fresh_not_copied', 'external_bank': 'not_copied',
+                             'legacy_codex_development_config': 'not_copied',
+                             'new_execution_review': 'Rebuild the new local executor; verify Ghost233 for each business GitHub operation and keep container/Docker disabled under the current plan.',
+                             'session': 'not_yet_verified'}}
     files = {str(p.relative_to(staged)): _hash(p.read_bytes()) for p in (staged / 'config.yaml', staged / 'SOUL.md')}
     for relative in ('memories/MEMORY.md', 'memories/USER.md'):
         if (staged / relative).exists():
