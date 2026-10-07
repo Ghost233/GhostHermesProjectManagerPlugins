@@ -130,10 +130,30 @@ class NativeGlobalValidationHost:
         return run
 
     def find_run(self, attempt):
-        return self._read(self._path(attempt['id'], 'run'))
+        run = self._read(self._path(attempt['id'], 'run'))
+        path = self._path(run['run_id'], 'worker-exit')
+        return {**run, **self._read(path)} if path.exists() else run
+
+    def _reap_runner(self, run_id):
+        with self.lock:
+            process = self.runners.get(run_id)
+            path = self._path(run_id, 'worker-exit')
+            if process is not None:
+                if process.poll() is None:
+                    return None
+                receipt = {'worker_pid': process.pid, 'worker_exit_code': process.wait()}
+                path.write_text(json.dumps(receipt))
+                del self.runners[run_id]
+                return receipt
+            return self._read(path) if path.exists() else None
 
     def read_result(self, run_id):
-        return self._read(self._path(run_id, 'result'))
+        exit_receipt = self._reap_runner(run_id)
+        if exit_receipt is None:
+            raise ManagementError('capability_unverified', 'The original native worker has not reached a verified terminal exit.')
+        if exit_receipt['worker_exit_code'] != 0:
+            raise ManagementError('capability_unverified', 'The original native worker failed with actual exit code ' + str(exit_receipt['worker_exit_code']) + '; no successful run receipt is accepted.')
+        return {**self._read(self._path(run_id, 'result')), **exit_receipt}
 
     def read_input_changes(self, attempt):
         with self.lock:
@@ -152,7 +172,9 @@ class NativeGlobalValidationHost:
                 process.terminate()
             process.wait(timeout=5)
             process.stdout.close()
-        # An already-started runner is reconciled separately, never cancelled by unload.
+        for run_id in list(self.runners):
+            self._reap_runner(run_id)
+        # Active runners are retained for original-run reconciliation, never cancelled by unload.
 
 
 def configured_global_validation_host(config, state_dir):

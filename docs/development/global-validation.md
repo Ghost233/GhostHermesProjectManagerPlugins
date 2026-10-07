@@ -70,3 +70,7 @@ Owner 通过唯一关联原 mono 起始消息发送 `全局验证 <plan|prepare|
 公开进度、返工材料与完成消息引用原任务；总负责人 summary、独立接收后的总管 Owner summary 保留验证 ID、固定版本、测试、占用和修复关系。没有当前全局完成证据时 `whole_project_complete=false`。证据变更后已发的历史消息保持可核对，当前视图不继续宣传失效的完成。
 
 `tests/test_global_validation.py` 在获准的合成仓库中演示原公开 mono 目标、child 交付、实际测试失败、明确 Issue 返工、真实 Lark SDK mention/消息构建及独立 native 接收、真实 child 源码修复 commit 和 unittest、父 gitlink/自身 unittest、重验、child 结果/总负责人 summary/总管回复原 Owner 消息，以及排队、失效、手动只观察、未分配模块和未知响应重启对账。mandatory 原生 SDK smoke 使用固定 pristine SDK 和 artificial home，不访问真实 Profile、配置、认证、聊天或仓库。
+
+## 原测试 worker 生命周期
+
+`read_result` 及 `close` 只 poll/wait 已真实结束的自有 runner，并持久记录原 `worker_pid/worker_exit_code`；终态引用随回收释放。非零 worker exit 不接受成功 JSON，测试子命令 exit 与 worker exit 分别核对。`find_run` 保留原 run 并展示已核实 exit；关闭不取消活跃 runner，活跃原动作仍须后续独立核实，不能因 watcher/插件关闭而当作测试结束。
