@@ -131,7 +131,7 @@ def operate(manager, identity, action, details):
             if set(details) != {'source_profile_id'} or details['source_profile_id'] not in data['profiles'] or manager.migration_host is None:
                 raise ManagementError('capability_unverified', 'Select a registered source on the configured native migration host.')
             return manager.migration_host.preview(data['profiles'][details['source_profile_id']])
-        if set(details) != {'plan_id', 'digest'}:
+        if set(details) - {'plan_id', 'digest', 'session_id'} or not {'plan_id', 'digest'} <= set(details) or action != 'check' and 'session_id' in details:
             raise ManagementError('invalid_change', 'Use the originally reviewed immutable plan ID and digest.')
         operation = data.get('migration_plans', {}).get(details['plan_id'])
         if not operation or operation['digest'] != details['digest']:
@@ -152,6 +152,18 @@ def operate(manager, identity, action, details):
                     operation.update(result)
                 except (ManagementError, OSError) as exc:
                     operation.update(status='blocked', needs_human=[str(exc)])
+            _save(manager, operation)
+            return operation
+        if action == 'check':
+            if manager.migration_host is None or not operation.get('material_receipt'):
+                operation.update(status='blocked', switch_state='not_switched', needs_human=['Prepare the configured native target and independent bot first.'])
+            else:
+                try:
+                    operation.update(manager.migration_host.check(operation, details.get('session_id')))
+                    if operation['status'] == 'prepared':
+                        operation['needs_human'] = operation['plan']['human_steps'] + ['Verify new bot/channel identity, original entry/task/bot/scheduler stop, and actual new-session prompt before explicit switch.']
+                except (ManagementError, OSError) as exc:
+                    operation.update(status='blocked', switch_state='not_switched', needs_human=[str(exc)])
             _save(manager, operation)
             return operation
         raise ManagementError('capability_unverified', 'The prepared native state requires current cutover and rollback evidence.')

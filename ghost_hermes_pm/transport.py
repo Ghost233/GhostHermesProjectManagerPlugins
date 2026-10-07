@@ -197,7 +197,7 @@ class ManagementClient:
                 with connection.makefile('rb') as reader:
                     response = _read_frame(reader)
         except (OSError, ValueError) as exc:
-            if operation == 'lifecycle':
+            if operation in {'lifecycle', 'migrate_profile'}:
                 raise ManagementError('outcome_unknown', 'Lifecycle response was not confirmed; inspect the same durable operation ID and original approved scope before any new decision.') from exc
             if operation in {'query_archive', 'protect_archive', 'backup_archive', 'restore_archive'}:
                 raise ManagementError('outcome_unknown', 'The archive operation response was not confirmed; inspect the same durable query/protection/backup/restore ID before retrying. Original entries remain inactive.') from exc
