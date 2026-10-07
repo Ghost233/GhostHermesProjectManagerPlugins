@@ -327,6 +327,25 @@ def register_native(ctx):
             'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['read_routes', 'delegate_issue', 'report_result', 'report_progress', 'report_summary', 'publish_owner_summary']}, 'details': {'type': 'object'}},
                 'required': ['action', 'details'], 'additionalProperties': False}}, handler=role_operation,
         description='Public scoped role collaboration')
+    def validation_operation(args):
+        try:
+            allowed = {'plan', 'start', 'finish', 'reconcile', 'check', 'rework', 'complete'}
+            if not isinstance(args, dict) or set(args) != {'action', 'details'} or args['action'] not in allowed:
+                raise ManagementError('invalid_change', 'The participant may validate its mono task; independent child materialization requires the original Owner entry.')
+            token = _credential(ctx.get_config('participant_credential_ref'))
+            if not state_dir or not token:
+                raise ManagementError('unauthorized', 'A distinct registered participant bridge is required.')
+            client = ManagementClient(state_dir, token)
+            client.read_participant_snapshot()
+            return json.dumps(client.global_validation(args['action'], args['details']))
+        except ManagementError as exc:
+            return json.dumps({'status': 'rejected', 'code': exc.code, 'message': str(exc)})
+
+    ctx.register_tool(name='hermes_pm_global_validation', toolset='hermes_pm',
+        schema={'name': 'hermes_pm_global_validation', 'description': 'Freeze related child deliveries, validate an actual stable mono combination, and return concrete repair Issues.',
+            'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['plan', 'start', 'finish', 'reconcile', 'check', 'rework', 'complete']}, 'details': {'type': 'object'}},
+                'required': ['action', 'details'], 'additionalProperties': False}}, handler=validation_operation,
+        description='Stable mono global validation and Issue rework')
     def knowledge_operation(args):
         try:
             if not isinstance(args, dict) or set(args) - {'action', 'source_id', 'query_id', 'question', 'scope_ids', 'request_id', 'channel_id', 'auto_supplement', 'material_ids'}:

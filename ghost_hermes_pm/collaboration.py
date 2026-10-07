@@ -110,7 +110,7 @@ def _result_handoff(manager, data, sender, target, original, text, kind='result'
     _channel(data, receiving['id']); _channel(data, sending['id'])
     if len([b for b in sending['bot_sources'] if b['profile_id'] == target['id']]) != 1:
         raise ManagementError('binding_conflict', 'The result target bot identity is not registered in this sending namespace.')
-    key = hashlib.sha256(json.dumps([kind, original['id'], sender['id'], target['id'], text if kind in {'summary', 'progress'} else None]).encode()).hexdigest()
+    key = hashlib.sha256(json.dumps([kind, original['id'], sender['id'], target['id'], text]).encode()).hexdigest()
     if key in state['handoffs']:
         return {**state['handoffs'][key], 'duplicate': True}
     _public_text(text, manager._sensitive_values())
@@ -123,6 +123,9 @@ def _result_handoff(manager, data, sender, target, original, text, kind='result'
         'delivery': 'pending', 'acceptance': 'awaiting_receiver', 'received_parts': {}, 'task_request_id': None,
         'result_task_id': original.get('task_request_id'), 'original_handoff_id': original['id'],
         'parent_handoff_id': original.get('parent_handoff_id'), 'created_at': _now(), 'whole_project_complete': False}
+    task = data['requests'].get(original.get('task_request_id'), {})
+    if task.get('whole_project_complete') and task.get('global_validation_id'):
+        record.update(whole_project_complete=True, global_validation_id=task['global_validation_id'], integration_status='verified_complete')
     state['handoffs'][key] = record
     return record
 
@@ -243,6 +246,11 @@ def perform(manager, identity, action, details):
             text = '项目进展汇总；子交付待集成，项目整体仍待全局验证。\nIssue：' + original['issue']['url'] + '\n负责人：' + principal['id'] + '\n当前 Issue 执行：' + task.get('execution', 'unverified') + '\n本 Issue 交付：' + task.get('task_delivery', 'pending')
             for child_result in received:
                 text += '\n已独立接收子结果：' + child_result['issue']['url'] + ' · ' + child_result['id'] + '\n' + ''.join(part['text'].split(']\n', 1)[1] for part in child_result['segments'])
+            rounds = [a for a in data.get('global_validations', {}).values() if a['request_id'] == task.get('id')]
+            if rounds:
+                text += '\n全局验证证据：' + json.dumps([{k: a.get(k) for k in ('id', 'status', 'mono_commit', 'children', 'occupancy', 'tests', 'rework', 'whole_project_complete', 'boundary_scope')} for a in rounds], ensure_ascii=False)
+            if task.get('whole_project_complete'):
+                text = '项目任务已通过当前稳定组合全局验证。\n' + text.replace('项目进展汇总；子交付待集成，项目整体仍待全局验证。', '项目整体完成证据已核对。')
             result = _result_handoff(manager, data, principal, data['profiles'][target_id], original, text, 'summary' if action == 'report_summary' else 'progress')
             result['received_result_ids'] = [h['id'] for h in received]
         elif action == 'publish_owner_summary':
@@ -258,11 +266,11 @@ def perform(manager, identity, action, details):
             key = hashlib.sha256(json.dumps(['owner-summary', original['id']]).encode()).hexdigest()
             if key in state['handoffs']:
                 return {**state['handoffs'][key], 'duplicate': True}
-            text = '总管回传原本人目标；整体完成仍待全局验证。\n' + '\n'.join(part['text'].split(']\n', 1)[1] for part in original['segments'])
+            text = ('总管回传原本人目标；项目整体完成证据已核对。\n' if original.get('whole_project_complete') else '总管回传原本人目标；整体完成仍待全局验证。\n') + '\n'.join(part['text'].split(']\n', 1)[1] for part in original['segments'])
             chunks = [text[n:n + 1400] for n in range(0, len(text), 1400)]
             result = {'id': key, 'kind': 'owner_summary', 'sender_profile_id': principal['id'], 'target_profile_id': principal['id'],
                 'sender_channel_id': entry['id'], 'target_channel_id': entry['id'], 'owner_origin': original['owner_origin'], 'source_anchor': anchor,
-                'issue': original['issue'], 'original_handoff_id': original['id'], 'whole_project_complete': False, 'channel_bindings': _freeze_channels(entry, entry),
+                'issue': original['issue'], 'original_handoff_id': original['id'], 'whole_project_complete': original.get('whole_project_complete', False), 'global_validation_id': original.get('global_validation_id'), 'channel_bindings': _freeze_channels(entry, entry),
                 'segments': [{'number': n + 1, 'uuid': str(uuid.uuid4()), 'status': 'pending', 'text': chunk, 'attempts': []} for n, chunk in enumerate(chunks)],
                 'delivery': 'pending', 'acceptance': 'owner_notification', 'created_at': _now()}
             state['handoffs'][key] = result
@@ -290,6 +298,8 @@ def perform(manager, identity, action, details):
             if not target:
                 raise ManagementError('binding_conflict', 'The registered result recipient is unavailable.')
             status = '子 Issue 已交付，待集成；全局验证尚未核对。' if principal['role'] == 'subproject_lead' else 'mono Issue 已交付；项目整体状态仍待全局验证。'
+            if task.get('whole_project_complete'):
+                status = 'mono 原 Issue 和稳定组合全局验证已完成；验证：' + task['global_validation_id']
             text = status + '\nIssue：' + task['accepted_scope']['url'] + '\n交付版本：' + str(task.get('delivery_evidence', {}).get('source_commit')) + '\nPR：' + task.get('pr_status', 'none') + '\n原验收与测试证据：' + json.dumps(task.get('delivery_evidence', {}).get('criteria', []), ensure_ascii=False)
             result = _result_handoff(manager, data, principal, target, original, text)
         elif action in {'claim_delivery', 'record_delivery'}:
@@ -380,7 +390,7 @@ def perform(manager, identity, action, details):
                     if parent:
                         parent.setdefault('received_results', []).append(handoff['id'])
                         parent['integration_status'] = 'awaiting_integration'
-                        parent['whole_project_complete'] = False
+                        parent['whole_project_complete'] = handoff.get('whole_project_complete', False)
                 result = handoff
         else:
             raise ManagementError('unsupported', 'This role operation is not supported.')

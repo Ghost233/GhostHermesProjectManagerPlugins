@@ -128,6 +128,14 @@ def create_router(authenticated_client):
         except ManagementError as exc:
             raise failure(exc) from exc
 
+    @router.post('/global-validation')
+    def global_validation(body: CollaborationOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            return client.global_validation(body.action, body.details)
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
     @router.post('/observations')
     def observations(body: ObservationOperation, request: Request):
         client = authenticated_client(request)

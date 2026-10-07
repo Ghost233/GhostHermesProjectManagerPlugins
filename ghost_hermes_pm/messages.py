@@ -291,6 +291,7 @@ class FeishuEntry:
             operations = {'执行': 'start_task', '核对执行': 'refresh_task', '核验执行能力': 'verify_task_execution', '核对Issue来源': 'refresh_task_source', '核对手动会话': 'refresh_task_manual'}
             operation = operations.get(text)
             control = None
+            validation = re.fullmatch(r'全局验证\s+(plan|prepare|start|finish|reconcile|check|rework|complete)[：:]\s*(\{.*\})', text, re.DOTALL)
             takeover = re.fullmatch(r'接管本次工作[：:]\s*([a-f0-9]{64})\s+回合[：:]\s*(\S+)', text)
             returning = text == '归还本次控制'
             preparation = re.fullmatch(r'确认基线[：:]\s*(\S+)\s+([a-f0-9]{40}|unborn)(?:\s+依赖[：:]([a-f0-9,]+))?(?:\s+保留[：:]([a-f0-9]{64}))?', text)
@@ -301,10 +302,25 @@ class FeishuEntry:
                 control = ('continue', 'Continue the original accepted Issue within the existing scope.')
             elif explicit:
                 control = ('append' if explicit.group(1) == '追加' else 'continue', explicit.group(2))
-            if operation or control or preparation or takeover or returning:
+            if operation or control or preparation or validation or takeover or returning:
                 def call_if_active():
                     with self.lifecycle_lock:
                         self.require_active(generation)
+                        if validation:
+                            try:
+                                details = json.loads(validation.group(2))
+                            except ValueError as exc:
+                                raise ManagementError('invalid_change', 'Global validation needs a concrete JSON operation.') from exc
+                            if not isinstance(details, dict):
+                                raise ManagementError('invalid_change', 'Global validation details must be an object.')
+                            if validation.group(1) == 'plan':
+                                if details.get('request_id') != result['request_id']:
+                                    raise ManagementError('binding_conflict', 'The validation must name this uniquely associated mono task.')
+                            else:
+                                attempt = next((a for a in self.manager().read_snapshot(identity)['global_validations'] if a['id'] == details.get('validation_id')), None)
+                                if not attempt or attempt['request_id'] != result['request_id']:
+                                    raise ManagementError('binding_conflict', 'The validation round belongs to another original task.')
+                            return self.manager().global_validation(identity, validation.group(1), details)
                         if takeover:
                             return self.manager().take_over_session(identity, result['request_id'], takeover.group(1), result['id'], takeover.group(2))
                         if returning:
