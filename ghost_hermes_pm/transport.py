@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -73,6 +73,8 @@ class ManagementServer:
                         elif payload.get('operation') == 'control_task':
                             result = bridge.manager.control_task(identity, payload.get('request_id'), payload.get('action'),
                                 payload.get('instruction_id'), payload.get('text'), payload.get('expected_turn_id'))
+                        elif payload.get('operation') == 'answer_human_request':
+                            result = bridge.manager.answer_human_request(identity, payload.get('request_id'), payload.get('human_request_id'), payload.get('reply_id'), payload.get('response'))
                         elif payload.get('operation') == 'record_task_delivery':
                             result = bridge.manager.record_task_delivery(identity, payload.get('request_id'), payload.get('report'))
                         else:
@@ -132,13 +134,13 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
                     response = _read_frame(reader)
         except (OSError, ValueError) as exc:
-            if operation in {'start_task', 'control_task'}:
+            if operation in {'start_task', 'control_task', 'answer_human_request'}:
                 raise ManagementError('outcome_unknown', 'Task start response was not confirmed; read the same durable request before retrying. Repository occupancy is retained.') from exc
             raise ManagementError('unavailable', 'The management instance is unavailable; no operation was confirmed.') from exc
         if 'error' in response:
@@ -160,6 +162,9 @@ class ManagementClient:
     def control_task(self, request_id, action, instruction_id, text=None, expected_turn_id=None):
         return self._call('control_task', request_id=request_id, action=action, instruction_id=instruction_id,
                           text=text, expected_turn_id=expected_turn_id)
+
+    def answer_human_request(self, request_id, human_request_id, reply_id, response):
+        return self._call('answer_human_request', request_id=request_id, human_request_id=human_request_id, reply_id=reply_id, response=response)
 
     def refresh_task(self, request_id):
         return self._call('refresh_task', request_id=request_id)

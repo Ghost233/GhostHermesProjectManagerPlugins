@@ -32,6 +32,7 @@ class CodexStdioAdapter:
         self._condition = threading.Condition()
         self._rpc_lock = threading.RLock()
         self._responses, self._events = {}, []
+        self._outgoing, self._server_requests = set(), {}
         self._counter, self._process, self.connection = 0, None, None
         self._closed = False
         self._failure_reason = None
@@ -92,11 +93,27 @@ class CodexStdioAdapter:
                     break
                 with self._condition:
                     if 'method' in envelope:
+                        rpc_id = envelope.get('id')
+                        if type(rpc_id) in (str, int):
+                            key = (type(rpc_id), rpc_id)
+                            if key in self._server_requests:
+                                if self._server_requests[key]['envelope'] != envelope:
+                                    break
+                            else:
+                                self._server_requests[key] = {'envelope': envelope, 'state': 'pending'}
+                        elif envelope['method'] == 'serverRequest/resolved':
+                            resolved = envelope.get('params', {})
+                            key = (type(resolved.get('requestId')), resolved.get('requestId'))
+                            current = self._server_requests.get(key)
+                            if current and current['envelope'].get('params', {}).get('threadId') == resolved.get('threadId'):
+                                current['state'] = 'resolved'
                         self._events.append(envelope)
                         if len(self._events) > 10000:
                             break
                     elif type(envelope.get('id')) in (str, int):
-                        self._responses[(type(envelope['id']), envelope['id'])] = envelope
+                        key = (type(envelope['id']), envelope['id'])
+                        if key in self._outgoing:
+                            self._responses[key] = envelope
                     else:
                         break
                     self._condition.notify_all()
@@ -111,6 +128,8 @@ class CodexStdioAdapter:
         with self._rpc_lock:
             self._counter += 1
             request_id = self._counter
+            with self._condition:
+                self._outgoing.add((int, request_id))
             self._write({'id': request_id, 'method': method, 'params': params})
             deadline = time.monotonic() + self.timeout
             with self._condition:
@@ -122,6 +141,7 @@ class CodexStdioAdapter:
                                               self._failure_reason or 'Codex response was not confirmed; mutating requests are never replayed.')
                     self._condition.wait(remaining)
                 response = self._responses.pop(key)
+                self._outgoing.discard(key)
             if 'error' in response:
                 raise ManagementError('service_rejected', 'Codex rejected ' + method + '; inspect the registered original service.')
             if 'result' not in response or not isinstance(response['result'], dict):
@@ -250,6 +270,25 @@ class CodexStdioAdapter:
         if not isinstance(thread, dict) or not isinstance(thread.get('status'), dict) or not isinstance(thread.get('turns', []), list) or any(not isinstance(t, dict) or not isinstance(t.get('items', []), list) or any(not isinstance(i, dict) for i in t.get('items', [])) for t in thread.get('turns', [])):
             raise ManagementError('capability_unverified', 'The original thread read is malformed or incomplete.')
         return thread
+
+    def server_requests(self, thread_id):
+        with self._condition:
+            return [json.loads(json.dumps(r)) for r in self._server_requests.values()
+                    if r['envelope'].get('params', {}).get('threadId') == thread_id]
+
+    def respond_server_request(self, rpc_id, envelope, result):
+        with self._rpc_lock, self._condition:
+            self._alive()
+            current = self._server_requests.get((type(rpc_id), rpc_id))
+            if not current or current['state'] != 'pending' or current['envelope'] != envelope:
+                raise ManagementError('binding_conflict', 'The original request is no longer pending on this connection.')
+            current['state'] = 'intent'
+            try:
+                self._write({'id': rpc_id, 'result': result})
+            except ManagementError:
+                current['state'] = 'outcome_unknown'
+                raise
+            current['state'] = 'sent'
 
     def take_events(self, thread_id):
         with self._condition:
