@@ -1,9 +1,11 @@
 """Durable Owner lifecycle intent and independently verified Profile boundaries."""
 from datetime import datetime, timezone
 import hashlib
+import json
 import re
+import sqlite3
 
-from .manager import ManagementError
+from .manager import ManagementError, _public_text
 
 COMPONENTS = ('profile_service', 'bot', 'scheduled_entry')
 
@@ -25,6 +27,40 @@ def _save(manager, operation):
     data.setdefault('lifecycle_operations', {})[operation['id']] = operation
     with manager._db:
         manager._save(version, data)
+
+
+def _scope_binding(data, profile_id):
+    profile = data['profiles'][profile_id]
+    return {k: profile.get(k) for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id', 'connection_refs')} | {
+        'repository_fingerprint': hashlib.sha256(json.dumps(data['projects'][profile['project_id']]['repo'], sort_keys=True).encode()).hexdigest()}
+
+
+def _checkpoint(manager, operation):
+    directory = manager.state_dir / 'lifecycle-checkpoints'
+    if directory != directory.resolve():
+        raise ManagementError('unavailable', 'Lifecycle checkpoint directory is an unknown alias.')
+    directory.mkdir(exist_ok=True)
+    artifact = directory / (hashlib.sha256(operation['id'].encode()).hexdigest() + '.sqlite3')
+    if artifact.exists() or artifact.is_symlink():
+        raise ManagementError('unavailable', 'An incomplete checkpoint artifact needs Owner reconciliation; it was preserved.')
+    with sqlite3.connect(artifact) as target:
+        manager._db.backup(target)
+        if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+            raise ManagementError('unavailable', 'Lifecycle directory checkpoint integrity is unverified.')
+    return {'status': 'verified_manager_directory', 'artifact_ref': str(artifact.relative_to(manager.state_dir)),
+            'sha256': hashlib.sha256(artifact.read_bytes()).hexdigest(), 'verified_at': _now(),
+            'external_state': 'not_backed_up', 'excluded': ['native_profiles', 'bots', 'scheduled_entries', 'source_archives', 'notification-health.json']}
+
+
+def _verified_fact(manager, fact, expected):
+    if not isinstance(fact, dict) or set(fact) - set(expected) - {'state', 'execution_coverage', 'evidence', 'verified_at'} or any(fact.get(k) != v for k, v in expected.items()) or not fact.get('evidence'):
+        raise ManagementError('capability_unverified', 'Current Profile component scope or evidence is incomplete.')
+    _public_text(json.dumps(fact), manager._sensitive_values())
+    at = datetime.fromisoformat(fact['verified_at'])
+    age = (datetime.now(timezone.utc) - at).total_seconds()
+    if not at.tzinfo or age < -5 or age > 300:
+        raise ManagementError('capability_unverified', 'Profile component evidence is stale.')
+    return fact
 
 
 def operate(manager, identity, action, details):
@@ -66,6 +102,7 @@ def operate(manager, identity, action, details):
             operation = {'id': details['operation_id'], 'action': action, 'profile_id': profile['id'],
                 'profile_ids': ids, 'project_ids': project_ids, 'status': 'processing', 'created_at': _now(),
                 'owner_origin': {'subject': identity.subject, 'source': identity.source}, 'checks': {},
+                'scope_bindings': {i: _scope_binding(data, i) for i in ids},
                 'entry_requests': {}, 'manual_required': [], 'manual_handled': [], 'needs_human': [], 'evidence': []}
             operations[operation['id']] = operation
             intent = {'operation_id': operation['id'], 'action': action, 'owner_origin': operation['owner_origin']}
@@ -84,6 +121,19 @@ def _check(manager, identity, operation, handled):
     state = 'stopped' if operation['action'] == 'archive' else 'ready'
     checks, needs = {}, []
     _, data = manager._load()
+    if operation.get('scope_bindings') != {i: _scope_binding(data, i) for i in operation['profile_ids']}:
+        operation.update(status='blocked', needs_human=['Original lifecycle Profile, responsibility or repository binding changed.'],
+                         checks={'directory_scope': {'status': 'blocked', 'reason': 'Original lifecycle binding changed.'}})
+        _save(manager, operation)
+        return operation
+    if state == 'ready' and not operation.get('checkpoint'):
+        try:
+            operation['checkpoint'] = _checkpoint(manager, operation)
+        except (OSError, sqlite3.Error, ManagementError) as exc:
+            operation.update(status='blocked', needs_human=[str(exc)])
+            _save(manager, operation)
+            return operation
+        _save(manager, operation)
     if state == 'stopped':
         task_checks = []
         for record in list(data['requests'].values()):
@@ -132,31 +182,34 @@ def _check(manager, identity, operation, handled):
             try:
                 if manager.lifecycle_host is None:
                     raise ManagementError('capability_unverified', 'No trusted native Profile lifecycle host verifies this component.')
+                expected = {'profile_id': profile_id, 'native_profile': profile['native_profile'], 'project_id': profile['project_id'],
+                            'component': component, 'operation_id': operation['id'], 'scope': 'profile', 'status': 'verified'}
                 if component != 'manual_execution' and key not in operation['entry_requests']:
-                    operation['entry_requests'][key] = {'status': 'intent', 'requested_at': _now()}
+                    capability = getattr(manager.lifecycle_host, 'capability', None)
+                    if not callable(capability):
+                        raise ManagementError('capability_unverified', 'A current native Profile scoped control capability is required before requesting entry changes.')
+                    proof = _verified_fact(manager, capability(profile, component, state, operation['id']), {**expected, 'action': state})
+                    operation['entry_requests'][key] = {'status': 'intent', 'requested_at': _now(), 'capability': proof}
                     _save(manager, operation)
                     try:
                         response = manager.lifecycle_host.request(profile, component, state, operation['id'])
-                        operation['entry_requests'][key] = {'status': response.get('status', 'outcome_unknown')}
-                    except (ManagementError, OSError, TimeoutError):
-                        operation['entry_requests'][key] = {'status': 'outcome_unknown'}
+                        if not isinstance(response, dict) or response.get('status') not in {'accepted', 'rejected', 'outcome_unknown'}:
+                            raise ManagementError('outcome_unknown', 'Unrecognized native lifecycle acknowledgement.')
+                        operation['entry_requests'][key].update(status=response['status'])
+                    except (ManagementError, OSError, TimeoutError, ValueError, TypeError):
+                        operation['entry_requests'][key].update(status='outcome_unknown')
                     _save(manager, operation)
                 component_state = 'stopped' if component == 'manual_execution' else state
                 fact = manager.lifecycle_host.inspect(profile, component, component_state, operation['id'])
-                expected = {'profile_id': profile_id, 'native_profile': profile['native_profile'], 'project_id': profile['project_id'],
-                            'component': component, 'operation_id': operation['id'], 'scope': 'profile', 'state': component_state, 'status': 'verified'}
-                if not isinstance(fact, dict) or any(fact.get(k) != v for k, v in expected.items()) or not fact.get('evidence') or component == 'manual_execution' and fact.get('execution_coverage') != 'complete':
-                    raise ManagementError('capability_unverified', 'Current Profile component scope or termination evidence is incomplete.')
-                at = datetime.fromisoformat(fact['verified_at'])
-                age = (datetime.now(timezone.utc) - at).total_seconds()
-                if not at.tzinfo or age < -5 or age > 300:
-                    raise ManagementError('capability_unverified', 'Profile component evidence is stale.')
-                checks[key] = fact
+                _verified_fact(manager, fact, expected)
+                if component == 'manual_execution' and fact.get('execution_coverage') != 'complete':
+                    raise ManagementError('capability_unverified', 'Current original manual execution coverage is incomplete.')
+                checks[key] = fact if fact.get('state') == component_state else {**fact, 'status': 'processing', 'reason': 'Requested state has not been verified.'}
             except (ManagementError, OSError, KeyError, TypeError, ValueError) as exc:
                 checks[key] = {'status': 'blocked', 'reason': str(exc)}
     flat = [item for v in checks.values() for item in (v if isinstance(v, list) else [v])]
     complete = not needs and all(c['status'] == 'verified' for c in flat)
-    operation.update(checks=checks, status='completed' if complete else 'blocked' if manager.lifecycle_host is None else 'processing', verified_at=_now(), needs_human=needs)
+    operation.update(checks=checks, status='completed' if complete else 'blocked' if any(c['status'] == 'blocked' for c in flat) else 'processing', verified_at=_now(), needs_human=needs)
     if not complete:
         operation['needs_human'] += [key + ': ' + str(v.get('reason', 'Verification pending.')) for key, v in checks.items() if isinstance(v, dict) and v['status'] != 'verified']
     version, data = manager._load()

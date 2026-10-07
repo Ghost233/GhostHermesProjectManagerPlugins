@@ -28,6 +28,12 @@ class ProfileHost:
         self.calls.append((profile['id'], component, state, operation_id))
         return {'status': 'accepted'}
 
+    def capability(self, profile, component, state, operation_id):
+        return {'profile_id': profile['id'], 'native_profile': profile['native_profile'], 'project_id': profile['project_id'],
+                'component': component, 'operation_id': operation_id, 'scope': 'profile', 'status': 'verified',
+                'action': state, 'evidence': 'synthetic-profile-scoped-native-control-only',
+                'verified_at': datetime.now(timezone.utc).isoformat()}
+
     def inspect(self, profile, component, state, operation_id):
         return {'profile_id': profile['id'], 'native_profile': profile['native_profile'],
                 'project_id': profile['project_id'], 'component': component, 'operation_id': operation_id,
@@ -145,6 +151,20 @@ def test_unknown_native_lifecycle_is_durably_blocked_and_directory_correction_ca
         assert snapshot['lifecycle_events'] == []
 
 
+def test_archive_never_creates_a_new_manual_control_grant_even_when_owner_has_a_control_adapter(tmp_path):
+    from test_manual_control import adapters, original_state, setup, ORIGINAL_TURN
+    repo, peer = make_repo(tmp_path / 'repo'), tmp_path / 'manual'
+    original_state(peer, repo)
+    read, control = adapters(peer)
+    host = ProfileHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host,
+                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+        host.manager = manager
+        request_id, observed = setup(manager, repo)
+        manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'observe-archive'})
+        with pytest.raises(ManagementError, match='lifecycle'):
+            manager.take_over_session(OWNER, request_id, observed['id'], 'new-archive-grant', ORIGINAL_TURN)
+        assert manager.read_snapshot(OWNER)['control_grants'] == []
 @pytest.mark.asyncio
 async def test_group_owner_archive_and_dashboard_restore_show_the_same_durable_lifecycle(tmp_path):
     from fastapi import FastAPI
@@ -300,3 +320,49 @@ def test_new_descendant_and_current_work_takeover_cannot_reopen_archiving_scope(
         with pytest.raises(ManagementError, match='Owner'):
             manager.lifecycle(VerifiedIdentity('fixture:lead', 'registered-bot'), 'restore', {'profile_id': 'mono-lead', 'operation_id': 'bot-authority'})
         assert len(manager.read_snapshot(OWNER)['projects']) == 1
+
+
+def test_restore_keeps_consistent_manager_checkpoint_and_blocks_changed_original_profile_binding(tmp_path):
+    from pathlib import Path
+    import sqlite3
+    host = ProfileHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host) as manager:
+        host.manager = manager
+        repo = make_repo(tmp_path / 'repo')
+        manager.apply_directory_change(OWNER, 0, registration(repo))
+        host.pending.add(('mono-lead', 'bot'))
+        manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'binding-archive'})
+        correction = registration(repo)['profile']
+        correction['native_profile'] = 'different-native'
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': correction})
+        calls = list(host.calls)
+        blocked = manager.lifecycle(OWNER, 'check', {'operation_id': 'binding-archive'})
+        assert blocked['status'] == 'blocked'
+        assert host.calls == calls
+        correction['native_profile'] = 'mono-lead'
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': correction})
+        host.pending.clear()
+        assert manager.lifecycle(OWNER, 'check', {'operation_id': 'binding-archive'})['status'] == 'completed'
+        restored = manager.lifecycle(OWNER, 'restore', {'profile_id': 'mono-lead', 'operation_id': 'checkpoint-restore'})
+        assert restored['checkpoint']['status'] == 'verified_manager_directory'
+        artifact = manager.state_dir / restored['checkpoint']['artifact_ref']
+        with sqlite3.connect(Path(artifact).as_uri() + '?mode=ro', uri=True) as db:
+            assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+            saved = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
+        assert saved['profiles']['mono-lead']['lifecycle'] == 'restoring'
+        assert saved['profiles']['mono-lead']['archive_intent']['operation_id'] == 'checkpoint-restore'
+        assert restored['checkpoint']['external_state'] == 'not_backed_up'
+
+
+def test_unknown_or_host_wide_native_control_capability_does_not_request_a_profile_stop(tmp_path):
+    class HostWide(ProfileHost):
+        def capability(self, *args):
+            return {**super().capability(*args), 'scope': 'host'}
+    host = HostWide()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host) as manager:
+        host.manager = manager
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        result = manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'no-host-stop'})
+        assert result['status'] == 'blocked'
+        assert host.calls == []
+        assert manager.read_snapshot(OWNER)['profiles'][0]['lifecycle'] == 'archiving'

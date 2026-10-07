@@ -350,6 +350,13 @@ class Manager:
         return operate(self, identity, action, details)
 
     def take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id):
+        with self._lock:
+            _, data = self._load()
+            record = self._request(identity, request_id, data)
+            from .lifecycle import require_active
+            require_active(data, record['profile_id'], record['project_id'])
+            if record.get('archive_stop_intent'):
+                raise ManagementError('lifecycle_blocked', 'Archived unstarted work needs a new explicit request before any manual takeover.')
         from .takeover import take_over_session
         return take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id)
 
