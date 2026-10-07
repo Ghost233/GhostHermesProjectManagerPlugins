@@ -83,6 +83,8 @@ class ManagementServer:
                                 payload.get('instruction_id'), payload.get('text'), payload.get('expected_turn_id'))
                         elif payload.get('operation') == 'answer_human_request':
                             result = bridge.manager.answer_human_request(identity, payload.get('request_id'), payload.get('human_request_id'), payload.get('reply_id'), payload.get('response'))
+                        elif payload.get('operation') == 'answer_from_knowledge':
+                            result = bridge.manager.answer_from_knowledge(identity, payload.get('request_id'), payload.get('human_request_id'), payload.get('query_id'), payload.get('material_ids'))
                         elif payload.get('operation') == 'record_task_delivery':
                             result = bridge.manager.record_task_delivery(identity, payload.get('request_id'), payload.get('report'))
                         elif payload.get('operation') == 'register_knowledge_source':
@@ -218,3 +220,7 @@ class ManagementClient:
 
     def supplement_knowledge(self, query_id, material_ids=None):
         return self._call('supplement_knowledge', query_id=query_id, material_ids=material_ids)
+
+    def answer_from_knowledge(self, request_id, human_request_id, query_id, material_ids):
+        return self._call('answer_from_knowledge', request_id=request_id, human_request_id=human_request_id,
+                          query_id=query_id, material_ids=material_ids)

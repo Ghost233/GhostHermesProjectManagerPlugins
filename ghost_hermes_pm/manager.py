@@ -355,6 +355,10 @@ class Manager:
         from .questions import answer_human_request
         return answer_human_request(self, identity, request_id, human_request_id, reply_id, response)
 
+    def answer_from_knowledge(self, identity, request_id, human_request_id, query_id, material_ids):
+        from .memory import answer_from_knowledge
+        return answer_from_knowledge(self, identity, request_id, human_request_id, query_id, material_ids)
+
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
         try:
