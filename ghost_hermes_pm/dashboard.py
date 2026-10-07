@@ -90,7 +90,9 @@ def create_router(authenticated_client):
             return last_snapshot
         except ManagementError as exc:
             if exc.code == 'unavailable' and last_snapshot is not None:
+                notifications = last_snapshot.get('notifications', {})
                 return {**last_snapshot, 'status': 'unverified', 'runtime': 'manager_unavailable',
+                        'notifications': {**notifications, 'health': {**notifications.get('health', {}), 'supervision': 'unavailable', 'delivery': 'unverified'}},
                         'needs_human': ['Manager unavailable; showing the last verified directory.']}
             raise failure(exc) from exc
 

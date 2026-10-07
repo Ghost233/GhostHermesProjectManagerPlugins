@@ -288,7 +288,7 @@ def test_child_result_uses_original_issue_delivery_and_parent_only_reports_pendi
         owner_summary = manager.collaborate(STEWARD, 'publish_owner_summary', {'handoff_id': received_summary['id']})
         packet = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': owner_summary['id']})
         assert packet['path'] == 'reply' and packet['reply_to'] == 'om_owner_goal'
-        assert packet['chat_id'] == 'oc_entry' and packet['mention_open_id'] == 'owner-steward'
+        assert packet['chat_id'] == 'oc_entry' and packet['mention_open_id'] is None
         assert '全局验证' in packet['text'] and owner_summary['whole_project_complete'] is False
         manager.collaborate(STEWARD, 'record_delivery', {'handoff_id': owner_summary['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_owner_summary', 'chat_id': 'oc_entry'}})
         assert manager.collaborate(STEWARD, 'publish_owner_summary', {'handoff_id': received_summary['id']})['duplicate']

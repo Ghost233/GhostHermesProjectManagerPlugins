@@ -11,6 +11,12 @@ const snapshot = {status: 'completed', version: 1, runtime: 'synthetic', project
     occupancy: {released: true}, whole_project_complete: false, children: [], inputs: [], tests: [], rework: [],
     unassigned: [{path: 'components/fixture-unassigned', commit: 'b'.repeat(40)}],
     preparation: {status: 'ended', receipt: {action_id: 'fixture-preparation-receipt', status: 'ended'}}}]};
+if (process.argv[3] === 'notifications') snapshot.notifications = {
+  health: {supervision: 'unavailable', delivery: 'unverified', last_checked_at: 10000,
+    sources: {'task-fixture': {status: 'unverified', service_id: 'original-service', last_confirmed_execution: 'running'}}},
+  events: [{id: 'notification-fixture', kind: 'human_request', project_id: 'mono', delivery: 'unknown', text: 'Which colour? 原请求 fixture-q',
+    mention_owner: true, segments: [{uuid: 'notification-uuid', attempts: [{status: 'delivered', chat_id: 'oc_entry', message_id: 'om_actual_local'}, {status: 'unknown'}]}]}
+  ]};
 const React = {Fragment: 'fragment',
   createElement(type, props, ...children) {return {type, props: props || {}, children};},
   useState(initial) {const i = cursor++; if (!(i in states)) states[i] = initial; return [states[i], value => {states[i] = value;}];},
@@ -27,7 +33,14 @@ function text(tree) {return Array.isArray(tree) ? tree.map(text).join('') : tree
 function find(tree, predicate) {const node = nodes(tree).find(predicate); assert.ok(node, 'Public rendered control not found'); return node;}
 (async () => {
   render(); await Promise.all(effects.map(effect => effect())); await new Promise(resolve => setImmediate(resolve)); let tree = render();
-  if (process.argv[3] === 'evidence') {
+  if (process.argv[3] === 'notifications') {
+    const section = find(tree, node => node.type === 'section' && text(node).includes('通知与监督健康'));
+    assert.ok(text(section).includes('unavailable') && text(section).includes('unverified'));
+    assert.ok(text(section).includes('Which colour? 原请求 fixture-q') && text(section).includes('unknown'));
+    assert.ok(text(section).includes('oc_entry') && text(section).includes('om_actual_local'));
+    assert.ok(text(section).includes('original-service') && text(section).includes('running'));
+    assert.ok(!nodes(section).some(node => node.type === 'button'), 'Notifications must remain factual read-only views');
+  } else if (process.argv[3] === 'evidence') {
     const evidence = find(tree, node => node.type === 'details' && text(node).includes('固定子交付、实际输入、Git 元数据、测试与返工证据'));
     assert.ok(text(evidence).includes('components/fixture-unassigned'), 'Unassigned path is missing from public evidence');
     assert.ok(text(evidence).includes('b'.repeat(40)), 'Unassigned fixed commit is missing from public evidence');

@@ -382,3 +382,178 @@ def test_verified_rework_is_immediately_linked_to_actual_public_child_outbox_onc
         assert notice['role_handoff_id'] == handoff and notice['mention_owner'] is False
         manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})
         assert len([e for e in manager.read_snapshot(OWNER)['notifications']['events'] if e['kind'] == 'rework']) == 1
+
+
+def test_summary_distinguishes_actual_new_progress_from_an_unchanged_period(tmp_path):
+    import json
+    from test_task_control import TURN
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        clock.advance(600)
+        (tmp_path / 'observed.json').write_text(json.dumps({'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': [{'id': 'progress-1', 'type': 'agentMessage', 'text': 'Verified selected project progress'}]}]}))
+        manager.run_notifications(OWNER)
+        clock.advance(300)
+        first = next(e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'summary')
+        assert '本周期已核实变化' in first['text'] and '无新进展' not in first['text']
+        clock.advance(900)
+        last = [e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'summary'][-1]
+        assert '无新进展' in last['text']
+
+
+def test_dashboard_offline_retains_same_notifications_but_never_claims_live_supervision_or_delivery(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from ghost_hermes_pm.dashboard import create_router
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.run_notifications(OWNER)
+        clock.advance(900)
+        manager.run_notifications(OWNER)
+        app = FastAPI()
+        app.include_router(create_router(lambda request: ManagementClient(tmp_path / 'state', 'owner')))
+        with TestClient(app) as browser:
+            with ManagementServer(manager, {'owner': OWNER}):
+                online = browser.get('/snapshot').json()
+                assert online['notifications'] == manager.read_snapshot(OWNER)['notifications']
+            offline = browser.get('/snapshot').json()
+            assert offline['runtime'] == 'manager_unavailable'
+            assert offline['notifications']['events'] == online['notifications']['events']
+            assert offline['notifications']['health']['supervision'] == 'unavailable'
+            assert offline['notifications']['health']['delivery'] == 'unverified'
+
+
+def test_owner_short_answer_quotes_actual_entry_notification_and_returns_to_original_rpc(tmp_path):
+    import asyncio
+    import json
+    from types import SimpleNamespace as NS
+    from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import Transport, Gateway
+    from test_questions import question_adapter, emit, user_question, replies
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question())
+        manager.refresh_task(OWNER, task_id)
+        entry = channel('steward', 'entry')
+        binding = {**entry, 'sender_tenant_key': entry['owner_tenant_key']}
+        class EntryTransport(Transport):
+            async def verify_identity(self, supplied):
+                return {'app_id': entry['app_id'], 'open_id': entry['recipient_open_id']}
+        transport, adapter = EntryTransport(), object()
+        intake = FeishuEntry(lambda: manager, OWNER.subject, {'enabled': True, 'verification_ref': 'fixture:entry', 'bindings': [binding]}, lambda url: None)
+        intake.attach_transport(adapter, transport)
+        asyncio.run(intake.deliver_notifications(OWNER))
+        alert = next(e for e in manager.read_snapshot(OWNER)['notifications']['events'] if e['kind'] == 'human_request')
+        actual_id = alert['segments'][0]['attempts'][0]['message_id']
+        raw = P2ImMessageReceiveV1({'header': {'event_type': 'im.message.receive_v1', 'app_id': entry['app_id'], 'tenant_key': entry['transport_tenant_key']},
+            'event': {'sender': {'sender_type': 'user', 'tenant_key': entry['owner_tenant_key'], 'sender_id': {'open_id': entry['owner_open_id'], 'user_id': 'native-owner'}},
+                'message': {'message_id': 'om_short_answer', 'chat_id': 'oc_entry', 'chat_type': 'group', 'message_type': 'text', 'parent_id': actual_id,
+                    'content': json.dumps({'text': '@_user_1 回答：Blue'}), 'mentions': [{'key': '@_user_1', 'mentioned_type': 'bot', 'tenant_key': entry['recipient_tenant_key'], 'id': {'open_id': entry['recipient_open_id']}}]}}})
+        original = NS(platform='feishu', user_id='native-owner', user_id_alt=None, chat_id='oc_entry', is_bot=False, message_id='om_short_answer')
+        event = NS(source=original, raw_message=raw, message_id=original.message_id)
+        assert asyncio.run(intake.receive(event, Gateway(adapter))) == {'action': 'skip'}
+        resolved = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        assert resolved['resolution'] == 'resolved' and resolved['reply']['source_anchor']['parent_id'] == actual_id
+        assert replies(tmp_path) == [{'id': 8, 'result': {'answers': {'colour': {'answers': ['Blue']}}}}]
+
+
+def test_stale_supervision_is_visible_without_claiming_current_delivery_or_current_source_coverage(tmp_path):
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        clock.advance(121)
+        stale = manager.read_snapshot(OWNER)['notifications']['health']
+        assert stale['supervision'] == 'unverified' and stale['delivery'] == 'unverified'
+        assert stale['sources'][task_id]['status'] == 'unverified'
+        assert stale['sources'][task_id]['last_confirmed_execution'] == 'running'
+        manager.run_notifications(OWNER)
+        assert manager.read_snapshot(OWNER)['notifications']['health']['supervision'] == 'running'
+
+
+def test_revoked_host_process_coverage_blocks_stall_and_keeps_unknown_coverage_visible(tmp_path):
+    clock = Clock()
+    host_receipt = {}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path, host_receipt), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        host_receipt['process_coverage'] = None
+        clock.advance(900)
+        assert not any(e['kind'] == 'suspected_stall' for e in manager.run_notifications(OWNER)['notifications'])
+        assert manager.read_snapshot(OWNER)['notifications']['health']['sources'][task_id]['stall_coverage'] == 'unverified'
+
+
+def test_approval_and_sensitive_requests_remain_immediate_and_stop_after_the_original_request_expires(tmp_path):
+    import json
+    from test_questions import question_adapter, emit, approval, user_question
+    from test_task_control import TURN
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, approval(rpc_id='operation'), user_question(rpc_id='secret', questions=[{'id': 'secret', 'header': 'Private', 'question': 'synthetic-sensitive-placeholder', 'isSecret': True, 'isOther': False, 'options': None}]))
+        events = [e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request']
+        assert len(events) == 2 and all(e['mention_owner'] for e in events)
+        assert any('具体操作' in e['text'] and '范围：turn' in e['text'] for e in events)
+        sensitive = next(q for q in manager.read_snapshot(OWNER)['requests'][0]['human_requests'] if q['category'] == 'sensitive')
+        secret_notice = next(e for e in events if e['human_request_id'] == sensitive['id'])
+        assert '原界面' in secret_notice['text'] and 'synthetic-sensitive-placeholder' not in json.dumps(manager.read_snapshot(OWNER))
+        clock.advance(1800)
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request']) == 4
+        (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': []}]}))
+        manager.run_notifications(OWNER)
+        clock.advance(1800)
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request']) == 4
+
+
+def test_repeated_handoff_block_does_not_create_new_alerts_or_new_execution(tmp_path):
+    import pytest
+    from ghost_hermes_pm import ManagementError
+    from test_task_control import wire
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        for _ in range(2):
+            with pytest.raises(ManagementError):
+                manager.record_task_delivery(OWNER, task_id, {'issue_updated_at': ISSUE['updated_at'], 'criteria': []})
+            manager.run_notifications(OWNER)
+        blocked = [e for e in manager.read_snapshot(OWNER)['notifications']['events'] if e['kind'] == 'blocked']
+        assert len(blocked) == 1 and blocked[0]['mention_owner'] is False
+        assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+
+
+def test_changed_responsibility_keeps_actual_execution_unknown_and_supervision_block_visible(tmp_path):
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        snapshot = manager.read_snapshot(OWNER)
+        profile = next(p for p in snapshot['profiles'] if p['id'] == 'mono-lead')
+        correction = {k: profile[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id', 'connection_refs')}
+        correction['identity_ref'] = 'fixture:new-responsible-role'
+        manager.apply_directory_change(OWNER, snapshot['version'], {'profile': correction})
+        manager.run_notifications(OWNER)
+        changed = manager.read_snapshot(OWNER)
+        assert changed['notifications']['health']['sources'][task_id]['status'] == 'unverified'
+        task = changed['requests'][0]
+        assert task['execution'] == 'unverified' and task['last_confirmed_execution'] == 'running' and task['repository_released'] is False
+        assert len([e for e in changed['notifications']['events'] if e['kind'] == 'needs_owner']) == 1
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'needs_owner']) == 1

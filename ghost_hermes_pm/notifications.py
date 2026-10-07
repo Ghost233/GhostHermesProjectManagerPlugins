@@ -35,7 +35,12 @@ def snapshot(manager, data, project_ids):
             continue
         handoff = data.get('collaboration', {}).get('handoffs', {}).get(event.get('role_handoff_id'))
         events.append({**event, 'delivery': handoff['delivery']} if handoff else event)
-    health['sources'] = {key: value for key, value in health.get('sources', {}).items() if data['requests'].get(key, {}).get('project_id') in project_ids}
+    health['sources'] = {key: dict(value) for key, value in health.get('sources', {}).items() if data['requests'].get(key, {}).get('project_id') in project_ids}
+    checked_at = health.get('last_checked_at')
+    if checked_at is not None and manager.notification_clock() - checked_at > 10 and health['supervision'] == 'running':
+        health.update(supervision='unverified', delivery='unverified', reason='supervision_check_stale')
+        for source in health['sources'].values():
+            source['status'] = 'unverified'
     return {'events': events,
             'health': health}
 
@@ -74,7 +79,7 @@ def observe(manager, task, thread=None, turn=None, items=(), events=()):
     digest = hashlib.sha256(json.dumps([task['execution'], turn, events], sort_keys=True).encode()).hexdigest() if verified else None
     task['supervision_observation'] = {'verified': verified, 'progress_digest': digest,
         'checked_at': manager.notification_clock(), 'explanation': explanation, 'complete': complete,
-        'source': 'original_thread_read', 'service_id': task['session']['service_id'],
+        'source': 'original_thread_read' if thread is not None else 'original_service_unavailable', 'service_id': task['session']['service_id'],
         'eligible_stall': verified and complete and task['execution'] == 'running' and not explanation}
 
 
@@ -105,11 +110,16 @@ def run(manager, identity):
         if manager._principal(identity, initial) is not None:
             raise ManagementError('forbidden', 'Only the manager supervision entry schedules global notifications.')
         task_ids = [t['id'] for t in initial['requests'].values() if t.get('session') and not t.get('repository_released') and t.get('outer_task_status') != 'stopped']
+    refresh_failures = {}
     for task_id in task_ids:
         try:
+            with manager._lock:
+                _, current = manager._load()
+                from .takeover import _assignment
+                _assignment(current['requests'][task_id], current)
             manager.refresh_task(identity, task_id)
-        except ManagementError:
-            continue
+        except ManagementError as exc:
+            refresh_failures[task_id] = exc.code
     with manager._lock, manager._db:
         version, data = manager._load()
         principal = manager._principal(identity, data)
@@ -117,9 +127,19 @@ def run(manager, identity):
             raise ManagementError('forbidden', 'Only the manager supervision entry schedules global notifications.')
         now = manager.notification_clock()
         saved = state(data)
+        for task_id, failure in refresh_failures.items():
+            task = data['requests'][task_id]
+            if task['execution'] not in {'unverified', 'stopping'}:
+                task['last_confirmed_execution'] = task['execution']
+            task['execution'] = 'stopping' if task.get('stop', {}).get('status') == 'processing' else 'unverified'
+            observe(manager, task)
+            if failure not in {'unavailable', 'outcome_unknown'}:
+                task['supervision_observation']['source'] = 'supervision_refresh_blocked'
+                emit(saved, 'needs_owner', task['project_id'], [task], '当前责任或原服务监督边界核查受阻；执行待核实，保留仓库占用，需要核对原授权与配置。\nIssue：' + task['accepted_scope']['url'], now, mention_owner=True, key='supervision-blocked:' + task_id)
         if saved.get('generation') != manager._notification_generation:
             for schedule in saved['projects'].values():
                 schedule['summary_at'] = now
+                schedule.pop('task_progress', None)
             for tracker in saved['tasks'].values():
                 tracker['progress_at'] = now
                 if 'disconnected_at' in tracker:
@@ -135,6 +155,10 @@ def run(manager, identity):
             if not task.get('repository_released') and task.get('outer_task_status') != 'stopped':
                 active.setdefault(task['project_id'], []).append(task)
         for task in data['requests'].values():
+            if task.get('handoff_reason') and not task.get('repository_released'):
+                reason = task['handoff_reason']
+                event = emit(saved, 'blocked', task['project_id'], [task], '交付交接受阻；保留原执行、改动与仓库占用。\n原因：' + reason + '\nIssue：' + task['accepted_scope']['url'], now, key='handoff-blocked:' + task['id'] + ':' + hashlib.sha256(reason.encode()).hexdigest())
+                event['handoff_reason'] = reason
             validation_id = task.get('global_validation_id')
             validation = data.get('global_validations', {}).get(validation_id, {})
             completion_key = 'project-complete:' + task['id'] + ':' + str(validation_id)
@@ -156,13 +180,13 @@ def run(manager, identity):
                     'service_id': observation['service_id'], 'checked_at': observation['checked_at'],
                     'last_confirmed_execution': task.get('last_confirmed_execution', task['execution']),
                     'execution': task['execution']}
-                if not observation['verified']:
+                if not observation['verified'] and observation['source'] != 'supervision_refresh_blocked':
                     tracker.setdefault('disconnected_at', now)
                     if now - tracker['disconnected_at'] >= 120 and not tracker.get('disconnect_sent'):
                         emit(saved, 'channel_lost', task['project_id'], [task],
                              '原监督通道持续失联2分钟；执行待核实，保留最后核实状态及仓库占用。\nIssue：' + task['accepted_scope']['url'], now)
                         tracker['disconnect_sent'] = True
-                elif 'disconnected_at' in tracker:
+                elif observation['verified'] and 'disconnected_at' in tracker:
                     if tracker.get('disconnect_sent'):
                         emit(saved, 'channel_recovered', task['project_id'], [task], '原监督通道已恢复核查；实际执行：' + task['execution'] + '\nIssue：' + task['accepted_scope']['url'], now)
                     tracker.pop('disconnected_at', None)
@@ -194,16 +218,19 @@ def run(manager, identity):
             if project_id not in active:
                 del saved['projects'][project_id]
         for project_id, tasks in active.items():
+            current_progress = {t['id']: json.dumps([t.get('supervision_observation', {}).get('progress_digest'), t['execution'], t.get('task_delivery'), t.get('pr_status'), [(q['id'], q['resolution']) for q in t.get('human_requests', [])]]) for t in tasks}
             schedule = saved['projects'].setdefault(project_id, {'summary_at': now})
+            schedule.setdefault('task_progress', current_progress)
             if now - schedule['summary_at'] < 900:
                 continue
             text = '项目汇总：' + project_id + '\n' + '\n'.join(
-                '负责人：' + t['profile_id'] + '；状态：' + t['execution'] + '\n进展：无新进展；交付：' + t.get('task_delivery', 'unmet') +
+                '负责人：' + t['profile_id'] + '；状态：' + t['execution'] + '\n进展：' + ('本周期已核实变化' if schedule['task_progress'].get(t['id']) != current_progress[t['id']] else '无新进展') + '；交付：' + t.get('task_delivery', 'unmet') +
                 '；PR：' + t.get('pr_status', 'none') + '\n阻塞：' + (t.get('unexecuted_reason') or '无已核实阻塞') +
                 '\n待处理：' + '\n'.join(human_text(q) for q in t.get('human_requests', []) if q['resolution'] == 'pending' and not q.get('reply')) +
                 '\n下一步：核对原服务与当前有效请求\nIssue：' + t['accepted_scope']['url'] for t in tasks)
             emit(saved, 'summary', project_id, tasks, text, now)
             schedule['summary_at'] = now
+            schedule['task_progress'] = current_progress
         from .collaboration import _channel
         entries = [c for c in data.get('collaboration', {}).get('channels', {}).values() if c['group_kind'] == 'entry']
         target = None
@@ -248,6 +275,10 @@ def manage(manager, identity, action, details):
         if not frozen or _channel(data, frozen['id']) != frozen:
             raise ManagementError('binding_conflict', 'The original notification entry channel changed or was unavailable.')
         if action == 'claim':
+            if event.get('handoff_reason') and not any(data['requests'][task_id].get('handoff_reason') == event['handoff_reason'] and not data['requests'][task_id].get('repository_released') for task_id in event['request_ids']):
+                event['delivery'] = 'expired'
+                manager._save(version, data)
+                return None
             if event.get('validation_id'):
                 validation = data.get('global_validations', {}).get(event['validation_id'], {})
                 if validation.get('status') != 'complete' or not validation.get('whole_project_complete'):
