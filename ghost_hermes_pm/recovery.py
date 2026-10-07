@@ -149,6 +149,9 @@ def reconcile_task(manager, identity, request_id):
                     last_confirmed_execution=task.get('execution'), last_confirmed_at=task.get('last_execution_verified_at'))
                 if task['execution'] == 'turn_ended':
                     recovery['status'], reason = _continue_if_safe(manager, identity, request_id)
+                    if recovery['status'] == 'continued_original_task':
+                        current = manager.refresh_task(identity, request_id)
+                        recovery.update(last_confirmed_execution=current['execution'], last_confirmed_at=current.get('last_execution_verified_at'))
                     if reason:
                         recovery['needs_human'].append(reason)
                 if any(q.get('resolution') in {'unverified', 'outcome_unknown'} for q in task.get('human_requests', [])):
@@ -181,7 +184,7 @@ def _continue_if_safe(manager, identity, request_id):
     _, session, adapter = _binding(manager, identity, request_id, data, 'related_execution')
     thread = _thread(adapter, session, require_input=False)
     turn = next((t for t in thread['turns'] if t.get('id') == session['turn_id']), None)
-    incomplete = adapter.verify_control(session['repository'], 'related_execution', session['capability']).get('work_incomplete', {})
+    incomplete = adapter.verify_control(session['repository'], 'related_execution', session['capability']).get('work_incomplete') or {}
     if not turn or turn.get('status') not in {'interrupted', 'failed'} or incomplete.get('thread_id') != session['thread_id'] or incomplete.get('turn_id') != session['turn_id'] or incomplete.get('status') != 'verified_incomplete' or not isinstance(incomplete.get('evidence'), str) or not incomplete['evidence']:
         return 'awaiting_reconciliation', 'Task stop and unfinished accepted work need fresh evidence; a historical turn end is insufficient.'
     related, evidence = terminal_evidence(adapter, session, thread, session['turn_id'])
@@ -194,3 +197,105 @@ def _continue_if_safe(manager, identity, request_id):
     manager.control_task(identity, request_id, 'append', instruction_id,
         'Continue only the unfinished original accepted task after verified execution stop.\n' + record['accepted_scope']['title'] + '\n' + record['accepted_scope']['body'], session['turn_id'])
     return 'continued_original_task', None
+
+
+def verify_directory(path):
+    """Read existing authority before opening any writable migration/queue path."""
+    import sqlite3
+    if not path.exists():
+        return
+    try:
+        with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as database:
+            if database.execute('PRAGMA quick_check').fetchone() != ('ok',):
+                raise ValueError('Directory consistency check failed.')
+            row = database.execute('SELECT schema_version, version, payload FROM directory WHERE id=1').fetchone()
+            if not row or type(row[1]) is not int or row[1] < 0:
+                raise ValueError('Authoritative directory row is missing.')
+            if row[0] != 1:
+                raise ManagementError('unknown_version', 'Directory schema requires a verified upgrade; no recovery writes were performed.')
+            payload = json.loads(row[2])
+            if not isinstance(payload, dict) or any(not isinstance(payload.get(k), dict) for k in ('projects', 'profiles')):
+                raise ValueError('Directory material is incomplete.')
+    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+        raise ManagementError('unavailable', 'Persistent directory is unavailable or corrupt; preserve it for recovery and do not dispatch.') from exc
+
+
+def configured_recovery_adapters(configs, state_dir):
+    """Fixed native original endpoints, backed by fresh hashed host validation."""
+    from pathlib import Path
+    if not configs:
+        return {}
+    allowed = {'executable', 'cwd', 'environment', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref'}
+    if not isinstance(configs, list):
+        raise ManagementError('invalid_change', 'Recovery requires an explicit native original endpoint list.')
+    adapters = {}
+    for config in configs:
+        if not isinstance(config, dict) or set(config) != allowed or any(not isinstance(config.get(k), str) or not config[k] for k in allowed - {'environment'}) or not Path(config['executable']).is_absolute() or not Path(config['endpoint']).is_absolute() or config['service_ref'] in adapters:
+            raise ManagementError('invalid_change', 'Specify fixed executable, source kind, original endpoint and explicit environment; no new server or default socket is accepted.')
+        command = [config['executable'], 'app-server', 'proxy', '--sock', config['endpoint']]
+        frozen = json.loads(json.dumps(config))
+        def verifier(binding, repository, context, frozen=frozen, command=command):
+            try:
+                base = Path(state_dir).resolve()
+                manifest = base / 'codex-recovery.json'
+                if manifest != manifest.resolve() or manifest.stat().st_size > 65536:
+                    raise ValueError('Invalid recovery manifest.')
+                reference = json.loads(manifest.read_text())[context['request_id']]
+                path = base / reference['path']
+                if path != path.resolve() or not path.is_relative_to(base / 'recovery-evidence') or path.stat().st_size > 1024 * 1024:
+                    raise ValueError('Invalid recovery receipt path.')
+                raw = path.read_bytes()
+                if hashlib.sha256(raw).hexdigest() != reference['sha256']:
+                    raise ValueError('Recovery receipt digest changed.')
+                report = json.loads(raw)
+                now = datetime.now(timezone.utc)
+                verified = datetime.fromisoformat(report['verified_at'])
+                expires = datetime.fromisoformat(report['expires_at'])
+                if not verified.tzinfo or not expires.tzinfo or not verified <= now < expires or (expires - verified).total_seconds() > 300 or report.get('recovery_binding') != context or report.get('endpoint_ref') != frozen['endpoint_ref'] or report.get('endpoint_sha256') != hashlib.sha256(frozen['endpoint'].encode()).hexdigest() or report.get('source_kind') != frozen['source_kind']:
+                    raise ValueError('The fresh original executor/session scope is missing or expired.')
+                connection = {'generation': binding['generation'], 'service_id': binding['service_id'], 'platform': binding.get('platform', report.get('platform'))}
+                from .validation import validate_receipts
+                proof = validate_receipts(report, connection, repository, command, frozen['environment'], state_dir, startup_kind='recovery')
+                return {**proof, **binding, 'recovery_binding': context, 'work_incomplete': report.get('work_incomplete'),
+                    'control_access': 'verified-original-input-path'}
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise ManagementError('capability_unverified', 'Fresh hashed original-service restart/connection, authorization and boundary evidence is unavailable; recovery control remains disabled.') from exc
+        adapters[config['service_ref']] = OriginalRecoveryAdapter(command, cwd=config['cwd'], env=config['environment'],
+            service_ref=config['service_ref'], source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'], verifier=verifier)
+    return adapters
+
+
+def reclaim_manager_socket(path):
+    """Called only while holding the exclusive manager lease; unknown files stay."""
+    import errno
+    import os
+    import socket
+    import stat
+    receipt_path = path.with_name('manager-runtime.json')
+    try:
+        if receipt_path.is_symlink() or receipt_path.stat().st_size > 4096:
+            raise ValueError('No bounded owned runtime receipt.')
+        receipt = json.loads(receipt_path.read_text())
+        actual = path.lstat()
+        if not stat.S_ISSOCK(actual.st_mode) or actual.st_uid != os.getuid() or receipt != {'pid': receipt.get('pid'), 'inode': actual.st_ino, 'device': actual.st_dev, 'uid': actual.st_uid} or type(receipt['pid']) is not int or receipt['pid'] <= 0:
+            raise ValueError('The runtime receipt does not identify this socket.')
+        try:
+            os.kill(receipt['pid'], 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise ValueError('The previous manager process is still present; no orphan claim is made.')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(.1)
+            try:
+                probe.connect(str(path))
+            except OSError as exc:
+                if exc.errno != errno.ECONNREFUSED:
+                    raise
+            else:
+                raise ValueError('A live service owns the recorded socket.')
+        if path.lstat() != actual:
+            raise ValueError('The socket changed during reconciliation.')
+        path.unlink()
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ManagementError('unavailable', 'An existing manager socket is not a verified orphan owned by this plugin; it was preserved.') from exc

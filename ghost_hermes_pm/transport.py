@@ -46,8 +46,9 @@ class ManagementServer:
         self._lease = open(self.manager.state_dir / 'manager.lock', 'a')
         try:
             fcntl.flock(self._lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if self.path.exists():
-                raise ManagementError('unavailable', 'An existing manager socket requires reconciliation; it was preserved.')
+            if self.path.exists() or self.path.is_symlink():
+                from .recovery import reclaim_manager_socket
+                reclaim_manager_socket(self.path)
             bridge = self
 
             class Handler(socketserver.StreamRequestHandler):
@@ -125,7 +126,13 @@ class ManagementServer:
 
             self._server = Server(str(self.path), Handler)
             os.chmod(self.path, 0o600)
-            self._inode = self.path.stat().st_ino
+            actual = self.path.stat()
+            self._inode = actual.st_ino
+            receipt_path = self.path.with_name('manager-runtime.json')
+            if receipt_path.is_symlink():
+                raise ManagementError('unavailable', 'Manager runtime receipt is an unknown alias; it was preserved.')
+            receipt_path.write_text(json.dumps({'pid': os.getpid(), 'inode': actual.st_ino, 'device': actual.st_dev, 'uid': actual.st_uid}))
+            os.chmod(receipt_path, 0o600)
             self._thread = threading.Thread(target=self._server.serve_forever,
                                             kwargs={'poll_interval': 0.05}, name='hermes-pm-directory', daemon=True)
             self._thread.start()

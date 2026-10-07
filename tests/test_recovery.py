@@ -139,3 +139,79 @@ def test_corrupt_durable_directory_blocks_restart_without_starting_any_service(t
     assert failure.value.code == 'unavailable'
     assert database.read_bytes() == before
     assert not (tmp_path / 'wire.jsonl').exists()
+
+
+def test_dashboard_uses_same_recovery_outcome_and_retains_last_confirmation_offline(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from ghost_hermes_pm.dashboard import create_router
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        manager.start_task(OWNER, request_id)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        app = FastAPI()
+        app.include_router(create_router(lambda request: ManagementClient(tmp_path / 'state', 'recovery-owner')))
+        browser = TestClient(app)
+        with ManagementServer(manager, {'recovery-owner': OWNER}):
+            response = browser.post('/task', json={'action': 'reconcile', 'request_id': request_id})
+            assert response.status_code == 200
+            task = response.json()
+            assert task['execution'] == 'unverified'
+            assert task['recovery']['status'] == 'blocked'
+            assert task['recovery']['last_confirmed_execution'] == 'running'
+            assert task['recovery']['last_confirmed_at']
+            assert task['repository_released'] is False
+            snap = browser.get('/snapshot').json()
+            assert snap == manager.read_snapshot(OWNER)
+            message = task['outbox'][-1]['segments'][0]['text']
+            assert 'running' in message and 'blocked' in message and '需本人处理' in message
+        offline = browser.get('/snapshot').json()
+        assert offline['status'] == 'unverified'
+        assert offline['runtime'] == 'manager_unavailable'
+        assert offline['requests'] == snap['requests']
+
+
+def test_native_recovery_configuration_never_connects_without_current_hashed_original_receipt(tmp_path):
+    from ghost_hermes_pm.recovery import configured_recovery_adapters
+    config = {'executable': sys.executable, 'cwd': str(tmp_path),
+        'environment': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(tmp_path / 'isolated-home')},
+        'service_ref': 'local:fixture-stdio', 'source_kind': 'daemon',
+        'endpoint': str(tmp_path / 'original.sock'), 'endpoint_ref': 'local:original-fixture'}
+    adapter = configured_recovery_adapters([config], tmp_path / 'state')['local:fixture-stdio']
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        manager.start_task(OWNER, request_id)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, recovery_adapters={adapter.service_ref: adapter}) as manager:
+        task = manager.reconcile_task(OWNER, request_id)
+        assert task['recovery']['status'] == 'blocked'
+        assert task['repository_released'] is False
+        assert adapter.connection is None
+        assert task['session']['service_id'].startswith('local:fixture-stdio:')
+
+
+def test_abrupt_manager_process_restart_reclaims_only_its_proven_orphan_socket(tmp_path):
+    import os
+    import subprocess
+    import pytest
+    state = tmp_path / 'state'
+    state.mkdir()
+    preserved = state / 'keep-user-file'
+    preserved.write_text('preserved')
+    process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('recovery_process_runner.py')), str(state)],
+        env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1])}, stdout=subprocess.PIPE, text=True)
+    try:
+        assert json.loads(process.stdout.readline())['ready'] is True
+        assert ManagementClient(state, 'recovery-owner').read_snapshot()['requests'] == []
+        process.kill()
+        process.wait(timeout=5)
+        with Manager(state, owner_identity_ref=OWNER.subject) as manager:
+            with ManagementServer(manager, {'recovery-owner': OWNER}):
+                assert ManagementClient(state, 'recovery-owner').read_snapshot()['status'] == 'completed'
+        assert preserved.read_text() == 'preserved'
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        process.stdout.close()

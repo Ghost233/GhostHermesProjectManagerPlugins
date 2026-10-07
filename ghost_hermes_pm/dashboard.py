@@ -169,7 +169,7 @@ def create_router(authenticated_client):
                 raise ManagementError('invalid_change', 'Control fields require a control action.')
             if body.action == 'delivery':
                 return client.record_task_delivery(body.request_id, body.report)
-            operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task', 'source': 'refresh_task_source'}.get(body.action)
+            operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task', 'reconcile': 'reconcile_task', 'source': 'refresh_task_source'}.get(body.action)
             if operation is None or body.report is not None:
                 raise ManagementError('invalid_change', 'Select verify, start, refresh or evidence-based delivery.')
             return getattr(client, operation)(body.request_id)

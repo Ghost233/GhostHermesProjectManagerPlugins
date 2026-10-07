@@ -112,6 +112,8 @@ class Manager:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._inflight = set()
+        from .recovery import verify_directory
+        verify_directory(self.state_dir / 'manager.sqlite3')
         self._db = sqlite3.connect(self.state_dir / 'manager.sqlite3', check_same_thread=False)
         self._db.execute('CREATE TABLE IF NOT EXISTS directory (id INTEGER PRIMARY KEY CHECK(id=1), schema_version INTEGER NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL)')
         self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 1, 0, ?)',
