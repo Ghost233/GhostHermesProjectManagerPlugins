@@ -136,6 +136,13 @@ class Manager:
         data.setdefault('intake_failures', {})
         data.setdefault('knowledge_sources', {})
         data.setdefault('knowledge_queries', {})
+        for query in data['knowledge_queries'].values():
+            for publication in query['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
         for record in data['requests'].values():
             session = record.get('session')
             if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
@@ -264,6 +271,14 @@ class Manager:
     def query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id=None, channel_id=None, auto_supplement=False):
         from .knowledge import query_knowledge
         return query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id, channel_id, auto_supplement)
+
+    def claim_knowledge_delivery(self, identity, query_id):
+        from .knowledge import claim_delivery
+        return claim_delivery(self, identity, query_id)
+
+    def record_knowledge_delivery(self, identity, query_id, segment_id, receipt):
+        from .knowledge import record_delivery
+        return record_delivery(self, identity, query_id, segment_id, receipt)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',
