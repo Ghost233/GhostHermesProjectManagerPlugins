@@ -22,8 +22,10 @@ class IssueSource:
         return dict(ISSUE)
 
 
-def register_roles(manager, root):
-    manager.apply_directory_change(OWNER, 0, registration(make_repo(root / 'mono')))
+def register_roles(manager, root, lead_capability='development'):
+    initial = registration(make_repo(root / 'mono'))
+    initial['profile']['capability'] = lead_capability
+    manager.apply_directory_change(OWNER, 0, initial)
     manager.apply_directory_change(OWNER, 1, {'profile': {'id': 'steward', 'native_profile': 'steward',
         'identity_ref': STEWARD.subject, 'role': 'steward', 'capability': 'non_development',
         'project_id': None, 'parent_profile_id': None, 'connection_refs': {}}})
@@ -183,8 +185,8 @@ CHILD = VerifiedIdentity('fixture:child', 'participant')
 CHILD_INGRESS = VerifiedIdentity('fixture:child', 'native-collaboration-ingress')
 
 
-def accepted_parent(manager, root):
-    register_roles(manager, root)
+def accepted_parent(manager, root, lead_capability='development'):
+    register_roles(manager, root, lead_capability)
     child_repo = make_repo(root / 'child')
     manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'project': {'id': 'child-project', 'name': 'Explicit child', 'repo_path': str(child_repo)},
         'profile': {'id': 'child', 'native_profile': 'child', 'identity_ref': CHILD.subject, 'role': 'subproject_lead', 'capability': 'development',
@@ -314,3 +316,171 @@ def test_owner_direct_child_issue_replies_to_owner_and_publicly_synchronizes_par
         assert result['acceptance'] == 'accepted' and len(manager.read_snapshot(OWNER)['requests']) == before
         assert manager.accept_request(OWNER, 'child-project', 'child', direct, ISSUE)['duplicate']
         assert len([h for h in manager.read_snapshot(OWNER)['collaboration']['handoffs'] if h.get('direct_task_id') == task['id']]) == 1
+
+
+def test_scoped_transfer_keeps_child_project_profile_and_stale_handoffs_blocked_with_actor_audit(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        parent_id, child = accepted_parent(manager, tmp_path)
+        delegated = manager.collaborate(LEAD, 'delegate_issue', {'parent_handoff_id': parent_id, 'target_profile_id': 'child', 'issue_url': ISSUE['url']})
+        other = {'project': {'id': 'other', 'name': 'Other mono', 'repo_path': str(make_repo(tmp_path / 'other'))},
+            'profile': {'id': 'other-lead', 'native_profile': 'other-lead', 'identity_ref': 'fixture:other', 'role': 'project_lead', 'capability': 'non_development', 'project_id': 'other'}}
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], other)
+        old = next(p for p in manager.read_snapshot(OWNER)['profiles'] if p['id'] == 'child')
+        moved = {k: old[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id', 'connection_refs')}
+        moved['parent_profile_id'] = 'other-lead'
+        version = manager.read_snapshot(OWNER)['version']
+        with pytest.raises(ManagementError): manager.apply_directory_change(LEAD, version, {'profile': moved})
+        manager.apply_directory_change(STEWARD, version, {'profile': moved})
+        updated = next(p for p in manager.read_snapshot(OWNER)['profiles'] if p['id'] == 'child')
+        assert all(updated[k] == old[k] for k in ('project_id', 'native_profile', 'identity_ref', 'connection_refs'))
+        with pytest.raises(ManagementError) as stale:
+            manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': delegated['id']})
+        assert stale.value.code == 'binding_conflict'
+        assert 'child' not in {p['id'] for p in manager.read_snapshot(LEAD)['profiles']}
+        audit = manager.read_snapshot(STEWARD)['directory_audit'][-1]
+        assert audit['actor'] == {'subject': STEWARD.subject, 'source': STEWARD.source, 'profile_id': 'steward'}
+        assert audit['changes'][0]['before']['parent_profile_id'] == 'mono-lead'
+        assert audit['changes'][0]['after']['parent_profile_id'] == 'other-lead'
+        assert audit['version'] == version + 1
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        assert manager.read_snapshot(STEWARD)['directory_audit'][-1] == audit
+
+
+def test_dashboard_collaboration_uses_same_owner_goal_and_visible_tree_without_actor_override(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from ghost_hermes_pm.dashboard import create_router
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        register_roles(manager, tmp_path)
+        independent = {'id': 'wiki', 'native_profile': 'wiki', 'identity_ref': 'fixture:wiki', 'role': 'independent', 'capability': 'non_development', 'project_id': None}
+        manager.apply_directory_change(OWNER, 2, {'profile': independent})
+        entry, sending, lead = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+        sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            app = FastAPI(); app.include_router(create_router(lambda request: client)); browser = TestClient(app)
+            assert browser.post('/collaboration', json={'action': 'register_channels', 'details': {'channels': [entry, sending, lead]}}).status_code == 200
+            goal = {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': ISSUE['url']}
+            assert browser.post('/collaboration', json={'action': 'project_goal', 'details': goal, 'actor': STEWARD.subject}).status_code == 422
+            response = browser.post('/collaboration', json={'action': 'project_goal', 'details': goal})
+            assert response.status_code == 200
+            state = browser.get('/snapshot').json()
+            assert state == client.read_snapshot()
+            assert state['collaboration']['handoffs'][0]['acceptance'] == 'awaiting_receiver'
+            assert {p['id'] for p in state['profiles']} == {'steward', 'mono-lead', 'wiki'}
+            assert next(p for p in state['profiles'] if p['id'] == 'wiki')['parent_profile_id'] is None
+            assert state['requests'] == []
+            participant = ManagementClient(tmp_path / 'state', 'lead')
+            with pytest.raises(Exception): participant.collaborate('project_goal', goal)
+            with pytest.raises(Exception): participant.collaborate('register_channels', {'channels': [entry]})
+            with pytest.raises(Exception): participant.collaborate('project_goal', {**goal, 'target_profile_id': 'wiki'})
+
+
+def test_changing_registered_native_channel_does_not_retarget_frozen_public_work(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        register_roles(manager, tmp_path)
+        entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+        sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving]})
+        h = manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': ISSUE['url']})
+        receiving['recipient_open_id'] = 'new-bot-identity'
+        manager.collaborate(OWNER, 'register_channels', {'channels': [receiving]})
+        with pytest.raises(ManagementError) as stale:
+            manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': h['id']})
+        assert stale.value.code == 'binding_conflict'
+        assert manager.read_snapshot(OWNER)['requests'] == []
+        assert manager.read_snapshot(OWNER)['collaboration']['handoffs'][0]['channel_binding'] == 'unverified'
+
+
+@pytest.mark.asyncio
+async def test_multipart_native_work_preserves_full_text_first_source_and_creates_only_one_task(tmp_path):
+    from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse
+    from ghost_hermes_pm.messages import FeishuEntry
+    class LongIssueSource:
+        def read_issue(self, url): return {**ISSUE, 'body': 'Original required scope. ' * 140 + ' \n'}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=LongIssueSource()) as manager:
+        register_roles(manager, tmp_path)
+        entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+        sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving]})
+        goal = manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': ISSUE['url']})
+        assert len(goal['segments']) > 1
+        native = Client.builder().app_id(receiving['app_id']).app_secret('synthetic-unused-secret').build()
+        native.request = lambda request: NS(code=0, raw=NS(content=b'{"code":0,"bot":{"open_id":"ou_mono-lead","activate_status":2}}'))
+        native.im.v1.message.reply = lambda request: ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_multipart_ack', 'chat_id': 'oc_project'}})
+        adapter = object()
+        intake = FeishuEntry(lambda: manager, OWNER.subject, {'enabled': True, 'verification_ref': 'fixture:multipart'}, lambda url: None, collaboration_identity_ref=LEAD.subject)
+        intake.attach_transport(adapter, NativeFeishuTransport(native))
+        gateway = NS(_intake_adapter_for=lambda source: adapter, _is_user_authorized_for_source=lambda source: True, _admit_bot_message_for_source=lambda source: True)
+        async def receive(text, message_id):
+            raw = P2ImMessageReceiveV1({'schema': '2.0', 'header': {'event_type': 'im.message.receive_v1', 'app_id': receiving['app_id'], 'tenant_key': receiving['transport_tenant_key']},
+                'event': {'sender': {'sender_type': 'bot', 'tenant_key': 'steward-tenant', 'sender_id': {'open_id': 'steward-seen-mono-lead', 'user_id': 'steward-user-mono-lead'}},
+                    'message': {'message_id': message_id, 'chat_id': 'oc_project', 'chat_type': 'group', 'message_type': 'text', 'content': json.dumps({'text': '@_user_1 ' + text}),
+                        'mentions': [{'key': '@_user_1', 'mentioned_type': 'bot', 'tenant_key': receiving['recipient_tenant_key'], 'id': {'open_id': receiving['recipient_open_id']}}]}}})
+            original = NS(platform='feishu', user_id='steward-user-mono-lead', user_id_alt=None, chat_id='oc_project', is_bot=True, message_id=message_id)
+            return await intake.receive(NS(source=original, raw_message=raw, message_id=message_id), gateway)
+        for number, segment in enumerate(goal['segments'], 1):
+            packet = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': goal['id']})
+            manager.collaborate(STEWARD, 'record_delivery', {'handoff_id': goal['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_part_' + str(number), 'chat_id': 'oc_project'}})
+            assert await receive(segment['text'], 'om_part_' + str(number)) == {'action': 'skip'}
+            if number == 1:
+                assert manager.read_snapshot(OWNER)['requests'] == []
+                assert await receive(segment['text'], 'om_duplicate_first') == {'action': 'skip'}
+                received = manager.read_snapshot(OWNER)['collaboration']['handoffs'][0]
+                assert received['received_parts']['1']['message_id'] == 'om_part_1'
+        task = manager.read_snapshot(OWNER)['requests'][0]
+        assert task['accepted_scope']['body'].endswith(' \n') and task['source_anchor']['message_id'] == 'om_part_1'
+        assert await receive(goal['segments'][-1]['text'], 'om_duplicate_last') == {'action': 'skip'}
+        assert len(manager.read_snapshot(OWNER)['requests']) == 1
+
+
+def test_direct_child_delivery_answers_original_owner_and_synchronizes_result_to_parent(tmp_path):
+    from test_task_execution import adapter_for, prepare_fixture
+    from test_task_control import TURN
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource(), codex_adapter=adapter_for(tmp_path)) as manager:
+        parent_id, child = accepted_parent(manager, tmp_path)
+        current = next(p for p in manager.read_snapshot(OWNER)['profiles'] if p['id'] == 'child')
+        profile = {k: current[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id')}
+        profile['connection_refs'] = {'codex': 'local:fixture-stdio'}
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': profile})
+        task = manager.accept_request(OWNER, 'child-project', 'child', source(child, message_id='om_direct_delivery'), ISSUE)['request']
+        manager.publish_request_message(OWNER, task['id'], 'confirmation', '已受理本人直接 Issue')
+        ack = manager.claim_delivery(CHILD, task['id'])
+        manager.record_delivery(CHILD, task['id'], ack['uuid'], {'status': 'delivered', 'chat_id': 'oc_project', 'message_id': 'om_direct_ack'})
+        prepare_fixture(manager, task['id'], tmp_path / 'child')
+        manager.start_task(CHILD, task['id'])
+        (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'pytest-direct-child', 'command': 'python -m pytest -q', 'cwd': str(tmp_path / 'child'), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed'}]}]}))
+        manager.record_task_delivery(CHILD, task['id'], {'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['pytest-direct-child']}], 'source_commit': None, 'pr_url': None, 'sync_branches': []})
+        result = manager.collaborate(CHILD, 'report_result', {'request_id': task['id']})
+        assert result['target_profile_id'] == 'mono-lead' and result['parent_handoff_id'] == parent_id
+        assert result['owner_origin']['source_anchor']['message_id'] == 'om_direct_delivery'
+        before = len(manager.read_snapshot(OWNER)['requests'])
+        packet = manager.collaborate(CHILD, 'claim_delivery', {'handoff_id': result['id']})
+        manager.collaborate(CHILD, 'record_delivery', {'handoff_id': result['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_direct_result', 'chat_id': 'oc_project'}})
+        lead = next(c for c in manager.read_snapshot(OWNER)['collaboration']['channels'] if c['profile_id'] == 'mono-lead')
+        received = source(lead, 'bot', 'om_direct_result'); received.update(tenant_key='child-tenant', sender_open_id='child-seen-lead')
+        manager.collaborate(INGRESS, 'ingest', {'channel_id': lead['id'], 'source_anchor': received, 'text': packet['text']})
+        publications = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == task['id'])['outbox']
+        assert any(p['kind'] == 'result' for p in publications)
+        assert len(manager.read_snapshot(OWNER)['requests']) == before
+        assert manager.collaborate(CHILD, 'report_result', {'request_id': task['id']})['duplicate']
+        with pytest.raises(Exception): manager.collaborate(LEAD, 'report_result', {'request_id': task['id']})
+
+
+
+def test_non_development_project_lead_can_coordinate_explicit_child_without_own_execution(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        parent_id, child_channel = accepted_parent(manager, tmp_path, lead_capability='non_development')
+        assert manager.read_snapshot(OWNER)['requests'] == []
+        delegated = manager.collaborate(LEAD, 'delegate_issue', {'parent_handoff_id': parent_id, 'target_profile_id': 'child', 'issue_url': ISSUE['url']})
+        packet = manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': delegated['id']})
+        manager.collaborate(LEAD, 'record_delivery', {'handoff_id': delegated['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_nondev_child', 'chat_id': 'oc_project'}})
+        observed = source(child_channel, 'bot', 'om_nondev_child'); observed.update(tenant_key='lead-tenant', sender_open_id='lead-seen-child')
+        accepted = manager.collaborate(CHILD_INGRESS, 'ingest', {'channel_id': child_channel['id'], 'source_anchor': observed, 'text': packet['text']})
+        assert accepted['acceptance'] == 'accepted'
+        tasks = manager.read_snapshot(OWNER)['requests']
+        assert len(tasks) == 1 and tasks[0]['profile_id'] == 'child'
+        assert manager.read_snapshot(LEAD)['execution'] == 'not_enabled'
+        with pytest.raises(Exception): manager.collaborate(CHILD, 'delegate_issue', {'parent_handoff_id': parent_id, 'target_profile_id': 'child', 'issue_url': ISSUE['url']})

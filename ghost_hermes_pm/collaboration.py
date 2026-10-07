@@ -27,11 +27,29 @@ def _channel(data, channel_id):
     return channel
 
 
+
+def _freeze_channels(sending, receiving):
+    return json.loads(json.dumps({sending['id']: sending, receiving['id']: receiving}))
+
+
+def _handoff_channels(data, handoff):
+    sending, receiving = _channel(data, handoff['sender_channel_id']), _channel(data, handoff['target_channel_id'])
+    if handoff.get('channel_bindings') != _freeze_channels(sending, receiving):
+        raise ManagementError('binding_conflict', 'The original handoff channel identities changed; reconcile this frozen public work before further publication or reception.')
+    return sending, receiving
+
 def snapshot(data, principal, visible):
     state = _state(data)
     handoffs = [h for h in state['handoffs'].values() if principal is None or principal['role'] == 'steward' or h['target_profile_id'] in visible or h['sender_profile_id'] in visible]
+    projected = []
+    for handoff in handoffs:
+        try:
+            _handoff_channels(data, handoff)
+            projected.append({**handoff, 'channel_binding': 'registered_match'})
+        except ManagementError as exc:
+            projected.append({**handoff, 'channel_binding': 'unverified', 'channel_reason': str(exc)})
     channels = [c for c in state['channels'].values() if principal is None or principal['role'] == 'steward' or c['profile_id'] in visible]
-    return {'enabled': False, 'real_group_acceptance': 'unverified', 'channels': channels, 'handoffs': handoffs}
+    return {'enabled': False, 'real_group_acceptance': 'unverified', 'channels': channels, 'handoffs': projected}
 
 
 def authorize_accept(manager, identity, delegation_id, project_id, profile_id, message, issue, data):
@@ -72,6 +90,7 @@ def _new_handoff(manager, data, sender, target, issue_url, owner_origin, source_
     handoff = {'id': key, 'sender_profile_id': sender['id'], 'target_profile_id': target['id'], 'kind': 'work',
         'source_anchor': dict(source_anchor), 'owner_origin': owner_origin, 'issue': issue,
         'sender_channel_id': sending['id'], 'target_channel_id': receiving['id'], 'segments': segments,
+        'channel_bindings': _freeze_channels(sending, receiving),
         'delivery': 'pending', 'acceptance': 'awaiting_receiver', 'received_parts': {}, 'task_request_id': None,
         'parent_handoff_id': parent_id, 'created_at': _now(), 'whole_project_complete': False}
     state['handoffs'][key] = handoff
@@ -100,6 +119,7 @@ def _result_handoff(manager, data, sender, target, original, text, kind='result'
     record = {'id': key, 'kind': kind, 'sender_profile_id': sender['id'], 'target_profile_id': target['id'],
         'source_anchor': dict(original['received_anchor']), 'owner_origin': original['owner_origin'], 'issue': original['issue'],
         'sender_channel_id': sending['id'], 'target_channel_id': receiving['id'], 'segments': segments,
+        'channel_bindings': _freeze_channels(sending, receiving),
         'delivery': 'pending', 'acceptance': 'awaiting_receiver', 'received_parts': {}, 'task_request_id': None,
         'result_task_id': original.get('task_request_id'), 'original_handoff_id': original['id'],
         'parent_handoff_id': original.get('parent_handoff_id'), 'created_at': _now(), 'whole_project_complete': False}
@@ -199,7 +219,7 @@ def perform(manager, identity, action, details):
             segments = [{'number': n + 1, 'uuid': str(uuid.uuid4()), 'status': 'pending', 'text': '[hermes-role-work ' + key + ' ' + str(n + 1) + '/' + str(len(chunks)) + ']\n' + chunk, 'attempts': []} for n, chunk in enumerate(chunks)]
             result = {'id': key, 'sender_profile_id': sender['id'], 'target_profile_id': target['id'], 'kind': 'work',
                 'source_anchor': dict(message), 'owner_origin': origin, 'issue': issue, 'sender_channel_id': sending['id'],
-                'target_channel_id': receiving['id'], 'segments': segments, 'delivery': 'pending', 'acceptance': 'awaiting_receiver',
+                'target_channel_id': receiving['id'], 'channel_bindings': _freeze_channels(sending, receiving), 'segments': segments, 'delivery': 'pending', 'acceptance': 'awaiting_receiver',
                 'received_parts': {}, 'task_request_id': None, 'created_at': _now(), 'whole_project_complete': False}
             state['handoffs'][key] = result
         elif action == 'delegate_issue':
@@ -214,20 +234,22 @@ def perform(manager, identity, action, details):
             original = state['handoffs'].get(details.get('handoff_id'))
             if set(details) != {'handoff_id'} or principal is None or not original or original['target_profile_id'] != principal['id'] or original['kind'] != 'work' or original['acceptance'] != 'accepted':
                 raise ManagementError('forbidden', 'Only the independently accepted assigned role reports its original work.')
+            _handoff_channels(data, original)
             if action == 'report_summary' and principal['role'] != 'project_lead':
                 raise ManagementError('forbidden', 'The project lead owns its project summary.')
             target_id = principal.get('parent_profile_id') if principal['role'] == 'subproject_lead' else original['sender_profile_id']
             task = data['requests'].get(original.get('task_request_id'), {})
             received = [state['handoffs'][i] for i in original.get('received_results', []) if i in state['handoffs'] and state['handoffs'][i]['acceptance'] == 'accepted']
-            text = '项目进展汇总；子交付待集成，项目整体仍待全局验证。\nIssue：' + original['issue']['url'] + '\n负责人：' + principal['id'] + '\nmono 执行：' + task.get('execution', 'unverified') + '\n本 Issue 交付：' + task.get('task_delivery', 'pending')
+            text = '项目进展汇总；子交付待集成，项目整体仍待全局验证。\nIssue：' + original['issue']['url'] + '\n负责人：' + principal['id'] + '\n当前 Issue 执行：' + task.get('execution', 'unverified') + '\n本 Issue 交付：' + task.get('task_delivery', 'pending')
             for child_result in received:
-                text += '\n已独立接收子结果：' + child_result['issue']['url'] + ' · ' + child_result['id']
+                text += '\n已独立接收子结果：' + child_result['issue']['url'] + ' · ' + child_result['id'] + '\n' + ''.join(part['text'].split(']\n', 1)[1] for part in child_result['segments'])
             result = _result_handoff(manager, data, principal, data['profiles'][target_id], original, text, 'summary' if action == 'report_summary' else 'progress')
             result['received_result_ids'] = [h['id'] for h in received]
         elif action == 'publish_owner_summary':
             original = state['handoffs'].get(details.get('handoff_id'))
             if set(details) != {'handoff_id'} or principal is None or principal['role'] != 'steward' or not original or original['target_profile_id'] != principal['id'] or original['kind'] not in {'summary', 'result', 'progress'} or original['acceptance'] != 'accepted':
                 raise ManagementError('forbidden', 'Only the steward returns an independently received project update to its original Owner goal.')
+            _handoff_channels(data, original)
             anchor = original['owner_origin']['source_anchor']
             entries = [c for c in state['channels'].values() if c['profile_id'] == principal['id'] and c['group_kind'] == 'entry' and all(c.get(k) == anchor.get(k) for k in ('app_id', 'chat_id', 'recipient_open_id', 'transport_tenant_key', 'recipient_tenant_key')) and c['owner_open_id'] == anchor['sender_open_id'] and c['owner_tenant_key'] == anchor['tenant_key']]
             if len(entries) != 1:
@@ -240,15 +262,26 @@ def perform(manager, identity, action, details):
             chunks = [text[n:n + 1400] for n in range(0, len(text), 1400)]
             result = {'id': key, 'kind': 'owner_summary', 'sender_profile_id': principal['id'], 'target_profile_id': principal['id'],
                 'sender_channel_id': entry['id'], 'target_channel_id': entry['id'], 'owner_origin': original['owner_origin'], 'source_anchor': anchor,
-                'issue': original['issue'], 'original_handoff_id': original['id'], 'whole_project_complete': False,
+                'issue': original['issue'], 'original_handoff_id': original['id'], 'whole_project_complete': False, 'channel_bindings': _freeze_channels(entry, entry),
                 'segments': [{'number': n + 1, 'uuid': str(uuid.uuid4()), 'status': 'pending', 'text': chunk, 'attempts': []} for n, chunk in enumerate(chunks)],
                 'delivery': 'pending', 'acceptance': 'owner_notification', 'created_at': _now()}
             state['handoffs'][key] = result
         elif action == 'report_result':
-            if set(details) != {'handoff_id'} or principal is None:
+            if set(details) not in ({'handoff_id'}, {'request_id'}) or principal is None:
                 raise ManagementError('forbidden', 'Only an assigned role reports its original Issue delivery.')
-            original = state['handoffs'].get(details['handoff_id'])
-            task = data['requests'].get((original or {}).get('task_request_id'))
+            if 'request_id' in details:
+                task = data['requests'].get(details['request_id'])
+                if principal['role'] != 'subproject_lead' or not task or task.get('actor_provenance', {}).get('owner_origin', {}).get('subject') != manager.owner_identity_ref or any(task['accepted_responsibility'].get(k) != principal.get(k) for k in task['accepted_responsibility']):
+                    raise ManagementError('forbidden', 'Direct child results require the original Owner request and unchanged responsible binding.')
+                direct = state['handoffs'].get(task.get('parent_sync_handoff_id'), {})
+                original = {'id': task['id'], 'received_anchor': task['source_anchor'], 'owner_origin': task['actor_provenance']['owner_origin'],
+                    'issue': task['accepted_scope'], 'task_request_id': task['id'], 'target_profile_id': task['profile_id'],
+                    'acceptance': 'accepted', 'parent_handoff_id': direct.get('parent_handoff_id')}
+            else:
+                original = state['handoffs'].get(details['handoff_id'])
+                task = data['requests'].get((original or {}).get('task_request_id'))
+                if original:
+                    _handoff_channels(data, original)
             if not original or original['target_profile_id'] != principal['id'] or original['acceptance'] != 'accepted' or not task or task.get('task_delivery') != 'delivered' or task['profile_id'] != principal['id']:
                 raise ManagementError('evidence_missing', 'The original assigned Issue has not been delivered with its own evidence.')
             target_id = principal.get('parent_profile_id') if principal['role'] == 'subproject_lead' else original['sender_profile_id']
@@ -265,8 +298,7 @@ def perform(manager, identity, action, details):
             handoff = state['handoffs'].get(details['handoff_id'])
             if not handoff or principal is not None and principal['id'] != handoff['sender_profile_id']:
                 raise ManagementError('forbidden', 'Only the assigned sending role can deliver its handoff.')
-            sending = _channel(data, handoff['sender_channel_id'])
-            target = _channel(data, handoff['target_channel_id'])
+            sending, target = _handoff_channels(data, handoff)
             if action == 'claim_delivery':
                 segment = next((s for s in handoff['segments'] if s['status'] != 'delivered'), None)
                 if segment is None or segment['status'] != 'pending':
@@ -298,6 +330,7 @@ def perform(manager, identity, action, details):
             handoff = state['handoffs'].get(details.get('handoff_id'))
             if set(details) != expected or identity.source != 'native-collaboration-ingress' or principal is None or not handoff or handoff['target_profile_id'] != principal['id'] or handoff['acceptance'] != 'accepted' or not handoff.get('task_request_id'):
                 raise ManagementError('forbidden', 'Only the independently accepted native receiver publishes task confirmation.')
+            _handoff_channels(data, handoff)
             request_id = handoff['task_request_id']
             if action == 'publish_ack':
                 return manager.publish_request_message(identity, request_id, 'confirmation', '已受理原本人目标：' + handoff['issue']['title'] + '\nIssue：' + handoff['issue']['url'] + '\n负责人：' + principal['id'] + '；等待明确基线与执行核验。')
@@ -316,6 +349,7 @@ def perform(manager, identity, action, details):
             handoff = state['handoffs'].get(marker.group('id'))
             if not handoff or principal['id'] != receiving['profile_id'] or receiving['id'] != handoff['target_channel_id'] or principal['id'] != handoff['target_profile_id']:
                 raise ManagementError('forbidden', 'The native receiver is outside this handoff responsibility.')
+            _handoff_channels(data, handoff)
             if any(receiving.get(k) != message.get(k) for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')):
                 raise ManagementError('binding_conflict', 'The original receiver namespace does not match the registered destination.')
             senders = [b for b in receiving['bot_sources'] if b['profile_id'] == handoff['sender_profile_id'] and b['open_id'] == message['sender_open_id'] and b['tenant_key'] == message['tenant_key']]
@@ -324,7 +358,9 @@ def perform(manager, identity, action, details):
                 raise ManagementError('binding_conflict', 'The source bot or full original handoff content could not be matched.')
             if handoff['acceptance'] == 'accepted':
                 return {**handoff, 'duplicate': True}
-            handoff['received_parts'][str(number)] = dict(message)
+            if str(number) in handoff['received_parts'] and handoff['acceptance'] == 'awaiting_receiver':
+                return {**handoff, 'duplicate': True}
+            handoff['received_parts'].setdefault(str(number), dict(message))
             result = handoff
             if len(handoff['received_parts']) == len(handoff['segments']):
                 handoff['received_anchor'] = handoff['received_parts']['1']

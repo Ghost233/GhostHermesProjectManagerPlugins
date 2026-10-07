@@ -229,6 +229,7 @@ class Manager:
             from .knowledge import snapshot_knowledge
             return {**snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_capabilities': [{'kind': kind, 'status': 'verified' if any(s['kind'] == kind and s['status'] == 'verified' and set(s['project_ids']) & {p['id'] for p in projects} for s in data.get('manual_sources', {}).values()) else 'unknown'} for kind in ('daemon', 'independent_cli', 'desktop')],
@@ -716,11 +717,13 @@ class Manager:
                 raise ManagementError('version_conflict', 'Directory changed; read the current version first.')
             if not isinstance(change, dict) or set(change) - {'project', 'profile'} or not change:
                 raise ManagementError('invalid_change', 'Expected project and/or profile changes.')
+            audit_changes = []
             if 'project' in change:
                 value = change['project']
                 self._validate_project(value)
                 candidate = {'id': value['id'], 'name': value['name'], 'repo': _repository(value)}
                 self._authorize_change(principal, 'project', candidate, data)
+                audit_changes.append({'kind': 'project', 'id': candidate['id'], 'before': data['projects'].get(candidate['id']), 'after': candidate})
                 data['projects'][value['id']] = candidate
             if 'profile' in change:
                 self._validate_profile(change['profile'], data)
@@ -734,8 +737,12 @@ class Manager:
                 value.update(lifecycle='configuring', can_execute=False,
                              capabilities={'execution': {'enabled': False, 'reason': 'Not verified by an execution adapter.'}})
                 self._authorize_change(principal, 'profile', value, data)
+                from .collaboration import _binding
+                audit_changes.append({'kind': 'profile', 'id': value['id'], 'before': _binding(existing) if existing else None, 'after': _binding(value)})
                 data['profiles'][value['id']] = value
             data['last_verified_at'] = datetime.now(timezone.utc).isoformat()
+            data.setdefault('directory_audit', []).append({'version': version + 1, 'at': data['last_verified_at'],
+                'actor': {'subject': identity.subject, 'source': identity.source, 'profile_id': principal['id'] if principal else None}, 'changes': audit_changes})
             self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
             return {'status': 'completed', 'version': version + 1, 'last_verified_at': data['last_verified_at'],
                     'needs_human': ['Verify native Profile, new bot identity, connections and execution capabilities.']}

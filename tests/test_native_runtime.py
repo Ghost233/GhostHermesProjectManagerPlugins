@@ -39,7 +39,7 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
         if runner == 'collaboration_smoke_runner.py':
             fixtures = scratch / 'collaboration-fixtures'
             fixtures.mkdir()
-            for name in ('test_collaboration.py', 'test_directory.py', 'test_requests.py'):
+            for name in ('test_collaboration.py', 'test_directory.py', 'test_requests.py', 'test_task_execution.py', 'test_task_control.py', 'codex_fixture_server.py'):
                 shutil.copy2(ROOT / 'tests' / name, fixtures / name)
         env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HERMES_HOME': str(home),
                'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'), 'PYTHONDONTWRITEBYTECODE': '1',

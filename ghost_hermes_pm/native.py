@@ -113,7 +113,7 @@ def register_native(ctx):
 
             ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
 
-            if codex_adapter is not None or observation_adapters or manager.knowledge_providers:
+            if codex_adapter is not None or observation_adapters or manager.knowledge_providers or intake.collaboration_entry:
                 async def supervise_single_issue():
                     import asyncio
                     identity = VerifiedIdentity(owner, 'verified-manager-supervision')
@@ -146,6 +146,14 @@ def register_native(ctx):
                                     async with intake.lock:
                                         await intake.deliver(identity, record['id'], transport, generation)
                                     break
+                        if intake.collaboration_entry:
+                            for handoff in manager.read_snapshot(identity)['collaboration']['handoffs']:
+                                if handoff['delivery'] == 'pending':
+                                    try:
+                                        async with intake.lock:
+                                            await intake.collaboration_entry.deliver(handoff['id'], generation)
+                                    except ManagementError:
+                                        continue
                         knowledge = manager.read_snapshot(identity)['knowledge_queries']
                         for query in knowledge:
                             if query.get('auto_supplement') and query.get('result_received') and not query.get('supplement'):
@@ -266,6 +274,25 @@ def register_native(ctx):
                                   'instruction_id': {'type': 'string'}, 'text': {'type': 'string'}, 'expected_turn_id': {'type': 'string'}, 'human_request_id': {'type': 'string'}, 'reply_id': {'type': 'string'}, 'response': {'type': 'object'}},
                                   'required': ['action', 'request_id'], 'additionalProperties': False}},
                       handler=task_operation, description='Single Issue execution and evidence')
+    def role_operation(args):
+        try:
+            allowed = {'read_routes', 'delegate_issue', 'report_result', 'report_progress', 'report_summary', 'publish_owner_summary'}
+            if not isinstance(args, dict) or set(args) != {'action', 'details'} or args['action'] not in allowed:
+                raise ManagementError('invalid_change', 'Participant collaboration accepts only scoped role work and summaries; the original native ingress supplies reception.')
+            token = _credential(ctx.get_config('participant_credential_ref'))
+            if not state_dir or not token:
+                raise ManagementError('unauthorized', 'A distinct registered participant bridge is required.')
+            client = ManagementClient(state_dir, token)
+            client.read_participant_snapshot()
+            return json.dumps(client.collaborate(args['action'], args['details']))
+        except ManagementError as exc:
+            return json.dumps({'status': 'rejected', 'code': exc.code, 'message': str(exc)})
+
+    ctx.register_tool(name='hermes_pm_collaborate', toolset='hermes_pm',
+        schema={'name': 'hermes_pm_collaborate', 'description': 'Read registered roles, delegate an explicit own child Issue, and report original work or project summaries.',
+            'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['read_routes', 'delegate_issue', 'report_result', 'report_progress', 'report_summary', 'publish_owner_summary']}, 'details': {'type': 'object'}},
+                'required': ['action', 'details'], 'additionalProperties': False}}, handler=role_operation,
+        description='Public scoped role collaboration')
     def knowledge_operation(args):
         try:
             if not isinstance(args, dict) or set(args) - {'action', 'source_id', 'query_id', 'question', 'scope_ids', 'request_id', 'channel_id', 'auto_supplement', 'material_ids'}:

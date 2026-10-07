@@ -47,22 +47,32 @@ sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 sys.path.insert(0, str(scratch / 'collaboration-fixtures'))
 from test_collaboration import channel, register_roles, IssueSource, STEWARD, OWNER
 from ghost_hermes_pm.transport import ManagementClient
-channels = [channel('steward', 'entry'), channel('steward'), channel('mono-lead')]
+from test_task_execution import adapter_for
+from test_task_control import TURN
+from ghost_hermes_pm.queue import workspace
+from tools.registry import registry
+channels = [channel('steward', 'entry'), channel('steward'), channel('mono-lead'), channel('child')]
+channels[2]['bot_sources'].append({'profile_id': 'child', 'open_id': 'child-seen-lead', 'tenant_key': 'child-tenant', 'native_ids': ['child-user-lead']})
+channels[3]['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-child', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-child']})
 channels[1]['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
 bindings = [{**{k: c[k] for k in ('app_id', 'recipient_open_id', 'recipient_tenant_key', 'transport_tenant_key', 'chat_id', 'profile_id', 'project_id', 'repository', 'verification_ref')},
     'owner_open_id': c['owner_open_id'], 'sender_tenant_key': c['owner_tenant_key'], 'owner_native_ids': ['owner-native']} for c in channels]
 bots = [{'profile_id': b['profile_id'], 'identity_ref': 'fixture:' + ('lead' if b['profile_id'] == 'mono-lead' else b['profile_id']),
     'app_id': c['app_id'], 'tenant_key': b['tenant_key'], 'open_id': b['open_id'], 'native_ids': b['native_ids']} for c in channels for b in c['bot_sources']]
 settings = {'manager_profile': 'default', 'state_dir': str(state), 'owner_identity_ref': OWNER.subject,
-    'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN', 'collaboration_identity_ref': STEWARD.subject,
+    'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN', 'participant_credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN',
+    'participant_entries': [{'identity_ref': 'fixture:lead', 'credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN'}, {'identity_ref': 'fixture:child', 'credential_ref': 'native:HERMES_FIXTURE_CHILD_TOKEN'}], 'collaboration_identity_ref': STEWARD.subject,
     'feishu_intake': {'enabled': True, 'verification_ref': 'fixture:owned-role-source', 'bindings': bindings, 'registered_bots': bots}}
-(home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=owner-native,steward-user-mono-lead,steward-user-steward,lead-user-steward\n')
-for profile in ('steward', 'mono-lead'):
+os.environ['HERMES_FIXTURE_CHILD_TOKEN'] = 'synthetic-child-credential'
+(home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=' + ','.join(sorted({'owner-native'} | {i for c in channels for b in c['bot_sources'] for i in b['native_ids']})) + '\n')
+for profile in ('steward', 'mono-lead', 'child'):
     get_profile_dir(profile).mkdir(parents=True, exist_ok=True)
     (get_profile_dir(profile) / '.env').write_text('')
 (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 import ghost_hermes_pm.github as external_issue
 external_issue.GitHubDeliverySource.read_issue = lambda self, url: IssueSource().read_issue(url)
+import ghost_hermes_pm.codex as original_codex
+original_codex.configured_adapter = lambda config, directory: adapter_for(scratch)
 plugins = get_plugin_manager()
 plugins.discover_and_load()
 
@@ -78,16 +88,17 @@ class FixtureRunner(GatewayRunner):
     async def _handle_active_session_busy_message(self, event, key): self.native.append(event); return True
     async def _handle_adapter_fatal_error(self, adapter): raise RuntimeError('Unexpected adapter failure')
 
-def raw(c, text, message_id, bot=False):
+def raw(c, text, message_id, bot=False, sender_profile='steward'):
+    sender = next((b for b in c['bot_sources'] if b['profile_id'] == sender_profile), None) if bot else None
     return P2ImMessageReceiveV1({'schema': '2.0', 'header': {'event_type': 'im.message.receive_v1', 'app_id': c['app_id'], 'tenant_key': c['transport_tenant_key']},
-        'event': {'sender': {'sender_type': 'bot' if bot else 'user', 'tenant_key': 'steward-tenant' if bot else c['owner_tenant_key'],
-            'sender_id': {'open_id': 'steward-seen-' + c['profile_id'] if bot else c['owner_open_id'], 'user_id': 'steward-user-' + c['profile_id'] if bot else 'owner-native'}},
+        'event': {'sender': {'sender_type': 'bot' if bot else 'user', 'tenant_key': sender['tenant_key'] if bot else c['owner_tenant_key'],
+            'sender_id': {'open_id': sender['open_id'] if bot else c['owner_open_id'], 'user_id': sender['native_ids'][0] if bot else 'owner-native'}},
             'message': {'message_id': message_id, 'chat_id': c['chat_id'], 'chat_type': 'group', 'message_type': 'text',
                 'content': json.dumps({'text': '@_user_1 ' + text}), 'mentions': [{'key': '@_user_1', 'mentioned_type': 'bot', 'tenant_key': c['recipient_tenant_key'], 'id': {'open_id': c['recipient_open_id']}}]}}})
 
 async def main():
     runners, adapters, clients, created, replies = [], [], [], [], []
-    for profile in ('steward', 'mono-lead'):
+    for profile in ('steward', 'mono-lead', 'child'):
         own = [c for c in channels if c['profile_id'] == profile]
         runner = object.__new__(FixtureRunner)
         runner.config = GatewayConfig(multiplex_profiles=True)
@@ -114,7 +125,7 @@ async def main():
             return CreateMessageResponse({'code': 0, 'data': {'message_id': 'om_cross_' + str(len(created)), 'chat_id': request.request_body.receive_id}})
         def reply(request, profile=profile):
             replies.append((profile, request))
-            return ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_ack_' + str(len(replies)), 'chat_id': 'oc_project', 'parent_id': request.message_id}})
+            return ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_ack_' + str(len(replies)), 'chat_id': 'oc_entry' if request.message_id == 'om_sdk_owner_goal_valid' else 'oc_project', 'parent_id': request.message_id}})
         native.im.v1.message.create, native.im.v1.message.reply = create, reply
         plugins.get_platform_handler_factories('hermes_feishu_pm')[0][0](native, adapter)
         runners.append(runner); adapters.append(adapter); clients.append(native)
@@ -123,6 +134,8 @@ async def main():
     repo = scratch / 'mono'; repo.mkdir(); subprocess.run(['git', 'init', '-q', str(repo)], check=True)
     owner.apply_directory_change(0, {'project': {'id': 'mono', 'name': 'Synthetic mono', 'repo_path': str(repo)}, 'profile': {'id': 'mono-lead', 'native_profile': 'mono-lead', 'identity_ref': 'fixture:lead', 'role': 'project_lead', 'capability': 'development', 'project_id': 'mono'}})
     owner.apply_directory_change(1, {'profile': {'id': 'steward', 'native_profile': 'steward', 'identity_ref': STEWARD.subject, 'role': 'steward', 'capability': 'non_development', 'project_id': None}})
+    child_repo = scratch / 'child-repo'; child_repo.mkdir(); subprocess.run(['git', 'init', '-q', str(child_repo)], check=True)
+    owner.apply_directory_change(2, {'project': {'id': 'child-project', 'name': 'Explicit SDK child', 'repo_path': str(child_repo)}, 'profile': {'id': 'child', 'native_profile': 'child', 'identity_ref': 'fixture:child', 'role': 'subproject_lead', 'capability': 'development', 'project_id': 'child-project', 'parent_profile_id': 'mono-lead', 'connection_refs': {'codex': 'local:fixture-stdio'}}})
     owner.collaborate('register_channels', {'channels': channels})
     incoming = raw(channels[0], '项目 mono https://github.com/Ghost233/fixture/issues/15', 'om_sdk_owner_goal')
     runners[0].authorized = False
@@ -149,6 +162,47 @@ async def main():
     adapters[1]._committed.clear()
     await adapters[1]._handle_message_event_data(original_bot)
     assert len(runners[1].budget_sources) == before and len(owner.read_snapshot()['requests']) == 1
+    def role(action, details):
+        return json.loads(registry.dispatch('hermes_pm_collaborate', {'action': action, 'details': details}, scope=str(home)))
+    child = ManagementClient(state, 'synthetic-child-credential')
+    delegated = role('delegate_issue', {'parent_handoff_id': h['id'], 'target_profile_id': 'child', 'issue_url': h['issue']['url']})
+    assert delegated['target_profile_id'] == 'child', delegated
+    assert role('delegate_issue', {'parent_handoff_id': h['id'], 'target_profile_id': 'child', 'issue_url': h['issue']['url']})['duplicate']
+    async def wait_created(count):
+        for _ in range(80):
+            if len(created) >= count: return
+            await asyncio.sleep(0.1)
+        raise AssertionError('Public sending did not drain the durable role outbox')
+    await wait_created(2)
+    await adapters[2]._handle_message_event_data(raw(channels[3], delegated['segments'][0]['text'], 'om_cross_2', bot=True, sender_profile='mono-lead'))
+    task = next(r for r in child.read_snapshot()['requests'] if r['profile_id'] == 'child')
+    assert task['task_start_anchor'] and task['actor_provenance']['actor']['subject'] == 'fixture:child'
+    current = workspace(next(p['repo'] for p in child.read_snapshot()['projects'] if p['id'] == 'child-project'))
+    child.prepare_task(task['id'], {'branch': current['branch'], 'commit': current['head'], 'workspace_digest': current['source_digest'], 'dependencies': [], 'issue_updated_at': h['issue']['updated_at']})
+    started = child.start_task(task['id'])
+    assert started['status'] == 'running', started
+    (scratch / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'sdk-child-test', 'command': 'python -m pytest -q', 'cwd': str(child_repo), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed'}]}]}))
+    delivered = child.record_task_delivery(task['id'], {'issue_updated_at': h['issue']['updated_at'], 'criteria': [{'text': h['issue']['body'], 'test_item_ids': ['sdk-child-test']}], 'source_commit': None, 'pr_url': None, 'sync_branches': []})
+    assert delivered['task_delivery'] == 'delivered', delivered
+    result = child.collaborate('report_result', {'handoff_id': delegated['id']})
+    await wait_created(3)
+    await adapters[1]._handle_message_event_data(raw(channels[2], result['segments'][0]['text'], 'om_cross_3', bot=True, sender_profile='child'))
+    summary = role('report_summary', {'handoff_id': h['id']})
+    assert summary['whole_project_complete'] is False and result['id'] in summary['received_result_ids'], summary
+    await wait_created(4)
+    await adapters[0]._handle_message_event_data(raw(channels[1], summary['segments'][0]['text'], 'om_cross_4', bot=True, sender_profile='mono-lead'))
+    for _ in range(80):
+        outputs = [x for x in owner.read_snapshot()['collaboration']['handoffs'] if x['kind'] == 'owner_summary']
+        if outputs and outputs[0]['delivery'] == 'delivered': break
+        await asyncio.sleep(0.1)
+    assert outputs[0]['source_anchor']['message_id'] == 'om_sdk_owner_goal_valid' and outputs[0]['delivery'] == 'delivered', outputs
+    parent = next(x for x in owner.read_snapshot()['collaboration']['handoffs'] if x['id'] == h['id'])
+    assert parent['integration_status'] == 'awaiting_integration' and parent['whole_project_complete'] is False
+    assert len(owner.read_snapshot()['requests']) == 2
+    for echo in ('收到', '谢谢', '进度：测试完成'):
+        await adapters[1]._handle_message_event_data(raw(channels[2], echo, 'om_echo_' + str(len(runners[1].native)), bot=True, sender_profile='child'))
+    assert len(owner.read_snapshot()['requests']) == 2 and len(created) == 4
+    assert role('ingest', {'channel_id': channels[2]['id'], 'source_anchor': {}, 'text': 'thanks'})['status'] == 'rejected'
     assert plugins.unload('ghost-hermes-pm')
     for runner in runners: runner.stopped.set()
     await asyncio.sleep(0.03)

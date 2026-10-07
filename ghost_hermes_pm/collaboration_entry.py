@@ -57,7 +57,7 @@ class CollaborationEntry:
             mentions = [m for m in message.mentions or [] if m.mentioned_type == 'bot' and m.tenant_key == channel['recipient_tenant_key'] and m.id.open_id == channel['recipient_open_id'] and m.key in text]
             if len(mentions) != 1:
                 return None
-            text = text.replace(mentions[0].key, '').strip()
+            text = text.replace(mentions[0].key, '', 1).lstrip()
             envelope = {'app_id': header.app_id, 'transport_tenant_key': header.tenant_key,
                 'tenant_key': sender.tenant_key, 'recipient_tenant_key': channel['recipient_tenant_key'],
                 'recipient_open_id': channel['recipient_open_id'], 'chat_id': message.chat_id,
@@ -65,6 +65,7 @@ class CollaborationEntry:
                 'parent_id': getattr(message, 'parent_id', None) or None, 'root_id': getattr(message, 'root_id', None) or None,
                 'thread_id': getattr(message, 'thread_id', None) or None}
             if sender.sender_type == 'user' and source.is_bot is False:
+                text = text.strip()
                 goal = re.fullmatch(r'项目\s+(\S+)\s+(https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*)', text)
                 if not goal or channel['group_kind'] != 'entry' or channel['owner_open_id'] != sender.sender_id.open_id or channel['owner_tenant_key'] != sender.tenant_key:
                     return None
@@ -102,9 +103,14 @@ class CollaborationEntry:
         return prepared.binding['profile_binding']['native_profile'] == runtime_profile
 
     async def deliver(self, handoff_id, generation):
+        routes = self.call('read_routes', {})
+        handoff = next((h for h in routes['handoffs'] if h['id'] == handoff_id), None)
+        if handoff is None:
+            raise ManagementError('forbidden', 'The role handoff is outside this publication scope.')
+        sending = next(c for c in routes['channels'] if c['id'] == handoff['sender_channel_id'])
         while True:
             self.intake.require_active(generation)
-            packet = self.call('claim_delivery', {'handoff_id': handoff_id})
+            packet = self.call('claim_delivery', {'handoff_id': handoff_id}, sending)
             if packet is None:
                 return
             binding = packet['sender_binding']
@@ -126,7 +132,7 @@ class CollaborationEntry:
                 except Exception:
                     self.intake.require_active(generation)
                     receipt = {'status': 'unknown'}
-            self.call('record_delivery', {'handoff_id': handoff_id, 'uuid': packet['uuid'], 'receipt': receipt})
+            self.call('record_delivery', {'handoff_id': handoff_id, 'uuid': packet['uuid'], 'receipt': receipt}, sending)
             if receipt.get('status') != 'delivered':
                 return
 
@@ -150,4 +156,7 @@ class CollaborationEntry:
                 self.call('record_ack', {'handoff_id': result['id'], 'uuid': segment['uuid'], 'receipt': receipt}, prepared.binding)
                 if receipt.get('status') != 'delivered':
                     break
+        elif result.get('kind') in {'summary', 'progress', 'result'} and result.get('acceptance') == 'accepted' and prepared.binding['profile_binding']['role'] == 'steward':
+            output = self.call('publish_owner_summary', {'handoff_id': result['id']}, prepared.binding)
+            await self.deliver(output['id'], generation)
         return {'action': 'skip'}
