@@ -204,6 +204,7 @@ async def main():
     assert len(owner.read_snapshot()['requests']) == 2 and len(created) == 4
     assert role('ingest', {'channel_id': channels[2]['id'], 'source_anchor': {}, 'text': 'thanks'})['status'] == 'rejected'
     assert plugins.unload('ghost-hermes-pm')
+    assert registry.get_entry('hermes_pm_collaborate', scope=str(home)) is None
     for runner in runners: runner.stopped.set()
     await asyncio.sleep(0.03)
     print('native load, Dashboard bridge, restart, teardown: OK')
