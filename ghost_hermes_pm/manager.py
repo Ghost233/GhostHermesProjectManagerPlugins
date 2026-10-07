@@ -98,12 +98,13 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
         self.knowledge_providers = dict(knowledge_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
+        self.control_adapters = dict(control_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -124,7 +125,7 @@ class Manager:
         with self._lock:
             if self.codex_adapter is not None:
                 self.codex_adapter.close()
-            for adapter in self.observation_adapters.values():
+            for adapter in (*self.observation_adapters.values(), *self.control_adapters.values()):
                 adapter.close()
             self._db.close()
 
@@ -153,17 +154,21 @@ class Manager:
                             segment['attempts'][-1]['status'] = 'unknown'
         from .observation import reconcile_connections
         reconcile_connections(self, data)
+        from .takeover import reconcile_grants
+        reconcile_grants(self, data)
         for record in data['requests'].values():
             session = record.get('session')
+            from .takeover import executor_for
+            executor = executor_for(self, record)
             for question in record.get('human_requests', []):
                 if question.get('resolution') == 'pending' and (record.get('repository_released') or record.get('outer_task_status') == 'stopped' or record.get('task_delivery') == 'delivered' or session and session.get('control') != 'assigned_task'):
                     question['resolution'] = 'expired'
                     question['control_enabled'] = False
-                if question.get('resolution') == 'pending' and (self.codex_adapter is None or self.codex_adapter.generation != question['generation'] or self.codex_adapter._closed):
+                if question.get('resolution') == 'pending' and (executor is None or executor.generation != question['generation'] or executor._closed):
                     question['resolution'] = 'unverified'
                     if question.get('reply', {}) and question['reply'].get('sent') == 'intent':
                         question['reply']['sent'] = 'outcome_unknown'
-            if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
+            if session and not record.get('repository_released') and (executor is None or executor.generation != session['generation'] or executor._closed):
                 record['execution'] = 'stopping' if record.get('stop', {}).get('status') == 'processing' else 'unverified'
                 record['unexecuted_reason'] = 'Original executor generation unavailable; reconciliation required.'
             for publication in record['outbox']:
@@ -212,12 +217,17 @@ class Manager:
                 capability = request.get('execution_capability', {})
                 if capability.get('enabled'):
                     try:
-                        if self.codex_adapter is None:
+                        from .takeover import executor_for
+                        actual_executor = executor_for(self, request)
+                        if actual_executor is None:
                             raise ManagementError('capability_unverified', 'Original executor unavailable.')
                         from .execution import _current_assignment
                         _current_assignment(self, request, data)
+                        if request.get('session', {}).get('origin') == 'manual_takeover' and data.get('control_grants', {}).get(request.get('control_grant_id'), {}).get('status') != 'active':
+                            raise ManagementError('capability_unverified', 'The current-work manual grant is inactive.')
                     except ManagementError as exc:
                         capability.update(enabled=False, status='blocked', reason=str(exc))
+            from .takeover import executor_for
             original_interface_requests = []
             if principal is None and self.codex_adapter and self.codex_adapter.connection:
                 original_interface_requests = [{'rpc_id': r['envelope']['id'], 'method': r['envelope']['method'],
@@ -233,12 +243,14 @@ class Manager:
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_capabilities': [{'kind': kind, 'status': 'verified' if any(s['kind'] == kind and s['status'] == 'verified' and set(s['project_ids']) & {p['id'] for p in projects} for s in data.get('manual_sources', {}).values()) else 'unknown'} for kind in ('daemon', 'independent_cli', 'desktop')],
-                    'original_interface_requests': original_interface_requests, 'collaboration': role_snapshot,
+                    'original_interface_requests': original_interface_requests,
+                    'control_grants': [g for g in data.get('control_grants', {}).values() if g['request_id'] in {r['id'] for r in requests}],
+                    'collaboration': role_snapshot,
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
                         'compatibility': 'unverified', 'real_connect': 'unverified', 'real_group_acceptance': 'unverified'}),
-                    'execution': 'available' if any(r.get('execution_capability', {}).get('enabled') and self.codex_adapter and r['execution_capability'].get('connection', {}).get('generation') == self.codex_adapter.generation and not self.codex_adapter._closed for r in requests) else 'not_enabled',
+                    'execution': 'available' if any(r.get('execution_capability', {}).get('enabled') and executor_for(self, r) and r['execution_capability'].get('connection', {}).get('generation') == executor_for(self, r).generation and not executor_for(self, r)._closed for r in requests) else 'not_enabled',
                     'needs_human': ['Capabilities require current service, permission and channel evidence.']}
 
     def accept_request(self, identity, project_id, profile_id, message, issue, *, delegation_id=None):
@@ -293,9 +305,18 @@ class Manager:
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
 
+    def take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id):
+        from .takeover import take_over_session
+        return take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id)
+
+    def return_session_control(self, identity, request_id, grant_id):
+        from .takeover import return_session_control
+        return return_session_control(self, identity, request_id, grant_id)
+
     def collaborate(self, identity, action, details):
         from .collaboration import perform
         return perform(self, identity, action, details)
+
     def register_observation_source(self, identity, registration):
         from .observation import register_source
         return register_source(self, identity, registration)
@@ -345,7 +366,13 @@ class Manager:
         if action in {'append', 'continue'}:
             self._refresh_observations_for_task(identity, request_id)
         from .control import control_task
-        return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
+        try:
+            return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
+        except ManagementError as exc:
+            if exc.code in {'binding_conflict', 'capability_unverified', 'unavailable', 'outcome_unknown', 'service_rejected'}:
+                from .takeover import suspend_grant
+                suspend_grant(self, identity, request_id, str(exc))
+            raise
 
     def associate_human_reply(self, identity, project_id, profile_id, message, text):
         from .questions import associate_human_reply

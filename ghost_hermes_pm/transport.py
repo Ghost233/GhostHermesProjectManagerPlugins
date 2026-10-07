@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'details'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'manual_session_id', 'grant_id', 'details'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -66,6 +66,10 @@ class ManagementServer:
                             if payload['operation'] == 'read_participant_snapshot' and identity.subject == bridge.manager.owner_identity_ref:
                                 raise ManagementError('forbidden', 'The participant entry cannot borrow owner authority.')
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
+                        elif payload.get('operation') == 'take_over_session':
+                            result = bridge.manager.take_over_session(identity, payload.get('request_id'), payload.get('manual_session_id'), payload.get('grant_id'), payload.get('expected_turn_id'))
+                        elif payload.get('operation') == 'return_session_control':
+                            result = bridge.manager.return_session_control(identity, payload.get('request_id'), payload.get('grant_id'))
                         elif payload.get('operation') == 'collaborate':
                             result = bridge.manager.collaborate(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'register_observation_source':
@@ -150,7 +154,7 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'collaborate'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'collaborate'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
@@ -174,6 +178,12 @@ class ManagementClient:
 
     def apply_directory_change(self, expected_version, change):
         return self._call('apply_directory_change', expected_version=expected_version, change=change)
+
+    def take_over_session(self, request_id, manual_session_id, grant_id, expected_turn_id):
+        return self._call('take_over_session', request_id=request_id, manual_session_id=manual_session_id, grant_id=grant_id, expected_turn_id=expected_turn_id)
+
+    def return_session_control(self, request_id, grant_id):
+        return self._call('return_session_control', request_id=request_id, grant_id=grant_id)
 
     def register_observation_source(self, registration):
         return self._call('register_observation_source', registration=registration)
