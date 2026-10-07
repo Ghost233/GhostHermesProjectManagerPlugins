@@ -557,3 +557,23 @@ def test_changed_responsibility_keeps_actual_execution_unknown_and_supervision_b
         assert task['execution'] == 'unverified' and task['last_confirmed_execution'] == 'running' and task['repository_released'] is False
         assert len([e for e in changed['notifications']['events'] if e['kind'] == 'needs_owner']) == 1
         assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'needs_owner']) == 1
+
+
+def test_idle_and_unchanged_active_sampling_do_not_expire_owner_scope_versions(tmp_path):
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        initial = manager.read_snapshot(OWNER)['version']
+        manager.run_notifications(OWNER)
+        clock.advance(5)
+        manager.run_notifications(OWNER)
+        assert manager.read_snapshot(OWNER)['version'] == initial
+        assert manager.read_snapshot(OWNER)['notifications']['health']['supervision'] == 'running'
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        stable = manager.read_snapshot(OWNER)['version']
+        clock.advance(5)
+        manager.run_notifications(OWNER)
+        assert manager.read_snapshot(OWNER)['version'] == stable
+        assert manager.read_snapshot(OWNER)['notifications']['health']['sources'][task_id]['checked_at'] == clock.now

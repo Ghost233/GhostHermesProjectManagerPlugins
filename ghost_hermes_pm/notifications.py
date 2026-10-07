@@ -23,7 +23,7 @@ def snapshot(manager, data, project_ids):
     if path.exists():
         try:
             external = json.loads(path.read_text())
-            if external.get('generation') == manager._notification_generation and external.get('supervision') == 'unavailable':
+            if external.get('generation') == manager._notification_generation:
                 health.update(external)
         except (OSError, ValueError):
             health.update(supervision='unverified', delivery='unverified')
@@ -104,6 +104,14 @@ def stall_coverage(manager, task):
         return 'unverified'
 
 
+def meaningful_observation(value):
+    if isinstance(value, dict):
+        return {key: meaningful_observation(item) for key, item in value.items() if key not in {'last_execution_verified_at', 'checked_at', 'observed_at', 'last_verified_at', 'last_verification_attempt_at'}}
+    if isinstance(value, list):
+        return [meaningful_observation(item) for item in value]
+    return value
+
+
 def run(manager, identity):
     with manager._lock:
         _, initial = manager._load()
@@ -111,13 +119,14 @@ def run(manager, identity):
             raise ManagementError('forbidden', 'Only the manager supervision entry schedules global notifications.')
         task_ids = [t['id'] for t in initial['requests'].values() if t.get('session') and not t.get('repository_released') and t.get('outer_task_status') != 'stopped']
     refresh_failures = {}
+    samples = {}
     for task_id in task_ids:
         try:
             with manager._lock:
                 _, current = manager._load()
                 from .takeover import _assignment
                 _assignment(current['requests'][task_id], current)
-            manager.refresh_task(identity, task_id)
+                samples[task_id] = manager.refresh_task(identity, task_id, sampling=True)
         except ManagementError as exc:
             refresh_failures[task_id] = exc.code
     with manager._lock, manager._db:
@@ -127,6 +136,7 @@ def run(manager, identity):
             raise ManagementError('forbidden', 'Only the manager supervision entry schedules global notifications.')
         now = manager.notification_clock()
         saved = state(data)
+        before_notifications = json.dumps({key: value for key, value in saved.items() if key != 'health'}, sort_keys=True)
         for task_id, failure in refresh_failures.items():
             task = data['requests'][task_id]
             if task['execution'] not in {'unverified', 'stopping'}:
@@ -173,9 +183,9 @@ def run(manager, identity):
             stop = task.get('stop', {})
             if stop.get('status') == 'confirmed' and task['execution'] == 'stopped' and task.get('repository_released'):
                 emit(saved, 'stop_confirmed', task['project_id'], [task], '停止已核实；保留已有改动与原会话。\nIssue：' + task['accepted_scope']['url'], now, key='stop:' + task['id'] + ':' + stop['instruction_id'])
-            observation = task.get('supervision_observation') if not task.get('repository_released') and task.get('outer_task_status') != 'stopped' else None
+            observation = samples.get(task['id'], task).get('supervision_observation') if not task.get('repository_released') and task.get('outer_task_status') != 'stopped' else None
             if observation:
-                tracker = saved['tasks'].setdefault(task['id'], {'progress_at': now, 'digest': observation['progress_digest'], 'stall_sent': False})
+                tracker = saved['tasks'].setdefault(task['id'], {'progress_at': now, 'digest': observation['progress_digest'], 'stall_sent': False, 'explanation': observation['explanation']})
                 saved['health']['sources'][task['id']] = {'status': 'verified' if observation['verified'] else 'unverified',
                     'service_id': observation['service_id'], 'checked_at': observation['checked_at'],
                     'last_confirmed_execution': task.get('last_confirmed_execution', task['execution']),
@@ -194,8 +204,8 @@ def run(manager, identity):
                     tracker.update(progress_at=now, stall_sent=False)
             if observation and observation['verified']:
                 tracker = saved['tasks'][task['id']]
-                if tracker['digest'] != observation['progress_digest'] or observation['explanation']:
-                    tracker.update(progress_at=now, digest=observation['progress_digest'], stall_sent=False)
+                if tracker['digest'] != observation['progress_digest'] or tracker.get('explanation') != observation['explanation']:
+                    tracker.update(progress_at=now, digest=observation['progress_digest'], explanation=observation['explanation'], stall_sent=False)
                 if observation['eligible_stall'] and now - tracker['progress_at'] >= 900 and not tracker['stall_sent']:
                     coverage = stall_coverage(manager, task)
                     saved['health']['sources'][task['id']]['stall_coverage'] = coverage
@@ -248,7 +258,8 @@ def run(manager, identity):
             if target is None:
                 event['delivery'] = 'blocked'
         saved['health'].update(supervision='running', last_checked_at=now)
-        manager._save(version, data)
+        if before_notifications != json.dumps({key: value for key, value in saved.items() if key != 'health'}, sort_keys=True) and (data['requests'] or saved['events']):
+            manager._save(version, data)
         persist_health(manager, saved['health'])
         return {'status': 'completed', 'notifications': list(saved['events'].values()), 'health': saved['health']}
 

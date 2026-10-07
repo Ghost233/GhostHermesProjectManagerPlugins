@@ -418,9 +418,9 @@ class Manager:
         from .recovery import reconcile_task
         return reconcile_task(self, identity, request_id)
 
-    def refresh_task(self, identity, request_id):
+    def refresh_task(self, identity, request_id, *, sampling=False):
         from .execution import refresh_task
-        return refresh_task(self, identity, request_id)
+        return refresh_task(self, identity, request_id, sampling=sampling)
 
     def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
         if action in {'append', 'continue'}:

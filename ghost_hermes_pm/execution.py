@@ -136,13 +136,15 @@ def start_task(manager, identity, request_id):
         return {'status': 'running', 'request_id': request_id, 'session': record['session']}
 
 
-def refresh_task(manager, identity, request_id):
+def refresh_task(manager, identity, request_id, *, sampling=False):
     with manager._lock:
         version, data = manager._load()
         record = _responsible(manager, identity, request_id, data)
+        from .notifications import meaningful_observation
+        before = meaningful_observation(record)
         if record.get('stop', {}).get('status') == 'processing':
             from .control import refresh_stop
-            return refresh_stop(manager, identity, request_id)
+            return refresh_stop(manager, identity, request_id, sampling=sampling)
         if record.get('outer_task_status') == 'stopped':
             return record
         session = record.get('session')
@@ -220,8 +222,9 @@ def refresh_task(manager, identity, request_id):
         if record['execution'] == 'unverified':
             from .notifications import observe
             observe(manager, record)
-        with manager._db:
-            manager._save(version, data)
+        if not sampling or before != meaningful_observation(record):
+            with manager._db:
+                manager._save(version, data)
         report_state = (record['execution'], record.get('turn_status'))
         if tuple(record.get('execution_report_state', ())) != report_state:
             record['execution_report_state'] = report_state

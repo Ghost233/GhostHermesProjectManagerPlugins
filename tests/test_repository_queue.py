@@ -335,7 +335,7 @@ async def test_group_and_dashboard_share_preparation_queue_reason_and_frozen_sou
             relevant = [s for s in transport.sent if s['reply_to'] == second['task_start_anchor']['message_id']]
             assert any('仓库排队' in s['text'] for s in relevant)
             assert any('来源变化' in s['text'] for s in relevant)
-            assert all(s['mention_open_id'] == 'ou_owner' for s in relevant)
+            assert all(s['mention_open_id'] is None for s in relevant)
 
 
 @pytest.mark.parametrize('filename', ['source.py', ' leading.py'])

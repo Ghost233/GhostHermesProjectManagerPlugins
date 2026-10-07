@@ -280,7 +280,7 @@ async def test_group_dashboard_and_bridge_show_same_manual_state_and_original_pu
             assert snapshot['manual_sessions'][0]['control'] == 'observe_only'
             assert 'private operation' not in json.dumps(snapshot)
             feedback = [s for s in transport.sent if '手动 Codex 只观察' in s['text']]
-            assert feedback and all(s['reply_to'] == task['task_start_anchor']['message_id'] and s['mention_open_id'] == 'ou_owner' for s in feedback)
+            assert feedback and all(s['reply_to'] == task['task_start_anchor']['message_id'] and s['mention_open_id'] is None for s in feedback)
     assert all(json.loads(line).get('method') in READ_ONLY for line in (peer / 'manual-wire.jsonl').read_text().splitlines())
 
 

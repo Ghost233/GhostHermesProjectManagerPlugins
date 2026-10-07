@@ -146,9 +146,12 @@ def register_native(ctx):
                         def poll_if_active():
                             with intake.lifecycle_lock:
                                 intake.require_active(generation)
-                                manager.refresh_manual_sessions(identity)
+                                if manager.observation_adapters or manager.read_snapshot(identity)['manual_sources']:
+                                    manager.refresh_manual_sessions(identity)
                                 for saved in manager.read_snapshot(identity)['requests']:
-                                    if saved.get('session') and not saved.get('repository_released'):
+                                    from .takeover import executor_for
+                                    actual = executor_for(manager, saved)
+                                    if saved.get('session') and not saved.get('repository_released') and (actual is None or actual._closed or actual.generation != saved['session']['generation'] or saved['execution'] in {'unverified', 'turn_ended', 'stopping'}):
                                         try:
                                             manager.reconcile_task(identity, saved['id'])
                                         except ManagementError:
@@ -164,7 +167,7 @@ def register_native(ctx):
                                 def observe_if_active(request_id=record['id']):
                                     with intake.lifecycle_lock:
                                         intake.require_active(generation)
-                                        return manager.refresh_task(identity, request_id)
+                                        return manager.refresh_task(identity, request_id, sampling=True)
                                 await asyncio.to_thread(observe_if_active)
                             anchor = record['source_anchor']
                             bindings = [b for b in intake.settings.get('bindings', []) if b.get('profile_id') == record['profile_id']
