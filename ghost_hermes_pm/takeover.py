@@ -99,6 +99,8 @@ class OriginalControlAdapter(CodexStdioAdapter):
 
 def executor_for(manager, record):
     session = record.get('session', {})
+    if session.get('recovery_ref'):
+        return manager.recovery_adapters.get(session['recovery_ref'])
     return manager.control_adapters.get(session.get('manual_source_id')) if session.get('origin') == 'manual_takeover' else manager.codex_adapter
 
 
@@ -228,6 +230,9 @@ def return_session_control(manager, identity, request_id, grant_id):
 
 def bind_executor(manager, record):
     adapter = executor_for(manager, record)
+    if adapter is not None and record.get('session', {}).get('recovery_ref'):
+        from .recovery import bind_recovery
+        return bind_recovery(manager, record, adapter)
     if adapter is not None and record.get('session', {}).get('origin') == 'manual_takeover':
         grant_id = record.get('control_grant_id')
         adapter.authority = lambda: _authority(manager, grant_id)

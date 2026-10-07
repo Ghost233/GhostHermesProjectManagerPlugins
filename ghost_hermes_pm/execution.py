@@ -25,7 +25,9 @@ def _current_assignment(manager, record, data):
         _assignment(record, data)
         return
     service_ref = profile.get('connection_refs', {}).get('codex')
-    if service_ref != manager.codex_adapter.service_ref or (record.get('accepted_codex_ref') is not None and record['accepted_codex_ref'] != service_ref):
+    from .takeover import executor_for
+    adapter = executor_for(manager, record)
+    if adapter is None or service_ref != adapter.service_ref or (record.get('accepted_codex_ref') is not None and record['accepted_codex_ref'] != service_ref):
         raise ManagementError('capability_unverified', 'The actual executor does not match the responsible Profile local Codex binding.')
     if record.get('accepted_repository_fingerprint') != repository_fingerprint(data['projects'][record['project_id']]['repo']):
         raise ManagementError('capability_unverified', 'The repository boundary differs from the accepted task scope.')

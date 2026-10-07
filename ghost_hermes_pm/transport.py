@@ -80,7 +80,7 @@ class ManagementServer:
                             result = bridge.manager.apply_directory_change(identity, payload.get('expected_version'), payload.get('change'))
                         elif payload.get('operation') == 'prepare_task':
                             result = bridge.manager.prepare_task(identity, payload.get('request_id'), payload.get('plan'))
-                        elif payload.get('operation') in {'start_task', 'refresh_task', 'verify_task_execution', 'refresh_task_source'}:
+                        elif payload.get('operation') in {'start_task', 'refresh_task', 'reconcile_task', 'verify_task_execution', 'refresh_task_source'}:
                             result = getattr(bridge.manager, payload['operation'])(identity, payload.get('request_id'))
                         elif payload.get('operation') == 'control_task':
                             result = bridge.manager.control_task(identity, payload.get('request_id'), payload.get('action'),
@@ -164,7 +164,7 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'reconcile_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
@@ -218,6 +218,9 @@ class ManagementClient:
 
     def answer_human_request(self, request_id, human_request_id, reply_id, response):
         return self._call('answer_human_request', request_id=request_id, human_request_id=human_request_id, reply_id=reply_id, response=response)
+
+    def reconcile_task(self, request_id):
+        return self._call('reconcile_task', request_id=request_id)
 
     def refresh_task(self, request_id):
         return self._call('refresh_task', request_id=request_id)
