@@ -393,3 +393,67 @@ def test_registered_original_endpoint_cannot_be_replaced_during_recovery(tmp_pat
         service.terminate()
         service.wait(timeout=5)
         service.stdout.close()
+
+
+def test_missing_current_process_exit_proof_keeps_stop_and_occupancy_unverified(tmp_path):
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        service_id = manager.start_task(OWNER, request_id)['session']['service_id']
+        manager.control_task(OWNER, request_id, 'stop', 'stop-before-crash', expected_turn_id=TURN)
+    original_state(tmp_path, repo, status='interrupted')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                 recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id, process_coverage=None)}) as manager:
+        task = manager.reconcile_task(OWNER, request_id)
+        assert task['execution'] == 'stopping'
+        assert task['stop']['status'] == 'processing'
+        assert task['repository_released'] is False
+        assert 'process coverage' in task['stop']['reason']
+    assert 'turn/start' not in methods(tmp_path)
+
+
+def test_only_new_live_rpc_can_receive_one_fresh_answer_after_reconnect(tmp_path):
+    from test_questions import user_question
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        service_id = manager.start_task(OWNER, request_id)['session']['service_id']
+    original_state(tmp_path, repo)
+    peer = tmp_path / 'original' / 'original-state.json'
+    state = json.loads(peer.read_text())
+    question = user_question()
+    question['id'] = 'fresh-incoming-rpc'
+    state['server_requests'] = [question]
+    peer.write_text(json.dumps(state))
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                 recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id)}) as manager:
+        with ManagementServer(manager, {'recovery-owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'recovery-owner')
+            task = client.reconcile_task(request_id)
+            live = task['human_requests'][0]
+            assert live['resolution'] == 'pending' and live['control_enabled'] is True
+            response = {'answers': {'colour': ['Blue']}}
+            sent = client.answer_human_request(request_id, live['id'], 'fresh-answer', response)
+            duplicate = client.answer_human_request(request_id, live['id'], 'fresh-answer', response)
+            assert sent['reply']['sent'] == 'sent'
+            assert duplicate['duplicate'] is True
+    assert json.loads(peer.read_text())['responses'] == [{'id': 'fresh-incoming-rpc', 'result': {'answers': {'colour': {'answers': ['Blue']}}}}]
+
+
+def test_unloaded_running_history_cannot_restore_live_task_monitoring(tmp_path):
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        service_id = manager.start_task(OWNER, request_id)['session']['service_id']
+    original_state(tmp_path, repo)
+    peer = tmp_path / 'original' / 'original-state.json'
+    state = json.loads(peer.read_text())
+    state['loaded'] = []
+    peer.write_text(json.dumps(state))
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                 recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id)}) as manager:
+        task = manager.reconcile_task(OWNER, request_id)
+        assert task['execution'] == 'unverified'
+        assert task['recovery']['status'] == 'blocked'
+        assert task['repository_released'] is False
+        assert task['session'].get('recovery_ref') is None

@@ -20,7 +20,7 @@ for line in sys.stdin:
     if method == 'initialize':
         result = {'userAgent': 'codex-cli/0.160.1', 'codexHome': str(root / 'synthetic-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
     elif method == 'thread/loaded/list':
-        result = {'data': [thread['id']], 'nextCursor': None}
+        result = {'data': state.get('loaded', [thread['id']]), 'nextCursor': None}
     elif method == 'thread/list':
         result = {'data': [thread], 'nextCursor': None, 'backwardsCursor': None}
     elif method == 'thread/read':

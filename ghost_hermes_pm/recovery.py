@@ -135,9 +135,17 @@ def reconcile_task(manager, identity, request_id):
                     proof = adapter.verify_recovery(repository, context)
                     if any(proof.get(k) != session['capability'].get(k) for k in ('permission_profile', 'policy_digest', 'runtime_roots')):
                         raise ManagementError('binding_conflict', 'Recovery proof differs from the original immutable write boundary.')
+                    loaded = adapter.loaded_threads()
+                    if any(not isinstance(t, str) or not t for t in loaded):
+                        raise ManagementError('capability_unverified', 'Current original loaded execution coverage is incomplete.')
                     thread = adapter.read_thread(session['thread_id'])
                     if thread.get('id') != session['thread_id'] or thread.get('cwd') != repository['worktree'] or not any(t.get('id') == session['turn_id'] for t in thread.get('turns', [])):
                         raise ManagementError('binding_conflict', 'The actual original thread and turn could not be identified.')
+                    if thread.get('status', {}).get('type') == 'active':
+                        if session['thread_id'] not in loaded:
+                            raise ManagementError('capability_unverified', 'Running historical state is not loaded execution on this original service; keep occupancy unverified.')
+                        if [t.get('id') for t in thread['turns'] if t.get('status') == 'inProgress'] != [session['turn_id']]:
+                            raise ManagementError('binding_conflict', 'The active original turn changed; no recovered input or dispatch is permitted.')
                     record.setdefault('connection_history', []).append({k: session.get(k) for k in ('service_ref', 'service_id', 'generation', 'endpoint_ref')})
                     session.pop('pid', None)
                     session.update(generation=adapter.generation, capability=proof, recovery_ref=session['service_ref'],
