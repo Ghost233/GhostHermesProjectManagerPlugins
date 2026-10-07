@@ -188,7 +188,7 @@ async def feishu_controls(root):
         assert len([r for r in wire(root) if r['method'] == 'turn/steer']) == 1
         assert len([r for r in wire(root) if r['method'] == 'turn/interrupt']) == 1
         assert transport.sent[-1]['reply_to'] == task['task_start_anchor']['message_id']
-        assert transport.sent[-1]['mention_open_id'] == 'ou_owner'
+        assert transport.sent[-1]['mention_open_id'] is None
         assert any('停止处理中' in s['text'] for s in transport.sent)
 
 

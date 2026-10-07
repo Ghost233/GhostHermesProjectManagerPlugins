@@ -318,7 +318,7 @@ def perform(manager, identity, action, details):
                 segment['attempts'].append({'status': 'sending', 'claimed_at': _now()})
                 manager._inflight.add(segment['uuid'])
                 if handoff['kind'] == 'owner_summary':
-                    result = {**segment, 'path': 'reply', 'chat_id': sending['chat_id'], 'reply_to': handoff['source_anchor']['message_id'], 'mention_open_id': sending['owner_open_id'], 'sender_binding': sending}
+                    result = {**segment, 'path': 'reply', 'chat_id': sending['chat_id'], 'reply_to': handoff['source_anchor']['message_id'], 'mention_open_id': None, 'sender_binding': sending}
                 else:
                     mentions = [b for b in sending['bot_sources'] if b['profile_id'] == handoff['target_profile_id']]
                     result = {**segment, 'path': 'create', 'chat_id': target['chat_id'], 'mention_open_id': mentions[0]['open_id'], 'sender_binding': sending}

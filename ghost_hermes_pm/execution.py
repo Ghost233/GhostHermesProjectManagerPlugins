@@ -140,13 +140,15 @@ def start_task(manager, identity, request_id):
         return {'status': 'running', 'request_id': request_id, 'session': record['session']}
 
 
-def refresh_task(manager, identity, request_id):
+def refresh_task(manager, identity, request_id, *, sampling=False):
     with manager._lock:
         version, data = manager._load()
         record = _responsible(manager, identity, request_id, data)
+        from .notifications import meaningful_observation
+        before = meaningful_observation(record)
         if record.get('stop', {}).get('status') == 'processing':
             from .control import refresh_stop
-            return refresh_stop(manager, identity, request_id)
+            return refresh_stop(manager, identity, request_id, sampling=sampling)
         if record.get('outer_task_status') == 'stopped':
             return record
         session = record.get('session')
@@ -213,12 +215,20 @@ def refresh_task(manager, identity, request_id):
                                      'output_digest': hashlib.sha256((item.get('aggregatedOutput') or '').encode()).hexdigest(),
                                      'source': 'codex_command_execution', 'service_id': session['service_id'],
                                      'generation': session['generation'], 'observed_at': record['last_execution_verified_at']})
+                from .notifications import observe
+                observe(manager, record, thread, turn, items, events)
                 record['command_evidence'] = commands
                 record.setdefault('test_evidence', [])
             except ManagementError as exc:
+                if record['execution'] != 'unverified':
+                    record['last_confirmed_execution'] = record['execution']
                 record.update(execution='unverified', unexecuted_reason=str(exc))
-        with manager._db:
-            manager._save(version, data)
+        if record['execution'] == 'unverified':
+            from .notifications import observe
+            observe(manager, record)
+        if not sampling or before != meaningful_observation(record):
+            with manager._db:
+                manager._save(version, data)
         report_state = (record['execution'], record.get('turn_status'))
         if tuple(record.get('execution_report_state', ())) != report_state:
             record['execution_report_state'] = report_state

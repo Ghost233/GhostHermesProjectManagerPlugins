@@ -98,7 +98,10 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None, notification_clock=None):
+        import time
+        self.notification_clock = notification_clock or time.time
+        self._notification_generation = str(uuid.uuid4())
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
@@ -128,6 +131,8 @@ class Manager:
                 self._save(version, data)
 
     def close(self):
+        from .notifications import shutdown
+        shutdown(self)
         with self._lock:
             if self.codex_adapter is not None:
                 self.codex_adapter.close()
@@ -150,6 +155,8 @@ class Manager:
         if schema != 1:
             raise ManagementError('unknown_version', 'Directory schema requires a verified upgrade.')
         data = json.loads(payload)
+        from .notifications import reconcile as reconcile_notifications
+        reconcile_notifications(self, data)
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
         data.setdefault('intake_failures', {})
@@ -264,9 +271,11 @@ class Manager:
             from .collaboration import snapshot as collaboration_snapshot
             role_snapshot = collaboration_snapshot(data, principal, visible_ids)
             from .knowledge import snapshot_knowledge
+            from .notifications import snapshot as notification_snapshot
             from .archives import snapshot_archives
             return {**snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'notifications': notification_snapshot(self, data, {p['id'] for p in projects}),
                     'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
@@ -283,6 +292,14 @@ class Manager:
                         'compatibility': 'unverified', 'real_connect': 'unverified', 'real_group_acceptance': 'unverified'}),
                     'execution': 'available' if any(r.get('execution_capability', {}).get('enabled') and executor_for(self, r) and r['execution_capability'].get('connection', {}).get('generation') == executor_for(self, r).generation and not executor_for(self, r)._closed for r in requests) else 'not_enabled',
                     'needs_human': ['Capabilities require current service, permission and channel evidence.']}
+
+    def manage_notifications(self, identity, action, details):
+        from .notifications import manage
+        return manage(self, identity, action, details)
+
+    def run_notifications(self, identity):
+        from .notifications import run
+        return run(self, identity)
 
     def accept_request(self, identity, project_id, profile_id, message, issue, *, delegation_id=None):
         """Accept an Issue snapshot from a trusted message entry; never start Codex."""
@@ -343,7 +360,11 @@ class Manager:
         if action in {'start', 'prepare'}:
             self.refresh_manual_sessions(identity)
         from .global_validation import perform
-        return perform(self, identity, action, details)
+        result = perform(self, identity, action, details)
+        if action == 'rework':
+            from .notifications import on_rework
+            on_rework(self, result)
+        return result
 
     def lifecycle(self, identity, action, details):
         from .lifecycle import operate
@@ -413,9 +434,9 @@ class Manager:
         from .recovery import reconcile_task
         return reconcile_task(self, identity, request_id)
 
-    def refresh_task(self, identity, request_id):
+    def refresh_task(self, identity, request_id, *, sampling=False):
         from .execution import refresh_task
-        return refresh_task(self, identity, request_id)
+        return refresh_task(self, identity, request_id, sampling=sampling)
 
     def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
         if action in {'append', 'continue'}:
@@ -468,7 +489,10 @@ class Manager:
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
         try:
-            return record_task_delivery(self, identity, request_id, report)
+            result = record_task_delivery(self, identity, request_id, report)
+            from .notifications import on_delivery
+            on_delivery(self, result)
+            return result
         except ManagementError as exc:
             with self._lock, self._db:
                 version, data = self._load()
@@ -721,7 +745,7 @@ class Manager:
                     self._save(version, data)
                     return {**segment, 'kind': publication['kind'], 'chat_id': anchor['chat_id'],
                             'reply_to': anchor['message_id'], 'thread_id': anchor.get('thread_id'),
-                            'mention_open_id': record['source_anchor']['sender_open_id']}
+                            'mention_open_id': record['source_anchor']['sender_open_id'] if publication['kind'] == 'confirmation' else None}
             return None
 
     def retry_delivery(self, identity, request_id):

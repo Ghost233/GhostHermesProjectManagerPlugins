@@ -315,7 +315,7 @@ async def _feishu_start(tmp_path):
         assert task['execution'] == 'running'
         assert any('Codex 已核实运行' in s['text'] for s in transport.sent)
         assert transport.sent[-1]['reply_to'] == task['task_start_anchor']['message_id']
-        assert transport.sent[-1]['mention_open_id'] == 'ou_owner'
+        assert transport.sent[-1]['mention_open_id'] is None
 
 
 def test_verified_feishu_execute_uses_same_single_task_entry_and_original_anchor(tmp_path):

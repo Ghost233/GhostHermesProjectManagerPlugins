@@ -121,6 +121,23 @@ def register_native(ctx):
 
             ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
 
+            async def supervise_notifications():
+                import asyncio
+                from .notifications import component_unavailable
+                identity = VerifiedIdentity(owner, 'verified-manager-notification-supervision')
+                generation = intake.generation
+                while resources is not None and not intake.closed:
+                    try:
+                        async with intake.lock:
+                            await intake.deliver_notifications(identity, generation)
+                    except Exception:
+                        if intake.closed or resources is None:
+                            return
+                        component_unavailable(manager)
+                    await asyncio.sleep(5)
+
+            ctx.spawn_task(supervise_notifications(), name='hermes-pm-notification-supervision')
+
             if codex_adapter is not None or recovery_adapters or observation_adapters or manager.knowledge_providers or control_adapters or manager.archive_providers or intake.collaboration_entry:
                 async def supervise_single_issue():
                     import asyncio
@@ -131,9 +148,12 @@ def register_native(ctx):
                         def poll_if_active():
                             with intake.lifecycle_lock:
                                 intake.require_active(generation)
-                                manager.refresh_manual_sessions(identity)
+                                if manager.observation_adapters or manager.read_snapshot(identity)['manual_sources']:
+                                    manager.refresh_manual_sessions(identity)
                                 for saved in manager.read_snapshot(identity)['requests']:
-                                    if saved.get('session') and not saved.get('repository_released'):
+                                    from .takeover import executor_for
+                                    actual = executor_for(manager, saved)
+                                    if saved.get('session') and not saved.get('repository_released') and (actual is None or actual._closed or actual.generation != saved['session']['generation'] or saved['execution'] in {'unverified', 'turn_ended', 'stopping'}):
                                         try:
                                             manager.reconcile_task(identity, saved['id'])
                                         except ManagementError:
@@ -149,7 +169,7 @@ def register_native(ctx):
                                 def observe_if_active(request_id=record['id']):
                                     with intake.lifecycle_lock:
                                         intake.require_active(generation)
-                                        return manager.refresh_task(identity, request_id)
+                                        return manager.refresh_task(identity, request_id, sampling=True)
                                 await asyncio.to_thread(observe_if_active)
                             anchor = record['source_anchor']
                             bindings = [b for b in intake.settings.get('bindings', []) if b.get('profile_id') == record['profile_id']

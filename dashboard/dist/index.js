@@ -227,6 +227,21 @@
         snapshot.intake_conditions && h('p', null, '消息入口：' + snapshot.intake_conditions.runtime_route +
           ' · 接缝兼容：' + snapshot.intake_conditions.compatibility + ' · 真实群验收：' + snapshot.intake_conditions.real_group_acceptance),
         snapshot.status === 'unverified' && h('p', { role: 'status' }, '管理实例离线，仅显示最后核实目录；修改未执行。'),
+        snapshot.notifications && h('section', null,
+          h('h2', null, '通知与监督健康'),
+          h('p', null, '监督：' + snapshot.notifications.health.supervision + ' · 通知通道：' + snapshot.notifications.health.delivery +
+            ' · 最后检查：' + (snapshot.notifications.health.last_checked_at || '尚未核实')),
+          h('ul', null, Object.entries(snapshot.notifications.health.sources || {}).map(function (entry) {
+            return h('li', { key: entry[0] }, entry[0] + ' · 原服务：' + entry[1].service_id + ' · ' + entry[1].status +
+              ' · 最后核实执行：' + entry[1].last_confirmed_execution + ' · 停滞核查覆盖：' + (entry[1].stall_coverage || '尚未核查'));
+          })),
+          h('ul', null, (snapshot.notifications.events || []).map(function (event) {
+            return h('li', { key: event.id },
+              h('p', null, event.kind + ' · 项目：' + event.project_id + ' · 投递：' + event.delivery),
+              h('pre', null, event.text),
+              h('details', null, h('summary', null, '原消息实际定位与逐段投递凭据'),
+                h('pre', null, JSON.stringify({ role_handoff_id: event.role_handoff_id, segments: event.segments || [] }, null, 2))));
+          }))),
         h('h2', null, '组织目录'),
         h('ul', null, snapshot.projects.map(function (p) {
           return h('li', { key: p.id, style: { marginBottom: '10px' } }, h('strong', null, p.name + ' (' + p.id + ')'),
