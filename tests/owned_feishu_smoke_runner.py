@@ -71,6 +71,8 @@ def fixture_issue(url):
     return {'url': url, 'title': 'Scope ' + url.rsplit('/', 1)[-1],
             'body': 'Frozen material for ' + url.rsplit('/', 1)[-1], 'updated_at': '2026-10-07T00:00:00Z'}
 external_issue.read_github_issue = fixture_issue
+from native_fixture_boundary import install
+install(home / 'plugins' / 'ghost-hermes-pm', {'feishu': lambda module: setattr(module, 'read_github_issue', fixture_issue)})
 plugins = get_plugin_manager()
 plugins.discover_and_load()
 assert platform_registry.get('hermes_feishu_pm') is not None

@@ -15,6 +15,8 @@ def _now():
 
 
 def require_active(data, profile_id, project_id):
+    if data.get('native_runtime_version_gate', {}).get('status') == 'unverified':
+        raise ManagementError('unknown_version', 'Current native version is unknown; no migration or new execution is permitted.')
     for obj in (data['profiles'].get(profile_id, {}), data['projects'].get(project_id, {})):
         if obj.get('migration_gate'):
             raise ManagementError('migration_blocked', 'Target Profile is configuring under an immutable migration plan; approve its verified cutover first.')

@@ -121,6 +121,12 @@ class FeishuEntry:
                         'root_id': getattr(message, 'root_id', None), 'thread_id': getattr(message, 'thread_id', None)}
             if not work:
                 manager = self.manager()
+                from .maintenance_entry import parse as parse_maintenance, reviewed as reviewed_maintenance, PreparedMaintenanceMessage
+                if parse_maintenance(command):
+                    if manager is None or len(mentions) != 1:
+                        return None
+                    details = reviewed_maintenance(manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry')), binding, command)
+                    return PreparedMaintenanceMessage(event, adapter, transport, binding, envelope, command, None, details)
                 from .migration_entry import parse as parse_migration, reviewed as reviewed_migration, PreparedMigrationMessage
                 if parse_migration(command):
                     if manager is None:
@@ -165,6 +171,8 @@ class FeishuEntry:
         if manager is None:
             return False
         snapshot = manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))
+        if getattr(prepared, 'maintenance_details', None):
+            return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile for p in snapshot['profiles'])
         if getattr(prepared, 'migration_details', None):
             return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile for p in snapshot['profiles'])
         from .lifecycle_entry import parse as parse_lifecycle
@@ -196,6 +204,9 @@ class FeishuEntry:
         async with self.lock:
             self.require_active(generation)
             if not prepared.issue_url:
+                if getattr(prepared, 'maintenance_details', None):
+                    from .maintenance_entry import process as process_maintenance
+                    return await process_maintenance(self, identity, prepared, generation)
                 if getattr(prepared, 'migration_details', None):
                     from .migration_entry import process as process_migration
                     return await process_migration(self, identity, prepared, generation)

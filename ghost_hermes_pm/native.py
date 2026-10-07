@@ -21,6 +21,16 @@ def _credential(reference):
 def register_native(ctx):
     from .migration_capture import capture_request
     ctx.register_hook('pre_api_request', capture_request)
+    from .native_maintenance import loaded_fact
+    registered_release = loaded_fact(ctx, register_native)
+    def loaded_version(args):
+        if args:
+            return json.dumps({'status': 'rejected', 'code': 'invalid_change', 'message': 'Loaded-version evidence accepts no actor or execution input.'})
+        return json.dumps(registered_release)
+    ctx.register_tool(name='hermes_pm_loaded_version', toolset='hermes_pm',
+        schema={'name': 'hermes_pm_loaded_version', 'description': 'Read actual native registration and entry bytecode/source evidence captured when this plugin instance loaded.',
+                'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
+        handler=loaded_version, description='Read the actual loaded plugin registration; capability acceptance is separate')
     state_dir = ctx.get_config('state_dir')
     manager_profile = ctx.get_config('manager_profile')
     owner = ctx.get_config('owner_identity_ref')
@@ -52,6 +62,10 @@ def register_native(ctx):
             intake.deactivate()
             if held is not None:
                 manager, server = held
+                try:
+                    manager.record_runtime_loss('native-unload-or-external-shutdown')
+                except Exception:
+                    pass  # An unavailable database cannot turn teardown into confirmed stop.
                 server.close()
                 manager.close()
             runtime = 'manager_unavailable'
@@ -99,6 +113,7 @@ def register_native(ctx):
             codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
             from .native_lifecycle import configured_lifecycle_host
             from .native_migration import configured_migration_host
+            from .native_maintenance import configured_maintenance_host
             def knowledge_credential(reference):
                 value = _credential(reference)
                 if value:
@@ -108,6 +123,7 @@ def register_native(ctx):
                               codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters, control_adapters=control_adapters,
                               knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {}), credential_resolver=knowledge_credential),
                               archive_providers=configured_archives(ctx.get_config('archive_providers', {})), recovery_adapters=recovery_adapters,
+                              maintenance_host=configured_maintenance_host(ctx.get_config('native_maintenance'), state_dir),
                               lifecycle_host=configured_lifecycle_host(ctx.get_config('native_profile_lifecycle'), state_dir),
                               migration_host=configured_migration_host(ctx.get_config('native_profile_migration'), state_dir, intake))
             for registration in ctx.get_config('manual_sources', []):

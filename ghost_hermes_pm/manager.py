@@ -98,7 +98,7 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None, migration_host=None, notification_clock=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None, migration_host=None, maintenance_host=None, notification_clock=None):
         import time
         self.notification_clock = notification_clock or time.time
         self._notification_generation = str(uuid.uuid4())
@@ -108,6 +108,7 @@ class Manager:
         self.global_validation_host = global_validation_host
         self.lifecycle_host = lifecycle_host
         self.migration_host = migration_host
+        self.maintenance_host = maintenance_host
         self.knowledge_providers = dict(knowledge_providers or {})
         self.archive_providers = dict(archive_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
@@ -116,6 +117,9 @@ class Manager:
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        bind_maintenance = getattr(self.maintenance_host, 'bind_manager_state', None)
+        if callable(bind_maintenance):
+            bind_maintenance(self.state_dir)
         self._lock = threading.RLock()
         self._inflight = set()
         from .recovery import verify_directory
@@ -218,6 +222,13 @@ class Manager:
             version += 1
             if not already_in_transaction:
                 self._db.commit()
+        if self.maintenance_host is not None:
+            from .maintenance import _runtime
+            try:
+                current = _runtime(self)
+                data['native_runtime_version_gate'] = {'status': 'verified', 'plugin_version': current['plugin_version'], 'verified_at': current['verified_at']}
+            except (ManagementError, OSError) as exc:
+                data['native_runtime_version_gate'] = {'status': 'unverified', 'reason': str(exc)}
         from .queue import refresh
         refresh(data)
         return version, data
@@ -274,7 +285,8 @@ class Manager:
             from .knowledge import snapshot_knowledge
             from .notifications import snapshot as notification_snapshot
             from .archives import snapshot_archives
-            return {**snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
+            from .maintenance import snapshot as maintenance_snapshot
+            return {'maintenance': maintenance_snapshot(self, data, principal), **snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
                     'notifications': notification_snapshot(self, data, {p['id'] for p in projects}),
                     'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
@@ -368,11 +380,24 @@ class Manager:
             on_rework(self, result)
         return result
 
+    def record_runtime_loss(self, reason):
+        from .maintenance import runtime_loss
+        runtime_loss(self, reason)
+
+    def maintenance(self, identity, action, details):
+        from .maintenance import operate
+        return operate(self, identity, action, details)
+
     def lifecycle(self, identity, action, details):
         from .lifecycle import operate
         return operate(self, identity, action, details)
 
     def migrate_profile(self, identity, action, details):
+        if action not in {'check', 'rollback'}:
+            with self._lock:
+                _, current = self._load()
+                if current.get('native_runtime_version_gate', {}).get('status') == 'unverified':
+                    raise ManagementError('unknown_version', 'Current native version is unknown; no migration is permitted.')
         from .migration import operate
         return operate(self, identity, action, details)
 
