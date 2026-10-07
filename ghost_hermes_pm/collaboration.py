@@ -1,0 +1,187 @@
+"""Role handoffs retain Owner origin, public delivery and independent reception."""
+from datetime import datetime, timezone
+import hashlib
+import json
+import re
+import uuid
+
+from .manager import ManagementError, _message_anchor, _public_text
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _state(data):
+    return data.setdefault('collaboration', {'channels': {}, 'handoffs': {}, 'real_group_acceptance': 'unverified', 'enabled': False})
+
+
+def _binding(profile):
+    return {k: profile.get(k) for k in ('id', 'identity_ref', 'native_profile', 'role', 'capability', 'project_id', 'parent_profile_id')}
+
+
+def _channel(data, channel_id):
+    channel = _state(data)['channels'].get(channel_id)
+    if not channel or channel['profile_binding'] != _binding(data['profiles'].get(channel['profile_id'], {})):
+        raise ManagementError('binding_conflict', 'The registered role channel responsibility changed.')
+    return channel
+
+
+def snapshot(data, principal, visible):
+    state = _state(data)
+    handoffs = [h for h in state['handoffs'].values() if principal is None or principal['role'] == 'steward' or h['target_profile_id'] in visible or h['sender_profile_id'] in visible]
+    channels = [c for c in state['channels'].values() if principal is None or principal['role'] == 'steward' or c['profile_id'] in visible]
+    return {'enabled': False, 'real_group_acceptance': 'unverified', 'channels': channels, 'handoffs': handoffs}
+
+
+def authorize_accept(manager, identity, delegation_id, project_id, profile_id, message, issue, data):
+    handoff = _state(data)['handoffs'].get(delegation_id)
+    principal = manager._principal(identity, data)
+    if identity.source != 'native-collaboration-ingress' or not principal or not handoff or handoff['target_profile_id'] != principal['id'] or profile_id != principal['id'] or project_id != principal['project_id'] or handoff['acceptance'] != 'source_received' or handoff['received_anchor'] != message or handoff['issue'] != issue:
+        raise ManagementError('forbidden', 'Delegated work requires the independent original native receiver and Owner-scoped handoff.')
+    _channel(data, handoff['target_channel_id'])
+    return {'actor': {'subject': identity.subject, 'source': identity.source, 'profile_id': principal['id']},
+        'owner_origin': handoff['owner_origin'], 'delegation_id': delegation_id,
+        'forwarding_profile_id': handoff['sender_profile_id'], 'new_owner_decision': False}
+
+
+def perform(manager, identity, action, details):
+    if not isinstance(details, dict):
+        raise ManagementError('invalid_change', 'A bounded role operation is required.')
+    with manager._lock:
+        version, data = manager._load()
+        principal = manager._principal(identity, data)
+        state = _state(data)
+        if action == 'register_channels':
+            if principal is not None or set(details) != {'channels'} or not isinstance(details['channels'], list):
+                raise ManagementError('forbidden', 'Only the Owner registers existing verified role/group namespaces.')
+            for supplied in details['channels']:
+                allowed = {'id', 'profile_id', 'group_kind', 'project_id', 'app_id', 'recipient_open_id', 'recipient_tenant_key', 'transport_tenant_key', 'chat_id', 'owner_open_id', 'owner_tenant_key', 'repository', 'verification_ref', 'bot_sources'}
+                if not isinstance(supplied, dict) or set(supplied) != allowed or any(not isinstance(v, str) or not v for k, v in supplied.items() if k not in {'project_id', 'bot_sources'}):
+                    raise ManagementError('invalid_change', 'Role channels require exact registered scalar identities and source observations.')
+                profile = data['profiles'].get(supplied['profile_id'])
+                if not profile or supplied['group_kind'] not in {'entry', 'project'} or supplied['group_kind'] == 'entry' and (profile['role'] != 'steward' or supplied['project_id'] is not None) or supplied['group_kind'] == 'project' and supplied['project_id'] not in data['projects']:
+                    raise ManagementError('invalid_change', 'The channel does not match an existing role and project group.')
+                if profile['role'] in {'project_lead', 'subproject_lead'}:
+                    group_project = data['profiles'][profile['parent_profile_id']]['project_id'] if profile['role'] == 'subproject_lead' else profile['project_id']
+                    if supplied['group_kind'] != 'project' or supplied['project_id'] != group_project:
+                        raise ManagementError('forbidden', 'Project roles stay in their own project group.')
+                if not isinstance(supplied['bot_sources'], list) or any(not isinstance(b, dict) or set(b) != {'profile_id', 'open_id', 'tenant_key', 'native_ids'} or b['profile_id'] not in data['profiles'] or not isinstance(b['native_ids'], list) or not b['native_ids'] or any(not isinstance(i, str) or not i for i in b['native_ids']) for b in supplied['bot_sources']):
+                    raise ManagementError('invalid_change', 'Bot source mappings require registered identities in the receiving app namespace.')
+                _public_text(json.dumps(supplied), manager._sensitive_values())
+                state['channels'][supplied['id']] = {**supplied, 'profile_binding': _binding(profile)}
+            result = {'status': 'registered', 'enabled': False}
+        elif action == 'project_goal':
+            if principal is not None or set(details) != {'sender_profile_id', 'target_profile_id', 'source_anchor', 'issue_url'}:
+                raise ManagementError('forbidden', 'A new project goal requires the verified Owner.')
+            sender = data['profiles'].get(details['sender_profile_id'], {})
+            target = data['profiles'].get(details['target_profile_id'], {})
+            if sender.get('role') != 'steward' or target.get('role') != 'project_lead':
+                raise ManagementError('forbidden', 'A project goal explicitly names its steward and registered project lead.')
+            message = details['source_anchor']
+            required = _message_anchor(message)
+            entry = [c for c in state['channels'].values() if c['profile_id'] == sender['id'] and c['group_kind'] == 'entry' and all(c.get(k) == message.get(k) for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')) and c['owner_open_id'] == message['sender_open_id'] and c['owner_tenant_key'] == message['tenant_key']]
+            targets = [c for c in state['channels'].values() if c['profile_id'] == target['id'] and c['group_kind'] == 'project']
+            if len(entry) != 1 or len(targets) != 1:
+                raise ManagementError('binding_conflict', 'The source entry and destination role channel must be unique.')
+            receiving = _channel(data, targets[0]['id'])
+            senders = [c for c in state['channels'].values() if c['profile_id'] == sender['id'] and c['chat_id'] == receiving['chat_id'] and c['group_kind'] == 'project']
+            if len(senders) != 1 or not details['issue_url'].startswith('https://github.com/' + receiving['repository'] + '/issues/'):
+                raise ManagementError('binding_conflict', 'The steward must be registered in the destination group and Issue repository.')
+            sending = _channel(data, senders[0]['id'])
+            mentions = [b for b in sending['bot_sources'] if b['profile_id'] == target['id']]
+            if len(mentions) != 1:
+                raise ManagementError('binding_conflict', 'A real target mention needs the target bot identity in the sending app namespace.')
+            key = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
+            existing = state['handoffs'].get(key)
+            if existing:
+                if existing['target_profile_id'] != target['id'] or existing['issue']['url'] != details['issue_url']:
+                    raise ManagementError('binding_conflict', 'This original Owner message already has a different project goal.')
+                return {**existing, 'duplicate': True}
+            if manager.delivery_source is None:
+                raise ManagementError('unavailable', 'A trusted Issue source is required.')
+            issue = manager.delivery_source.read_issue(details['issue_url'])
+            if not isinstance(issue, dict) or issue.get('url') != details['issue_url'] or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
+                raise ManagementError('invalid_change', 'The original Issue scope could not be verified.')
+            _public_text(issue['title'] + '\n' + issue['body'], manager._sensitive_values())
+            origin = {'subject': identity.subject, 'source': identity.source, 'source_anchor': dict(message)}
+            text = '项目工作交接：' + issue['title'] + '\nIssue：' + issue['url'] + '\n受理版本：' + issue['updated_at'] + '\n原本人目标：' + issue['body']
+            chunks = [text[n:n + 1400] for n in range(0, len(text), 1400)]
+            segments = [{'number': n + 1, 'uuid': str(uuid.uuid4()), 'status': 'pending', 'text': '[hermes-role-work ' + key + ' ' + str(n + 1) + '/' + str(len(chunks)) + ']\n' + chunk, 'attempts': []} for n, chunk in enumerate(chunks)]
+            result = {'id': key, 'sender_profile_id': sender['id'], 'target_profile_id': target['id'], 'kind': 'work',
+                'source_anchor': dict(message), 'owner_origin': origin, 'issue': issue, 'sender_channel_id': sending['id'],
+                'target_channel_id': receiving['id'], 'segments': segments, 'delivery': 'pending', 'acceptance': 'awaiting_receiver',
+                'received_parts': {}, 'task_request_id': None, 'created_at': _now(), 'whole_project_complete': False}
+            state['handoffs'][key] = result
+        elif action in {'claim_delivery', 'record_delivery'}:
+            allowed = {'handoff_id'} if action == 'claim_delivery' else {'handoff_id', 'uuid', 'receipt'}
+            if set(details) != allowed:
+                raise ManagementError('invalid_change', 'Only original handoff delivery fields are accepted.')
+            handoff = state['handoffs'].get(details['handoff_id'])
+            if not handoff or principal is not None and principal['id'] != handoff['sender_profile_id']:
+                raise ManagementError('forbidden', 'Only the assigned sending role can deliver its handoff.')
+            sending = _channel(data, handoff['sender_channel_id'])
+            target = _channel(data, handoff['target_channel_id'])
+            if action == 'claim_delivery':
+                segment = next((s for s in handoff['segments'] if s['status'] != 'delivered'), None)
+                if segment is None or segment['status'] != 'pending':
+                    return None
+                segment['status'] = 'sending'
+                segment['attempts'].append({'status': 'sending', 'claimed_at': _now()})
+                manager._inflight.add(segment['uuid'])
+                mentions = [b for b in sending['bot_sources'] if b['profile_id'] == handoff['target_profile_id']]
+                result = {**segment, 'path': 'create', 'chat_id': target['chat_id'], 'mention_open_id': mentions[0]['open_id'], 'sender_binding': sending}
+            else:
+                segment = next((s for s in handoff['segments'] if s['uuid'] == details['uuid']), None)
+                receipt = details['receipt']
+                if not segment or segment['status'] != 'sending' or not isinstance(receipt, dict) or receipt.get('status') not in {'delivered', 'failed', 'unknown'}:
+                    raise ManagementError('binding_conflict', 'There is no original in-flight role delivery.')
+                receipt = {k: receipt.get(k) for k in ('status', 'message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id', 'code')}
+                if receipt['status'] == 'delivered' and (not isinstance(receipt['message_id'], str) or not receipt['message_id'] or receipt['chat_id'] != target['chat_id']):
+                    receipt['status'] = 'unknown'
+                segment['status'] = receipt['status']
+                segment['attempts'][-1].update(receipt)
+                manager._inflight.discard(segment['uuid'])
+                result = handoff
+            statuses = [s['status'] for s in handoff['segments']]
+            handoff['delivery'] = next((s for s in ('unknown', 'sending', 'failed', 'pending') if s in statuses), 'delivered')
+        elif action == 'ingest':
+            if identity.source != 'native-collaboration-ingress' or principal is None or set(details) != {'channel_id', 'source_anchor', 'text'}:
+                raise ManagementError('forbidden', 'Independent reception requires the separate native ingress credential.')
+            receiving = _channel(data, details['channel_id'])
+            message = details['source_anchor']
+            _message_anchor(message)
+            marker = re.match(r'^\[hermes-role-work ([a-f0-9]{64}) (\d+)/(\d+)\]\n', details['text'])
+            if not marker:
+                raise ManagementError('invalid_change', 'Only an explicit original work marker may create delegated work.')
+            handoff = state['handoffs'].get(marker.group(1))
+            if not handoff or principal['id'] != receiving['profile_id'] or receiving['id'] != handoff['target_channel_id'] or principal['id'] != handoff['target_profile_id']:
+                raise ManagementError('forbidden', 'The native receiver is outside this handoff responsibility.')
+            if any(receiving.get(k) != message.get(k) for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')):
+                raise ManagementError('binding_conflict', 'The original receiver namespace does not match the registered destination.')
+            senders = [b for b in receiving['bot_sources'] if b['profile_id'] == handoff['sender_profile_id'] and b['open_id'] == message['sender_open_id'] and b['tenant_key'] == message['tenant_key']]
+            number = int(marker.group(2))
+            if len(senders) != 1 or int(marker.group(3)) != len(handoff['segments']) or not 1 <= number <= len(handoff['segments']) or handoff['segments'][number - 1]['text'] != details['text']:
+                raise ManagementError('binding_conflict', 'The source bot or full original handoff content could not be matched.')
+            if handoff['acceptance'] == 'accepted':
+                return {**handoff, 'duplicate': True}
+            handoff['received_parts'][str(number)] = dict(message)
+            result = handoff
+            if len(handoff['received_parts']) == len(handoff['segments']):
+                handoff['received_anchor'] = handoff['received_parts']['1']
+                handoff['acceptance'] = 'source_received'
+                with manager._db:
+                    manager._save(version, data)
+                if principal['capability'] == 'development':
+                    task = manager.accept_request(identity, principal['project_id'], principal['id'], handoff['received_anchor'], handoff['issue'], delegation_id=handoff['id'])['request']
+                else:
+                    task = None
+                version, data = manager._load()
+                handoff = _state(data)['handoffs'][handoff['id']]
+                handoff.update(acceptance='accepted', accepted_at=_now(), task_request_id=task['id'] if task else None)
+                result = handoff
+        else:
+            raise ManagementError('unsupported', 'This role operation is not supported.')
+        with manager._db:
+            manager._save(version, data)
+        return result

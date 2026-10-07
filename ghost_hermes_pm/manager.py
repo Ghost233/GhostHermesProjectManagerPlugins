@@ -158,6 +158,11 @@ class Manager:
                         if segment['attempts']:
                             segment['attempts'][-1]['status'] = 'unknown'
             record['delivery'] = _delivery_status(record)
+        for handoff in data.get('collaboration', {}).get('handoffs', {}).values():
+            for segment in handoff['segments']:
+                if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                    segment['status'] = 'unknown'
+                    segment['attempts'][-1]['status'] = 'unknown'
         from .queue import refresh
         refresh(data)
         return version, data
@@ -204,9 +209,11 @@ class Manager:
                     'service_id': self.codex_adapter.connection['service_id'], 'generation': self.codex_adapter.generation,
                     'thread_id': None, 'url': None, 'answerable': False, 'resolution': r['state'],
                     'availability': 'original_client_required'} for r in self.codex_adapter.server_requests(None)]
+            from .collaboration import snapshot as collaboration_snapshot
+            role_snapshot = collaboration_snapshot(data, principal, visible_ids)
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
-                    'original_interface_requests': original_interface_requests,
+                    'original_interface_requests': original_interface_requests, 'collaboration': role_snapshot,
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
@@ -214,12 +221,16 @@ class Manager:
                     'execution': 'available' if any(r.get('execution_capability', {}).get('enabled') and self.codex_adapter and r['execution_capability'].get('connection', {}).get('generation') == self.codex_adapter.generation and not self.codex_adapter._closed for r in requests) else 'not_enabled',
                     'needs_human': ['Capabilities require current service, permission and channel evidence.']}
 
-    def accept_request(self, identity, project_id, profile_id, message, issue):
+    def accept_request(self, identity, project_id, profile_id, message, issue, *, delegation_id=None):
         """Accept an Issue snapshot from a trusted message entry; never start Codex."""
         with self._lock, self._db:
             self._db.execute('BEGIN IMMEDIATE')
             version, data = self._load()
-            if self._principal(identity, data) is not None:
+            actor_provenance = None
+            if delegation_id is not None:
+                from .collaboration import authorize_accept
+                actor_provenance = authorize_accept(self, identity, delegation_id, project_id, profile_id, message, issue, data)
+            elif self._principal(identity, data) is not None:
                 raise ManagementError('forbidden', 'New work requires the verified owner.')
             profile = data['profiles'].get(profile_id)
             if project_id not in data['projects'] or not profile or profile['project_id'] != project_id or profile['capability'] != 'development':
@@ -242,6 +253,8 @@ class Manager:
                       'acceptance': 'accepted', 'accepted_at': datetime.now(timezone.utc).isoformat(),
                       'execution': 'waiting', 'unexecuted_reason': 'Codex execution is not enabled.',
                       'delivery': 'pending', 'messages': [], 'outbox': []}
+            if actor_provenance is not None:
+                record['actor_provenance'] = actor_provenance
             data['requests'][key] = record
             from .queue import enroll
             enroll(data, record, data['projects'][project_id]['repo'])
@@ -256,6 +269,10 @@ class Manager:
         if principal and principal['role'] != 'steward' and record['profile_id'] not in self._visible_profile_ids(principal, data):
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
+
+    def collaborate(self, identity, action, details):
+        from .collaboration import perform
+        return perform(self, identity, action, details)
 
     def refresh_task_source(self, identity, request_id):
         from .queue import refresh_task_source
