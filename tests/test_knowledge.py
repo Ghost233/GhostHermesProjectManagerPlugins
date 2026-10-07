@@ -333,3 +333,127 @@ def test_actual_registered_bot_messages_and_builders_complete_public_query_resul
             assert query['supplement']['status'] == 'accepted'
             assert len([r for r in wire(tmp_path) if r['method'] == 'turn/steer']) == 1
             assert owner.read_snapshot()['requests'][0]['id'] == request_id
+
+
+def test_verified_owner_can_directly_mention_independent_wiki_without_development_issue(tmp_path):
+    import asyncio
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import CONFIG, Gateway, event
+    source = source_grant()
+    channel = {'id': 'wiki-direct', 'profile_id': 'wiki', 'app_id': 'cli_wiki', 'transport_tenant_key': 'tenant-transport',
+        'recipient_tenant_key': 'tenant-wiki-bot', 'recipient_open_id': 'ou_wiki_self', 'chat_id': 'oc_project',
+        'scope_ids': ['public'], 'view_subjects': [OWNER.subject], 'wiki_mention_open_id': 'ou_wiki_self'}
+    source['public_channels'] = [channel]
+    owner_binding = {**CONFIG['bindings'][0], **channel, 'project_id': None, 'owner_native_ids': ['u_owner', 'ou_owner']}
+    settings = {**CONFIG, 'bindings': [owner_binding]}
+    sent = []
+    adapter = object()
+    provider = local_provider(tmp_path)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, knowledge_providers={'local:fixture-wiki': provider}) as manager:
+        manager.apply_directory_change(OWNER, 0, {'profile': WIKI})
+        manager.register_knowledge_source(OWNER, 1, source)
+        intake = FeishuEntry(lambda: manager, OWNER.subject, settings, lambda _: None)
+        intake.attach_transport(adapter, native_transport('cli_wiki', 'ou_wiki_self', 'om_direct_', sent))
+        incoming = event('@_user_1 查询 fixture-wiki public：retry delivery', 'om_direct_question')
+        incoming.raw_message.header.app_id = 'cli_wiki'
+        incoming.raw_message.event.message.mentions[0].id.open_id = 'ou_wiki_self'
+        incoming.raw_message.event.message.mentions[0].tenant_key = 'tenant-wiki-bot'
+        incoming.source.profile = 'wiki'
+        assert asyncio.run(intake.receive(incoming, Gateway(adapter))) == {'action': 'skip'}
+        snapshot = manager.read_snapshot(OWNER)
+        assert snapshot['requests'] == []
+        assert snapshot['knowledge_queries'][0]['status'] == 'found'
+        assert snapshot['knowledge_queries'][0]['requester'] == OWNER.subject
+        assert sent[0].message_id == 'om_direct_question'
+        assert json.loads(sent[0].request_body.content)['zh_cn']['content'][0][0]['user_id'] == 'ou_owner'
+        assert not (tmp_path / 'wire.jsonl').exists()
+
+
+import pytest
+
+
+@pytest.mark.parametrize('state', ['idle', 'wrong_turn', 'stopping', 'returned', 'observe_only', 'disconnected'])
+def test_late_ended_returned_or_uncontrolled_material_never_starts_or_steers(tmp_path, state):
+    import sqlite3
+    from test_directory import make_repo
+    from test_task_execution import accepted, adapter_for
+    from test_task_control import TURN, wire
+    provider = local_provider(tmp_path)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), knowledge_providers={'local:fixture-wiki': provider}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            query_id = prepared_result(manager, client, tmp_path, request_id)
+            if state == 'idle':
+                (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': []}]}))
+            elif state == 'wrong_turn':
+                (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'active', 'activeFlags': []}, 'turns': [{'id': 'new-manual-turn', 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}))
+            elif state == 'stopping':
+                client.control_task(request_id, 'stop', 'stop-before-material', expected_turn_id=TURN)
+            elif state == 'disconnected':
+                manager.codex_adapter.close()
+            else:
+                # External persisted binding fixture represents #20's future control-return/import boundary.
+                # The behavior is exercised only via public supplement, never a private control helper.
+                with sqlite3.connect(tmp_path / 'state' / 'manager.sqlite3') as db:
+                    payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
+                    payload['requests'][request_id]['session']['control'] = state
+                    db.execute('UPDATE directory SET payload=?', (json.dumps(payload),))
+            result = client.supplement_knowledge(query_id)
+            assert result['status'] == 'materials_only'
+            methods = [r['method'] for r in wire(tmp_path)]
+            assert methods.count('turn/start') == 1
+            assert 'turn/steer' not in methods
+            assert client.read_snapshot()['knowledge_queries'][0]['materials']
+
+
+@pytest.mark.parametrize('field,value', [('app_id','cli_other'), ('transport_tenant_key','wrong-transport'),
+    ('sender_tenant_key','wrong-tenant'), ('sender_open_id','ou_unknown'), ('recipient_tenant_key','wrong-recipient-tenant')])
+def test_arbitrary_bot_reply_or_namespace_cannot_impersonate_registered_wiki(tmp_path, field, value):
+    import asyncio
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import CONFIG, Gateway
+    from test_directory import make_repo
+    from test_task_execution import accepted
+    provider = local_provider(tmp_path)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, knowledge_providers={'local:fixture-wiki': provider}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            client.register_knowledge_source(client.read_snapshot()['version'], public_grant())
+            client.query_knowledge('fixture-wiki', 'registered-query', 'retry', ['public'], request_id=request_id, channel_id='project-chat')
+            binding = public_grant()['wiki_bindings'][0]
+            altered = {**binding, field: value}
+            message = bot_message(altered, '资料查询 registered-query', 'om_unknown', 'om_ack')
+            adapter, sent = object(), []
+            settings = {**CONFIG, 'registered_bots': [{'profile_id': binding['sender_profile_id'], 'identity_ref': binding['sender_identity_ref'],
+                'app_id': binding['app_id'], 'tenant_key': binding['sender_tenant_key'], 'open_id': binding['sender_open_id'], 'native_ids': binding['sender_native_ids']}]}
+            entry = FeishuEntry(lambda: manager, OWNER.subject, settings, lambda _: None)
+            entry.attach_transport(adapter, native_transport('cli_wiki', 'ou_wiki_self', 'om_no_', sent))
+            assert asyncio.run(entry.receive(message, Gateway(adapter))) is None
+            assert sent == []
+            assert client.read_snapshot()['knowledge_queries'][0]['status'] == 'awaiting_wiki'
+
+
+def test_source_refusal_conflict_and_secret_have_real_scoped_results_without_leaking(tmp_path):
+    provider = local_provider(tmp_path)
+    class Denied:
+        def query(self, **request):
+            return {'status': 'denied', 'materials': [], 'requester': request['requester'], 'searched_scope': request['scope_ids'], 'observed_at': '2026-10-07T00:00:00Z'}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, knowledge_providers={'local:fixture-wiki': Denied()}) as manager:
+        manager.apply_directory_change(OWNER, 0, {'profile': WIKI})
+        manager.register_knowledge_source(OWNER, 1, source_grant())
+        denied = manager.query_knowledge(OWNER, 'fixture-wiki', 'denied-query', 'retry', ['public'])
+        assert denied['status'] == 'denied' and denied['searched_scope'] == ['public']
+        manager.knowledge_providers['local:fixture-wiki'] = provider
+        for document in provider.documents:
+            if document['scope_id'] == 'public': document['kind'] = 'conflict'
+        conflict = manager.query_knowledge(OWNER, 'fixture-wiki', 'conflicting', 'retry', ['public'])
+        assert conflict['materials'][0]['kind'] == 'conflict'
+        (tmp_path / 'source' / 'retry.md').write_text('Retry policy\n\nAPI_KEY=synthetic-protected-credential\n')
+        secret = manager.query_knowledge(OWNER, 'fixture-wiki', 'secret', 'retry API_KEY', ['public'])
+        assert secret['status'] == 'source_denied' and secret['materials'] == []
+        assert 'synthetic-protected-credential' not in json.dumps(manager.read_snapshot(OWNER))

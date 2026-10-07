@@ -58,7 +58,7 @@ manager = get_plugin_manager()
 manager.discover_and_load()
 info = next(p for p in manager.list_plugins() if p['name'] == 'ghost-hermes-pm')
 assert info['enabled'] and info['error'] is None, info
-assert info['tools'] == 2 and info['commands'] == 1 and info['hooks'] == 1, info
+assert info['tools'] == 3 and info['commands'] == 1 and info['hooks'] == 1, info
 assert not (state / 'manager.sock').exists(), 'Ordinary CLI discovery must not start authority.'
 assert not (state / 'manager.lock').exists(), 'Ordinary CLI discovery must not acquire the manager lease.'
 assert not (state / 'manager.sqlite3').exists(), 'Ordinary CLI discovery must not create authoritative storage.'
@@ -200,6 +200,7 @@ async def exercise_gateway_lifecycle():
     await asyncio.sleep(0)
     assert registry.get_entry('hermes_pm_snapshot', scope=str(home)) is None
     assert registry.get_entry('hermes_pm_task', scope=str(home)) is None
+    assert registry.get_entry('hermes_pm_knowledge', scope=str(home)) is None
     manager.discover_and_load(force=True)
     assert not (state / 'manager.sock').exists(), 'Rediscovery without Gateway context remains read-only.'
     restarted_gateway = GatewayFixture()

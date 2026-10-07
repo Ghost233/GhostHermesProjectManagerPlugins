@@ -383,7 +383,7 @@ def resolve_knowledge(manager, identity, query_id):
         _query_scope(manager, requester, query['source_id'], query['scope_ids'], data)
         query.update(result)
         query['result_version'] = _digest({'status': query['status'], 'materials': query['materials'], 'scopes': query['scope_ids']})
-        binding = next(b for b in source['wiki_bindings'] if b['id'] == query['received_binding_id'])
+        binding = query.get('response_binding') or next(b for b in source['wiki_bindings'] if b['id'] == query['received_binding_id'])
         _publication(query, 'result', _result_text(query), binding, query['received_query_anchor'], query['received_query_anchor']['sender_open_id'])
         manager._save(version, data)
         return query
@@ -521,3 +521,30 @@ def next_delivery_binding(manager, identity, query_id):
                     continue
                 return dict(publication['binding']) if segment['status'] == 'pending' else None
         return None
+
+
+def receive_direct_query(manager, identity, source_id, query_id, question, scope_ids, channel_id, anchor):
+    from .manager import _message_anchor
+    with manager._lock, manager._db:
+        version, data = manager._load()
+        if manager._principal(identity, data) is not None:
+            raise ManagementError('forbidden', 'Direct personal Wiki queries require the verified original human requester.')
+        source = _query_scope(manager, identity, source_id, scope_ids, data)
+        channel = _channel(source, channel_id, identity.subject, scope_ids)
+        _message_anchor(anchor)
+        _public_text(question, manager._sensitive_values())
+        if channel['profile_id'] != source['wiki_profile_id'] or any(anchor.get(k) != channel[k] for k in NAMESPACE):
+            raise ManagementError('forbidden', 'The direct query does not identify this independent Wiki and approved public group.')
+        existing = data['knowledge_queries'].get(query_id)
+        if existing:
+            if any(existing.get(k) != v for k, v in {'source_id': source_id, 'requester': identity.subject, 'question': question, 'scope_ids': scope_ids, 'source_anchor': anchor}.items()):
+                raise ManagementError('binding_conflict', 'The original query message already identifies another source request.')
+            return existing
+        query = {'id': query_id, 'source_id': source_id, 'question': question, 'scope_ids': list(scope_ids),
+            'requester': identity.subject, 'request_id': None, 'channel_id': channel_id, 'auto_supplement': False,
+            'source_revision': source['revision'], 'status': 'awaiting_wiki', 'created_at': _now(), 'materials': [],
+            'outbox': [], 'source_anchor': dict(anchor), 'received_query_anchor': dict(anchor),
+            'response_binding': {k: channel[k] for k in NAMESPACE}, 'direct_query': True}
+        data['knowledge_queries'][query_id] = query
+        manager._save(version, data)
+        return query

@@ -291,6 +291,21 @@
               ' · 受理：' + f.acceptance + ' · 通知：' + f.notification.status,
               h('div', null, f.reason));
           }))),
+        h('section', null, h('h2', null, '资料来源与查询'),
+          h('p', null, '按实际提问者和明确分享范围查询，原资料库只读。资料不变成新授权；迟到结果只展示材料。'),
+          h('ul', null, (snapshot.knowledge_sources || []).map(function (source) {
+            return h('li', { key: source.id }, source.name + ' · ' + source.id + ' · Wiki：' + source.wiki_profile_id,
+              h('details', null, h('summary', null, '查询主体与公开范围'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(source, null, 2))));
+          })),
+          h('ul', null, (snapshot.knowledge_queries || []).map(function (query) {
+            return h('li', { key: query.id, style: { marginBottom: '14px' } }, query.id + ' · ' + query.source_id + ' · ' + query.status,
+              h('div', null, '实际提问者：' + query.requester + ' · 范围：' + query.scope_ids.join(', ') + ' · 原任务：' + (query.request_id || '独立查询')),
+              h('div', null, '结果关联：' + (query.result_anchor ? query.result_anchor.chat_id + ' / ' + query.result_anchor.message_id : '待核对')),
+              h('ul', null, (query.materials || []).map(function (material) { return h('li', { key: material.id }, '[' + material.kind + '] ' + material.text,
+                h('div', null, material.locator + ' · ' + material.version + ' · ' + material.updated_at)); })),
+              query.supplement && h('div', null, '原会话事实补充：' + query.supplement.status + ' · ' + (query.supplement.reason || '执行结果仍需核对')),
+              h('details', null, h('summary', null, '公开查询与逐段凭据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(query.outbox || [], null, 2))));
+          }))),
         h('h2', null, '登记或修正'),
         h('p', null, '这里只保存非敏感引用；不创建原生 Profile、机器人、仓库或 worktree。项目身份不能改绑到新项目。'),
         h('form', { onSubmit: preview },

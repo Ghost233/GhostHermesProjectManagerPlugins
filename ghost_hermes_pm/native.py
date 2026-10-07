@@ -106,7 +106,7 @@ def register_native(ctx):
                         tasks = manager.read_snapshot(identity)['requests']
                         for record in tasks:
                             session = record.get('session')
-                            if session and session.get('thread_id') and session['generation'] == codex_adapter.generation and not record.get('repository_released'):
+                            if codex_adapter is not None and session and session.get('thread_id') and session['generation'] == codex_adapter.generation and not record.get('repository_released'):
                                 def observe_if_active(request_id=record['id']):
                                     with intake.lifecycle_lock:
                                         intake.require_active(generation)

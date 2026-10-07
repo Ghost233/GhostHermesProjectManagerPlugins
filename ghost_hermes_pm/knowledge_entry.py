@@ -42,9 +42,13 @@ def prepare_knowledge_message(entry, event, adapter):
     try:
         source, raw = event.source, event.raw_message
         sender, message, header = raw.event.sender, raw.event.message, raw.header
-        if getattr(source.platform, 'value', source.platform) not in {'feishu', OWNED_PLATFORM} or header.event_type != 'im.message.receive_v1' or message.chat_type != 'group' or source.is_bot is not True or sender.sender_type not in {'bot', 'app'}:
+        if getattr(source.platform, 'value', source.platform) not in {'feishu', OWNED_PLATFORM} or header.event_type != 'im.message.receive_v1' or message.chat_type != 'group' :
             return None
         ids = sender.sender_id
+        if source.is_bot is False and sender.sender_type == 'user':
+            return _prepare_owner_query(entry, event, adapter)
+        if source.is_bot is not True or sender.sender_type not in {'bot', 'app'}:
+            return None
         if source.user_id != (getattr(ids, 'user_id', None) or ids.open_id) or source.chat_id != message.chat_id or event.message_id != message.message_id or source.message_id != message.message_id:
             return None
         text, ats = _content(message)
@@ -100,11 +104,16 @@ async def process_knowledge_message(entry, prepared, generation):
     entry.require_active(generation)
     async with entry.lock:
         manager = entry.manager()
-        if prepared.knowledge_kind == 'query':
+        if prepared.knowledge_kind in {'query', 'direct'}:
             snapshot = manager.read_snapshot(VerifiedIdentity(entry.owner, 'trusted-knowledge-source'))
             receiver = next(p for p in snapshot['profiles'] if p['id'] == prepared.binding['profile_id'])
             wiki = VerifiedIdentity(receiver['identity_ref'], 'verified-wiki-inbox')
-            manager.receive_wiki_query(wiki, prepared.query_id, prepared.knowledge_binding_id, prepared.envelope)
+            if prepared.knowledge_kind == 'direct':
+                parsed = re.fullmatch(r'查询\s+([A-Za-z0-9_.:-]+)\s+([A-Za-z0-9_,.-]+)[：:]\s*(.+)', prepared.command, re.DOTALL)
+                manager.receive_direct_knowledge_query(prepared.sender_identity, parsed.group(1), prepared.query_id,
+                    parsed.group(3), parsed.group(2).split(','), prepared.knowledge_binding_id, prepared.envelope)
+            else:
+                manager.receive_wiki_query(wiki, prepared.query_id, prepared.knowledge_binding_id, prepared.envelope)
             def read_if_active():
                 with entry.lifecycle_lock:
                     entry.require_active(generation)
@@ -150,3 +159,40 @@ async def deliver_knowledge(entry, identity, query_id, transport, generation=Non
         entry.manager().record_knowledge_delivery(identity, query_id, segment['uuid'], receipt)
         if receipt.get('status') != 'delivered':
             return
+
+
+def _prepare_owner_query(entry, event, adapter):
+    from .knowledge import _digest
+    source, raw = event.source, event.raw_message
+    sender, message, header = raw.event.sender, raw.event.message, raw.header
+    ids = sender.sender_id
+    if source.user_id != (getattr(ids, 'user_id', None) or ids.open_id) or source.chat_id != message.chat_id or event.message_id != message.message_id or source.message_id != message.message_id:
+        return None
+    owners = [b for b in entry.settings.get('bindings', []) if b.get('app_id') == header.app_id and b.get('transport_tenant_key') == header.tenant_key
+        and b.get('sender_tenant_key') == sender.tenant_key and b.get('owner_open_id') == ids.open_id and b.get('chat_id') == message.chat_id
+        and b.get('verification_ref') and (b.get('owner_native_ids') is None or source.user_id in b['owner_native_ids'])]
+    if len(owners) != 1:
+        return None
+    owner = owners[0]
+    text, ats = _content(message)
+    mentions = [m for m in (message.mentions or []) if m.id.open_id == owner['recipient_open_id'] and m.tenant_key == owner['recipient_tenant_key']
+        and m.mentioned_type == 'bot' and (m.key in text or m.id.open_id in ats)]
+    if len(mentions) != 1:
+        return None
+    text = text.replace(mentions[0].key, '').strip()
+    parsed = re.fullmatch(r'查询\s+([A-Za-z0-9_.:-]+)\s+([A-Za-z0-9_,.-]+)[：:]\s*(.+)', text, re.DOTALL)
+    if not parsed:
+        return None
+    snapshot = entry.manager().read_snapshot(VerifiedIdentity(entry.owner, 'trusted-source-policy'))
+    grant = next((s for s in snapshot['knowledge_sources'] if s['id'] == parsed.group(1)), None)
+    channel = next((c for c in grant['public_channels'] if c['profile_id'] == grant['wiki_profile_id'] and all(c[k] == owner[k] for k in NAMESPACE)), None) if grant else None
+    if not channel:
+        return None
+    envelope = {k: owner[k] for k in NAMESPACE} | {'tenant_key': sender.tenant_key, 'sender_open_id': ids.open_id,
+        'message_id': message.message_id, 'parent_id': getattr(message, 'parent_id', None), 'root_id': getattr(message, 'root_id', None),
+        'thread_id': getattr(message, 'thread_id', None)}
+    transport = next((t for a, t in entry.transports if a is adapter), None)
+    if transport is None:
+        return None
+    return PreparedKnowledgeMessage(event, adapter, transport, owner, envelope, text, None, 'direct',
+        _digest(envelope), channel['id'], VerifiedIdentity(entry.owner, 'verified-original-human-wiki-query'))

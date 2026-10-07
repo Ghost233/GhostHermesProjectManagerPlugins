@@ -362,6 +362,10 @@ class Manager:
         from .knowledge import next_delivery_binding
         return next_delivery_binding(self, identity, query_id)
 
+    def receive_direct_knowledge_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor):
+        from .knowledge import receive_direct_query
+        return receive_direct_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor)
+
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',
                    'association_unverified': 'Input could not be associated; quote the confirmed task start message.',
