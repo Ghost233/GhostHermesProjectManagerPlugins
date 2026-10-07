@@ -141,7 +141,8 @@ class OwnedFeishuAdapter(FeishuAdapter):
                 if not any(p['id'] == matching[0]['profile_id'] and p['identity_ref'] == matching[0]['identity_ref'] for p in scope['profiles']):
                     return 'owned_bot_scope_rejected'
                 project_ids = {p['id'] for p in scope['projects']}
-                if not any(b['chat_id'] == message.chat_id and b['project_id'] in project_ids for b in self.bindings):
+                knowledge_allowed = manager.knowledge_bot_allowed(matching[0], self._app_id, message.chat_id, sender.tenant_key, ids.open_id, native_ids)
+                if not knowledge_allowed and not any(b['chat_id'] == message.chat_id and b['project_id'] in project_ids for b in self.bindings):
                     return 'owned_bot_scope_rejected'
             except ManagementError:
                 return 'owned_bot_scope_rejected'

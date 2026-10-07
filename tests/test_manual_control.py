@@ -396,3 +396,36 @@ async def test_group_dashboard_show_same_owner_grant_and_non_interrupting_return
             assert len(feedback) == 2 and all(s['reply_to'] == task['task_start_anchor']['message_id'] and s['mention_open_id'] == 'ou_owner' for s in feedback)
     methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
     assert methods.count('turn/steer') == 1 and 'turn/interrupt' not in methods
+
+
+@pytest.mark.parametrize('authorization', ['active', 'returned', 'new_grant_after_query'])
+def test_scoped_wiki_facts_use_original_manual_executor_and_cannot_cross_grant_epoch(tmp_path, authorization):
+    from test_knowledge import local_provider, WIKI, prepared_result
+    repo = make_repo(tmp_path / 'repo')
+    peer = tmp_path / 'original'
+    original_state(peer, repo)
+    read, control = adapters(peer)
+    provider = local_provider(tmp_path)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control},
+                 knowledge_providers={'local:fixture-wiki': provider}) as manager:
+        request_id, observed = setup(manager, repo)
+        manager.take_over_session(OWNER, request_id, observed['id'], 'grant-current-work', ORIGINAL_TURN)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'manual-owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'manual-owner')
+            query_id = prepared_result(manager, client, tmp_path, request_id, auto=False)
+            if authorization != 'active': client.return_session_control(request_id, 'grant-current-work')
+            if authorization == 'new_grant_after_query': client.take_over_session(request_id, observed['id'], 'new-explicit-grant', ORIGINAL_TURN)
+            result = client.supplement_knowledge(query_id)
+            assert result['status'] == ('accepted' if authorization == 'active' else 'materials_only')
+            snapshot = client.read_snapshot()
+            assert snapshot['knowledge_queries'][0]['requester'] == OWNER.subject
+            assert snapshot['knowledge_queries'][0]['scope_ids'] == ['public']
+            assert snapshot['knowledge_queries'][0]['materials']
+    steering = [json.loads(line) for line in (peer / 'original-wire.jsonl').read_text().splitlines() if json.loads(line).get('method') == 'turn/steer']
+    assert len(steering) == (1 if authorization == 'active' else 0)
+    if steering:
+        assert steering[0]['params']['threadId'] == ORIGINAL_THREAD and steering[0]['params']['expectedTurnId'] == ORIGINAL_TURN
+        assert 'untrusted source data' in steering[0]['params']['input'][0]['text']
+    assert not (tmp_path / 'wire.jsonl').exists(), 'Wiki facts must not connect or control the independent owned executor.'
