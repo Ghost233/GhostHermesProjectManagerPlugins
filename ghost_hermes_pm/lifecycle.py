@@ -141,9 +141,10 @@ def _check(manager, identity, operation, handled):
                     except (ManagementError, OSError, TimeoutError):
                         operation['entry_requests'][key] = {'status': 'outcome_unknown'}
                     _save(manager, operation)
-                fact = manager.lifecycle_host.inspect(profile, component, state, operation['id'])
+                component_state = 'stopped' if component == 'manual_execution' else state
+                fact = manager.lifecycle_host.inspect(profile, component, component_state, operation['id'])
                 expected = {'profile_id': profile_id, 'native_profile': profile['native_profile'], 'project_id': profile['project_id'],
-                            'component': component, 'operation_id': operation['id'], 'scope': 'profile', 'state': state, 'status': 'verified'}
+                            'component': component, 'operation_id': operation['id'], 'scope': 'profile', 'state': component_state, 'status': 'verified'}
                 if not isinstance(fact, dict) or any(fact.get(k) != v for k, v in expected.items()) or not fact.get('evidence') or component == 'manual_execution' and fact.get('execution_coverage') != 'complete':
                     raise ManagementError('capability_unverified', 'Current Profile component scope or termination evidence is incomplete.')
                 at = datetime.fromisoformat(fact['verified_at'])
@@ -155,7 +156,7 @@ def _check(manager, identity, operation, handled):
                 checks[key] = {'status': 'blocked', 'reason': str(exc)}
     flat = [item for v in checks.values() for item in (v if isinstance(v, list) else [v])]
     complete = not needs and all(c['status'] == 'verified' for c in flat)
-    operation.update(checks=checks, status='completed' if complete else 'processing', verified_at=_now(), needs_human=needs)
+    operation.update(checks=checks, status='completed' if complete else 'blocked' if manager.lifecycle_host is None else 'processing', verified_at=_now(), needs_human=needs)
     if not complete:
         operation['needs_human'] += [key + ': ' + str(v.get('reason', 'Verification pending.')) for key, v in checks.items() if isinstance(v, dict) and v['status'] != 'verified']
     version, data = manager._load()

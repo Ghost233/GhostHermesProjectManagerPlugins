@@ -863,6 +863,11 @@ class Manager:
                 value.setdefault('parent_profile_id', None)
                 value.setdefault('connection_refs', {})
                 existing = data['profiles'].get(value['id'])
+                parent_id = value.get('parent_profile_id')
+                if parent_id and (existing is None or existing.get('parent_profile_id') != parent_id):
+                    from .lifecycle import require_active
+                    parent = data['profiles'][parent_id]
+                    require_active(data, parent_id, parent['project_id'])
                 if existing and existing['project_id'] != value['project_id']:
                     raise ManagementError('binding_conflict', 'Profile has a long-term project binding; create a new Profile.')
                 value.update(lifecycle='configuring', can_execute=False,
