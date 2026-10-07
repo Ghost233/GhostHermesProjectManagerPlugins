@@ -50,12 +50,12 @@ def test_active_projects_are_summarized_every_fifteen_minutes_even_without_progr
             clock.advance(899)
             assert client.run_notifications()['notifications'] == []
             clock.advance(1)
-            first = client.run_notifications()['notifications']
+            first = [e for e in client.run_notifications()['notifications'] if e['kind'] == 'summary']
             assert len(first) == 1 and first[0]['kind'] == 'summary'
             assert first[0]['project_id'] == 'mono' and first[0]['request_ids'] == [task_id]
             assert all(label in first[0]['text'] for label in ('状态', '进展', '阻塞', '待处理', '下一步', '无新进展'))
             clock.advance(900)
-            assert len(client.run_notifications()['notifications']) == 2
+            assert len([e for e in client.run_notifications()['notifications'] if e['kind'] == 'summary']) == 2
             assert client.read_snapshot()['notifications']['events'][-1]['kind'] == 'summary'
 
 
@@ -125,3 +125,90 @@ def test_real_lark_entry_builder_mentions_only_urgent_owner_and_keeps_actual_loc
         assert all(item['tag'] != 'at' for item in second)
         event = manager.read_snapshot(OWNER)['notifications']['events'][-1]
         assert event['delivery'] == 'delivered' and event['segments'][0]['attempts'][-1]['message_id'] == 'om_entry_summary'
+
+
+def test_stall_threshold_checks_original_service_again_and_never_interrupts_or_starts_new_execution(tmp_path):
+    import json
+    from test_task_control import TURN, wire
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        clock.advance(899)
+        assert not any(e['kind'] == 'suspected_stall' for e in manager.run_notifications(OWNER)['notifications'])
+        reads_before = len([r for r in wire(tmp_path) if r['method'] == 'thread/read'])
+        clock.advance(1)
+        events = manager.run_notifications(OWNER)['notifications']
+        assert len([r for r in wire(tmp_path) if r['method'] == 'thread/read']) > reads_before
+        stalls = [e for e in events if e['kind'] == 'suspected_stall']
+        assert len(stalls) == 1 and '核查' in stalls[0]['text'] and stalls[0]['mention_owner'] is False
+        clock.advance(900)
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'suspected_stall']) == 1
+        assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+        assert not any(r['method'] == 'turn/interrupt' for r in wire(tmp_path))
+        (tmp_path / 'observed.json').write_text(json.dumps({'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': [{'id': 'fresh', 'type': 'agentMessage', 'text': 'new verified progress'}]}]}))
+        manager.run_notifications(OWNER)
+        clock.advance(899)
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'suspected_stall']) == 1
+
+
+def test_waits_explained_long_commands_and_unverified_history_do_not_raise_stall(tmp_path):
+    import json
+    from test_task_control import TURN
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        for observation in [
+            {'status': {'type': 'active', 'activeFlags': ['waitingOnApproval']}},
+            {'status': {'type': 'active', 'activeFlags': ['waitingOnUserInput']}},
+            {'status': {'type': 'active', 'activeFlags': []}, 'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'long', 'command': 'python -m pytest', 'cwd': str(tmp_path / 'repo'), 'status': 'inProgress'}]}]},
+            {'status': {'type': 'active', 'activeFlags': []}, 'turns': []},
+        ]:
+            (tmp_path / 'observed.json').write_text(json.dumps(observation))
+            clock.advance(901)
+            assert not any(e['kind'] == 'suspected_stall' for e in manager.run_notifications(OWNER)['notifications'])
+
+
+def test_continuous_original_channel_loss_warns_once_after_two_minutes_and_once_on_recovery(tmp_path):
+    import json
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        (tmp_path / 'behavior.json').write_text(json.dumps({'rpc_error': 'thread/read'}))
+        manager.run_notifications(OWNER)
+        clock.advance(119)
+        assert not any(e['kind'] == 'channel_lost' for e in manager.run_notifications(OWNER)['notifications'])
+        clock.advance(1)
+        lost = manager.run_notifications(OWNER)['notifications']
+        assert len([e for e in lost if e['kind'] == 'channel_lost']) == 1
+        clock.advance(500)
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'channel_lost']) == 1
+        task = manager.read_snapshot(OWNER)['requests'][0]
+        assert task['execution'] == 'unverified' and task['last_confirmed_execution'] == 'running'
+        assert task['repository_released'] is False and task['task_delivery'] == 'unmet'
+        (tmp_path / 'behavior.json').write_text('{}')
+        restored = manager.run_notifications(OWNER)['notifications']
+        assert len([e for e in restored if e['kind'] == 'channel_recovered']) == 1
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'channel_recovered']) == 1
+        assert manager.read_snapshot(OWNER)['notifications']['health']['sources'][task_id]['status'] == 'verified'
+
+
+def test_active_background_and_unknown_process_coverage_explain_or_block_stall_judgment(tmp_path):
+    import json
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        manager.run_notifications(OWNER)
+        (tmp_path / 'background.json').write_text(json.dumps({'': {'data': [{'itemId': 'bg', 'processId': 'registered-background', 'command': 'python -m pytest'}], 'nextCursor': None}}))
+        clock.advance(900)
+        assert not any(e['kind'] == 'suspected_stall' for e in manager.run_notifications(OWNER)['notifications'])

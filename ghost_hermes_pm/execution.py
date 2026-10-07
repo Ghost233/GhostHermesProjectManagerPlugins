@@ -209,10 +209,17 @@ def refresh_task(manager, identity, request_id):
                                      'output_digest': hashlib.sha256((item.get('aggregatedOutput') or '').encode()).hexdigest(),
                                      'source': 'codex_command_execution', 'service_id': session['service_id'],
                                      'generation': session['generation'], 'observed_at': record['last_execution_verified_at']})
+                from .notifications import observe
+                observe(manager, record, thread, turn, items, events)
                 record['command_evidence'] = commands
                 record.setdefault('test_evidence', [])
             except ManagementError as exc:
+                if record['execution'] != 'unverified':
+                    record['last_confirmed_execution'] = record['execution']
                 record.update(execution='unverified', unexecuted_reason=str(exc))
+        if record['execution'] == 'unverified':
+            from .notifications import observe
+            observe(manager, record)
         with manager._db:
             manager._save(version, data)
         report_state = (record['execution'], record.get('turn_status'))

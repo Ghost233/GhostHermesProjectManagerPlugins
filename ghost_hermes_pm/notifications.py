@@ -11,6 +11,7 @@ def state(data):
         'supervision': 'unverified', 'delivery': 'unverified', 'last_checked_at': None}})
     for key in ('human_requests', 'anchors'):
         saved.setdefault(key, {})
+    saved['health'].setdefault('sources', {})
     return saved
 
 
@@ -43,7 +44,53 @@ def emit(saved, kind, project_id, tasks, text, now, *, human_request_id=None, me
     return saved['events'].setdefault(key, event)
 
 
+def observe(manager, task, thread=None, turn=None, items=(), events=()):
+    verified = thread is not None and task['execution'] != 'unverified'
+    explanation = 'explicit_wait' if task['execution'] in {'waiting_input', 'waiting_approval', 'stopping'} else None
+    if any(item.get('type') in {'commandExecution', 'mcpToolCall', 'dynamicToolCall', 'collabAgentToolCall'} and item.get('status') == 'inProgress' for item in items):
+        explanation = 'current_long_operation'
+    if any(q['resolution'] == 'pending' and not q.get('reply') and (q.get('blocking') is True or q['category'] == 'approval') for q in task.get('human_requests', [])):
+        explanation = 'pending_human_request'
+    complete = bool(turn and turn.get('itemsView') == 'full')
+    digest = hashlib.sha256(json.dumps([task['execution'], turn, events], sort_keys=True).encode()).hexdigest() if verified else None
+    task['supervision_observation'] = {'verified': verified, 'progress_digest': digest,
+        'checked_at': manager.notification_clock(), 'explanation': explanation, 'complete': complete,
+        'source': 'original_thread_read', 'service_id': task['session']['service_id'],
+        'eligible_stall': verified and complete and task['execution'] == 'running' and not explanation}
+
+
+def stall_coverage(manager, task):
+    from .takeover import executor_for
+    from .control import terminal_evidence
+    adapter = executor_for(manager, task)
+    if adapter is None:
+        return 'unverified'
+    try:
+        session = task['session']
+        thread = adapter.read_thread(session['thread_id'])
+        if thread.get('id') != session['thread_id'] or thread.get('cwd') != session['repository']['worktree']:
+            return 'unverified'
+        related, evidence = terminal_evidence(adapter, session, thread, session['turn_id'])
+        if any(r['kind'] in {'background_terminal', 'unfinished_item'} or r['thread_id'] != session['thread_id'] for r in related):
+            return 'explained_related_execution'
+        if not any(e.get('process_coverage') for e in evidence):
+            return 'unverified'
+        return 'verified'
+    except ManagementError:
+        return 'unverified'
+
+
 def run(manager, identity):
+    with manager._lock:
+        _, initial = manager._load()
+        if manager._principal(identity, initial) is not None:
+            raise ManagementError('forbidden', 'Only the manager supervision entry schedules global notifications.')
+        task_ids = [t['id'] for t in initial['requests'].values() if t.get('session') and not t.get('repository_released') and t.get('outer_task_status') != 'stopped']
+    for task_id in task_ids:
+        try:
+            manager.refresh_task(identity, task_id)
+        except ManagementError:
+            continue
     with manager._lock, manager._db:
         version, data = manager._load()
         principal = manager._principal(identity, data)
@@ -56,6 +103,38 @@ def run(manager, identity):
             if not task.get('repository_released') and task.get('outer_task_status') != 'stopped':
                 active.setdefault(task['project_id'], []).append(task)
         for task in data['requests'].values():
+            observation = task.get('supervision_observation')
+            if observation:
+                tracker = saved['tasks'].setdefault(task['id'], {'progress_at': now, 'digest': observation['progress_digest'], 'stall_sent': False})
+                saved['health']['sources'][task['id']] = {'status': 'verified' if observation['verified'] else 'unverified',
+                    'service_id': observation['service_id'], 'checked_at': observation['checked_at'],
+                    'last_confirmed_execution': task.get('last_confirmed_execution', task['execution']),
+                    'execution': task['execution']}
+                if not observation['verified']:
+                    tracker.setdefault('disconnected_at', now)
+                    if now - tracker['disconnected_at'] >= 120 and not tracker.get('disconnect_sent'):
+                        emit(saved, 'channel_lost', task['project_id'], [task],
+                             '原监督通道持续失联2分钟；执行待核实，保留最后核实状态及仓库占用。\nIssue：' + task['accepted_scope']['url'], now)
+                        tracker['disconnect_sent'] = True
+                elif 'disconnected_at' in tracker:
+                    if tracker.get('disconnect_sent'):
+                        emit(saved, 'channel_recovered', task['project_id'], [task], '原监督通道已恢复核查；实际执行：' + task['execution'] + '\nIssue：' + task['accepted_scope']['url'], now)
+                    tracker.pop('disconnected_at', None)
+                    tracker.pop('disconnect_sent', None)
+                    tracker.update(progress_at=now, stall_sent=False)
+            if observation and observation['verified']:
+                tracker = saved['tasks'][task['id']]
+                if tracker['digest'] != observation['progress_digest'] or observation['explanation']:
+                    tracker.update(progress_at=now, digest=observation['progress_digest'], stall_sent=False)
+                if observation['eligible_stall'] and now - tracker['progress_at'] >= 900 and not tracker['stall_sent']:
+                    coverage = stall_coverage(manager, task)
+                    saved['health']['sources'][task['id']]['stall_coverage'] = coverage
+                    if coverage == 'verified':
+                        emit(saved, 'suspected_stall', task['project_id'], [task],
+                             '疑似停滞：已核查原执行服务及后台覆盖，连续15分钟未见可核实进展，未发现明确等待或可解释长命令。\nIssue：' + task['accepted_scope']['url'] + '\n原会话：' + task['session']['thread_id'], now)
+                        tracker['stall_sent'] = True
+                    elif coverage == 'explained_related_execution':
+                        tracker.update(progress_at=now, stall_sent=False)
             for question in task.get('human_requests', []):
                 if question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled') or not (question.get('blocking') is True or question['category'] == 'approval'):
                     continue
