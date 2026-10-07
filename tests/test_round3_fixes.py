@@ -38,7 +38,8 @@ def actual_delivery(root, client, request_id, repo, scope):
     result = subprocess.run(argv, cwd=repo, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, text=True, capture_output=True)
     assert result.returncode == 0 and '1 passed' in result.stdout
     (root / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'scope-test', 'command': ' '.join(argv), 'cwd': str(repo), 'status': 'completed', 'exitCode': result.returncode, 'aggregatedOutput': result.stdout + result.stderr}]}]}))
-    return client.record_task_delivery(request_id, {'issue_updated_at': scope['updated_at'], 'criteria': [{'text': scope['body'].removeprefix('- [ ] '), 'test_item_ids': ['scope-test']}], 'source_commit': None, 'pr_url': None, 'sync_branches': []})
+    from ghost_hermes_pm.delivery import acceptance_criteria
+    return client.record_task_delivery(request_id, {'issue_updated_at': scope['updated_at'], 'criteria': [{'text': text, 'test_item_ids': ['scope-test']} for text in acceptance_criteria(scope['body'])], 'source_commit': None, 'pr_url': None, 'sync_branches': []})
 
 
 @pytest.mark.parametrize('criterion', ['Merge status must be displayed.', '合并 PR 的状态必须展示'])

@@ -56,6 +56,9 @@ def executed_tests(command, output):
         return max(0, int(counts[-1]) - (int(skips[-1]) if skips else 0)) if counts and re.search(r'^OK(?: \(skipped=\d+\))?$', output, re.MULTILINE) else 0
     return 0
 
+OPTIONAL_MERGE = re.compile(r'\b(?:not required|not necessary|does not need)\b.{0,40}?\bmerg(?:e|ed|ing)\b|(?:不是必须|并非必须|非必须|未要求).{0,30}?合并|\b(?:no|without)\s+(?:PR\s+)?merg(?:e|ing)\b|\bmerg(?:e|ed|ing)\b.{0,40}?\b(?:not required|optional)\b|\b(?:may|can|could|optional)\b.{0,40}?\bmerg(?:e|ed)\b|(?:无需|不要求|不需要|可选|酌情|可以).{0,30}?合并|合并.{0,20}(?:可选|不作要求|不作为交付条件)', re.IGNORECASE)
+
+
 def delivery_requirements(body):
     """Freeze explicit merge duties; mentions and uncertain language are not duties."""
     required, forbidden, unclear = [], [], []
@@ -64,9 +67,8 @@ def delivery_requirements(body):
             if not re.search(r'\bmerg(?:e|ed|es|ing)\b|合并', clause, re.IGNORECASE):
                 continue
             negative = re.search(r"\b(?:must not|shall not|do not|don't|never)\s+(?:be\s+)?merg(?:e|ed)\b|(?:禁止|不得|不要|不能|勿)\s*(?:合并|(?:此|本|该)?\s*PR\s*合并)", clause, re.IGNORECASE)
-            optional_pattern = r'\b(?:not required|not necessary|does not need)\b.{0,40}?\bmerg(?:e|ed|ing)\b|(?:不是必须|并非必须|非必须|未要求).{0,30}?合并|\b(?:no|without)\s+(?:PR\s+)?merg(?:e|ing)\b|\bmerg(?:e|ed|ing)\b.{0,40}?\b(?:not required|optional)\b|\b(?:may|can|could|optional)\b.{0,40}?\bmerg(?:e|ed)\b|(?:无需|不要求|不需要|可选|酌情|可以).{0,30}?合并|合并.{0,20}(?:可选|不作要求|不作为交付条件)'
-            optional = re.search(optional_pattern, clause, re.IGNORECASE)
-            affirmative = re.sub(optional_pattern, ' ', clause, flags=re.IGNORECASE)
+            optional = OPTIONAL_MERGE.search(clause)
+            affirmative = OPTIONAL_MERGE.sub(' ', clause)
             # Status-bearing noun phrases are subjects/objects, not merge commands.
             affirmative = re.sub(r'\bmerg(?:e|ed|ing)\s+(?:status|state)\b|合并\s*(?:(?:此|本|该)?\s*(?:PR|拉取请求|代码|变更|提交))?\s*(?:的)?\s*(?:当前|相关|最终)?\s*状态', ' ', affirmative, flags=re.IGNORECASE)
             obligation = re.search(r'\b(?:must|shall|has to|have to|needs to|is required to)\s+(?:be\s+)?merg(?:e|ed)\b|\bmerg(?:e|ed|ing)\b.{0,40}\b(?:is required|is mandatory)\b|^\s*merge\b|(?:必须|务必|须|应当|需要|要求)\s*(?:先|完成\s*(?:此|本|该)?\s*PR\s*)?合并|^\s*(?:合并(?:此|本|该)?\s*PR|将.+合并到)|完成\s*PR\s*合并(?:后|之后).{0,20}(?:交付|验收)', affirmative, re.IGNORECASE)
