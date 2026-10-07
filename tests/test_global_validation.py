@@ -596,3 +596,21 @@ def test_original_input_change_event_invalidates_even_when_ignored_bytes_are_res
         ended = manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
         assert ended['status'] == 'invalidated' and ended['occupancy']['released'] is True
         assert ended['input_change_events'][0]['path'] == str(child / 'hidden.py')
+
+
+def test_restart_without_original_input_watch_withdraws_current_completion(tmp_path):
+    host = FixtureHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
+        session = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == parent)['session']
+        (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'OK'}]}]}}))
+        manager.record_task_delivery(LEAD, parent, {'source_commit': git(mono, 'rev-parse', 'HEAD'), 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['mono-test']}]})
+        assert manager.global_validation(LEAD, 'complete', {'validation_id': plan['id']})['whole_project_complete'] is True
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as restored:
+        current = restored.global_validation(LEAD, 'check', {'validation_id': plan['id']})
+        assert current['status'] == 'unverified' and current['whole_project_complete'] is False
+        assert current['occupancy']['released'] is True
+        assert next(r for r in restored.read_snapshot(OWNER)['requests'] if r['id'] == parent)['whole_project_complete'] is False
