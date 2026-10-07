@@ -181,9 +181,7 @@ def run(manager, identity):
                 '；PR：' + t.get('pr_status', 'none') + '\n阻塞：' + (t.get('unexecuted_reason') or '无已核实阻塞') +
                 '\n待处理：' + '\n'.join(human_text(q) for q in t.get('human_requests', []) if q['resolution'] == 'pending' and not q.get('reply')) +
                 '\n下一步：核对原服务与当前有效请求\nIssue：' + t['accepted_scope']['url'] for t in tasks)
-            key = hashlib.sha256(json.dumps(['summary', project_id, now]).encode()).hexdigest()
-            saved['events'][key] = {'id': key, 'kind': 'summary', 'project_id': project_id,
-                'request_ids': [t['id'] for t in tasks], 'text': text, 'created_at': now, 'delivery': 'pending'}
+            emit(saved, 'summary', project_id, tasks, text, now)
             schedule['summary_at'] = now
         from .collaboration import _channel
         entries = [c for c in data.get('collaboration', {}).get('channels', {}).values() if c['group_kind'] == 'entry']

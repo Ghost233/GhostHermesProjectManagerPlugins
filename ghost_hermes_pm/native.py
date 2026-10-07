@@ -119,6 +119,23 @@ def register_native(ctx):
 
             ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
 
+            async def supervise_notifications():
+                import asyncio
+                from .notifications import component_unavailable
+                identity = VerifiedIdentity(owner, 'verified-manager-notification-supervision')
+                generation = intake.generation
+                while resources is not None and not intake.closed:
+                    try:
+                        async with intake.lock:
+                            await intake.deliver_notifications(identity, generation)
+                    except Exception:
+                        if intake.closed or resources is None:
+                            return
+                        component_unavailable(manager)
+                    await asyncio.sleep(5)
+
+            ctx.spawn_task(supervise_notifications(), name='hermes-pm-notification-supervision')
+
             if codex_adapter is not None or recovery_adapters or observation_adapters or manager.knowledge_providers or control_adapters or manager.archive_providers or intake.collaboration_entry:
                 async def supervise_single_issue():
                     import asyncio
