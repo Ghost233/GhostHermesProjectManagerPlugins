@@ -138,6 +138,14 @@ def create_router(authenticated_client):
         except ManagementError as exc:
             raise failure(exc) from exc
 
+    @router.post('/lifecycle')
+    def lifecycle(body: CollaborationOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            return client.lifecycle(body.action, body.details)
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
     @router.post('/observations')
     def observations(body: ObservationOperation, request: Request):
         client = authenticated_client(request)

@@ -25,9 +25,13 @@
     const [roleReview, setRoleReview] = React.useState(null);
     const [validationForm, setValidationForm] = React.useState({ action: 'plan', details: '' });
     const [validationReview, setValidationReview] = React.useState(null);
+    const [lifecycleForm, setLifecycleForm] = React.useState({ action: 'archive', target: '', manual: '' });
+    const [lifecycleReview, setLifecycleReview] = React.useState(null);
     const [observerForm, setObserverForm] = React.useState({ id: '', kind: 'daemon', projects: '', adapter_ref: '' });
     async function refresh() {
-      try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
+      try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError('');
+        setLifecycleReview(function (current) { return current && current.details.expected_version !== undefined && current.details.expected_version !== value.version ? null : current; });
+        return value; }
       catch (e) { setError(String(e.message || e)); }
     }
     React.useEffect(function () { refresh(); }, []);
@@ -248,9 +252,39 @@
         h('ul', null, snapshot.profiles.map(function (p) {
           return h('li', { key: p.id }, p.id + ' · ' + p.role + ' · ' + p.capability + ' · 项目：' + (p.project_id || '独立'),
             h('div', null, '上级：' + (p.parent_profile_id || (p.role === 'project_lead' ? '项目根负责人（可合并两层）' : '项目树外')) + ' · 长期项目绑定：' + (p.project_id || '独立资料范围')),
-            h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：配置中 · 执行：未启用'),
+            h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：' + p.lifecycle + ' · 执行：' + (p.can_execute ? '已验证' : '未启用')),
             h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
         })),
+        h('section', null, h('h2', null, '项目封存与逐个恢复'),
+          h('p', null, '封存父负责人和显式下属，分别核实原执行、Profile 服务、机器人与定时入口。恢复只启用指定负责人；旧工作需要新的明确安排。'),
+          h('ul', null, (snapshot.lifecycle_operations || []).map(function (operation) {
+            return h('li', { key: operation.id }, operation.id + ' · ' + operation.action + ' · ' + operation.status + ' · 范围：' + operation.profile_ids.join(', '),
+              h('div', null, '核实：' + (operation.verified_at || '待核实')),
+              h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(operation.checks, null, 2)),
+              h('div', null, (operation.needs_human || []).join('；')));
+          })),
+          h('form', { onSubmit: function (e) {
+            e.preventDefault();
+            const details = lifecycleForm.action === 'check' ? { operation_id: lifecycleForm.target.trim(), handled_manual_session_ids: lifecycleForm.manual.split(',').map(function (id) { return id.trim(); }).filter(Boolean) } :
+              { profile_id: lifecycleForm.target.trim(), operation_id: window.crypto.randomUUID(), expected_version: snapshot.version,
+                expected_profile_ids: [lifecycleForm.target.trim()].concat(lifecycleForm.action === 'archive' ? snapshot.profiles.filter(function (p) {
+                  return p.parent_profile_id === lifecycleForm.target.trim();
+                }).map(function (p) { return p.id; }) : []).sort() };
+            setLifecycleReview({ action: lifecycleForm.action, details: details });
+          } },
+            h('select', { value: lifecycleForm.action, onChange: function (e) { setLifecycleForm(Object.assign({}, lifecycleForm, { action: e.target.value })); setLifecycleReview(null); } },
+              ['archive', 'restore', 'check'].map(function (a) { return h('option', { key: a, value: a }, a); })),
+            h('label', null, '负责人 ID / 核对操作 ID', h('input', { value: lifecycleForm.target, onChange: function (e) { setLifecycleForm(Object.assign({}, lifecycleForm, { target: e.target.value })); setLifecycleReview(null); } })),
+            lifecycleForm.action === 'check' && h('label', null, '本人已处理的手动会话 ID（逗号分隔）', h('input', { value: lifecycleForm.manual, onChange: function (e) { setLifecycleForm(Object.assign({}, lifecycleForm, { manual: e.target.value })); setLifecycleReview(null); } })),
+            h('button', { style: button, disabled: saving || snapshot.status === 'unverified' }, '预览生命周期操作')),
+          lifecycleReview && h('div', null,
+            h('pre', null, JSON.stringify(lifecycleReview, null, 2)),
+            h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: async function () {
+              setSaving(true);
+              try { await sdk.fetchJSON(api + '/lifecycle', { method: 'POST', body: JSON.stringify(lifecycleReview) }); setLifecycleReview(null); await refresh(); }
+              catch (e) { await refresh(); setError(String(e.message || e) + ' · 操作 ID：' + lifecycleReview.details.operation_id); }
+              finally { setSaving(false); }
+            } }, '本人确认执行'))),
         h('section', null, h('h2', null, '公开协作与任务关系'),
           h('p', null, '三层项目明确登记子负责人；合并两层由项目根负责人直接承接。发送、独立受理与执行分别核对。真实群验收：' + ((snapshot.collaboration || {}).real_group_acceptance || 'unverified')),
           h('ul', null, ((snapshot.collaboration || {}).handoffs || []).map(function (link) {

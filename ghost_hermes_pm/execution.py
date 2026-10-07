@@ -39,6 +39,10 @@ def start_task(manager, identity, request_id):
     with manager._lock:
         version, data = manager._load()
         record = _responsible(manager, identity, request_id, data)
+        from .lifecycle import require_active
+        require_active(data, record['profile_id'], record['project_id'])
+        if record.get('archive_stop_intent'):
+            raise ManagementError('lifecycle_blocked', 'This unstarted work was archived; accept a new explicit request.')
         adapter = manager.codex_adapter
         if adapter is None:
             raise ManagementError('capability_unverified', 'Codex execution is not enabled.')

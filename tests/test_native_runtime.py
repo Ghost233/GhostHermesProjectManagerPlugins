@@ -10,7 +10,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('notifications_smoke_runner.py', False, ''), ('recovery_smoke_runner.py', False, ''), ('memory_smoke_runner.py', False, ''), ('collaboration_smoke_runner.py', False, ''), ('manual_control_smoke_runner.py', False, ''), ('archive_smoke_runner.py', False, ''), ('knowledge_smoke_runner.py', False, ''), ('manual_observation_smoke_runner.py', False, ''), ('repository_queue_smoke_runner.py', False, ''), ('questions_smoke_runner.py', False, ''), ('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
+@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('lifecycle_smoke_runner.py', False, ''), ('notifications_smoke_runner.py', False, ''), ('recovery_smoke_runner.py', False, ''), ('memory_smoke_runner.py', False, ''), ('collaboration_smoke_runner.py', False, ''), ('manual_control_smoke_runner.py', False, ''), ('archive_smoke_runner.py', False, ''), ('knowledge_smoke_runner.py', False, ''), ('manual_observation_smoke_runner.py', False, ''), ('repository_queue_smoke_runner.py', False, ''), ('questions_smoke_runner.py', False, ''), ('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
 def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(runner, artifact_mismatch, unload_stage):
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     sdk = Path(configured) if configured else ROOT / 'tests' / 'fixtures' / 'hermes-sdk'
@@ -39,6 +39,11 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
         if runner == 'memory_smoke_runner.py':
             for name in ('test_project_memory.py', 'memory_fixture_server.py'):
                 shutil.copy2(ROOT / 'tests' / name, fixtures / name)
+        if runner == 'lifecycle_smoke_runner.py':
+            fixtures = scratch / 'lifecycle-fixtures'
+            fixtures.mkdir()
+            for name in ('test_lifecycle.py', 'test_directory.py', 'test_requests.py', 'test_task_execution.py', 'test_task_control.py'):
+                shutil.copy2(ROOT / 'tests' / name, fixtures / name)
         if runner in {'collaboration_smoke_runner.py', 'notifications_smoke_runner.py'}:
             fixtures = scratch / 'collaboration-fixtures'
             fixtures.mkdir()
@@ -56,5 +61,5 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
                                 cwd=scratch, env=env, text=True, capture_output=True, timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr
         assert 'native load, Dashboard bridge, restart, teardown: OK' in result.stdout
-        if runner == 'archive_smoke_runner.py':
+        if runner in {'archive_smoke_runner.py', 'lifecycle_smoke_runner.py'}:
             print(result.stdout)

@@ -95,10 +95,12 @@ def register_native(ctx):
             from .recovery import configured_recovery_adapters
             recovery_adapters = configured_recovery_adapters(ctx.get_config('codex_recovery', []), state_dir)
             codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
+            from .native_lifecycle import configured_lifecycle_host
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
                               codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters, control_adapters=control_adapters,
                               knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {})),
-                              archive_providers=configured_archives(ctx.get_config('archive_providers', {})), recovery_adapters=recovery_adapters)
+                              archive_providers=configured_archives(ctx.get_config('archive_providers', {})), recovery_adapters=recovery_adapters,
+                              lifecycle_host=configured_lifecycle_host(ctx.get_config('native_profile_lifecycle'), state_dir))
             for registration in ctx.get_config('manual_sources', []):
                 manager.register_observation_source(VerifiedIdentity(owner, 'trusted-native-source-registration'), registration)
             server = ManagementServer(manager, credentials)
@@ -259,6 +261,22 @@ def register_native(ctx):
                       schema={'name': 'hermes_pm_snapshot', 'description': 'Read the verified project directory; does not execute tasks.',
                               'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
                       handler=snapshot, description='Project directory and verified capability status')
+    def lifecycle_status(args):
+        if not isinstance(args, dict) or set(args) - {'operation_id'} or 'operation_id' in args and (not isinstance(args['operation_id'], str) or not args['operation_id']):
+            return json.dumps({'status': 'rejected', 'code': 'invalid_change', 'message': 'Lifecycle tools read registered facts; Owner changes use the verified human entry.'})
+        facts = json.loads(snapshot())
+        if facts.get('status') != 'completed':
+            return json.dumps(facts)
+        operations = [o for o in facts['lifecycle_operations'] if not args.get('operation_id') or o['id'] == args['operation_id']]
+        ids = {o['id'] for o in operations}
+        return json.dumps({'status': 'completed', 'version': facts['version'], 'lifecycle_operations': operations,
+                           'lifecycle_events': [e for e in facts['lifecycle_events'] if e['operation_id'] in ids],
+                           'profiles': facts['profiles'], 'projects': facts['projects']})
+
+    ctx.register_tool(name='hermes_pm_lifecycle', toolset='hermes_pm',
+        schema={'name': 'hermes_pm_lifecycle', 'description': 'Read verified archive and individual restoration facts; human authorization is not a tool argument.',
+            'parameters': {'type': 'object', 'properties': {'operation_id': {'type': 'string'}}, 'additionalProperties': False}},
+        handler=lifecycle_status, description='Read durable project lifecycle and component verification')
     def observe(args):
         try:
             if not isinstance(args, dict) or set(args) - {'scope'}:
