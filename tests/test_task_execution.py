@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.codex import CodexStdioAdapter, repository_fingerprint
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo, registration
@@ -40,9 +41,9 @@ def prepare_fixture(manager, request_id, repo):
         'workspace_digest': current['source_digest']})
 
 
-def accepted(manager, repo):
+def accepted(manager, repo, scope=ISSUE):
     manager.apply_directory_change(OWNER, 0, execution_registration(repo))
-    request = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, ISSUE)['request']
+    request = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, scope)['request']
     manager.publish_request_message(OWNER, request['id'], 'confirmation', '已受理')
     segment = manager.claim_delivery(OWNER, request['id'])
     manager.record_delivery(OWNER, request['id'], segment['uuid'],

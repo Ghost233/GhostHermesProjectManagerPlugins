@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 
 from ghost_hermes_pm import Manager, ManagementError
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.codex import repository_fingerprint
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo

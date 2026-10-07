@@ -69,7 +69,7 @@ native_profile_migration:
 
 `activate` 需要原 plan ID/digest、本人切换预览的 `expected_version`、明确 `expected_profile_ids`、原完成封存 `archive_operation_id` 和实际新 `session_id`。目录变化或不同 scope 拒绝。先持久化 switching intent，再重新核对原 SourceGrant/身份绑定、原 Profile 服务/bot/定时入口/manual-related execution 的当前独立停止证据，并在旧入口停止后建立最终原档案 checkpoint。
 
-总管、独立 Wiki/个人助手及其他明确单入口迁移使用 `expected_old_profile_ids: [source_profile_id]`；`archive_operation_id` 为本人审定的稳定单入口停用 ID。它是 migration 自己的 single-entry retirement，不调用项目子树封存、不更改 projects/上下级、不扩大为其他 host。先验证新 native 材料、实际新会话和新 bot 身份，再保存原 Profile 的 `lifecycle=archiving` 与 durable gate；目录修正及 #22 重启都会保留抑制状态。随后只停止原 Profile 的受控 request/current executor/current grant，并逐项核对服务、bot、timer 和完整在途覆盖；unserved 受理不宣称 chat/cron 已终止。
+总管、独立 Wiki/个人助手及其他明确单入口迁移使用 `expected_old_profile_ids: [source_profile_id]`；`archive_operation_id` 为本人审定的稳定单入口停用 ID。它是 migration 自己的 single-entry retirement，不调用项目子树封存、不更改 projects/上下级、不扩大为其他 host。先验证新 native 材料、实际新会话和新 bot 身份，再保存原 Profile 的 `lifecycle=archiving` 与 durable gate；目录修正及 [重启后对账任务与人工请求](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/22) 重启都会保留抑制状态。随后只停止原 Profile 的受控 request/current executor/current grant，并逐项核对服务、bot、timer 和完整在途覆盖；unserved 受理不宣称 chat/cron 已终止。
 
 原生 scope capability 的独立证据可列出 `manual_execution_ids`；已有只观察会话同样保留。本人在原界面明确处理，`check` 传 `handled_manual_execution_ids`，并取得实际 terminal proof 才可完成；一句已处理不够，不创建 takeover/interrupt。外部动作前保存每项 intent；丢回执/restart 只沿原 ID/原宿主/原执行对账，不重放 unknown request。单入口停止完成后仍不自动 serve 新入口；本人重新查看当前版本、沿同一单入口范围明确 `activate`，原 stop approved_scope 的 version 始终保留。
 
@@ -106,3 +106,7 @@ python -m pytest -q -p no:cacheprovider --basetemp=/tmp/hpm-migration-check
 可用 `HERMES_TEST_SESSION_PYTHON` 指向独立 test-only runtime；未提供时使用当前 Python。`.[test]` 的四个新增精确依赖取自固定 SDK lock：openai 2.24.0、anthropic 0.87.0、Pillow 12.3.0、tenacity 9.1.4。CI 安装 `.[test]` 并运行所有 mandatory SDK cases，不跳过缺失依赖；PR 验证保留，push 仅 main，远程 CI 用于同一已本地完整验收版本的最终确认。
 
 这些证据覆盖公开协议与 native primitives。真实用户 Profile/原库/secret storage、实际新机器人和群权限、生产新会话、全部旧 chat/cron/background 的当前终止覆盖、外部 bank reader/writer 身份隔离、外部服务原位恢复和长期 scheduler 仍须按具体获准计划逐项验收。当前代码验收没有正式安装、开真实 bot、迁移用户原资料、业务网络调用或自动启动旧入口。
+
+## 新机器人通道收据
+
+`bot-info` 成功只证明新 app 的有效 bot 身份。切换前 `verify_new_bot` 对本计划 digest 重新读取每个新通道的群权限和实际平台消息，要求新 bot 的 `通道验收 DIGEST` 已投递到准确 tenant/chat，以及准确 Owner 在该消息下独立回复 `已受理验收 DIGEST`。`feishu_intake.channel_acceptance[DIGEST][CHAT_ID]` 只登记两条原消息定位符，不能填写状态或能力证明。权限拒绝、消息删除、另一 app/tenant/bot/group/Owner、缺独立受理或另一计划的文本均保持 blocked，发生任何旧入口控制动作之前先完成这些核验。适配器只读已有收据，不自动发送真实消息。

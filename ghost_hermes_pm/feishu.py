@@ -1,7 +1,6 @@
 """Native Feishu SDK requests. One persisted UUID and receipt per logical segment."""
 import asyncio
 import json
-import subprocess
 
 from .manager import ManagementError
 
@@ -37,6 +36,43 @@ class NativeFeishuTransport:
             return None
         return {'app_id': config.app_id, 'open_id': bot['open_id']}
 
+    async def verify_channel(self, binding, evidence, challenge):
+        """Re-read platform receipts; the caller supplies locators, never success claims."""
+        from lark_oapi.api.im.v1 import GetChatRequest, GetMessageRequest
+        identity = await self.verify_identity(binding)
+        if identity != {'app_id': binding['app_id'], 'open_id': binding['recipient_open_id']}:
+            raise ManagementError('capability_unverified', 'The current bot identity is unverified.')
+        self.lifecycle_check()
+        group = await asyncio.to_thread(self.native.im.v1.chat.get, GetChatRequest.builder().chat_id(binding['chat_id']).user_id_type('open_id').build())
+        self.lifecycle_check()
+        if type(group.code) is not int or group.code != 0 or group.data is None or group.data.tenant_key != binding['recipient_tenant_key']:
+            raise ManagementError('capability_unverified', 'The current bot cannot read the exact original tenant/group.')
+        if not isinstance(evidence, dict) or set(evidence) != {'delivery_message_id', 'acceptance_message_id'} or any(not isinstance(v, str) or not v for v in evidence.values()) or len(set(evidence.values())) != 2:
+            raise ManagementError('capability_unverified', 'Actual delivery and independent acceptance message locators are required.')
+        messages = []
+        for field in ('delivery_message_id', 'acceptance_message_id'):
+            locator = evidence[field]
+            result = await asyncio.to_thread(self.native.im.v1.message.get, GetMessageRequest.builder().message_id(locator).user_id_type('open_id').build())
+            self.lifecycle_check()
+            items = getattr(getattr(result, 'data', None), 'items', None)
+            if type(result.code) is not int or result.code != 0 or not isinstance(items, list) or len(items) != 1:
+                raise ManagementError('capability_unverified', 'A current platform channel receipt is unavailable.')
+            item = items[0]
+            if item.message_id != locator or item.chat_id != binding['chat_id'] or item.deleted is not False or item.sender is None or item.sender.id_type != 'open_id':
+                raise ManagementError('capability_unverified', 'Channel receipt source identity or content is unverified.')
+            messages.append(item)
+        delivery, acceptance = messages
+        if delivery.sender.sender_type != 'app' or delivery.sender.id != identity['open_id'] or delivery.sender.tenant_key != binding['recipient_tenant_key'] or acceptance.sender.sender_type != 'user' or acceptance.sender.id != binding.get('owner_open_id') or acceptance.sender.tenant_key != binding.get('sender_tenant_key') or acceptance.parent_id != delivery.message_id:
+            raise ManagementError('capability_unverified', 'The actual delivery and independent acceptance do not bind this bot, Owner and group.')
+        try:
+            delivered_text = json.loads(delivery.body.content)['text']
+            accepted_text = json.loads(acceptance.body.content)['text']
+        except (AttributeError, ValueError, KeyError, TypeError) as exc:
+            raise ManagementError('capability_unverified', 'Channel acceptance needs exact readable challenge messages.') from exc
+        if delivered_text != '通道验收 ' + challenge or accepted_text != '已受理验收 ' + challenge:
+            raise ManagementError('capability_unverified', 'The platform acceptance belongs to another configuration or migration plan.')
+        return {**identity, 'chat_id': binding['chat_id'], 'recipient_tenant_key': binding['recipient_tenant_key'], 'transport_tenant_key': binding['transport_tenant_key'], 'sender_tenant_key': binding['sender_tenant_key'], **evidence, 'challenge': challenge, 'source': 'actual_feishu_group_and_message_reads'}
+
     async def send(self, segment):
         self.lifecycle_check()
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody, CreateMessageRequest, CreateMessageRequestBody
@@ -71,17 +107,6 @@ class NativeFeishuTransport:
 
 
 def read_github_issue(url):
-    """Read the fixed Issue scope only after verifying the mandated GitHub account."""
-    def run(*args):
-        result = subprocess.run(['gh', *args], text=True, capture_output=True, timeout=30)
-        if result.returncode:
-            raise ManagementError('unavailable', 'The GitHub Issue source could not be verified.')
-        return result.stdout
-    try:
-        run('auth', 'switch', '--hostname', 'github.com', '--user', 'Ghost233')
-        if run('api', '--hostname', 'github.com', 'user', '--jq', '.login').strip() != 'Ghost233':
-            raise ManagementError('unauthorized', 'The GitHub account must be Ghost233.')
-        value = json.loads(run('issue', 'view', url, '--json', 'url,title,body,updatedAt'))
-        return {'url': value['url'], 'title': value['title'], 'body': value['body'], 'updated_at': value['updatedAt']}
-    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError) as exc:
-        raise ManagementError('unavailable', 'The GitHub Issue source could not be verified.') from exc
+    """The intake preserves its unavailable code while sharing authenticated Issue reads."""
+    from .github import GitHubDeliverySource
+    return GitHubDeliverySource(error_code='unavailable').read_issue(url)

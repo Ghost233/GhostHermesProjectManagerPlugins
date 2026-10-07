@@ -9,7 +9,8 @@ from .manager import ManagementError
 
 
 class GitHubDeliverySource:
-    def __init__(self, state_dir=None):
+    def __init__(self, state_dir=None, *, error_code="evidence_missing"):
+        self.error_code = error_code
         self.state_dir = Path(state_dir).resolve() if state_dir is not None else None
 
     def read_test_version(self, session, item_id):
@@ -29,7 +30,7 @@ class GitHubDeliverySource:
     def _run(self, *args):
         result = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=30)
         if result.returncode:
-            raise ManagementError('evidence_missing', 'GitHub delivery evidence could not be read.')
+            raise ManagementError(self.error_code, 'GitHub delivery evidence could not be read.')
         return result.stdout
 
     def _business(self, *args):
@@ -39,16 +40,16 @@ class GitHubDeliverySource:
                 raise ManagementError('unauthorized', 'The actual GitHub account must be Ghost233.')
             return self._run(*args)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ManagementError('evidence_missing', 'GitHub evidence is unavailable; delivery remains pending.') from exc
+            raise ManagementError(self.error_code, 'GitHub evidence is unavailable; the operation remains pending.') from exc
 
     def read_issue(self, url):
         if not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', url):
-            raise ManagementError('evidence_missing', 'The original GitHub Issue URL is required.')
+            raise ManagementError(self.error_code, 'The original GitHub Issue URL is required.')
         try:
             value = json.loads(self._business('issue', 'view', url, '--json', 'url,title,body,updatedAt'))
             return {'url': value['url'], 'title': value['title'], 'body': value['body'], 'updated_at': value['updatedAt']}
         except (ValueError, KeyError, TypeError) as exc:
-            raise ManagementError('evidence_missing', 'The actual Issue source could not be verified.') from exc
+            raise ManagementError(self.error_code, 'The actual Issue source could not be verified.') from exc
 
     def read_pr(self, url):
         try:

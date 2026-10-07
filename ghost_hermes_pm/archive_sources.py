@@ -6,6 +6,24 @@ from .manager import ManagementError
 from .observation import ReadOnlyCodexAdapter
 
 
+def verify_feishu_source(client, binding):
+    from lark_oapi import AppType, BaseRequest, HttpMethod, AccessTokenType
+    from lark_oapi.api.tenant.v2 import QueryTenantRequest
+    config = getattr(client, 'config', None)
+    if config is None or config.app_id != binding['app_id'] or config.enable_set_token is not False or config.app_type != AppType.SELF:
+        raise ManagementError('capability_unverified', 'Original archive credential ownership is unverified.')
+    response = client.request(BaseRequest.builder().http_method(HttpMethod.GET).uri('/open-apis/bot/v3/info').token_types({AccessTokenType.TENANT}).build())
+    tenant = client.tenant.v2.tenant.query(QueryTenantRequest.builder().build())
+    try:
+        payload = json.loads(response.raw.content)
+        bot = payload['bot']
+        if type(response.code) is not int or response.code != 0 or type(payload.get('code')) is not int or payload['code'] != 0 or bot['open_id'] != binding['bot_open_id'] or bot.get('activate_status') != 2 or type(tenant.code) is not int or tenant.code != 0 or tenant.data.tenant.tenant_key != binding['tenant_key']:
+            raise ValueError('Original source identity mismatch.')
+    except (AttributeError, ValueError, TypeError, KeyError) as exc:
+        raise ManagementError('capability_unverified', 'Current original Feishu app, tenant and bot identity could not be verified.') from exc
+    return {**binding, 'evidence_ref': 'actual_feishu_bot_and_tenant_reads'}
+
+
 class FeishuArchiveProvider:
     kind = 'feishu_remote'
 

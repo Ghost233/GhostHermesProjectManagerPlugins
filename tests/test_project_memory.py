@@ -3,6 +3,7 @@ import json
 import pytest
 
 from ghost_hermes_pm import Manager, ManagementError, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo
 from test_task_execution import accepted, prepare_fixture
@@ -73,7 +74,7 @@ def completed_delivery(root, client, request_id):
     observed = {'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': [
         {'type': 'agentMessage', 'id': 'final', 'text': 'Done, all tests passed. Raw conversation must not be copied.'},
         {'type': 'commandExecution', 'id': 'pytest-1', 'command': 'python -m pytest tests/test_fixture.py -q',
-         'cwd': str(root / 'repo'), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed; raw output must not be copied'}]}]}
+         'cwd': str(root / 'repo'), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed in 0.01s\nraw output must not be copied'}]}]}
     (root / 'observed.json').write_text(json.dumps(observed))
     return client.record_task_delivery(request_id, {'issue_updated_at': ISSUE['updated_at'],
         'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['pytest-1']}], 'source_commit': None, 'pr_url': None, 'sync_branches': []})

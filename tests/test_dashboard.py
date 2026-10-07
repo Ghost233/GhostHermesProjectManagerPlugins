@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from ghost_hermes_pm.dashboard import create_router
 from test_directory import OWNER, registration, make_repo

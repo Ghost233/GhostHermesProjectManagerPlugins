@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.feishu import read_github_issue
 from ghost_hermes_pm.messages import FeishuEntry
 from test_directory import OWNER, make_repo, registration

@@ -7,6 +7,7 @@ import sys
 import yaml
 
 scratch = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(scratch / 'readiness-fixtures'))
 protected = [Path.home() / '.hermes', Path.home() / '.codex']
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
@@ -23,6 +24,7 @@ settings = {'state_dir': str(state), 'participant_credential_ref': 'native:HERME
 (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 from ghost_hermes_pm import Manager, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from ghost_hermes_pm.dashboard import create_router
 sys.path.insert(0, str(scratch / 'control-fixtures'))

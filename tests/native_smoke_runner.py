@@ -33,6 +33,7 @@ state = scratch / 'state'
 repo = scratch / 'repo'
 repo.mkdir()
 subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'fixed native mono'], check=True)
 settings = {'manager_profile': 'default', 'state_dir': str(state), 'owner_identity_ref': 'fixture:owner',
             'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN', 'allow_local_dashboard_owner': True,
             'participant_credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN',
@@ -42,6 +43,13 @@ settings['feishu_intake'] = {'enabled': True, 'verification_ref': 'fixture:contr
      'verification_ref': 'fixture:identity-map', 'app_id': 'cli_fixture', 'recipient_open_id': 'ou_lead',
      'owner_open_id': 'ou_owner', 'owner_native_ids': ['u_owner', 'on_owner'], 'chat_id': 'oc_fixture', 'project_id': 'mono', 'profile_id': 'lead',
      'repository': 'Ghost233/fixture'}]}
+settings['profile_readiness'] = {'lead': {'native_home': str(home)}}
+settings['global_validation_host'] = {'host_id': 'local:native-sdk-original-host', 'generation': 'controlled-sdk-generation', 'runner': [sys.executable], 'watcher': [sys.executable, '-c', 'import time; time.sleep(60)'], 'tests': {'unit': ['-c', 'assert True']}, 'environment': {'PATH': '/usr/bin:/bin'}}
+settings['archive_providers'] = {'local:original-remote': {'kind': 'feishu_remote', 'binding': {'app_id': 'cli_archive', 'tenant_key': 'tenant-archive', 'bot_open_id': 'ou_archive'}, 'chat_scopes': {'public': ['oc_archive']}, 'credential_ref': 'native:HERMES_FIXTURE_APP_SECRET'}}
+ready_profile = {'id': 'lead', 'native_profile': 'default', 'identity_ref': 'fixture:lead', 'role': 'project_lead', 'capability': 'development', 'project_id': 'mono', 'parent_profile_id': None, 'connection_refs': {'bot': 'identity:cli_fixture:ou_lead', 'credential': 'native:HERMES_FIXTURE_APP_SECRET'}}
+import hashlib
+ready_digest = hashlib.sha256(json.dumps(ready_profile, sort_keys=True).encode()).hexdigest()
+settings['feishu_intake']['channel_acceptance'] = {ready_digest: {'oc_fixture': {'delivery_message_id': 'om_channel_delivery', 'acceptance_message_id': 'om_channel_acceptance'}}}
 (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'],
                                                 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 preserved = state / 'user-file'
@@ -53,7 +61,7 @@ import ghost_hermes_pm.feishu as issue_source
 issue_source.read_github_issue = lambda url: {'url': url, 'title': 'Native Issue fixture',
     'body': 'Accepted fixture material.\n' + 'A' * 4000, 'updated_at': '2026-10-07T00:00:00Z'}
 from native_fixture_boundary import install
-install(home / 'plugins' / 'ghost-hermes-pm', {'feishu': lambda module: setattr(module, 'read_github_issue', issue_source.read_github_issue)})
+install(home / 'plugins' / 'ghost-hermes-pm', {'feishu': lambda module: setattr(module, 'read_github_issue', issue_source.read_github_issue)}, synthetic_readiness=False)
 from hermes_cli.plugins import get_plugin_manager
 from hermes_cli.web_server_dashboard import _discover_dashboard_plugins, _mount_plugin_api_routes
 manager = get_plugin_manager()
@@ -89,8 +97,7 @@ headers = {'x-fixture-session': 'verified-owner'}
 base = '/api/plugins/ghost-hermes-pm'
 assert browser.get(base + '/snapshot').status_code == 401
 change = {'project': {'id': 'mono', 'name': 'Native Fixture Mono', 'repo_path': str(repo), 'test_artifact_paths': [str(repo / 'build')]},
-          'profile': {'id': 'lead', 'native_profile': 'default', 'identity_ref': 'fixture:lead', 'role': 'project_lead',
-                      'capability': 'development', 'project_id': 'mono', 'parent_profile_id': None, 'connection_refs': {}}}
+          'profile': ready_profile}
 import asyncio
 from hermes_cli.lifecycle import ainvoke_hook
 from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -152,7 +159,7 @@ async def exercise_gateway_lifecycle():
     task_rejection = json.loads(registry.dispatch('hermes_pm_task', {'action': 'verify', 'request_id': 'unknown'}, scope=str(home)))
     assert task_rejection['status'] == 'rejected' and task_rejection['code'] == 'invalid_change'
     from lark_oapi import Client
-    from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse
+    from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse, GetChatResponse, GetMessageResponse
     from gateway.session import SessionSource
     from gateway.config import Platform
     from gateway.platforms.event import MessageEvent
@@ -177,6 +184,17 @@ async def exercise_gateway_lifecycle():
     factories = manager.get_platform_handler_factories('hermes_feishu_pm')
     assert len(factories) == 1
     factories[0][0](native, gateway.adapter)
+    native.im.v1.chat.get = lambda request: GetChatResponse({'code': 0, 'data': {'tenant_key': 'tenant-bot'}})
+    def channel_message(request):
+        delivery = request.message_id == 'om_channel_delivery'
+        return GetMessageResponse({'code': 0, 'data': {'items': [{'message_id': request.message_id, 'chat_id': 'oc_fixture', 'deleted': False, 'parent_id': None if delivery else 'om_channel_delivery', 'sender': {'id': 'ou_lead' if delivery else 'ou_owner', 'id_type': 'open_id', 'sender_type': 'app' if delivery else 'user', 'tenant_key': 'tenant-bot' if delivery else 'tenant-owner'}, 'body': {'content': json.dumps({'text': ('通道验收 ' if delivery else '已受理验收 ') + ready_digest})}}]}})
+    native.im.v1.message.get = channel_message
+    enabled = browser.post(base + '/directory', json={'expected_version': browser.get(base + '/snapshot', headers=headers).json()['version'], 'change': {'enable_profile': 'lead'}}, headers=headers)
+    assert enabled.status_code == 200, enabled.text
+    verified = browser.get(base + '/snapshot', headers=headers).json()['profiles'][0]
+    assert verified['lifecycle'] == 'active' and verified['can_execute'] is False
+    assert verified['readiness']['channels'][0]['source'] == 'actual_feishu_group_and_message_reads'
+
     source = gateway.adapter.build_source(chat_id='oc_fixture', chat_type='group',
                            user_id='u_owner', user_id_alt='on_owner', is_bot=False,
                            message_id='om_inbound')
@@ -200,7 +218,46 @@ async def exercise_gateway_lifecycle():
     assert await ainvoke_hook('pre_gateway_dispatch', event=inbound, gateway=gateway) == []
     await gateway.adapter._handle_message_event_data(raw)
     assert len(sent) == 4, 'Duplicate receive must not resend acknowledged segments.'
-    verified_version = accepted['version']
+    from ghost_hermes_pm.transport import ManagementClient
+    owner_client = ManagementClient(state, 'synthetic-owner-credential')
+    task_id = accepted['requests'][0]['id']
+    fixed_head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+    plan = owner_client.global_validation('plan', {'request_id': task_id, 'mono_commit': fixed_head, 'children': [], 'test_ids': ['unit']})
+    prepared = owner_client.global_validation('prepare', {'validation_id': plan['id'], 'children': []})
+    assert prepared['status'] == 'ready' and prepared['preparation']['receipt']['related_execution'] == 'ended'
+    try:
+        owner_client.global_validation('start', {'validation_id': plan['id']})
+    except Exception as error:
+        assert error.code == 'capability_unverified', error
+    else:
+        raise AssertionError('Actual native host must retain missing physical boundary proof gate.')
+    from lark_oapi.core.http.transport import Transport as SDKHttp
+    from lark_oapi.core.model import RawResponse
+    archive_calls = []
+    def archive_http(conf, request, option=None):
+        archive_calls.append(request.uri)
+        if '/auth/' in request.uri:
+            body = {'code': 0, 'tenant_access_token': 'synthetic-token', 'expire': 3600}
+        elif '/bot/' in request.uri:
+            body = {'code': 0, 'bot': {'open_id': 'ou_archive', 'activate_status': 2}}
+        elif '/tenant/' in request.uri:
+            body = {'code': 0, 'data': {'tenant': {'tenant_key': 'tenant-archive'}}}
+        else:
+            assert request.uri == '/open-apis/im/v1/messages', request.uri
+            body = {'code': 0, 'data': {'has_more': False, 'items': [{'message_id': 'om_original', 'chat_id': 'oc_archive', 'deleted': False, 'body': {'content': '{"text":"Original remote requirement"}'}}]}}
+        response = RawResponse(); response.status_code = 200; response.headers = {'Content-Type': 'application/json'}; response.content = json.dumps(body).encode()
+        return response
+    SDKHttp.execute = archive_http
+    owner_client.apply_directory_change(owner_client.read_snapshot()['version'], {'profile': {'id': 'wiki', 'native_profile': 'wiki', 'identity_ref': 'fixture:wiki', 'role': 'independent', 'capability': 'non_development'}})
+    owner_client.register_knowledge_source(owner_client.read_snapshot()['version'], {'id': 'original-archive-grant', 'name': 'Explicit original remote source', 'provider_ref': 'local:original-remote', 'wiki_profile_id': 'wiki', 'query_subjects': {'fixture:lead': ['public']}, 'public_channels': [], 'task_profiles': [], 'wiki_bindings': []})
+    owner_client.register_archive_source({'id': 'original-remote', 'kind': 'feishu_remote', 'provider_ref': 'local:original-remote', 'grant_source_id': 'original-archive-grant', 'new_profile_id': 'lead', 'scope_ids': ['public'], 'authorization_ref': 'owner:explicit-original-archive'})
+    remote = ManagementClient(state, 'synthetic-participant-credential').query_archive('original-remote', 'native-archive-query', 'requirement', ['public'], True)
+    assert remote['status'] == 'complete', remote
+    assert remote['records'][0]['locator'] == 'feishu-archive:oc_archive#om_original'
+    assert '/open-apis/tenant/v2/tenant/query' in archive_calls
+    assert '/open-apis/im/v1/messages' in archive_calls
+    verified_version = owner_client.read_snapshot()['version']
+
     gateway.stopped.set()
     await asyncio.sleep(0)
     assert not (state / 'manager.sock').exists(), 'Gateway shutdown must release authority before plugin unload.'
@@ -217,7 +274,7 @@ async def exercise_gateway_lifecycle():
     restarted_gateway = GatewayFixture()
     assert await ainvoke_hook('pre_gateway_dispatch', event=event, gateway=restarted_gateway) == []
     again = browser.get(base + '/snapshot', headers=headers).json()
-    assert again['version'] == verified_version + 1 and len(again['profiles']) == 1 and len(again['requests']) == 1, again
+    assert again['version'] == verified_version + 1 and {p['id'] for p in again['profiles']} == {'lead', 'wiki'} and len(again['requests']) == 1, again
     assert again['maintenance']['events'][-1]['status'] == 'pending_verification'
     assert again['maintenance']['events'][-1]['execution_stopped'] is False
     assert manager.unload('ghost-hermes-pm')

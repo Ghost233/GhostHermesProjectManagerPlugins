@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from ghost_hermes_pm import Manager, ManagementError, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, registration
 from test_repository_queue import commit_repo, acknowledge, queue_adapter
@@ -63,7 +64,7 @@ def combination(manager, root, *, unassigned=False, public_goal=False):
     kid = acknowledge(manager, 'child-project', 'child-lead', 'child')
     prepare_fixture(manager, kid, child)
     session = manager.start_task(OWNER, kid)['session']
-    (root / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'child-test', 'command': 'python -m unittest', 'cwd': str(child), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'OK'}]}]}}))
+    (root / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'child-test', 'command': 'python -m unittest', 'cwd': str(child), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'Ran 1 test in 0.01s\n\nOK'}]}]}}))
     manager.record_task_delivery(OWNER, kid, {'source_commit': child_head, 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['child-test']}]})
     prepare_fixture(manager, parent, mono)
     manager.start_task(OWNER, parent)
@@ -267,7 +268,7 @@ def test_final_completion_requires_original_mono_acceptance_and_fresh_stable_val
         assert own_unmet.value.code == 'evidence_missing'
         task = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == parent)
         session = task['session']
-        (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'OK'}]}]}}))
+        (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'Ran 1 test in 0.01s\n\nOK'}]}]}}))
         manager.record_task_delivery(LEAD, parent, {'source_commit': git(mono, 'rev-parse', 'HEAD'), 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['mono-test']}]})
         completed = manager.global_validation(LEAD, 'complete', {'validation_id': plan['id']})
         assert completed['whole_project_complete'] is True and completed['status'] == 'complete'
@@ -366,7 +367,8 @@ class RunnerIssueSource(IssueReadSource):
         result = subprocess.run([sys.executable, '-m', 'unittest', 'discover'], cwd=repo, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True)
         assert result.returncode == 0, result.stdout + result.stderr
         output = result.stdout + result.stderr
-        self.receipts[item_id] = {'service_id': session['service_id'], 'generation': session['generation'], 'turn_id': session['turn_id'], 'item_id': item_id,
+        import re
+        self.receipts[item_id] = {'executed_tests': int(re.search(r'Ran (\d+) tests? in', output).group(1)), 'service_id': session['service_id'], 'generation': session['generation'], 'turn_id': session['turn_id'], 'item_id': item_id,
             'command_sha256': hashlib.sha256(b'python -m unittest discover').hexdigest(), 'output_digest': hashlib.sha256(output.encode()).hexdigest(), 'exit_code': 0,
             'before_source_digest': fixed, 'after_source_digest': fixed, 'source_access': 'read-only', 'git_access': 'read-only', 'artifact_roots': session['repository']['test_artifact_paths']}
         observed = root / 'queue-observed.json'
@@ -607,7 +609,7 @@ def test_restart_without_original_input_watch_withdraws_current_completion(tmp_p
         manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
         manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
         session = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == parent)['session']
-        (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'OK'}]}]}}))
+        (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'Ran 1 test in 0.01s\n\nOK'}]}]}}))
         manager.record_task_delivery(LEAD, parent, {'source_commit': git(mono, 'rev-parse', 'HEAD'), 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['mono-test']}]})
         assert manager.global_validation(LEAD, 'complete', {'validation_id': plan['id']})['whole_project_complete'] is True
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as restored:

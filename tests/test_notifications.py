@@ -1,5 +1,6 @@
 """Notification timings through the shared management boundary and public native sender."""
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo
 from test_task_execution import adapter_for, execution_registration, prepare_fixture
@@ -297,7 +298,7 @@ def test_project_completion_is_once_only_after_fresh_stable_global_validation_an
         assert not any(e['kind'] == 'project_completed' for e in manager.run_notifications(OWNER)['notifications'])
         task = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == parent)
         session = task['session']
-        (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'OK'}]}]}}))
+        (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'Ran 1 test in 0.01s\n\nOK'}]}]}}))
         manager.record_task_delivery(LEAD, parent, {'source_commit': git(mono, 'rev-parse', 'HEAD'), 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['mono-test']}]})
         manager.global_validation(LEAD, 'complete', {'validation_id': plan['id']})
         assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'project_completed']) == 1

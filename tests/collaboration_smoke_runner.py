@@ -136,10 +136,10 @@ async def main():
     await plugins.ainvoke_hook('pre_gateway_dispatch', event=object(), gateway=runners[0])
     owner = ManagementClient(state, 'synthetic-owner-credential')
     repo = scratch / 'mono'; repo.mkdir(); subprocess.run(['git', 'init', '-q', str(repo)], check=True)
-    owner.apply_directory_change(0, {'project': {'id': 'mono', 'name': 'Synthetic mono', 'repo_path': str(repo)}, 'profile': {'id': 'mono-lead', 'native_profile': 'mono-lead', 'identity_ref': 'fixture:lead', 'role': 'project_lead', 'capability': 'development', 'project_id': 'mono'}})
-    owner.apply_directory_change(1, {'profile': {'id': 'steward', 'native_profile': 'steward', 'identity_ref': STEWARD.subject, 'role': 'steward', 'capability': 'non_development', 'project_id': None}})
+    owner.apply_directory_change(0, {'enable_profile': 'mono-lead', 'project': {'id': 'mono', 'name': 'Synthetic mono', 'repo_path': str(repo)}, 'profile': {'id': 'mono-lead', 'native_profile': 'mono-lead', 'identity_ref': 'fixture:lead', 'role': 'project_lead', 'capability': 'development', 'project_id': 'mono'}})
+    owner.apply_directory_change(1, {'enable_profile': 'steward', 'profile': {'id': 'steward', 'native_profile': 'steward', 'identity_ref': STEWARD.subject, 'role': 'steward', 'capability': 'non_development', 'project_id': None}})
     child_repo = scratch / 'child-repo'; child_repo.mkdir(); subprocess.run(['git', 'init', '-q', str(child_repo)], check=True)
-    owner.apply_directory_change(2, {'project': {'id': 'child-project', 'name': 'Explicit SDK child', 'repo_path': str(child_repo)}, 'profile': {'id': 'child', 'native_profile': 'child', 'identity_ref': 'fixture:child', 'role': 'subproject_lead', 'capability': 'development', 'project_id': 'child-project', 'parent_profile_id': 'mono-lead', 'connection_refs': {'codex': 'local:fixture-stdio'}}})
+    owner.apply_directory_change(2, {'enable_profile': 'child', 'project': {'id': 'child-project', 'name': 'Explicit SDK child', 'repo_path': str(child_repo)}, 'profile': {'id': 'child', 'native_profile': 'child', 'identity_ref': 'fixture:child', 'role': 'subproject_lead', 'capability': 'development', 'project_id': 'child-project', 'parent_profile_id': 'mono-lead', 'connection_refs': {'codex': 'local:fixture-stdio'}}})
     owner.collaborate('register_channels', {'channels': channels})
     incoming = raw(channels[0], '项目 mono https://github.com/Ghost233/fixture/issues/15', 'om_sdk_owner_goal')
     runners[0].authorized = False

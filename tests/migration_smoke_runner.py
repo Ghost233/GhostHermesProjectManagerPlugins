@@ -34,6 +34,7 @@ os.environ['HERMES_DISABLE_PROJECT_PLUGINS'] = '1'
 sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 sys.path.insert(0, str(scratch / 'migration-fixtures'))
 from ghost_hermes_pm import Manager, VerifiedIdentity, ManagementError
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from ghost_hermes_pm.native_migration import NativeMigrationHost, verify_new_bot
 from ghost_hermes_pm.native_lifecycle import NativeMultiplexLifecycleHost
@@ -136,13 +137,19 @@ def process_proof(binding):
 class SyntheticBotPeer:
     """External Feishu bot-info response boundary; the production transport is unchanged."""
     config = NS(enable_set_token=False, app_type=AppType.SELF, app_id='cli_new', app_secret='synthetic-new-bot')
+    def __init__(self):
+        from lark_oapi.api.im.v1 import GetChatResponse, GetMessageResponse
+        def message(request):
+            delivered = request.message_id == 'om_migration_delivery'
+            return GetMessageResponse({'code': 0, 'data': {'items': [{'message_id': request.message_id, 'chat_id': 'oc_synthetic', 'deleted': False, 'parent_id': None if delivered else 'om_migration_delivery', 'sender': {'id': 'ou_new' if delivered else 'ou_synthetic_owner', 'id_type': 'open_id', 'sender_type': 'app' if delivered else 'user', 'tenant_key': 'synthetic-bot-tenant' if delivered else 'synthetic-owner'}, 'body': {'content': json.dumps({'text': ('通道验收 ' if delivered else '已受理验收 ') + plan['digest']})}}]}})
+        self.im = NS(v1=NS(chat=NS(get=lambda request: GetChatResponse({'code': 0, 'data': {'tenant_key': 'synthetic-bot-tenant'}})), message=NS(get=message)))
     def request(self, request):
         assert request.uri == '/open-apis/bot/v3/info'
         return NS(code=0, raw=NS(content=json.dumps({'code': 0, 'bot': {'open_id': 'ou_new', 'activate_status': 2}}).encode()))
 
 
 bindings = [{'profile_id': profile, 'project_id': None if global_entry else 'mono', 'app_id': app, 'recipient_open_id': bot,
-    'chat_id': 'oc_synthetic', 'recipient_tenant_key': 'synthetic-bot-tenant', 'transport_tenant_key': 'synthetic-transport'}
+    'owner_open_id': 'ou_synthetic_owner', 'sender_tenant_key': 'synthetic-owner', 'chat_id': 'oc_synthetic', 'recipient_tenant_key': 'synthetic-bot-tenant', 'transport_tenant_key': 'synthetic-transport'}
     for profile, app, bot in [(old_name, 'cli_old', 'ou_old'), (new_name, 'cli_new', 'ou_new')]]
 intake = NS(settings={'bindings': bindings}, transports=[(object(), NativeFeishuTransport(SyntheticBotPeer()))])
 migration_host = NativeMigrationHost(home, scratch / 'native-work', verifier=lambda operation: verify_new_bot(intake, operation))
@@ -209,6 +216,7 @@ try:
                 'selection': selected, 'preferences': [{'statement': 'Use short progress updates.', 'scope': {'kind': 'profile', 'id': new_name} if global_entry else {'kind': 'project', 'id': 'mono'}}],
                 'execution': {'model': 'synthetic-model', 'provider': 'custom', 'toolsets': ['memory']}, 'archive_source_ids': ['original-history'],
                 'external_memory': {'kind': 'builtin'}, 'human_steps': ['Provision independent cli_new/ou_new native bot credentials.']})
+            intake.settings['channel_acceptance'] = {plan['digest']: {'oc_synthetic': {'delivery_message_id': 'om_migration_delivery', 'acceptance_message_id': 'om_migration_acceptance'}}}
             key = {'plan_id': plan['id'], 'digest': plan['digest']}
             prepared = owner.migrate_profile('prepare', key)
             assert prepared['status'] == 'prepared'

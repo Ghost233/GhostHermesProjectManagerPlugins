@@ -95,16 +95,15 @@ def verify_new_bot(intake, operation):
         matched = None
         for _, transport in intake.transports:
             if isinstance(transport, NativeFeishuTransport) and transport.native.config.app_id == binding['app_id']:
-                verified = asyncio.run(transport.verify_identity(binding))
-                if verified == {'app_id': binding['app_id'], 'open_id': binding['recipient_open_id']}:
-                    matched = verified
-                    break
+                evidence = intake.settings.get('channel_acceptance', {}).get(operation['digest'], {}).get(binding['chat_id'])
+                matched = asyncio.run(transport.verify_channel(binding, evidence, operation['digest']))
+                break
         if matched is None:
             raise ManagementError('capability_unverified', 'The real new native bot transport has not verified its own independent credentials and app/open identity.')
         expected.append({**matched, 'chat_id': binding['chat_id'], 'recipient_tenant_key': binding['recipient_tenant_key'],
                          'transport_tenant_key': binding['transport_tenant_key']})
     return {'status': 'verified', 'plan_digest': operation['digest'], 'target_identity_ref': target['identity_ref'],
-            'bots': expected, 'credentials': 'actual_native_bot_info_success', 'channel': 'exact_owner_registered_scope'}
+            'bots': expected, 'credentials': 'actual_native_bot_info_success', 'channel': 'actual_group_permission_delivery_and_independent_acceptance'}
 
 
 def configured_migration_host(config, state_dir, intake=None):

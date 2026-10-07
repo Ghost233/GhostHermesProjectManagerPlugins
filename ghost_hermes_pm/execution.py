@@ -201,6 +201,7 @@ def refresh_task(manager, identity, request_id, *, sampling=False):
                               last_execution_verified_at=datetime.now(timezone.utc).isoformat())
                 import hashlib
                 from .manager import _public_text
+                from .delivery import executed_tests
                 commands = []
                 for item in items:
                     if item.get('type') != 'commandExecution' or item.get('status') not in {'completed', 'failed', 'declined'}:
@@ -212,6 +213,7 @@ def refresh_task(manager, identity, request_id, *, sampling=False):
                         continue
                     commands.append({'item_id': item['id'], 'turn_id': session['turn_id'], 'command': command,
                                      'cwd': item.get('cwd'), 'status': item['status'], 'exit_code': item.get('exitCode'),
+                                     'executed_tests': executed_tests(command, item.get('aggregatedOutput') or ''),
                                      'output_digest': hashlib.sha256((item.get('aggregatedOutput') or '').encode()).hexdigest(),
                                      'source': 'codex_command_execution', 'service_id': session['service_id'],
                                      'generation': session['generation'], 'observed_at': record['last_execution_verified_at']})

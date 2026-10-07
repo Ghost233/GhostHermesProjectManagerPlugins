@@ -1,6 +1,6 @@
-# 单 Issue Codex 执行切片（#16）
+# 单 Issue Codex 执行切片（[执行一个 Codex Issue 并核对交付结果](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/16)）
 
-原任务的追加、停止和明确继续见 [控制切片（#17）](codex-task-control.md)。
+原任务的追加、停止和明确继续见 [在原会话追加、停止和明确继续任务](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/17)。
 
 本切片实现真实自有 stdio app-server adapter 与统一任务入口；协议替身测试不等于获准真实服务验收。当前真实启动能力保持未启用：尚无符合全部写入、工具、连接与真实执行要求的完整验证收据。没有连接原 daemon、读取已有会话、修改真实配置或使用 full access。
 

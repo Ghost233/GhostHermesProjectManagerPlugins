@@ -14,14 +14,18 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def require_active(data, profile_id, project_id):
+def require_active(data, profile_id, project_id, *, configuration=False):
     if data.get('native_runtime_version_gate', {}).get('status') == 'unverified':
         raise ManagementError('unknown_version', 'Current native version is unknown; no migration or new execution is permitted.')
     for obj in (data['profiles'].get(profile_id, {}), data['projects'].get(project_id, {})):
         if obj.get('migration_gate'):
             raise ManagementError('migration_blocked', 'Target Profile is configuring under an immutable migration plan; approve its verified cutover first.')
-        if obj.get('lifecycle') not in {None, 'configuring', 'active'} or obj.get('archive_intent') not in (None, False):
+        if obj.get('lifecycle') not in ({None, 'configuring', 'active'} if configuration else {None, 'active'}) or obj.get('archive_intent') not in (None, False):
             raise ManagementError('lifecycle_blocked', 'Project lifecycle prevents new work or continuation; reconcile the Owner intent.')
+    profile = data['profiles'].get(profile_id, {})
+    from .readiness import profile_digest
+    if not configuration and (profile.get('lifecycle') != 'active' or profile.get('readiness', {}).get('configuration_digest') != profile_digest(profile)):
+        raise ManagementError('lifecycle_blocked', 'The configured Profile identity and channel admission have not been verified and explicitly enabled.')
     if data.get('maintenance_mode') not in (None, False):
         raise ManagementError('lifecycle_blocked', 'Manager lifecycle maintenance prevents new work.')
 
@@ -102,7 +106,7 @@ def operate(manager, identity, action, details):
                 raise ManagementError('invalid_change', 'Lifecycle target must be a registered project responsible Profile.')
             ids = [profile['id']]
             if action == 'archive':
-                require_active(data, profile['id'], profile['project_id'])
+                require_active(data, profile['id'], profile['project_id'], configuration=True)
                 ids += [p['id'] for p in data['profiles'].values() if p.get('parent_profile_id') == profile['id']]
             else:
                 if profile.get('lifecycle') != 'archived':

@@ -1,6 +1,6 @@
-# 原任务控制切片（#17）
+# 原任务控制切片（[在原会话追加、停止和明确继续任务](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/17)）
 
-本切片在 #16 的原 stdio 服务、连接代次、任务会话及仓库占用上实现追加、任务停止和明确继续。JSONL 协议 peer、人工宿主收据及 pristine Hermes SDK smoke 都是离线验证。当前没有获准模型服务的追加、中断、后台核实或继续验收；#16 的完整生产写入边界也仍未通过。真实能力保持未启用，不能以收据形状或 RPC 返回成功替代真实结果。
+本切片在 [执行一个 Codex Issue 并核对交付结果](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/16) 的原 stdio 服务、连接代次、任务会话及仓库占用上实现追加、任务停止和明确继续。JSONL 协议 peer、人工宿主收据及 pristine Hermes SDK smoke 都是离线验证。当前没有获准模型服务的追加、中断、后台核实或继续验收；[执行一个 Codex Issue 并核对交付结果](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/16) 的完整生产写入边界也仍未通过。真实能力保持未启用，不能以收据形状或 RPC 返回成功替代真实结果。
 
 ## 一个控制入口
 
@@ -44,7 +44,7 @@ idle 输入以登记的上一回合为 `expected_turn_id`。先确认原 cwd、�
 
 明确继续必须有已确认停止记录、当前有效责任及原服务代次，并且没有其他未释放的同逻辑仓库任务；当前实际执行覆盖证据也重新核验。先登记新的 `execution_arrangements`，记录原 request/thread、上一 stop/turn、真实授权者、当前基线、连接代次及占用，再发核实 idle 的原会话新回合。应答未知仍保留新安排和占用。旧 `stop_records` 保持原终态；新的活动安排不能改写旧停止决定。
 
-可信宿主的 `codex-validation.json` 继续要求 #16 的四类当前 hashed 收据，可另外包含 `task_control`。这份收据与固定二进制、配置、平台、仓库 fingerprint、服务与 generation 绑定，包含：
+可信宿主的 `codex-validation.json` 继续要求 [执行一个 Codex Issue 并核对交付结果](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/16) 的四类当前 hashed 收据，可另外包含 `task_control`。这份收据与固定二进制、配置、平台、仓库 fingerprint、服务与 generation 绑定，包含：
 
 - 实际方法 `thread/read`、`turn/steer`、`turn/start`、`turn/interrupt`、`thread/backgroundTerminals/list`、`thread/loaded/list`。
 - active_append、idle_input、interrupt、stop_verification、explicit_continue、wrong_turn、duplicate_instruction、disconnect、background_pagination、related_children、exclusive_input 的实际 PASS 结果，以及真实原 thread/turn 和不同的新 turn。

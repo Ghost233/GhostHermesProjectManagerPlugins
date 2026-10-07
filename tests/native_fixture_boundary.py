@@ -5,7 +5,11 @@ from pathlib import Path
 import sys
 
 
-def install(plugin_root, callbacks):
+def install(plugin_root, callbacks, *, synthetic_readiness=True):
+    callbacks = dict(callbacks)
+    if synthetic_readiness:
+        from readiness_support import FixtureReadinessHost
+        callbacks.setdefault('readiness', lambda module: setattr(module, 'configured_readiness_host', lambda config, intake, resolver: FixtureReadinessHost()))
     root = Path(plugin_root).resolve()
     class Loader(importlib.machinery.SourceFileLoader):
         def exec_module(self, module):

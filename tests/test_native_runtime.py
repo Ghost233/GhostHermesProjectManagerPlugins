@@ -32,6 +32,9 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
                 shutil.copytree(source, plugin / name, ignore=shutil.ignore_patterns('__pycache__'))
             else:
                 shutil.copy2(source, plugin / name)
+        readiness_fixtures = scratch / 'readiness-fixtures'
+        readiness_fixtures.mkdir()
+        shutil.copy2(ROOT / 'tests' / 'readiness_support.py', readiness_fixtures / 'readiness_support.py')
         if runner in {'wiki_mcp_smoke_runner.py', 'recovery_smoke_runner.py', 'archive_smoke_runner.py', 'task_control_smoke_runner.py', 'repository_queue_smoke_runner.py', 'manual_observation_smoke_runner.py', 'questions_smoke_runner.py', 'manual_control_smoke_runner.py', 'knowledge_smoke_runner.py', 'memory_smoke_runner.py'}:
             fixtures = scratch / ('takeover-fixtures' if runner == 'manual_control_smoke_runner.py' else 'manual-fixtures' if runner == 'manual_observation_smoke_runner.py' else 'queue-fixtures' if runner == 'repository_queue_smoke_runner.py' else 'control-fixtures')
             fixtures.mkdir()
@@ -57,10 +60,13 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
             fixtures.mkdir()
             for name in ('test_collaboration.py', 'test_directory.py', 'test_requests.py', 'test_task_execution.py', 'test_task_control.py', 'codex_fixture_server.py', 'test_questions.py', 'questions_fixture_server.py'):
                 shutil.copy2(ROOT / 'tests' / name, fixtures / name)
+        for fixture_dir in scratch.glob('*-fixtures'):
+            shutil.copy2(ROOT / 'tests' / 'readiness_support.py', fixture_dir / 'readiness_support.py')
         env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HERMES_HOME': str(home),
                'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'), 'PYTHONDONTWRITEBYTECODE': '1',
                'PYTHONPATH': str(staged), 'HERMES_FIXTURE_OWNER_TOKEN': 'synthetic-owner-credential',
-               'HERMES_FIXTURE_PARTICIPANT_TOKEN': 'synthetic-participant-credential'}
+               'HERMES_FIXTURE_PARTICIPANT_TOKEN': 'synthetic-participant-credential',
+               'HERMES_FIXTURE_APP_SECRET': 'synthetic-unused-secret'}
         if runner == 'maintenance_smoke_runner.py':
             fixtures = scratch / 'maintenance-fixtures'
             fixtures.mkdir()

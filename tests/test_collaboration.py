@@ -6,6 +6,7 @@ from lark_oapi import Client
 from lark_oapi.api.im.v1 import CreateMessageResponse
 
 from ghost_hermes_pm import Manager, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementServer, ManagementClient
 from ghost_hermes_pm.feishu import NativeFeishuTransport
 from test_directory import OWNER, registration, make_repo

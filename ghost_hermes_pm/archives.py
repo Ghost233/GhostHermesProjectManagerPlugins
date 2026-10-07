@@ -321,14 +321,39 @@ def snapshot_archives(manager,identity,data):
         'archive_restores':[r for r in data.get('archive_restores',{}).values() if identity.subject==manager.owner_identity_ref]}
 
 
-def configured_providers(config):
+def configured_providers(config, *, state_dir=None, credential_resolver=None):
     if not config:
         return {}
-    if not isinstance(config,dict):
-        raise ManagementError('invalid_change','Archive providers require explicit trusted host references.')
-    result={}
-    for ref,value in config.items():
-        if not isinstance(ref,str) or not ref.startswith('local:') or not isinstance(value,dict) or set(value)-{'path','session_scopes','files'} or not {'path','session_scopes'}<=set(value):
-            raise ManagementError('invalid_change','Local archive configuration needs an approved native database and migration session manifest.')
-        result[ref]=HermesArchiveProvider(value['path'],value['session_scopes'],files=value.get('files'))
+    if not isinstance(config, dict):
+        raise ManagementError('invalid_change', 'Archive providers require explicit trusted original source references.')
+    from .archive_sources import FeishuArchiveProvider, CodexArchiveProvider, verify_feishu_source
+    from .observation import configured_observation_adapters
+    result = {}
+    for ref, value in config.items():
+        if not isinstance(ref, str) or not ref.startswith('local:') or not isinstance(value, dict):
+            raise ManagementError('invalid_change', 'Archive configuration needs explicit original source references.')
+        kind = value.get('kind', 'hermes_local')
+        if kind == 'hermes_local':
+            if set(value) - {'kind', 'path', 'session_scopes', 'files'} or not {'path', 'session_scopes'} <= set(value):
+                raise ManagementError('invalid_change', 'Local archives require an approved native database and session manifest.')
+            result[ref] = HermesArchiveProvider(value['path'], value['session_scopes'], files=value.get('files'))
+        elif kind == 'feishu_remote':
+            if set(value) != {'kind', 'binding', 'chat_scopes', 'credential_ref'} or not isinstance(value['credential_ref'], str) or not value['credential_ref'].startswith('native:'):
+                raise ManagementError('invalid_change', 'Remote archives require exact app/tenant/bot scopes and a native credential reference.')
+            secret = credential_resolver(value['credential_ref']) if callable(credential_resolver) else None
+            if not secret:
+                raise ManagementError('capability_unverified', 'The original remote archive native credential is unavailable.')
+            from lark_oapi import Client
+            binding = value['binding']
+            if not isinstance(binding, dict) or not isinstance(binding.get('app_id'), str):
+                raise ManagementError('invalid_change', 'The original remote app identity is required.')
+            client = Client.builder().app_id(binding['app_id']).app_secret(secret).build()
+            result[ref] = FeishuArchiveProvider(client, binding, value['chat_scopes'], lambda native, binding=dict(binding): verify_feishu_source(native, binding))
+        elif kind == 'codex_history':
+            if set(value) != {'kind', 'adapter', 'thread_scopes'} or state_dir is None:
+                raise ManagementError('invalid_change', 'Codex archives require an original read-only proxy configuration and trusted evidence directory.')
+            adapters = configured_observation_adapters([value['adapter']], state_dir)
+            result[ref] = CodexArchiveProvider(adapters[value['adapter']['service_ref']], value['thread_scopes'])
+        else:
+            raise ManagementError('invalid_change', 'Unknown original archive source kind.')
     return result

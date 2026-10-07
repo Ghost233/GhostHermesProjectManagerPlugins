@@ -1,4 +1,5 @@
 from ghost_hermes_pm import Manager, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from test_directory import OWNER, make_repo, registration
 
 

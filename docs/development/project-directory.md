@@ -1,4 +1,4 @@
-# Project directory slice (#14)
+# Project directory slice ([登记开发项目与 Profile 并展示可用条件](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/14))
 
 The next slice adds authoritative request/delivery/clarification/failure/condition fields to the same snapshot. Its default-disabled independent Feishu driver, fixed private SDK contracts and outstanding real-connection/group gates are documented in [request intake](request-intake.md).
 
@@ -48,3 +48,9 @@ Use pristine official Hermes source at `bd0affe5e5f723579df8902852f5d0c47795f355
 
 
 Gateway runtime evidence is fixed to the SDK commit above: `gateway/run_inbound.py:111–123` calls the formal hook with `event`, `gateway=self` and `session_store`, before sender authorization. Directory bootstrap returns no directive. Request intake is now in the independently registered owned adapter before debounce/busy; it uses original-source native authorization and budget before committing to consume, and the cold hook does not duplicate intake. `hermes_cli/lifecycle.py:32–39` and `hermes_cli/plugins_dispatch.py:482–518` await async hooks on the Gateway's existing loop; `hermes_cli/plugins.py:419–429` supervises `ctx.spawn_task` and cancels it on unload. `gateway/run_shutdown.py:2286–2288` implements the public shutdown waiter. Profile/home selection is documented by `hermes_cli/plugins.py:1768–1791`; secret-scope provenance comes from `agent/secret_scope.py:155–167`. The plugin's explicit captured-home checks cover cross-profile callbacks instead of relying on a source message's identity or an environment variable claiming Gateway mode.
+
+## 明确启用与准入
+
+登记后的 Profile 保持 `configuring`。本人使用同一认证目录入口提交 `{"enable_profile":"PROFILE_ID"}`，可以与明确目录登记同一原子操作提交；目录版本仍必须匹配。生产 `profile_readiness` 配置只登记已有原生 Profile 的 `native_home`，身份、bot/credential 引用与实际 app secret 所属由原生适配器核对。平台通道验收使用当前配置 digest 的实际 SDK 群权限读取、bot 已投递消息及本人独立回复受理消息；配置 `feishu_intake.channel_acceptance[DIGEST][CHAT_ID]` 只保存 `delivery_message_id` 和 `acceptance_message_id` 定位符。两条实际平台原文分别为 `通道验收 DIGEST` 与回复它的 `已受理验收 DIGEST`，绑定准确 app/bot/tenant/chat/Owner，缺一项保持配置中。本插件不自动发送验收消息。
+
+启用证明只开放已验证身份的工作准入。执行、原会话观察、手动控制及资料查询继续按各自收据和 SourceGrant 独立核验；Wiki、个人助手等非开发能力不依赖 Codex。目录身份、角色、项目、父子关系或连接引用改变后，旧配置 digest 不再开放新工作，须重读实际来源并明确启用。配置中可查询、对账和完成原记录重复读取，不能创建新受理。

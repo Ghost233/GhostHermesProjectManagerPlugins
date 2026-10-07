@@ -27,6 +27,7 @@ home, state = scratch / 'home', scratch / 'state'
 sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 sys.path.insert(0, str(scratch / 'control-fixtures'))
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementServer, ManagementClient
 from test_directory import OWNER, make_repo
 from test_task_execution import accepted, prepare_fixture
