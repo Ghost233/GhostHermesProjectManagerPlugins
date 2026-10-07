@@ -21,7 +21,7 @@ TOOLS = {'model_files', 'shell_git', 'test_process', 'code_mode', 'local_mcp', '
 
 def validate_receipts(report, connection, repository, command, env, state_dir):
     receipts = report.get('receipts') if isinstance(report, dict) else None
-    if not isinstance(receipts, dict) or set(receipts) not in (set(KINDS), set(KINDS) | {'task_control'}):
+    if not isinstance(receipts, dict) or not set(KINDS).issubset(receipts) or set(receipts) - set(KINDS) - {'task_control', 'human_response'}:
         raise ManagementError('capability_unverified', 'Hashed current-service enforcement, tool, startup and executor-coverage receipts are required.')
     binary_digest = hashlib.sha256(Path(command[0]).read_bytes()).hexdigest()
     configuration_digest = hashlib.sha256(json.dumps({'command': command, 'environment': env}, sort_keys=True).encode()).hexdigest()
@@ -31,7 +31,8 @@ def validate_receipts(report, connection, repository, command, env, state_dir):
     verified = {}
     evidence_root = (Path(state_dir) / 'validation-evidence').resolve()
     control = None
-    for kind in (*KINDS, *(['task_control'] if 'task_control' in receipts else [])):
+    human_response = None
+    for kind in (*KINDS, *(k for k in ('task_control', 'human_response') if k in receipts)):
         reference = receipts[kind]
         if not isinstance(reference, dict) or set(reference) != {'path', 'sha256'}:
             raise ManagementError('capability_unverified', 'Each validation receipt needs a fixed local digest.')
@@ -67,6 +68,12 @@ def validate_receipts(report, connection, repository, command, env, state_dir):
             if not isinstance(methods, list) or any(not isinstance(m, str) for m in methods) or set(methods) != CONTROL_METHODS or not isinstance(checks, dict) or set(checks) != CONTROL_CHECKS or any(v != 'PASS' for v in checks.values()) or not receipt.get('thread_id') or not receipt.get('turn_id') or not receipt.get('new_turn_id') or receipt['turn_id'] == receipt['new_turn_id']:
                 raise ManagementError('capability_unverified', 'Actual task control, exclusive idle input and related-execution coverage are incomplete.')
             control = receipt
+        elif kind == 'human_response':
+            methods = {'thread/read', 'item/tool/requestUserInput', 'item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'serverRequest/resolved'}
+            checks = {'question', 'nonblocking', 'command_approval', 'file_approval', 'permission_approval', 'owner_only', 'wrong_request', 'duplicate', 'resolved_race', 'disconnect', 'secret', 'unknown_no_replay'}
+            if set(receipt.get('actual_methods', [])) != methods or not isinstance(receipt.get('checks'), dict) or set(receipt['checks']) != checks or any(v != 'PASS' for v in receipt['checks'].values()) or not receipt.get('thread_id') or not receipt.get('turn_id') or receipt.get('original_connection_responses') is not True:
+                raise ManagementError('capability_unverified', 'Actual original-connection human response and race evidence is incomplete.')
+            human_response = receipt
         elif receipt.get('registered_executors_complete') is not True or receipt.get('competing_execution') != 'none':
             raise ManagementError('capability_unverified', 'Other execution in this logical repository cannot be excluded.')
         verified[kind] = reference['sha256']
@@ -87,4 +94,6 @@ def validate_receipts(report, connection, repository, command, env, state_dir):
             coverage = control['process_coverage']
             if coverage.get('kind') == 'task_processes_stopped' and coverage.get('thread_id') == control['thread_id'] and coverage.get('turn_id') == control['turn_id'] and coverage.get('all_registered_processes_exited') is True:
                 result['process_coverage'] = {**coverage, 'evidence': digest}
+    if human_response is not None:
+        result.setdefault('task_control', {})['human_response'] = 'receipt:' + verified['human_response']
     return result

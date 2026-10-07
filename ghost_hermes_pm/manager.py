@@ -140,6 +140,14 @@ class Manager:
         data.setdefault('intake_failures', {})
         for record in data['requests'].values():
             session = record.get('session')
+            for question in record.get('human_requests', []):
+                if question.get('resolution') == 'pending' and (record.get('repository_released') or record.get('outer_task_status') == 'stopped' or record.get('task_delivery') == 'delivered' or session and session.get('control') != 'assigned_task'):
+                    question['resolution'] = 'expired'
+                    question['control_enabled'] = False
+                if question.get('resolution') == 'pending' and (self.codex_adapter is None or self.codex_adapter.generation != question['generation'] or self.codex_adapter._closed):
+                    question['resolution'] = 'unverified'
+                    if question.get('reply', {}) and question['reply'].get('sent') == 'intent':
+                        question['reply']['sent'] = 'outcome_unknown'
             if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
                 record['execution'] = 'stopping' if record.get('stop', {}).get('status') == 'processing' else 'unverified'
                 record['unexecuted_reason'] = 'Original executor generation unavailable; reconciliation required.'
@@ -190,8 +198,15 @@ class Manager:
                         _current_assignment(self, request, data)
                     except ManagementError as exc:
                         capability.update(enabled=False, status='blocked', reason=str(exc))
+            original_interface_requests = []
+            if principal is None and self.codex_adapter and self.codex_adapter.connection:
+                original_interface_requests = [{'rpc_id': r['envelope']['id'], 'method': r['envelope']['method'],
+                    'service_id': self.codex_adapter.connection['service_id'], 'generation': self.codex_adapter.generation,
+                    'thread_id': None, 'url': None, 'answerable': False, 'resolution': r['state'],
+                    'availability': 'original_client_required'} for r in self.codex_adapter.server_requests(None)]
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'original_interface_requests': original_interface_requests,
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
@@ -265,6 +280,14 @@ class Manager:
     def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
         from .control import control_task
         return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
+
+    def associate_human_reply(self, identity, project_id, profile_id, message, text):
+        from .questions import associate_human_reply
+        return associate_human_reply(self, identity, project_id, profile_id, message, text)
+
+    def answer_human_request(self, identity, request_id, human_request_id, reply_id, response):
+        from .questions import answer_human_request
+        return answer_human_request(self, identity, request_id, human_request_id, reply_id, response)
 
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery

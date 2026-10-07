@@ -15,6 +15,9 @@
     const [saving, setSaving] = React.useState(false);
     const [controlTexts, setControlTexts] = React.useState({});
     const [controlIntents, setControlIntents] = React.useState({});
+    const [humanAnswers, setHumanAnswers] = React.useState({});
+    const [humanReviewed, setHumanReviewed] = React.useState({});
+    const [humanIntents, setHumanIntents] = React.useState({});
     const [preparationPlans, setPreparationPlans] = React.useState({});
     async function refresh() {
       try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
@@ -55,6 +58,33 @@
       try { await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify({ action: action, request_id: requestId }) }); await refresh(); }
       catch (e) { await refresh(); setError(String(e.message || e)); }
       finally { setSaving(false); }
+    }
+    async function answerHuman(record, question, decision) {
+      if (humanIntents[question.id]) {
+        await refresh(); setError('先核对原请求状态；保留人工答复 ID：' + humanIntents[question.id].reply_id); return;
+      }
+      let response;
+      if (question.category === 'approval') {
+        response = { decision: decision, operation_id: question.operation_id, scope: 'turn' };
+        if (question.method === 'item/permissions/requestApproval') {
+          try { response.permissions = decision === 'decline' ? {} : JSON.parse(humanAnswers[question.id + ':permissions'] || ''); }
+          catch (e) { setError('请填写本次明确批准的权限 JSON 子集。'); return; }
+        }
+      } else {
+        const answers = {};
+        question.questions.forEach(function (q) { answers[q.id] = [humanAnswers[question.id + ':' + q.id] || '']; });
+        response = { answers: answers };
+      }
+      const body = { action: 'answer', request_id: record.id, human_request_id: question.id,
+        reply_id: window.crypto.randomUUID(), response: response };
+      setHumanIntents(Object.assign({}, humanIntents, { [question.id]: body }));
+      setSaving(true);
+      try {
+        await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify(body) });
+        await refresh();
+      } catch (e) {
+        await refresh(); setError(String(e.message || e) + ' · 先核对请求；答复 ID：' + body.reply_id);
+      } finally { setSaving(false); }
     }
     async function prepareAction(record) {
       const selected = preparationPlans[record.id] || {};
@@ -136,6 +166,12 @@
             h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：配置中 · 执行：未启用'),
             h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
         })),
+        (snapshot.original_interface_requests || []).length > 0 && h('section', null, h('h2', null, '原服务需人工处理'),
+          h('ul', null, snapshot.original_interface_requests.map(function (request) {
+            return h('li', { key: request.generation + ':' + String(request.rpc_id) }, request.method + ' · 服务：' + request.service_id +
+              ' · 请求：' + String(request.rpc_id) + ' · 状态：' + request.resolution,
+              h('p', null, '该请求没有核实的任务对应。请在实际原客户端界面处理；安全链接尚不可用，勿在群中输入秘密。'));
+          }))),
         h('h2', null, '已受理请求'),
         h('p', null, '任务与原群消息共用管理实例。执行能力按当前连接和权限证据核验；轮次结束、验收交付与 PR 状态分别显示。'),
         !(snapshot.requests || []).length && h('p', null, '尚无核实的受理记录。'),
@@ -181,6 +217,50 @@
               (r.stop_records || []).length > 0 && h('details', null, h('summary', null, '停止记录、相关执行与继续安排'),
                 h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ stops: r.stop_records,
                   arrangements: r.execution_arrangements || [], controls: r.controls || [] }, null, 2)))),
+            (r.human_requests || []).map(function (q) {
+              const reply = q.reply || {};
+              const canAnswer = inputOpen && q.answerable && q.control_enabled && q.resolution === 'pending' &&
+                !q.reply && !humanIntents[q.id] && snapshot.status === 'completed' && !saving;
+              return h('section', { key: q.id, style: { margin: '12px 0', padding: '12px', border: '1px solid #8886', borderRadius: '6px' } },
+                h('strong', null, '人工请求 · ' + q.category),
+                h('div', null, '请求 ID：' + q.id),
+                h('div', null, '收到：' + (reply.received ? '是' : '未答复') + ' · 送回：' + (reply.sent || '未送回') +
+                  ' · 原请求已处理：' + q.resolution + ' · 执行结果：' + q.execution_result),
+                h('div', null, '服务：' + q.service_id + ' · 会话：' + q.thread_id + ' · 轮次：' + (q.turn_id || '未提供') +
+                  ' · 阻塞：' + (q.blocking === null ? '待核对' : q.blocking ? '是' : '否')),
+                q.answerable && q.category !== 'approval' && (q.questions || []).map(function (item) {
+                  const key = q.id + ':' + item.id;
+                  return h('label', { key: item.id, style: { display: 'block', marginTop: '8px' } }, item.question,
+                    h('input', { value: humanAnswers[key] || '', disabled: !canAnswer,
+                      onChange: function (e) { setHumanAnswers(Object.assign({}, humanAnswers, { [key]: e.target.value })); },
+                      list: item.options ? 'options-' + q.id + '-' + item.id : undefined,
+                      style: { display: 'block', width: '100%', color: 'inherit', background: 'transparent', border: '1px solid #8886', padding: '7px' } }),
+                    item.options && h('datalist', { id: 'options-' + q.id + '-' + item.id }, item.options.map(function (o) {
+                      return h('option', { key: o.label, value: o.label }, o.description);
+                    })));
+                }),
+                q.answerable && q.category === 'approval' && h(React.Fragment, null,
+                  h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(q.operation, null, 2)),
+                  h('div', null, '操作 ID：' + q.operation_id + ' · 批准范围：仅本回合（turn）'),
+                  q.method === 'item/permissions/requestApproval' && h('label', null, '明确批准的权限 JSON 子集',
+                    h('textarea', { value: humanAnswers[q.id + ':permissions'] || '', disabled: !canAnswer,
+                      onChange: function (e) { setHumanAnswers(Object.assign({}, humanAnswers, { [q.id + ':permissions']: e.target.value })); },
+                      style: { display: 'block', width: '100%', color: 'inherit', background: 'transparent' } })),
+                  h('label', null, h('input', { type: 'checkbox', checked: !!humanReviewed[q.id], disabled: !canAnswer,
+                    onChange: function (e) { setHumanReviewed(Object.assign({}, humanReviewed, { [q.id]: e.target.checked })); } }),
+                    '本人已核对上述具体操作与仅本回合的授权范围'),
+                  h('div', null, h('button', { style: button, disabled: !canAnswer || !humanReviewed[q.id],
+                    onClick: function () { answerHuman(r, q, 'accept'); } }, '批准此操作（仅本回合）'),
+                    h('button', { style: button, disabled: !canAnswer || !humanReviewed[q.id],
+                    onClick: function () { answerHuman(r, q, 'decline'); } }, '拒绝此操作'))),
+                q.answerable && q.category !== 'approval' && h('button', { style: button,
+                  disabled: !canAnswer || !(q.questions || []).every(function (item) { return String(humanAnswers[q.id + ':' + item.id] || '').trim(); }),
+                  onClick: function () { answerHuman(r, q); } }, '将本人答案送回原请求'),
+                !q.answerable && h('p', null, '请在原服务的安全原界面处理。原会话：' + q.thread_id +
+                  '；安全链接尚不可用。不要在群或此表单输入秘密答案。'),
+                q.answerable && !q.control_enabled && h('p', null, '原连接人工答复能力尚未核验；请定位原界面。'),
+                (q.reply || humanIntents[q.id]) && h('button', { style: button, onClick: function () { taskAction('refresh', r.id); }, disabled: saving }, '核对原请求与执行结果'));
+            }),
             r.execution_capability && h('div', null, '启动能力：' + r.execution_capability.status + (r.execution_capability.reason ? ' · ' + r.execution_capability.reason : '')),
             h('button', { style: button, onClick: function () { taskAction('source', r.id); }, disabled: saving || snapshot.status !== 'completed' }, '核对 Issue 来源'),
             r.issue_source && h('details', null, h('summary', null, 'Issue 来源：' + r.issue_source.status + ' · 已受理版本保留'),

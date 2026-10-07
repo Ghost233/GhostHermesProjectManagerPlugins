@@ -144,6 +144,8 @@ def refresh_task(manager, identity, request_id):
                 thread = adapter.read_thread(session['thread_id'])
                 if thread.get('id') != session['thread_id'] or thread.get('cwd') != repository['worktree']:
                     raise ManagementError('capability_unverified', 'The observation does not identify the original task and boundary.')
+                from .questions import sync_human_requests
+                sync_human_requests(manager, record, adapter, thread)
                 events = adapter.take_events(session['thread_id'])
                 record.setdefault('service_events', []).extend({'method': e['method'], 'turn_id': e.get('params', {}).get('turnId'),
                                                               'request_id': e.get('id'), 'generation': adapter.generation}
@@ -206,6 +208,8 @@ def refresh_task(manager, identity, request_id):
             manager.publish_request_message(identity, request_id, 'progress', '执行核对：' + record['execution'] + '\nIssue：' + record['accepted_scope']['url'] +
                                         '\n交付：' + record.get('task_delivery', 'unmet') + '；PR：' + record.get('pr_status', 'none') +
                                         '\n核实时间：' + record.get('last_execution_verified_at', '待核对'))
+        from .questions import notify_human_requests
+        notify_human_requests(manager, identity, request_id)
         return record
 
 
