@@ -1,5 +1,6 @@
 """Single accepted Issue execution, persisted before every external mutation."""
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .manager import ManagementError, _repository
 from .codex import repository_fingerprint
@@ -13,6 +14,21 @@ def _responsible(manager, identity, request_id, data):
     return record
 
 
+
+def _current_assignment(manager, record, data):
+    profile = data['profiles'].get(record['profile_id'])
+    accepted = record.get('accepted_responsibility')
+    if not profile or not isinstance(accepted, dict) or any(profile.get(k) != v for k, v in accepted.items()) or profile.get('project_id') != record['project_id'] or profile.get('capability') != 'development' or profile.get('role') not in {'project_lead', 'subproject_lead'}:
+        raise ManagementError('forbidden', 'The current Profile no longer has the accepted responsibility; original work requires reconciliation.')
+    service_ref = profile.get('connection_refs', {}).get('codex')
+    if service_ref != manager.codex_adapter.service_ref or (record.get('accepted_codex_ref') is not None and record['accepted_codex_ref'] != service_ref):
+        raise ManagementError('capability_unverified', 'The actual executor does not match the responsible Profile local Codex binding.')
+    if record.get('accepted_repository_fingerprint') != repository_fingerprint(data['projects'][record['project_id']]['repo']):
+        raise ManagementError('capability_unverified', 'The repository boundary differs from the accepted task scope.')
+    repository = data['projects'][record['project_id']]['repo']
+    if any(manager.state_dir.is_relative_to(Path(repository[k])) for k in ('worktree', 'git_dir', 'common_dir')):
+        raise ManagementError('capability_unverified', 'Authoritative manager and validation/test receipts must be outside the task writable repository and Git metadata.')
+
 def start_task(manager, identity, request_id):
     with manager._lock:
         version, data = manager._load()
@@ -20,6 +36,7 @@ def start_task(manager, identity, request_id):
         adapter = manager.codex_adapter
         if adapter is None:
             raise ManagementError('capability_unverified', 'Codex execution is not enabled.')
+        _current_assignment(manager, record, data)
         if record.get('session'):
             raise ManagementError('binding_conflict', 'This task already has a session or an unresolved start intent; reconcile it first.')
         if record['task_start_anchor'] is None:
@@ -36,7 +53,7 @@ def start_task(manager, identity, request_id):
         baseline = source_state(repository)
         record['session'] = {**adapter.connection, 'thread_id': None, 'turn_id': None,
                              'logical_repository': repository['logical_id'], 'start_phase': 'thread_start_intent',
-                             'control': 'assigned_task', 'capability': proof, 'baseline': baseline}
+                             'control': 'assigned_task', 'capability': proof, 'baseline': baseline, 'repository': repository}
         record.update(execution='unverified', unexecuted_reason='Thread creation needs confirmation.',
                       task_delivery='unmet', pr_status='none', repository_released=False)
         with manager._db:
@@ -69,7 +86,8 @@ def start_task(manager, identity, request_id):
             if not isinstance(turn.get('id'), str) or not turn['id']:
                 raise ManagementError('outcome_unknown', 'The turn identity was not confirmed.')
             record['session'].update(turn_id=turn['id'], start_phase='turn_registered')
-            record.update(execution='running', unexecuted_reason=None, last_execution_verified_at=datetime.now(timezone.utc).isoformat())
+            record.update(execution='running', unexecuted_reason=None, last_execution_verified_at=datetime.now(timezone.utc).isoformat(),
+                          execution_capability={'status': 'verified', 'enabled': True, 'connection': adapter.connection, 'proof': proof})
             with manager._db:
                 manager._save(version + 3, data)
         except ManagementError as exc:
@@ -95,7 +113,7 @@ def refresh_task(manager, identity, request_id):
             record.update(execution='unverified', unexecuted_reason='The original executor generation is unavailable; matching history is not control identity.')
         else:
             try:
-                repository = data['projects'][record['project_id']]['repo']
+                repository = session.get('repository') or data['projects'][record['project_id']]['repo']
                 actual = _repository({'repo_path': repository['worktree'], 'test_artifact_paths': repository['test_artifact_paths']})
                 if repository_fingerprint(actual) != session['capability']['repository_fingerprint']:
                     raise ManagementError('capability_unverified', 'Repository permissions changed; execution requires reconciliation.')
@@ -177,6 +195,7 @@ def verify_task_execution(manager, identity, request_id):
             result = {'status': 'blocked', 'enabled': False, 'reason': 'No registered local stdio executor.'}
         else:
             try:
+                _current_assignment(manager, record, data)
                 proof = adapter.verify_start(repository)
                 result = {'status': 'verified', 'enabled': True, 'connection': adapter.connection, 'proof': proof}
             except ManagementError as exc:

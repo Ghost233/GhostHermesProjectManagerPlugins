@@ -173,6 +173,16 @@ class Manager:
                 profiles = [p for p in profiles if p['project_id'] == scope]
             visible_ids = {p['id'] for p in profiles}
             requests = [r for r in data['requests'].values() if r['profile_id'] in visible_ids]
+            for request in requests:
+                capability = request.get('execution_capability', {})
+                if capability.get('enabled'):
+                    try:
+                        if self.codex_adapter is None:
+                            raise ManagementError('capability_unverified', 'Original executor unavailable.')
+                        from .execution import _current_assignment
+                        _current_assignment(self, request, data)
+                    except ManagementError as exc:
+                        capability.update(enabled=False, status='blocked', reason=str(exc))
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
@@ -204,6 +214,9 @@ class Manager:
             record = {'id': key, 'project_id': project_id, 'profile_id': profile_id,
                       'accepted_scope': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')},
                       'source_anchor': dict(message), 'task_start_anchor': None,
+                      'accepted_responsibility': {k: profile.get(k) for k in ('id', 'identity_ref', 'project_id', 'capability', 'role', 'parent_profile_id')},
+                      'accepted_codex_ref': profile.get('connection_refs', {}).get('codex'),
+                      'accepted_repository_fingerprint': hashlib.sha256(json.dumps(data['projects'][project_id]['repo'], sort_keys=True).encode()).hexdigest(),
                       'acceptance': 'accepted', 'accepted_at': datetime.now(timezone.utc).isoformat(),
                       'execution': 'waiting', 'unexecuted_reason': 'Codex execution is not enabled.',
                       'delivery': 'pending', 'messages': [], 'outbox': []}

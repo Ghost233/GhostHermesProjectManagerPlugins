@@ -15,14 +15,20 @@ def adapter_for(root):
                 'repository_fingerprint': repository_fingerprint(repository), 'permission_profile': 'fixture-boundary',
                 'runtime_roots': [repository['worktree']], 'policy_digest': 'fixture-policy',
                 'platform_enforcement': 'synthetic-peer-only', 'tool_paths': 'synthetic-peer-only',
-                'task_start': 'synthetic-peer-only', 'model': 'fixture-model'}
+                'task_start': 'synthetic-peer-only', 'manual_execution_coverage': 'synthetic-peer-only', 'model': 'fixture-model'}
     return CodexStdioAdapter([sys.executable, str(Path(__file__).with_name('codex_fixture_server.py')), str(root)],
                             cwd=root, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(root / 'codex-home')},
                             service_ref='local:fixture-stdio', verifier=verifier, timeout=2)
 
 
+
+def execution_registration(repo):
+    value = registration(repo)
+    value['profile']['connection_refs']['codex'] = 'local:fixture-stdio'
+    return value
+
 def accepted(manager, repo):
-    manager.apply_directory_change(OWNER, 0, registration(repo))
+    manager.apply_directory_change(OWNER, 0, execution_registration(repo))
     request = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, ISSUE)['request']
     manager.publish_request_message(OWNER, request['id'], 'confirmation', '已受理')
     segment = manager.claim_delivery(OWNER, request['id'])
@@ -247,7 +253,7 @@ def test_issue_requiring_merge_keeps_delivery_unmet_but_records_actual_pr_state(
             return head
     source = Source()
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), delivery_source=source) as manager:
-        manager.apply_directory_change(OWNER, 0, registration(repo))
+        manager.apply_directory_change(OWNER, 0, execution_registration(repo))
         scope = {**ISSUE, 'body': '- [ ] Run fixture tests\n- [ ] Merge PR into main'}
         request_id = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, scope)['request']['id']
         manager.publish_request_message(OWNER, request_id, 'confirmation', '已受理')
@@ -282,7 +288,7 @@ async def _feishu_start(tmp_path):
     from test_feishu_entry import CONFIG, Gateway, Transport, event
     adapter, transport = object(), Transport()
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
-        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        manager.apply_directory_change(OWNER, 0, execution_registration(make_repo(tmp_path / 'repo')))
         intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda _: ISSUE)
         intake.attach_transport(adapter, transport)
         assert await intake.receive(event(), Gateway(adapter)) == {'action': 'skip'}
@@ -299,3 +305,113 @@ async def _feishu_start(tmp_path):
 def test_verified_feishu_execute_uses_same_single_task_entry_and_original_anchor(tmp_path):
     import asyncio
     asyncio.run(_feishu_start(tmp_path))
+
+
+def test_native_task_tool_cannot_borrow_owner_credential_alias(tmp_path, monkeypatch):
+    from types import ModuleType
+    from test_plugin_entry import Context, load_entry
+    secrets = ModuleType('agent.secret_scope')
+    secrets.get_secret = lambda ref: 'fixture-owner-token'
+    monkeypatch.setitem(sys.modules, 'agent.secret_scope', secrets)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-owner-token': OWNER}):
+            ctx = Context({'state_dir': str(tmp_path / 'state'), 'participant_credential_ref': 'native:OWNER_ALIAS'})
+            load_entry().register(ctx)
+            result = json.loads(ctx.tools['hermes_pm_task']({'action': 'verify', 'request_id': request_id}))
+            assert result['status'] == 'rejected'
+            assert result['code'] == 'forbidden'
+            assert 'fixture-owner-token' not in str(result)
+
+
+def test_dirty_source_changes_cannot_be_delivered_as_unchanged_head_commit(tmp_path):
+    import subprocess
+    import pytest
+    from ghost_hermes_pm import ManagementError
+    repo = make_repo(tmp_path / 'repo')
+    (repo / 'source.py').write_text('original\n')
+    subprocess.run(['git', '-C', str(repo), 'add', 'source.py'], check=True)
+    subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'baseline'], check=True)
+    head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+    (repo / 'source.py').write_text('preexisting user change\n')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        manager.start_task(OWNER, request_id)
+        (repo / 'source.py').write_text('new uncommitted task change\n')
+        (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': '00000000-0000-7000-8000-000000000017',
+            'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'pytest-1',
+                'command': 'python -m pytest tests/test_fixture.py -q', 'cwd': str(repo), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed'}]}]}))
+        report = {'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['pytest-1']}],
+                  'source_commit': head, 'pr_url': None, 'sync_branches': []}
+        with pytest.raises(ManagementError) as unsafe:
+            manager.record_task_delivery(OWNER, request_id, report)
+        assert unsafe.value.code == 'evidence_missing'
+        assert manager.read_snapshot(OWNER)['requests'][0]['repository_released'] is False
+        assert (repo / 'source.py').read_text() == 'new uncommitted task change\n'
+
+
+def test_directory_correction_cannot_reassign_old_task_or_use_wrong_executor(tmp_path):
+    import pytest
+    from ghost_hermes_pm import ManagementError
+    for change in ({'capability': 'non_development'}, {'identity_ref': 'fixture:new-lead'},
+                   {'connection_refs': {'codex': 'local:different-executor'}}):
+        case = tmp_path / str(len(list(tmp_path.iterdir())))
+        case.mkdir()
+        with Manager(case / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(case)) as manager:
+            repo = make_repo(case / 'repo')
+            request_id = accepted(manager, repo)
+            correction = execution_registration(repo)['profile']
+            correction.update(change)
+            manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': correction})
+            with pytest.raises(ManagementError):
+                manager.start_task(OWNER, request_id)
+            assert manager.codex_adapter.connection is None
+            assert manager.read_snapshot(OWNER)['requests'][0].get('session') is None
+
+
+def test_existing_thread_observation_keeps_original_repository_after_directory_correction(tmp_path):
+    adapter = adapter_for(tmp_path)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+        repo = make_repo(tmp_path / 'repo')
+        request_id = accepted(manager, repo)
+        manager.start_task(OWNER, request_id)
+        other = make_repo(tmp_path / 'corrected-repo')
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'project': registration(other)['project']})
+        observed = manager.refresh_task(OWNER, request_id)
+        assert observed['execution'] == 'running'
+        assert observed['session']['logical_repository'] == str(repo / '.git')
+        assert observed['repository_released'] is False
+        methods = [json.loads(line)['method'] for line in (tmp_path / 'wire.jsonl').read_text().splitlines()]
+        assert methods.count('thread/start') == methods.count('turn/start') == 1
+        assert methods[-1] == 'thread/read'
+
+
+def test_plain_echo_cannot_be_relabelled_as_a_passing_test(tmp_path):
+    import pytest
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        repo = make_repo(tmp_path / 'repo')
+        request_id = accepted(manager, repo)
+        manager.start_task(OWNER, request_id)
+        (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': '00000000-0000-7000-8000-000000000017',
+            'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'echo-1',
+                'command': 'echo all tests passed', 'cwd': str(repo), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'all tests passed'}]}]}))
+        report = {'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['echo-1']}],
+                  'source_commit': None, 'pr_url': None, 'sync_branches': []}
+        with pytest.raises(ManagementError) as fabricated:
+            manager.record_task_delivery(OWNER, request_id, report)
+        assert fabricated.value.code == 'evidence_missing'
+        assert manager.read_snapshot(OWNER)['requests'][0]['test_evidence'] == []
+
+
+def test_executor_cannot_write_authoritative_manager_receipts_inside_repository(tmp_path):
+    import pytest
+    from ghost_hermes_pm import ManagementError
+    repo = make_repo(tmp_path / 'repo')
+    adapter = adapter_for(tmp_path)
+    with Manager(repo / 'manager-state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+        request_id = accepted(manager, repo)
+        with pytest.raises(ManagementError) as overlap:
+            manager.start_task(OWNER, request_id)
+        assert overlap.value.code == 'capability_unverified'
+        assert adapter.connection is None

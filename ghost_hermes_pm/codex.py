@@ -148,13 +148,13 @@ class CodexStdioAdapter:
         if self.verifier is None:
             raise ManagementError('capability_unverified', 'Platform filesystem and tool enforcement evidence is missing; task start remains disabled.')
         proof = self.verifier(dict(connection), json.loads(json.dumps(repository)))
-        required = ('permission_profile', 'policy_digest', 'platform_enforcement', 'tool_paths', 'task_start', 'model')
+        required = ('permission_profile', 'policy_digest', 'platform_enforcement', 'tool_paths', 'task_start', 'manual_execution_coverage', 'model')
         if not isinstance(proof, dict) or any(not isinstance(proof.get(k), str) or not proof[k] for k in required) or proof.get('generation') != self.generation or proof.get('service_id') != connection['service_id'] or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']]:
             raise ManagementError('capability_unverified', 'Execution evidence is incomplete or belongs to another connection or repository.')
         if '0.160.1' not in connection['user_agent']:
             raise ManagementError('capability_unverified', 'The connected Codex protocol version is not verified.')
         profiles = self._pages('permissionProfile/list', {'cwd': repository['worktree'], 'limit': 100})
-        if not any(p.get('id') == proof['permission_profile'] and p.get('allowed') is True for p in profiles):
+        if not any(isinstance(p, dict) and p.get('id') == proof['permission_profile'] and p.get('allowed') is True for p in profiles):
             raise ManagementError('capability_unverified', 'The verified permission profile is not selectable on this service.')
         # Full loaded/list coverage comes from this executor only. A host verifier must
         # also establish manual/desktop coverage; matching histories cannot do so.
@@ -183,11 +183,14 @@ class CodexStdioAdapter:
 
     def read_thread(self, thread_id):
         self.connect()
-        return self._call('thread/read', {'threadId': thread_id, 'includeTurns': True}).get('thread', {})
+        thread = self._call('thread/read', {'threadId': thread_id, 'includeTurns': True}).get('thread')
+        if not isinstance(thread, dict) or not isinstance(thread.get('status'), dict) or not isinstance(thread.get('turns', []), list) or any(not isinstance(t, dict) or not isinstance(t.get('items', []), list) or any(not isinstance(i, dict) for i in t.get('items', [])) for t in thread.get('turns', [])):
+            raise ManagementError('capability_unverified', 'The original thread read is malformed or incomplete.')
+        return thread
 
     def take_events(self, thread_id):
         with self._condition:
-            matching = [e for e in self._events if e.get('params', {}).get('threadId') == thread_id]
+            matching = [e for e in self._events if isinstance(e.get('params'), dict) and e['params'].get('threadId') == thread_id]
             self._events = [e for e in self._events if e not in matching]
             return matching
 

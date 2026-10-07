@@ -75,7 +75,7 @@ def register_native(ctx):
             from .github import GitHubDeliverySource
             codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
-                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource())
+                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir))
             server = ManagementServer(manager, credentials)
             try:
                 server.start()
@@ -165,11 +165,14 @@ def register_native(ctx):
                       handler=snapshot, description='Project directory and verified capability status')
     def task_operation(args):
         try:
+            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report'}:
+                raise ManagementError('invalid_change', 'Task input cannot assert actor, permission or capability.')
             reference = ctx.get_config('participant_credential_ref')
             token = _credential(reference) if reference else None
             if not state_dir or not token:
                 raise ManagementError('unauthorized', 'A configured participant bridge is required.')
             client = ManagementClient(state_dir, token)
+            client.read_participant_snapshot()  # Reject owner aliases at the authoritative bridge.
             action = args.get('action')
             if action == 'delivery':
                 result = client.record_task_delivery(args.get('request_id'), args.get('report'))

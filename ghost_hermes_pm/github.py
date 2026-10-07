@@ -2,12 +2,30 @@
 import json
 import re
 import subprocess
+from pathlib import Path
 from urllib.parse import quote
 
 from .manager import ManagementError
 
 
 class GitHubDeliverySource:
+    def __init__(self, state_dir=None):
+        self.state_dir = Path(state_dir).resolve() if state_dir is not None else None
+
+    def read_test_version(self, session, item_id):
+        if self.state_dir is None or not isinstance(item_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', item_id):
+            raise ManagementError('evidence_missing', 'A registered test runner receipt is required.')
+        path = self.state_dir / 'test-evidence' / (session['thread_id'] + '-' + session['turn_id'] + '-' + item_id + '.json')
+        try:
+            if path != path.resolve() or path.stat().st_size > 65536:
+                raise ValueError('Invalid test receipt.')
+            receipt = json.loads(path.read_text())
+            if not isinstance(receipt, dict) or receipt.get('thread_id') != session['thread_id']:
+                raise ValueError('Receipt thread mismatch.')
+            return receipt
+        except (OSError, ValueError) as exc:
+            raise ManagementError('evidence_missing', 'No trusted runner receipt binds this test to the fixed delivery source.') from exc
+
     def _run(self, *args):
         result = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=30)
         if result.returncode:

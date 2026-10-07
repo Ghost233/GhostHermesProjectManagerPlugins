@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 import re
 import subprocess
+import shlex
 
 from .manager import ManagementError, _git, _public_text
 
@@ -14,6 +15,7 @@ def source_state(repository):
     head = result.stdout.strip() if result.returncode == 0 else None
     files = _git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z').split('\0')
     digest = hashlib.sha256()
+    file_digests = {}
     artifacts = [Path(p) for p in repository['test_artifact_paths']]
     for name in sorted(set(files) - {''}):
         path = root / name
@@ -21,13 +23,30 @@ def source_state(repository):
             continue
         digest.update(name.encode())
         if path.is_symlink():
-            digest.update(path.readlink().as_posix().encode())
+            raw = path.readlink().as_posix().encode()
         elif path.is_file():
-            digest.update(path.read_bytes())
+            raw = path.read_bytes()
         elif not path.exists():
-            digest.update(b'<deleted>')
-    return {'head': head, 'source_digest': digest.hexdigest(), 'workspace_status': _git(root, 'status', '--porcelain=v1')}
+            raw = None
+        else:
+            continue
+        digest.update(raw if raw is not None else b'<deleted>')
+        file_digests[name] = hashlib.sha256(raw).hexdigest() if raw is not None else None
+    return {'head': head, 'source_digest': digest.hexdigest(), 'file_digests': file_digests, 'workspace_status': _git(root, 'status', '--porcelain=v1')}
 
+
+
+def _direct_test_command(command):
+    if any(character in command for character in '|;&<>\n'):
+        return False
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        return False
+    if not args or any(a in {'--help', '-h', '--version', '--collect-only', '--co'} for a in args):
+        return False
+    name = Path(args[0]).name
+    return (name == 'pytest' or (re.fullmatch(r'python(?:[0-9.]+)?', name) and args[1:3] in [['-m', 'pytest'], ['-m', 'unittest']]))
 
 def acceptance_criteria(body):
     checks = re.findall(r'^\s*[-*]\s+\[[ xX]\]\s+(.+)$', body, re.MULTILINE)
@@ -39,7 +58,7 @@ def record_task_delivery(manager, identity, request_id, report):
     if not isinstance(report, dict) or set(report) - {'issue_updated_at', 'criteria', 'source_commit', 'pr_url', 'sync_branches'}:
         raise ManagementError('invalid_change', 'Delivery accepts evidence references, never passed or delivered declarations.')
     with manager._lock:
-        refreshed = refresh_task(manager, identity, request_id)
+        refresh_task(manager, identity, request_id)
         version, data = manager._load()
         record = _responsible(manager, identity, request_id, data)
         if record['execution'] != 'turn_ended' or record.get('turn_status') != 'completed' or not record.get('history_complete'):
@@ -49,7 +68,10 @@ def record_task_delivery(manager, identity, request_id, report):
         criteria = report.get('criteria')
         if report.get('issue_updated_at') != scope['updated_at'] or not isinstance(criteria, list) or [c.get('text') for c in criteria if isinstance(c, dict)] != expected:
             raise ManagementError('evidence_missing', 'Every frozen Issue acceptance item must have an exact evidence association.')
-        repository = data['projects'][record['project_id']]['repo']
+        if manager._principal(identity, data) is not None:
+            from .execution import _current_assignment
+            _current_assignment(manager, record, data)
+        repository = record['session'].get('repository') or data['projects'][record['project_id']]['repo']
         evidence = {c['item_id']: c for c in record.get('command_evidence', [])}
         tests, artifacts = {}, []
         for criterion in criteria:
@@ -85,6 +107,30 @@ def record_task_delivery(manager, identity, request_id, report):
             raise ManagementError('evidence_missing', 'Source delivery needs the current fixed commit and a verified handoff preserving pre-existing user content.')
         if commit is not None and commit != current['head']:
             raise ManagementError('evidence_missing', 'The supplied commit does not identify this local delivery version.')
+        if source_changed:
+            before, after = baseline.get('file_digests', {}), current['file_digests']
+            for name in set(before) | set(after):
+                if before.get(name) == after.get(name):
+                    continue
+                blob = subprocess.run(['git', '-C', repository['worktree'], 'show', commit + ':' + name], capture_output=True)
+                fixed_digest = hashlib.sha256(blob.stdout).hexdigest() if blob.returncode == 0 else None
+                if fixed_digest != after.get(name):
+                    raise ManagementError('evidence_missing', 'A changed source file is absent from the supplied fixed commit; user content was preserved.')
+        for item_id, test in tests.items():
+            if not source_changed and _direct_test_command(test['command']):
+                continue
+            reader = getattr(manager.delivery_source, 'read_test_version', None)
+            if reader is None:
+                raise ManagementError('evidence_missing', 'Source changes or custom/compound commands require trusted test runner receipts; completion text and command labels are insufficient.')
+            receipt = reader(record['session'], item_id)
+            expected_receipt = {'service_id': test['service_id'], 'generation': test['generation'], 'turn_id': test['turn_id'],
+                'item_id': item_id, 'command_sha256': hashlib.sha256(test['command'].encode()).hexdigest(),
+                'output_digest': test['output_digest'], 'exit_code': 0, 'before_source_digest': current['source_digest'],
+                'after_source_digest': current['source_digest'], 'source_access': 'read-only', 'git_access': 'read-only',
+                'artifact_roots': repository['test_artifact_paths']}
+            if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in expected_receipt.items()):
+                raise ManagementError('evidence_missing', 'The test runner receipt does not verify this stable delivery source and test-only write boundary.')
+            tests[item_id] = {**test, 'tested_source_digest': current['source_digest'], 'version_source': 'trusted_host_test_runner'}
         pr_url = report.get('pr_url')
         pr = None
         branches = report.get('sync_branches', [])

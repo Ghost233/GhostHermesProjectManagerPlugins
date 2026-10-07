@@ -58,7 +58,7 @@ manager = get_plugin_manager()
 manager.discover_and_load()
 info = next(p for p in manager.list_plugins() if p['name'] == 'ghost-hermes-pm')
 assert info['enabled'] and info['error'] is None, info
-assert info['tools'] == 1 and info['commands'] == 1 and info['hooks'] == 1, info
+assert info['tools'] == 2 and info['commands'] == 1 and info['hooks'] == 1, info
 assert not (state / 'manager.sock').exists(), 'Ordinary CLI discovery must not start authority.'
 assert not (state / 'manager.lock').exists(), 'Ordinary CLI discovery must not acquire the manager lease.'
 assert not (state / 'manager.sqlite3').exists(), 'Ordinary CLI discovery must not create authoritative storage.'
@@ -140,6 +140,8 @@ async def exercise_gateway_lifecycle():
     assert snapshot['version'] == 1 and len(snapshot['profiles']) == 1, snapshot
     from tools.registry import registry
     assert json.loads(registry.dispatch('hermes_pm_snapshot', {}, scope=str(home)))['profiles'][0]['id'] == 'lead'
+    task_rejection = json.loads(registry.dispatch('hermes_pm_task', {'action': 'verify', 'request_id': 'unknown'}, scope=str(home)))
+    assert task_rejection['status'] == 'rejected' and task_rejection['code'] == 'invalid_change'
     from lark_oapi import Client
     from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse
     from gateway.session import SessionSource
@@ -197,6 +199,7 @@ async def exercise_gateway_lifecycle():
     assert manager.unload('ghost-hermes-pm')
     await asyncio.sleep(0)
     assert registry.get_entry('hermes_pm_snapshot', scope=str(home)) is None
+    assert registry.get_entry('hermes_pm_task', scope=str(home)) is None
     manager.discover_and_load(force=True)
     assert not (state / 'manager.sock').exists(), 'Rediscovery without Gateway context remains read-only.'
     restarted_gateway = GatewayFixture()

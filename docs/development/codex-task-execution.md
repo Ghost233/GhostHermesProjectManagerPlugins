@@ -10,21 +10,21 @@
 
 启动顺序为：
 
-1. 确认公开受理锚、负责范围、逻辑仓库没有其他未释放外层任务，重新取得本地仓库物理布局。
+1. 确认公开受理锚、冻结负责身份/项目/kind/role及仓库fingerprint仍与当前目录相符、当前负责Profile的local Codex ref与实际adapter一致、逻辑仓库没有其他未释放外层任务，再重新取得本地仓库物理布局。旧记录缺少冻结责任证据时先对账；目录纠正不能默默重新派给新身份或新执行器。
 2. initialize/initialized 确认实际自有进程、连接 generation 和来源；验证权限 profile 可选、完整 loaded/list 与当前执行能力证据。
 3. 先提交 SQLite `thread_start_intent`，然后 `thread/start`；响应中的 thread ID 即使权限核对失败也先登记。
 4. 核对实际 cwd、`canAcceptDirectInput`、固定 CLI、activePermissionProfile 与 runtime roots；提交 thread 绑定及 `turn_start_intent` 后才发 `turn/start`。
 5. 当前目标、冻结 Issue 版本及验收、仓库/子仓/产物边界、Matt 工作流、Ghost233 与本地同步约束进入该独立任务会话。
 
-超时、EOF、异常响应、落盘失败或权限不符保留意图/原 thread 和仓库占用。重复 start 不新建线程。更换自有进程会取得新的 generation；相同 CODEX_HOME 或历史不能接替原执行器控制。刷新只使用 `thread/read`，从不 resume。完整 JSONL 帧上限 16 MiB；超过上限使监测失联、执行待核实，不能据此宣称停止。bridge 执行操作预算 30 秒；启动应答不明需读取原 durable request，不能盲目重发。
+超时、EOF、异常响应、落盘失败或权限不符保留意图/原 thread 和仓库占用。重复 start 不新建线程。更换自有进程会取得新的 generation；相同 CODEX_HOME 或历史不能接替原执行器控制。刷新按已登记 session 的原仓库快照只使用 `thread/read`，目录纠正不改写原仓库占用，也不 resume。完整 JSONL 帧上限 16 MiB；超过上限使监测失联、执行待核实，不能据此宣称停止。bridge 执行操作预算 30 秒；启动应答不明需读取原 durable request，不能盲目重发。
 
 ## 状态与交付证据
 
 消息送达 `delivery` 与任务验收 `task_delivery` 是两个字段。执行分别显示 running、waiting_approval、waiting_input、related_execution、turn_ended、unverified。轮次 completed、failed、interrupted 单列；后台命令/相关子会话未终结时不能普通交付。缺少完整 turn items 时不能交付。
 
-交付输入只提供冻结验收项及证据引用，不接受 `passed` / `delivered` 布尔值。每项原 Markdown checklist 按原顺序逐字对应；没有 checklist 时使用原 body。测试引用正式 `commandExecution` item，必须原任务仓库内 completed、exit 0；agentMessage 中的“测试通过”没有证据效力。保存命令、cwd、exit、原 service/generation/thread/turn/item、观察时间和输出 digest，不保存全部输出或秘密。未引用的命令不自动当测试。固定文件证据读取允许的普通文件并核对 SHA-256。
+交付输入只提供冻结验收项及证据引用，不接受 `passed` / `delivered` 布尔值。每项原 Markdown checklist 按原顺序逐字对应；没有 checklist 时使用原 body。测试引用正式 `commandExecution` item，必须原任务仓库内 completed、exit 0；agentMessage 中的“测试通过”没有证据效力。保存命令、cwd、exit、原 service/generation/thread/turn/item、观察时间和输出 digest，不保存全部输出或秘密。未引用的命令不自动当测试。只直接识别正常 pytest/unittest 执行；echo、collect/help/version、复杂shell或其他自定义runner需可信测试runner收据，不能经 test_item_ids 标签伪造测试。固定文件证据读取允许的普通文件并核对 SHA-256。源码变化后的测试还须有独立可信测试 runner 写入 state_dir/test-evidence 的版本收据，绑定实际 command/output digest、thread/turn/item、相同 before/after 源码 digest、源码/Git只读和授权产物目录；仅在测试后读到某个 HEAD 不证明该版本接受了测试。缺少收据不交付，任务会话自身不能写入管理实例的证据目录；state_dir 位于任务仓库或其Git写集内时在连接前拒绝启动。
 
-源码变化需要当前固定提交与工作区交接核对，保留原有用户内容。纯测试或无源码变化不要求新增提交/PR。实际 PR 读取独立显示 awaiting_review、awaiting_merge、merged；冻结验收明确以“Merge…”或“合并…PR”等列出合并要求时，未合并不交付，还须核验实际 base 分支本地与远端完整 hash。其他合并措辞由本人明确冻结为验收条目，不能从普通文本猜测任务要求。GitHub 只读 source 在每个认证业务命令前 switch Ghost233 并核验实际 login；不符停止。交付模块自身不 push、merge、stash、reset 或清理用户内容。
+源码变化需要当前固定提交与工作区交接核对，逐一核对变化文件在该 commit 中的 blob，保留原有用户内容。相同 porcelain 状态不能把既有 dirty 文件的新改动变成已提交源码。纯测试或无源码变化不要求新增提交/PR。实际 PR 读取独立显示 awaiting_review、awaiting_merge、merged；冻结验收明确以“Merge…”或“合并…PR”等列出合并要求时，未合并不交付，还须核验实际 base 分支本地与远端完整 hash。其他合并措辞由本人明确冻结为验收条目，不能从普通文本猜测任务要求。GitHub 只读 source 在每个认证业务命令前 switch Ghost233 并核验实际 login；不符停止。交付模块自身不 push、merge、stash、reset 或清理用户内容。
 
 ## 原生配置与验证收据
 
