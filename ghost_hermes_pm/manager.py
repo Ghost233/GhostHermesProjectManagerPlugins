@@ -98,10 +98,11 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, observation_adapters=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
+        self.knowledge_providers = dict(knowledge_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
@@ -141,6 +142,15 @@ class Manager:
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
         data.setdefault('intake_failures', {})
+        data.setdefault('knowledge_sources', {})
+        data.setdefault('knowledge_queries', {})
+        for query in data['knowledge_queries'].values():
+            for publication in query['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
         from .observation import reconcile_connections
         reconcile_connections(self, data)
         for record in data['requests'].values():
@@ -209,7 +219,8 @@ class Manager:
                     'service_id': self.codex_adapter.connection['service_id'], 'generation': self.codex_adapter.generation,
                     'thread_id': None, 'url': None, 'answerable': False, 'resolution': r['state'],
                     'availability': 'original_client_required'} for r in self.codex_adapter.server_requests(None)]
-            return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
+            from .knowledge import snapshot_knowledge
+            return {**snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
@@ -345,6 +356,50 @@ class Manager:
     def verify_task_execution(self, identity, request_id):
         from .execution import verify_task_execution
         return verify_task_execution(self, identity, request_id)
+
+    def register_knowledge_source(self, identity, expected_version, source):
+        from .knowledge import register_source
+        return register_source(self, identity, expected_version, source)
+
+    def query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id=None, channel_id=None, auto_supplement=False):
+        from .knowledge import query_knowledge
+        return query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id, channel_id, auto_supplement)
+
+    def claim_knowledge_delivery(self, identity, query_id):
+        from .knowledge import claim_delivery
+        return claim_delivery(self, identity, query_id)
+
+    def record_knowledge_delivery(self, identity, query_id, segment_id, receipt):
+        from .knowledge import record_delivery
+        return record_delivery(self, identity, query_id, segment_id, receipt)
+
+    def receive_wiki_query(self, identity, query_id, binding_id, anchor):
+        from .knowledge import receive_wiki_query
+        return receive_wiki_query(self, identity, query_id, binding_id, anchor)
+
+    def resolve_knowledge(self, identity, query_id):
+        from .knowledge import resolve_knowledge
+        return resolve_knowledge(self, identity, query_id)
+
+    def receive_wiki_result(self, identity, query_id, binding_id, anchor, result_version):
+        from .knowledge import receive_wiki_result
+        return receive_wiki_result(self, identity, query_id, binding_id, anchor, result_version)
+
+    def supplement_knowledge(self, identity, query_id, material_ids=None):
+        from .knowledge import supplement_knowledge
+        return supplement_knowledge(self, identity, query_id, material_ids)
+
+    def knowledge_bot_allowed(self, bot, app_id, chat_id, tenant_key, open_id, native_ids):
+        from .knowledge import registered_bot_allowed
+        return registered_bot_allowed(self, bot, app_id, chat_id, tenant_key, open_id, native_ids)
+
+    def next_knowledge_delivery_binding(self, identity, query_id):
+        from .knowledge import next_delivery_binding
+        return next_delivery_binding(self, identity, query_id)
+
+    def receive_direct_knowledge_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor):
+        from .knowledge import receive_direct_query
+        return receive_direct_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',

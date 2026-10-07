@@ -25,6 +25,21 @@ class TaskOperation(BaseModel):
     reply_id: str | None = None
     response: dict | None = None
 
+
+class KnowledgeOperation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: str
+    source: dict | None = None
+    expected_version: int | None = Field(default=None, strict=True, ge=0)
+    source_id: str | None = None
+    query_id: str | None = None
+    question: str | None = None
+    scope_ids: list[str] | None = None
+    request_id: str | None = None
+    channel_id: str | None = None
+    auto_supplement: bool = False
+    material_ids: list[str] | None = None
+
 class ObservationOperation(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: str
@@ -101,6 +116,21 @@ def create_router(authenticated_client):
             if operation is None or body.report is not None:
                 raise ManagementError('invalid_change', 'Select verify, start, refresh or evidence-based delivery.')
             return getattr(client, operation)(body.request_id)
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
+    @router.post('/knowledge')
+    def knowledge(body: KnowledgeOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            if body.action == 'register':
+                return client.register_knowledge_source(body.expected_version, body.source)
+            if body.action == 'query':
+                return client.query_knowledge(body.source_id, body.query_id, body.question, body.scope_ids,
+                    body.request_id, body.channel_id, body.auto_supplement)
+            if body.action == 'supplement':
+                return client.supplement_knowledge(body.query_id, body.material_ids)
+            raise ManagementError('invalid_change', 'Select source registration, scoped query or original-task fact supplement.')
         except ManagementError as exc:
             raise failure(exc) from exc
 
