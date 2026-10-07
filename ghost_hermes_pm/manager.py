@@ -315,6 +315,30 @@ class Manager:
         from .knowledge import record_delivery
         return record_delivery(self, identity, query_id, segment_id, receipt)
 
+    def receive_wiki_query(self, identity, query_id, binding_id, anchor):
+        from .knowledge import receive_wiki_query
+        return receive_wiki_query(self, identity, query_id, binding_id, anchor)
+
+    def resolve_knowledge(self, identity, query_id):
+        from .knowledge import resolve_knowledge
+        return resolve_knowledge(self, identity, query_id)
+
+    def receive_wiki_result(self, identity, query_id, binding_id, anchor, result_version):
+        from .knowledge import receive_wiki_result
+        return receive_wiki_result(self, identity, query_id, binding_id, anchor, result_version)
+
+    def supplement_knowledge(self, identity, query_id, material_ids=None):
+        from .knowledge import supplement_knowledge
+        return supplement_knowledge(self, identity, query_id, material_ids)
+
+    def knowledge_bot_allowed(self, bot, app_id, chat_id, tenant_key, open_id, native_ids):
+        from .knowledge import registered_bot_allowed
+        return registered_bot_allowed(self, bot, app_id, chat_id, tenant_key, open_id, native_ids)
+
+    def next_knowledge_delivery_binding(self, identity, query_id):
+        from .knowledge import next_delivery_binding
+        return next_delivery_binding(self, identity, query_id)
+
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',
                    'association_unverified': 'Input could not be associated; quote the confirmed task start message.',

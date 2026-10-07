@@ -64,6 +64,10 @@ class FeishuEntry:
         """Inspect one original event without auth charges, writes or external requests."""
         if self.closed or self.settings.get('enabled') is not True or not self.settings.get('verification_ref'):
             return None
+        from .knowledge_entry import prepare_knowledge_message
+        knowledge = prepare_knowledge_message(self, event, adapter)
+        if knowledge is not None:
+            return knowledge
         try:
             source, header, raw = event.source, event.raw_message.header, event.raw_message.event
             if getattr(source.platform, 'value', source.platform) not in {'feishu', OWNED_PLATFORM} or source.is_bot is not False:
@@ -122,12 +126,17 @@ class FeishuEntry:
         if manager is None:
             return False
         snapshot = manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))
+        if getattr(prepared, 'knowledge_kind', None):
+            return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile for p in snapshot['profiles'])
         return any(p['id'] == prepared.binding['profile_id'] and p['project_id'] == prepared.binding['project_id']
                    and p['native_profile'] == runtime_profile and p['capability'] == 'development'
                    for p in snapshot['profiles'])
 
     async def process_prepared(self, prepared, generation=None):
         """Business processing after the owned driver has irrevocably consumed this original."""
+        if getattr(prepared, 'knowledge_kind', None):
+            from .knowledge_entry import process_knowledge_message
+            return await process_knowledge_message(self, prepared, self.generation if generation is None else generation)
         identity = VerifiedIdentity(self.owner, 'verified-feishu-owner-entry')
         binding, envelope, transport = prepared.binding, prepared.envelope, prepared.transport
         generation = self.generation if generation is None else generation
@@ -276,3 +285,7 @@ class FeishuEntry:
             self.manager().record_delivery(identity, request_id, segment['uuid'], receipt)
             if receipt.get('status') != 'delivered':
                 break
+
+    async def deliver_knowledge(self, identity, query_id, transport, generation=None):
+        from .knowledge_entry import deliver_knowledge
+        return await deliver_knowledge(self, identity, query_id, transport, generation)

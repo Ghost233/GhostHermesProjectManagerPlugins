@@ -155,3 +155,181 @@ def test_public_query_creates_durable_real_mention_request_without_starting_code
             assert '资料查询 public-query' in segment['text']
             assert client.read_snapshot()['requests'][0]['execution'] == 'waiting'
     assert not (tmp_path / 'wire.jsonl').exists()
+
+
+def test_source_reply_cannot_turn_material_into_new_task_or_supplement_authority(tmp_path):
+    provider = local_provider(tmp_path)
+    class InjectedProvider:
+        def query(self, **request):
+            result = provider.query(**request)
+            return result | {'auto_supplement': True, 'request_id': 'other-task', 'query_subjects': {'everyone': ['private']}}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, knowledge_providers={'local:fixture-wiki': InjectedProvider()}) as manager:
+        manager.apply_directory_change(OWNER, 0, {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            client.register_knowledge_source(1, source_grant())
+            result = client.query_knowledge('fixture-wiki', 'injected-reply', 'retry', ['public'])
+            assert result['status'] == 'source_denied'
+            assert result['request_id'] is None
+            assert result['auto_supplement'] is False
+            assert result['materials'] == []
+            assert client.read_snapshot()['requests'] == []
+
+
+def test_registered_wiki_resolves_original_requester_and_returns_to_actual_sender(tmp_path):
+    import pytest
+    from ghost_hermes_pm import ManagementError
+    from test_directory import make_repo
+    from test_task_execution import accepted
+    provider = local_provider(tmp_path)
+    wiki_identity = VerifiedIdentity(WIKI['identity_ref'], 'verified-wiki-source')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, knowledge_providers={'local:fixture-wiki': provider}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER, 'wiki': wiki_identity}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            client.register_knowledge_source(client.read_snapshot()['version'], public_grant())
+            query = client.query_knowledge('fixture-wiki', 'resolve-query', 'retry delivery', ['public'], request_id=request_id, channel_id='project-chat')
+            outgoing = manager.claim_knowledge_delivery(OWNER, query['id'])
+            manager.record_knowledge_delivery(OWNER, query['id'], outgoing['uuid'],
+                {'status': 'delivered', 'message_id': 'om_query', 'chat_id': 'oc_project', 'parent_id': outgoing['reply_to']})
+            binding = public_grant()['wiki_bindings'][0]
+            received = {k: binding[k] for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')}
+            received.update(tenant_key=binding['sender_tenant_key'], sender_open_id=binding['sender_open_id'], message_id='om_query', parent_id='om_ack', root_id=None, thread_id=None)
+            manager.receive_wiki_query(wiki_identity, query['id'], binding['id'], received)
+            result = ManagementClient(tmp_path / 'state', 'wiki').resolve_knowledge(query['id'])
+            assert result['requester'] == OWNER.subject
+            assert result['status'] == 'found'
+            assert result['materials'][0]['text'].startswith('Retry only definite failures.')
+            reply = manager.claim_knowledge_delivery(wiki_identity, query['id'])
+            assert reply['reply_to'] == 'om_query'
+            assert reply['mention_open_id'] == 'ou_lead_in_wiki'
+            assert reply['app_id'] == 'cli_wiki'
+            assert '资料结果 resolve-query' in reply['text']
+            assert 'sha256:' in reply['text']
+            assert 'PRIVATE' not in reply['text']
+
+
+def prepared_result(manager, client, source_root, request_id, query_id='facts-query', auto=True):
+    from test_task_control import TURN
+    source = public_grant()
+    client.register_knowledge_source(client.read_snapshot()['version'], source)
+    query = client.query_knowledge('fixture-wiki', query_id, 'retry delivery', ['public'], request_id=request_id,
+                                   channel_id='project-chat', auto_supplement=auto)
+    segment = manager.claim_knowledge_delivery(OWNER, query_id)
+    manager.record_knowledge_delivery(OWNER, query_id, segment['uuid'], {'status': 'delivered', 'message_id': 'om_query', 'chat_id': 'oc_project'})
+    binding = source['wiki_bindings'][0]
+    anchor = {k: binding[k] for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')}
+    anchor.update(tenant_key=binding['sender_tenant_key'], sender_open_id=binding['sender_open_id'], message_id='om_query', parent_id='om_ack', root_id=None, thread_id=None)
+    wiki = VerifiedIdentity(WIKI['identity_ref'], 'verified-wiki-source')
+    manager.receive_wiki_query(wiki, query_id, binding['id'], anchor)
+    result = manager.resolve_knowledge(wiki, query_id)
+    segment = manager.claim_knowledge_delivery(wiki, query_id)
+    manager.record_knowledge_delivery(wiki, query_id, segment['uuid'], {'status': 'delivered', 'message_id': 'om_wiki_result', 'chat_id': 'oc_project'})
+    binding = source['wiki_bindings'][1]
+    returned = {k: binding[k] for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')}
+    returned.update(tenant_key=binding['sender_tenant_key'], sender_open_id=binding['sender_open_id'], message_id='om_wiki_result', parent_id='om_query', root_id=None, thread_id=None)
+    manager.receive_wiki_result(wiki, query_id, binding['id'], returned, result['result_version'])
+    return query_id
+
+
+def test_task_supplement_targets_original_active_turn_once_and_carries_facts_as_data(tmp_path):
+    from test_directory import make_repo
+    from test_task_execution import accepted, adapter_for
+    from test_task_control import THREAD, TURN, wire
+    provider = local_provider(tmp_path)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
+                 knowledge_providers={'local:fixture-wiki': provider}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            query_id = prepared_result(manager, client, tmp_path, request_id)
+            first = client.supplement_knowledge(query_id)
+            repeated = client.supplement_knowledge(query_id)
+            assert first['status'] == repeated['status'] == 'accepted'
+            steering = [r for r in wire(tmp_path) if r['method'] == 'turn/steer']
+            assert len(steering) == 1
+            assert steering[0]['params']['threadId'] == THREAD and steering[0]['params']['expectedTurnId'] == TURN
+            text = steering[0]['params']['input'][0]['text']
+            assert 'Retry only definite failures' in text
+            assert 'untrusted source data' in text
+            assert 'Current accepted goal' in text and 'Repository boundary' in text
+            assert 'PRIVATE' not in text
+            assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+            assert client.read_snapshot()['knowledge_queries'][0]['supplement']['instruction_id'].startswith('knowledge:')
+
+
+def bot_message(binding, text, message_id, parent_id):
+    from types import SimpleNamespace as NS
+    from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
+    raw = {'header': {'app_id': binding['app_id'], 'tenant_key': binding['transport_tenant_key'], 'event_type': 'im.message.receive_v1'},
+           'event': {'sender': {'sender_type': 'bot', 'tenant_key': binding['sender_tenant_key'],
+               'sender_id': {'open_id': binding['sender_open_id'], 'user_id': binding['sender_native_ids'][0]}},
+           'message': {'message_id': message_id, 'chat_id': binding['chat_id'], 'chat_type': 'group', 'message_type': 'post',
+               'parent_id': parent_id, 'content': json.dumps({'zh_cn': {'content': [[
+                   {'tag': 'at', 'user_id': binding['recipient_open_id']}, {'tag': 'text', 'text': '\n' + text}]]}}),
+               'mentions': [{'key': '@_user_1', 'id': {'open_id': binding['recipient_open_id']},
+                   'mentioned_type': 'bot', 'tenant_key': binding['recipient_tenant_key']}]}}}
+    source = NS(platform='feishu', user_id=binding['sender_native_ids'][0], user_id_alt=None, chat_id=binding['chat_id'],
+                is_bot=True, message_id=message_id, profile=binding['profile_id'])
+    return NS(source=source, raw_message=P2ImMessageReceiveV1(raw), message_id=message_id, text=text)
+
+
+def native_transport(app_id, open_id, prefix, sent):
+    from types import SimpleNamespace as NS
+    from lark_oapi import Client
+    from lark_oapi.api.im.v1 import ReplyMessageResponse
+    from ghost_hermes_pm.feishu import NativeFeishuTransport
+    client = Client.builder().app_id(app_id).app_secret('synthetic-unused-' + app_id).build()
+    client.request = lambda request: NS(code=0, raw=NS(content=json.dumps({'code': 0, 'bot': {'open_id': open_id, 'activate_status': 2}}).encode()))
+    def reply(request):
+        sent.append(request)
+        return ReplyMessageResponse({'code': 0, 'data': {'message_id': prefix + str(len(sent)), 'chat_id': 'oc_project', 'parent_id': request.message_id}})
+    client.im.v1.message.reply = reply
+    return NativeFeishuTransport(client)
+
+
+def test_actual_registered_bot_messages_and_builders_complete_public_query_result_and_task_fact_chain(tmp_path):
+    import asyncio
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import CONFIG, Gateway
+    from test_directory import make_repo
+    from test_task_execution import accepted, adapter_for
+    from test_task_control import wire
+    provider = local_provider(tmp_path)
+    source = public_grant()
+    sender = VerifiedIdentity('fixture:lead', 'verified-native-participant')
+    settings = {**CONFIG, 'registered_bots': [{'profile_id': b['sender_profile_id'], 'identity_ref': b['sender_identity_ref'],
+        'app_id': b['app_id'], 'tenant_key': b['sender_tenant_key'], 'open_id': b['sender_open_id'], 'native_ids': b['sender_native_ids']} for b in source['wiki_bindings']]}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), knowledge_providers={'local:fixture-wiki': provider}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER, 'lead': sender}):
+            owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
+            owner.register_knowledge_source(owner.read_snapshot()['version'], source)
+            lead.query_knowledge('fixture-wiki', 'full-chain', 'retry delivery', ['public'], request_id=request_id, channel_id='project-chat', auto_supplement=True)
+            left, right, left_sent, right_sent = object(), object(), [], []
+            left_transport = native_transport('cli_fixture', 'ou_lead', 'om_lead_', left_sent)
+            right_transport = native_transport('cli_wiki', 'ou_wiki_self', 'om_wiki_', right_sent)
+            intake = FeishuEntry(lambda: manager, OWNER.subject, settings, lambda _: None)
+            intake.attach_transport(left, left_transport); intake.attach_transport(right, right_transport)
+            async def exchange():
+                await intake.deliver_knowledge(sender, 'full-chain', left_transport)
+                query_text = json.loads(left_sent[0].request_body.content)['zh_cn']['content'][0][1]['text'].strip()
+                query_event = bot_message(source['wiki_bindings'][0], query_text, 'om_lead_1', 'om_ack')
+                assert await intake.receive(query_event, Gateway(right)) == {'action': 'skip'}
+                assert right_sent[0].message_id == 'om_lead_1'
+                assert json.loads(right_sent[0].request_body.content)['zh_cn']['content'][0][0]['user_id'] == 'ou_lead_in_wiki'
+                result_text = json.loads(right_sent[0].request_body.content)['zh_cn']['content'][0][1]['text'].strip()
+                result_event = bot_message(source['wiki_bindings'][1], result_text, 'om_wiki_1', 'om_lead_1')
+                assert await intake.receive(result_event, Gateway(left)) == {'action': 'skip'}
+                assert await intake.receive(result_event, Gateway(left)) == {'action': 'skip'}
+            asyncio.run(exchange())
+            query = lead.read_snapshot()['knowledge_queries'][0]
+            assert query['status'] == 'found'
+            assert query['supplement']['status'] == 'accepted'
+            assert len([r for r in wire(tmp_path) if r['method'] == 'turn/steer']) == 1
+            assert owner.read_snapshot()['requests'][0]['id'] == request_id

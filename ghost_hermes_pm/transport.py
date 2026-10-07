@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -81,6 +81,10 @@ class ManagementServer:
                             result = bridge.manager.register_knowledge_source(identity, payload.get('expected_version'), payload.get('source'))
                         elif payload.get('operation') == 'query_knowledge':
                             result = bridge.manager.query_knowledge(identity, payload.get('source_id'), payload.get('query_id'), payload.get('question'), payload.get('scope_ids'), payload.get('request_id'), payload.get('channel_id'), payload.get('auto_supplement', False))
+                        elif payload.get('operation') == 'resolve_knowledge':
+                            result = bridge.manager.resolve_knowledge(identity, payload.get('query_id'))
+                        elif payload.get('operation') == 'supplement_knowledge':
+                            result = bridge.manager.supplement_knowledge(identity, payload.get('query_id'), payload.get('material_ids'))
                         else:
                             raise ManagementError('unsupported', 'This management operation is not enabled.')
                         response = {'result': result}
@@ -188,3 +192,9 @@ class ManagementClient:
     def query_knowledge(self, source_id, query_id, question, scope_ids, request_id=None, channel_id=None, auto_supplement=False):
         return self._call('query_knowledge', source_id=source_id, query_id=query_id, question=question, scope_ids=scope_ids,
                           request_id=request_id, channel_id=channel_id, auto_supplement=auto_supplement)
+
+    def resolve_knowledge(self, query_id):
+        return self._call('resolve_knowledge', query_id=query_id)
+
+    def supplement_knowledge(self, query_id, material_ids=None):
+        return self._call('supplement_knowledge', query_id=query_id, material_ids=material_ids)
