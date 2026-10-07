@@ -212,5 +212,12 @@ def _prepare_owner_query(entry, event, adapter):
     transport = next((t for a, t in entry.transports if a is adapter), None)
     if transport is None:
         return None
+    query_id = _digest(envelope)
+    if archive:
+        keys = NAMESPACE + ('tenant_key', 'sender_open_id', 'message_id')
+        namespace = {k: envelope[k] for k in keys}
+        existing = next((q for q in snapshot['archive_queries'] if q.get('source_anchor') and q['requester'] == entry.owner
+            and all(q['source_anchor'].get(k) == namespace[k] for k in keys)), None)
+        query_id = existing['id'] if existing else _digest(namespace)
     return PreparedKnowledgeMessage(event, adapter, transport, owner, envelope, text, None, 'archive' if archive else 'direct',
-        _digest(envelope), channel['id'], VerifiedIdentity(entry.owner, 'verified-original-human-wiki-query'))
+        query_id, channel['id'], VerifiedIdentity(entry.owner, 'verified-original-human-wiki-query'))

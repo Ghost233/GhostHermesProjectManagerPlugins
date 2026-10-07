@@ -374,6 +374,9 @@ def test_unknown_group_archive_delivery_keeps_original_uuid_and_never_replays(tm
         assert segment['status']=='unknown'
         asyncio.run(deliver(intake,OWNER,result['id'],transport))
         assert asyncio.run(intake.receive(message,Gateway(adapter)))=={'action':'skip'}
+        message.raw_message.event.message.root_id='om_later_optional_root'
+        assert asyncio.run(intake.receive(message,Gateway(adapter)))=={'action':'skip'}
+        assert len(manager.read_snapshot(OWNER)['archive_queries'])==1
         assert len(transport.sent)==1
         assert transport.sent[0]['uuid']==segment['uuid']
 

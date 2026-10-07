@@ -39,16 +39,20 @@ class NativeFeishuTransport:
 
     async def send(self, segment):
         self.lifecycle_check()
-        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
+        from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody, CreateMessageRequest, CreateMessageRequestBody
         content = json.dumps({'zh_cn': {'content': [[
             {'tag': 'at', 'user_id': segment['mention_open_id']},
             {'tag': 'text', 'text': '\n' + segment['text']}]]}}, ensure_ascii=False)
-        body = ReplyMessageRequestBody.builder().msg_type('post').content(content).uuid(segment['uuid']).reply_in_thread(bool(segment.get('thread_id'))).build()
-        request = ReplyMessageRequest.builder().message_id(segment['reply_to']).request_body(body).build()
+        if segment.get('path') == 'create':
+            body = CreateMessageRequestBody.builder().receive_id(segment['chat_id']).msg_type('post').content(content).uuid(segment['uuid']).build()
+            request = CreateMessageRequest.builder().receive_id_type('chat_id').request_body(body).build()
+        else:
+            body = ReplyMessageRequestBody.builder().msg_type('post').content(content).uuid(segment['uuid']).reply_in_thread(bool(segment.get('thread_id'))).build()
+            request = ReplyMessageRequest.builder().message_id(segment['reply_to']).request_body(body).build()
         try:
             def reply_if_active():
                 self.lifecycle_check()
-                return self.native.im.v1.message.reply(request)
+                return self.native.im.v1.message.create(request) if segment.get('path') == 'create' else self.native.im.v1.message.reply(request)
             response = await asyncio.to_thread(reply_if_active)
             self.lifecycle_check()
         except Exception:

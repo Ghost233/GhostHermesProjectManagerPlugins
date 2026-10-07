@@ -19,6 +19,8 @@
     const [humanReviewed, setHumanReviewed] = React.useState({});
     const [humanIntents, setHumanIntents] = React.useState({});
     const [preparationPlans, setPreparationPlans] = React.useState({});
+    const [roleForm, setRoleForm] = React.useState({ sender: '', target: '', issue: '', anchor: '', channels: '' });
+    const [roleReview, setRoleReview] = React.useState(null);
     const [observerForm, setObserverForm] = React.useState({ id: '', kind: 'daemon', projects: '', adapter_ref: '' });
     async function refresh() {
       try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
@@ -52,6 +54,26 @@
       try { await sdk.fetchJSON(api + '/directory', { method: 'POST', body: JSON.stringify(review) });
         setReview(null); await refresh(); }
       catch (e) { setError(String(e.message || e)); }
+      finally { setSaving(false); }
+    }
+    function roleField(key, label, multiline) {
+      return h('label', { style: { display: 'block', margin: '8px 0' } }, label,
+        h(multiline ? 'textarea' : 'input', { value: roleForm[key], rows: multiline ? 4 : undefined,
+          onChange: function (e) { setRoleForm(Object.assign({}, roleForm, { [key]: e.target.value })); setRoleReview(null); },
+          style: { width: '100%', padding: '7px', color: 'inherit', background: 'transparent', border: '1px solid #8886' } }));
+    }
+    function previewRole(action) {
+      try {
+        const details = action === 'register_channels' ? { channels: JSON.parse(roleForm.channels) } : {
+          sender_profile_id: roleForm.sender.trim(), target_profile_id: roleForm.target.trim(),
+          issue_url: roleForm.issue.trim(), source_anchor: JSON.parse(roleForm.anchor) };
+        setRoleReview({ action: action, details: details }); setError('');
+      } catch (e) { setError('请填写可核对的群路由或原本人消息锚 JSON。'); }
+    }
+    async function applyRole() {
+      setSaving(true);
+      try { await sdk.fetchJSON(api + '/collaboration', { method: 'POST', body: JSON.stringify(roleReview) }); setRoleReview(null); await refresh(); }
+      catch (e) { await refresh(); setError(String(e.message || e)); }
       finally { setSaving(false); }
     }
     async function observationAction(register) {
@@ -177,9 +199,32 @@
         })),
         h('ul', null, snapshot.profiles.map(function (p) {
           return h('li', { key: p.id }, p.id + ' · ' + p.role + ' · ' + p.capability + ' · 项目：' + (p.project_id || '独立'),
+            h('div', null, '上级：' + (p.parent_profile_id || (p.role === 'project_lead' ? '项目根负责人（可合并两层）' : '项目树外')) + ' · 长期项目绑定：' + (p.project_id || '独立资料范围')),
             h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：配置中 · 执行：未启用'),
             h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
         })),
+        h('section', null, h('h2', null, '公开协作与任务关系'),
+          h('p', null, '三层项目明确登记子负责人；合并两层由项目根负责人直接承接。发送、独立受理与执行分别核对。真实群验收：' + ((snapshot.collaboration || {}).real_group_acceptance || 'unverified')),
+          h('ul', null, ((snapshot.collaboration || {}).handoffs || []).map(function (link) {
+            const task = (snapshot.requests || []).find(function (r) { return r.id === link.task_request_id || r.id === link.result_task_id || r.id === link.direct_task_id; });
+            return h('li', { key: link.id, style: { margin: '12px 0', overflowWrap: 'anywhere' } },
+              h('strong', null, link.sender_profile_id + ' → ' + link.target_profile_id + ' · ' + link.kind),
+              h('div', null, '关联：' + link.id + ' · 上级目标：' + (link.parent_handoff_id || link.original_handoff_id || '原本人目标')),
+              h('div', null, '发送：' + link.delivery + ' · 独立受理：' + link.acceptance + ' · 执行：' + (task ? task.execution : '汇报不创建开发执行')),
+              h('div', null, 'Issue：' + link.issue.url + ' · 原消息锚：' + link.source_anchor.chat_id + '/' + link.source_anchor.message_id),
+              h('div', null, '接收锚：' + (link.received_anchor ? link.received_anchor.chat_id + '/' + link.received_anchor.message_id : '待核对') + ' · 任务确认锚：' + (task && task.task_start_anchor ? task.task_start_anchor.message_id : '待核对')),
+              h('div', null, '集成：' + (link.integration_status || '待核对') + ' · 项目整体：待全局验证'),
+              h('div', null, '原群身份绑定：' + (link.channel_binding || 'unverified') + (link.channel_reason ? ' · ' + link.channel_reason : '')),
+              h('details', null, h('summary', null, '公开材料与逐段凭据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(link.segments, null, 2))));
+          })),
+          h('details', null, h('summary', null, 'Owner 登记已核实路由与明确项目目标'),
+            roleField('channels', '已有角色群路由数组 JSON（含原 app namespace、来源身份观察和 verification_ref）', true),
+            h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: function () { previewRole('register_channels'); } }, '核对群路由'),
+            roleField('sender', '已登记总管 Profile ID'), roleField('target', '明确目标总负责人 Profile ID'), roleField('issue', '明确项目 Issue URL'),
+            roleField('anchor', '原本人消息锚 JSON', true),
+            h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: function () { previewRole('project_goal'); } }, '核对公开项目交接'),
+            roleReview && h('div', null, h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(roleReview, null, 2)),
+              h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: applyRole }, '提交这条公开协作操作')))),
         h('section', null,
         h('h2', null, '手动 Codex 只观察'),
         h('p', null, '只读取已登记原执行器，保留手动会话；daemon、独立 CLI 与桌面分别核验，其他服务活动仍未知。'),

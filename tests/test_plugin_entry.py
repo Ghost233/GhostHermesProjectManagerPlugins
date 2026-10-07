@@ -32,6 +32,14 @@ class Context:
         self.cleanups.append(callback)
 
 
+def fixture_native_home(monkeypatch, home):
+    from types import ModuleType
+    import sys
+    constants = ModuleType('hermes_constants')
+    constants.get_hermes_home = lambda: home
+    monkeypatch.setitem(sys.modules, 'hermes_constants', constants)
+
+
 def load_entry():
     spec = importlib.util.spec_from_file_location('fixture_plugin', ROOT / '__init__.py', submodule_search_locations=[str(ROOT)])
     module = importlib.util.module_from_spec(spec)
@@ -39,7 +47,8 @@ def load_entry():
     return module
 
 
-def test_formal_plugin_registers_synchronously_without_configuration_side_effects():
+def test_formal_plugin_registers_synchronously_without_configuration_side_effects(tmp_path, monkeypatch):
+    fixture_native_home(monkeypatch, tmp_path / 'native-home')
     ctx = Context({})
     result = load_entry().register(ctx)
     assert result is None
@@ -52,7 +61,8 @@ def test_formal_plugin_registers_synchronously_without_configuration_side_effect
     assert 'feishu' not in ctx.platforms
 
 
-def test_native_reader_with_participant_secret_but_missing_state_path_stays_configuring(monkeypatch):
+def test_native_reader_with_participant_secret_but_missing_state_path_stays_configuring(tmp_path, monkeypatch):
+    fixture_native_home(monkeypatch, tmp_path / 'native-home')
     from types import ModuleType
     import sys
     secrets = ModuleType('agent.secret_scope')
@@ -69,6 +79,7 @@ def test_native_reader_with_participant_secret_but_missing_state_path_stays_conf
 
 
 def test_participant_snapshot_rejects_owner_token_alias_without_revealing_secret(tmp_path, monkeypatch):
+    fixture_native_home(monkeypatch, tmp_path / 'native-home')
     from types import ModuleType
     import sys
     from ghost_hermes_pm import Manager, VerifiedIdentity
@@ -95,6 +106,9 @@ def test_participant_snapshot_rejects_owner_token_alias_without_revealing_secret
                 assert result['status'] == 'unverified'
                 assert 'projects' not in result
                 assert 'synthetic-owner-token' not in str(result)
+                role_alias = json.loads(ctx.tools['hermes_pm_collaborate']({'action': 'read_routes', 'details': {}}))
+                assert role_alias['status'] == 'rejected' and role_alias['code'] == 'forbidden'
+                assert 'synthetic-owner-token' not in str(role_alias)
                 settings.pop('dashboard_credential_ref')
                 unknown_owner = json.loads(ctx.tools['hermes_pm_snapshot']({}))
                 assert unknown_owner['status'] == 'unverified'

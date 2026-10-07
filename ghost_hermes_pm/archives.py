@@ -237,8 +237,12 @@ def query_archive(manager,identity,source_id,query_id,question,scope_ids,complet
         queries=data.setdefault('archive_queries',{})
         existing=queries.get(query_id)
         if existing:
-            if any(existing.get(k)!=v for k,v in inputs.items()):
+            anchor_keys=NAMESPACE+('tenant_key','sender_open_id','message_id')
+            previous=existing.get('source_anchor')
+            same_anchor=previous is None and anchor is None or isinstance(previous,dict) and isinstance(anchor,dict) and all(previous.get(k)==anchor.get(k) for k in anchor_keys)
+            if any(existing.get(k)!=v for k,v in inputs.items() if k!='source_anchor') or not same_anchor:
                 raise ManagementError('binding_conflict','The archive query ID already identifies another scope.')
+            # Preserve the original optional locator and any unknown delivery, including legacy IDs.
             return existing
         provider=manager.archive_providers.get(source['provider_ref'])
         query={'id':query_id,**inputs,'grant_revision':grant['revision'],'status':'reading','records':[],'outbox':[],'created_at':_now()}

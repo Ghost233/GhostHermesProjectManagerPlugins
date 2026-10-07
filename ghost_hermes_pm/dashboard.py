@@ -54,6 +54,11 @@ class ArchiveOperation(BaseModel):
     protection_id: str | None = None
     kind: str = 'checkpoint'
 
+class CollaborationOperation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: str
+    details: dict
+
 class ObservationOperation(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: str
@@ -105,6 +110,14 @@ def create_router(authenticated_client):
             if body.action == 'restore':
                 return client.restore_archive(body.backup_id, body.restore_id)
             raise ManagementError('invalid_change', 'Select a registered archive query, explicit protection, checkpoint or data-only restore.')
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
+    @router.post('/collaboration')
+    def collaboration(body: CollaborationOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            return client.collaborate(body.action, body.details)
         except ManagementError as exc:
             raise failure(exc) from exc
 
