@@ -135,6 +135,14 @@ class Manager:
         data.setdefault('intake_failures', {})
         for record in data['requests'].values():
             session = record.get('session')
+            for question in record.get('human_requests', []):
+                if question.get('resolution') == 'pending' and (record.get('repository_released') or record.get('outer_task_status') == 'stopped' or record.get('task_delivery') == 'delivered' or session and session.get('control') != 'assigned_task'):
+                    question['resolution'] = 'expired'
+                    question['control_enabled'] = False
+                if question.get('resolution') == 'pending' and (self.codex_adapter is None or self.codex_adapter.generation != question['generation'] or self.codex_adapter._closed):
+                    question['resolution'] = 'unverified'
+                    if question.get('reply', {}) and question['reply'].get('sent') == 'intent':
+                        question['reply']['sent'] = 'outcome_unknown'
             if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
                 record['execution'] = 'stopping' if record.get('stop', {}).get('status') == 'processing' else 'unverified'
                 record['unexecuted_reason'] = 'Original executor generation unavailable; reconciliation required.'
@@ -244,6 +252,10 @@ class Manager:
     def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
         from .control import control_task
         return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
+
+    def associate_human_reply(self, identity, project_id, profile_id, message, text):
+        from .questions import associate_human_reply
+        return associate_human_reply(self, identity, project_id, profile_id, message, text)
 
     def answer_human_request(self, identity, request_id, human_request_id, reply_id, response):
         from .questions import answer_human_request

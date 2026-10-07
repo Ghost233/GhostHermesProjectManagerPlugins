@@ -20,6 +20,9 @@ class TaskOperation(BaseModel):
     instruction_id: str | None = None
     text: str | None = None
     expected_turn_id: str | None = None
+    human_request_id: str | None = None
+    reply_id: str | None = None
+    response: dict | None = None
 
 def create_router(authenticated_client):
     router = APIRouter()
@@ -55,6 +58,12 @@ def create_router(authenticated_client):
     def task(body: TaskOperation, request: Request):
         client = authenticated_client(request)
         try:
+            if body.action == 'answer':
+                if any(v is not None for v in (body.report, body.instruction_id, body.text, body.expected_turn_id)):
+                    raise ManagementError('invalid_change', 'Human response fields cannot carry other task operations.')
+                return client.answer_human_request(body.request_id, body.human_request_id, body.reply_id, body.response)
+            if any(v is not None for v in (body.human_request_id, body.reply_id, body.response)):
+                raise ManagementError('invalid_change', 'Human response fields require answer action.')
             if body.action in {'append', 'stop', 'continue'}:
                 if body.report is not None:
                     raise ManagementError('invalid_change', 'Control requests cannot assert delivery evidence.')

@@ -110,8 +110,11 @@ class FeishuEntry:
                         'root_id': getattr(message, 'root_id', None), 'thread_id': getattr(message, 'thread_id', None)}
             if not work:
                 manager = self.manager()
-                if manager is None or not any(r['profile_id'] == binding['profile_id'] and all(r['source_anchor'].get(k) == envelope[k] for k in ('app_id', 'tenant_key', 'recipient_tenant_key', 'transport_tenant_key', 'recipient_open_id', 'chat_id', 'sender_open_id'))
-                    for r in manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))['requests']):
+                human_reply = bool(re.match(r'^(回答|批准|拒绝)', command))
+                if manager is None or not any(r['project_id'] == binding['project_id'] and r['profile_id'] == binding['profile_id'] and r.get('human_requests') for r in manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))['requests']) and human_reply:
+                    return None
+                if not human_reply and (manager is None or not any(r['profile_id'] == binding['profile_id'] and all(r['source_anchor'].get(k) == envelope[k] for k in ('app_id', 'tenant_key', 'recipient_tenant_key', 'transport_tenant_key', 'recipient_open_id', 'chat_id', 'sender_open_id'))
+                    for r in manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))['requests'])):
                     return None
             return PreparedMessage(event, adapter, transport, binding, envelope, command, work.group(1) if work else None)
         except (AttributeError, KeyError, TypeError, ValueError):
@@ -199,6 +202,35 @@ class FeishuEntry:
                 return None
             self.manager().retry_delivery(identity, record['id'])
             await self.deliver(identity, record['id'], transport, generation)
+            return {'action': 'skip'}
+        if re.match(r'^(回答|批准|拒绝)', text):
+            try:
+                def answer_if_active():
+                    with self.lifecycle_lock:
+                        self.require_active(generation)
+                        return self.manager().associate_human_reply(identity, binding['project_id'], binding['profile_id'], envelope, text)
+                result = await asyncio.to_thread(answer_if_active)
+                if result['status'] == 'answered':
+                    await self.deliver(identity, result['request_id'], transport, generation)
+                    reply = result['human_request']['reply']
+                    feedback = '人工答复已收到；送回：' + reply['sent'] + '；已处理与执行结果请核对原请求。'
+                else:
+                    feedback = '存在多个人工请求，请引用具体人工请求 ID 后回答。'
+                    self.manager().record_clarification_delivery(identity, result['id'], {'status': 'unknown'})
+            except ManagementError as exc:
+                feedback = '人工答复未执行：' + str(exc)
+                result = None
+            self.require_active(generation)
+            try:
+                receipt = await transport.send({'uuid': __import__('uuid').uuid4().hex, 'text': feedback,
+                    'chat_id': envelope['chat_id'], 'reply_to': envelope['message_id'],
+                    'thread_id': envelope['thread_id'], 'mention_open_id': envelope['sender_open_id']})
+                self.require_active(generation)
+            except Exception:
+                self.require_active(generation)
+                receipt = {'status': 'unknown'}
+            if result and result['status'] == 'needs_clarification':
+                self.manager().record_clarification_delivery(identity, result['id'], receipt)
             return {'action': 'skip'}
         result = self.manager().associate_message(identity, binding['project_id'], binding['profile_id'], envelope, text)
         if result['status'] == 'unassociated':

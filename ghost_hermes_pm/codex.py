@@ -93,6 +93,8 @@ class CodexStdioAdapter:
                     break
                 with self._condition:
                     if 'method' in envelope:
+                        if not isinstance(envelope['method'], str) or not isinstance(envelope.get('params', {}), dict) or ('id' in envelope and type(envelope['id']) not in (str, int)):
+                            break
                         rpc_id = envelope.get('id')
                         if type(rpc_id) in (str, int):
                             key = (type(rpc_id), rpc_id)
