@@ -33,7 +33,7 @@ def _binding(manager, identity, request_id, data, action):
     actual = _repository({'repo_path': repository['worktree'], 'test_artifact_paths': repository['test_artifact_paths']})
     if repository_fingerprint(actual) != session['capability']['repository_fingerprint'] or any(manager.state_dir.is_relative_to(Path(repository[k])) for k in ('worktree', 'git_dir', 'common_dir')):
         raise ManagementError('capability_unverified', 'The original repository control boundary needs reconciliation.')
-    adapter.verify_control(repository, action)
+    adapter.verify_control(repository, action, session['capability'])
     return record, session, adapter
 
 
@@ -81,11 +81,13 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
         if expected_turn_id != session['turn_id']:
             raise ManagementError('binding_conflict', 'The expected original turn does not match; nothing was sent.')
         method = 'turn/steer' if thread['status'].get('type') == 'active' else 'turn/start'
+        if action == 'continue' and method != 'turn/start':
+            raise ManagementError('binding_conflict', 'Explicit continuation requires verified idle new-turn semantics.')
         if method == 'turn/steer' and (len(active) != 1 or active[0].get('id') != session['turn_id']):
             raise ManagementError('binding_conflict', 'The expected original active turn does not match; nothing was sent.')
         known_turn_ids = session.setdefault('known_turn_ids', [session['turn_id']])
         if method == 'turn/start':
-            adapter.verify_control(session['repository'], 'idle_input')
+            adapter.verify_control(session['repository'], 'idle_input', session['capability'])
             adapter.verify_idle(thread, session['turn_id'], known_turn_ids)
         instruction = {'id': instruction_id, **request, 'thread_id': session['thread_id'], 'turn_id': session['turn_id'],
                        'generation': session['generation'], 'method': method, 'previous_turn_id': session['turn_id'],

@@ -183,13 +183,15 @@ class CodexStdioAdapter:
     def start_turn(self, thread_id, prompt):
         return self._call('turn/start', {'threadId': thread_id, 'input': [{'type': 'text', 'text': prompt, 'text_elements': []}]})
 
-    def verify_control(self, repository, action):
+    def verify_control(self, repository, action, expected_capability):
         self._alive()
         if self.verifier is None or self.connection is None:
             raise ManagementError('capability_unverified', 'Current-service task control receipts are missing.')
         proof = self.verifier(dict(self.connection), json.loads(json.dumps(repository)))
         if not isinstance(proof, dict) or proof.get('generation') != self.generation or proof.get('service_id') != self.connection['service_id'] or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']] or not isinstance(proof.get('task_control'), dict) or not isinstance(proof['task_control'].get(action), str) or not proof['task_control'][action]:
             raise ManagementError('capability_unverified', 'This task control has not been verified on the original service and boundary.')
+        if any(proof.get(k) != expected_capability.get(k) for k in ('permission_profile', 'policy_digest', 'runtime_roots')):
+            raise ManagementError('capability_unverified', 'The fresh control proof does not match the original task permission boundary.')
         return proof
 
     def steer_turn(self, thread_id, turn_id, text, instruction_id):
@@ -224,7 +226,7 @@ class CodexStdioAdapter:
         return self._call('turn/interrupt', {'threadId': thread_id, 'turnId': turn_id})
 
     def verify_process_coverage(self, session, stop):
-        proof = self.verify_control(session['repository'], 'related_execution')
+        proof = self.verify_control(session['repository'], 'related_execution', session['capability'])
         coverage = proof.get('process_coverage')
         if not isinstance(coverage, dict) or not isinstance(coverage.get('evidence'), str) or not coverage['evidence']:
             raise ManagementError('capability_unverified', 'Host process coverage is missing; empty native background lists cannot prove all related processes stopped.')

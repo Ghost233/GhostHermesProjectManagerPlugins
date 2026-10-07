@@ -122,6 +122,10 @@
         h('ul', null, (snapshot.requests || []).map(function (r) {
           const source = r.source_anchor;
           const anchor = r.task_start_anchor;
+          const controlled = r.session && r.session.control === 'assigned_task' && r.task_delivery !== 'delivered';
+          const inputOpen = controlled && !r.repository_released && !['stopping', 'stopped'].includes(r.execution);
+          const continueOpen = controlled && r.execution === 'stopped' && r.outer_task_status === 'stopped' &&
+            r.stop && r.stop.status === 'confirmed' && r.repository_released;
           return h('li', { key: r.id, style: { marginBottom: '18px' } },
             h('strong', null, r.project_id + ' · 负责人：' + r.profile_id),
             h('div', null, h('a', { href: r.accepted_scope.url, target: '_blank', rel: 'noreferrer' }, r.accepted_scope.title)),
@@ -138,11 +142,11 @@
                 onChange: function (e) { setControlTexts(Object.assign({}, controlTexts, { [r.id]: e.target.value })); },
                 style: { margin: '6px', padding: '7px', color: 'inherit', background: 'transparent', border: '1px solid #8886' } })),
               h('button', { style: button, onClick: function () { controlAction('append', r); },
-                disabled: saving || snapshot.status !== 'completed' || !r.session.turn_id || !String(controlTexts[r.id] || '').trim() || ['stopping', 'stopped'].includes(r.execution) }, '追加到原会话'),
+                disabled: saving || snapshot.status !== 'completed' || !r.session.turn_id || !String(controlTexts[r.id] || '').trim() || !inputOpen }, '追加到原会话'),
               h('button', { style: button, onClick: function () { controlAction('stop', r); },
-                disabled: saving || snapshot.status !== 'completed' || !r.session.turn_id || ['stopping', 'stopped'].includes(r.execution) }, '结束当前任务'),
+                disabled: saving || snapshot.status !== 'completed' || !r.session.turn_id || !inputOpen }, '结束当前任务'),
               h('button', { style: button, onClick: function () { controlAction('continue', r); },
-                disabled: saving || snapshot.status !== 'completed' || r.execution !== 'stopped' || !String(controlTexts[r.id] || '').trim() }, '明确继续原工作'),
+                disabled: saving || snapshot.status !== 'completed' || !continueOpen || !String(controlTexts[r.id] || '').trim() }, '明确继续原工作'),
               r.stop && h('div', null, '停止：' + r.stop.status + ' · 中断 RPC：' + r.stop.rpc_status +
                 ' · 最后核实：' + (r.stop.last_verified_at || '待核对') + (r.stop.reason ? ' · ' + r.stop.reason : '')),
               (r.stop_records || []).length > 0 && h('details', null, h('summary', null, '停止记录、相关执行与继续安排'),

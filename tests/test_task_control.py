@@ -483,3 +483,37 @@ def test_delivered_task_cannot_reuse_expired_control_after_releasing_repository(
                 client.control_task(request_id, 'append', 'expired-control', text='Start more work.', expected_turn_id=TURN)
         assert not any(r['method'] == 'turn/steer' for r in wire(tmp_path))
         assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+
+
+@pytest.mark.parametrize('field,value', [('policy_digest', 'changed-policy'), ('permission_profile', 'changed-profile')])
+def test_fresh_control_proof_cannot_replace_original_task_permission_boundary(tmp_path, field, value):
+    from ghost_hermes_pm import ManagementError
+    host_proof = {}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path, control_proof=host_proof)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            host_proof[field] = value
+            with pytest.raises(ManagementError) as changed:
+                client.control_task(request_id, 'append', 'changed-permissions', text='Add a check.', expected_turn_id=TURN)
+            assert changed.value.code == 'capability_unverified'
+        assert not any(r['method'] == 'turn/steer' for r in wire(tmp_path))
+
+
+def test_explicit_continue_requires_idle_new_turn_semantics_even_if_old_turn_looks_active(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            client.control_task(request_id, 'stop', 'stop-1', expected_turn_id=TURN)
+            terminal_state(tmp_path)
+            assert client.refresh_task(request_id)['execution'] == 'stopped'
+            (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'active', 'activeFlags': []},
+                'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}))
+            with pytest.raises(ManagementError) as race:
+                client.control_task(request_id, 'continue', 'continue-raced', text='Continue the accepted work.', expected_turn_id=TURN)
+            assert race.value.code == 'binding_conflict'
+        assert not any(r['method'] == 'turn/steer' for r in wire(tmp_path))
