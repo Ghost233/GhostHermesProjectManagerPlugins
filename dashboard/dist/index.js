@@ -19,6 +19,7 @@
     const [humanReviewed, setHumanReviewed] = React.useState({});
     const [humanIntents, setHumanIntents] = React.useState({});
     const [preparationPlans, setPreparationPlans] = React.useState({});
+    const [observerForm, setObserverForm] = React.useState({ id: '', kind: 'daemon', projects: '', adapter_ref: '' });
     async function refresh() {
       try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
       catch (e) { setError(String(e.message || e)); }
@@ -52,6 +53,19 @@
         setReview(null); await refresh(); }
       catch (e) { setError(String(e.message || e)); }
       finally { setSaving(false); }
+    }
+    async function observationAction(register) {
+      const body = register ? { action: 'register', registration: { id: observerForm.id.trim(), kind: observerForm.kind,
+        adapter_ref: observerForm.adapter_ref.trim(), project_ids: observerForm.projects.split(',').map(function (id) { return id.trim(); }).filter(Boolean) } } : { action: 'refresh' };
+      setSaving(true);
+      try { await sdk.fetchJSON(api + '/observations', { method: 'POST', body: JSON.stringify(body) }); await refresh(); }
+      catch (e) { await refresh(); setError(String(e.message || e)); }
+      finally { setSaving(false); }
+    }
+    function observerField(key, label, options) {
+      const props = { value: observerForm[key], onChange: function (e) { setObserverForm(Object.assign({}, observerForm, { [key]: e.target.value })); },
+        style: { margin: '6px', padding: '7px', color: 'inherit', background: 'transparent', border: '1px solid #8886' } };
+      return h('label', { style: { display: 'block' } }, label, options ? h('select', props, options.map(function (kind) { return h('option', { key: kind, value: kind }, kind); })) : h('input', props));
     }
     async function taskAction(action, requestId) {
       setSaving(true);
@@ -166,6 +180,24 @@
             h('div', null, '原生 Profile 引用：' + p.native_profile + ' · 生命周期：配置中 · 执行：未启用'),
             h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
         })),
+        h('section', null,
+        h('h2', null, '手动 Codex 只观察'),
+        h('p', null, '只读取已登记原执行器，保留手动会话；daemon、独立 CLI 与桌面分别核验，其他服务活动仍未知。'),
+        h('button', { style: button, onClick: function () { observationAction(false); }, disabled: saving || snapshot.status !== 'completed' }, '核对手动会话'),
+        h('ul', null, (snapshot.manual_capabilities || []).map(function (capability) { return h('li', { key: capability.kind }, capability.kind + '：' + capability.status); })),
+        h('ul', null, (snapshot.manual_sources || []).map(function (source) { return h('li', { key: source.id },
+          source.id + ' · ' + source.kind + ' · ' + source.status + ' · 权限 observe_only',
+          source.reason && h('div', null, source.reason),
+          h('details', null, h('summary', null, '原服务与可读取范围'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(source, null, 2)))); })),
+        h('ul', null, (snapshot.manual_sessions || []).map(function (session) { return h('li', { key: session.id },
+          session.source_kind + ' / ' + session.thread_id + '：' + session.state + ' · 只观察',
+          h('div', null, '最后核实：' + session.last_verified_at + ' · 最后已知：' + (session.last_known_state || '未知')),
+          h('div', null, '仓库：' + session.logical_repository + ' · 排队：' + (session.blocks_repository ? '等待手动执行或核实' : '本来源已核实无相关执行')),
+          session.reason && h('div', null, session.reason)); })),
+        h('details', null, h('summary', null, '登记已配置的原服务观察来源'),
+          observerField('id', '来源稳定 ID'), observerField('kind', '来源类别', ['daemon', 'independent_cli', 'desktop']),
+          observerField('projects', '已登记项目 ID（逗号分隔）'), observerField('adapter_ref', '已配置本地 adapter 引用'),
+          h('button', { style: button, onClick: function () { observationAction(true); }, disabled: saving || snapshot.status !== 'completed' }, '登记来源'))),
         (snapshot.original_interface_requests || []).length > 0 && h('section', null, h('h2', null, '原服务需人工处理'),
           h('ul', null, snapshot.original_interface_requests.map(function (request) {
             return h('li', { key: request.generation + ':' + String(request.rpc_id) }, request.method + ' · 服务：' + request.service_id +
@@ -290,6 +322,21 @@
             return h('li', { key: f.id }, f.source_anchor.chat_id + ' / ' + f.source_anchor.message_id +
               ' · 受理：' + f.acceptance + ' · 通知：' + f.notification.status,
               h('div', null, f.reason));
+          }))),
+        h('section', null, h('h2', null, '资料来源与查询'),
+          h('p', null, '按实际提问者和明确分享范围查询，原资料库只读。资料不变成新授权；迟到结果只展示材料。'),
+          h('ul', null, (snapshot.knowledge_sources || []).map(function (source) {
+            return h('li', { key: source.id }, source.name + ' · ' + source.id + ' · Wiki：' + source.wiki_profile_id,
+              h('details', null, h('summary', null, '查询主体与公开范围'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(source, null, 2))));
+          })),
+          h('ul', null, (snapshot.knowledge_queries || []).map(function (query) {
+            return h('li', { key: query.id, style: { marginBottom: '14px' } }, query.id + ' · ' + query.source_id + ' · ' + query.status,
+              h('div', null, '实际提问者：' + query.requester + ' · 范围：' + query.scope_ids.join(', ') + ' · 原任务：' + (query.request_id || '独立查询')),
+              h('div', null, '结果关联：' + (query.result_anchor ? query.result_anchor.chat_id + ' / ' + query.result_anchor.message_id : '待核对')),
+              h('ul', null, (query.materials || []).map(function (material) { return h('li', { key: material.id }, '[' + material.kind + '] ' + material.text,
+                h('div', null, material.locator + ' · ' + material.version + ' · ' + material.updated_at)); })),
+              query.supplement && h('div', null, '原会话事实补充：' + query.supplement.status + ' · ' + (query.supplement.reason || '执行结果仍需核对')),
+              h('details', null, h('summary', null, '公开查询与逐段凭据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(query.outbox || [], null, 2))));
           }))),
         h('h2', null, '登记或修正'),
         h('p', null, '这里只保存非敏感引用；不创建原生 Profile、机器人、仓库或 worktree。项目身份不能改绑到新项目。'),

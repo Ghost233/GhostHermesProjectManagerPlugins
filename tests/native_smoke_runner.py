@@ -58,7 +58,10 @@ manager = get_plugin_manager()
 manager.discover_and_load()
 info = next(p for p in manager.list_plugins() if p['name'] == 'ghost-hermes-pm')
 assert info['enabled'] and info['error'] is None, info
-assert info['tools'] == 2 and info['commands'] == 1 and info['hooks'] == 1, info
+assert info['commands'] == 1 and info['hooks'] == 1, info
+from tools.registry import registry
+for tool_name in ('hermes_pm_snapshot', 'hermes_pm_task', 'hermes_pm_observe', 'hermes_pm_knowledge'):
+    assert registry.get_entry(tool_name, scope=str(home)) is not None, tool_name
 assert not (state / 'manager.sock').exists(), 'Ordinary CLI discovery must not start authority.'
 assert not (state / 'manager.lock').exists(), 'Ordinary CLI discovery must not acquire the manager lease.'
 assert not (state / 'manager.sqlite3').exists(), 'Ordinary CLI discovery must not create authoritative storage.'
@@ -138,8 +141,10 @@ async def exercise_gateway_lifecycle():
     assert response.status_code == 200, response.text
     snapshot = browser.get(base + '/snapshot', headers=headers).json()
     assert snapshot['version'] == 1 and len(snapshot['profiles']) == 1, snapshot
-    from tools.registry import registry
     assert json.loads(registry.dispatch('hermes_pm_snapshot', {}, scope=str(home)))['profiles'][0]['id'] == 'lead'
+    observation = json.loads(registry.dispatch('hermes_pm_observe', {'scope': 'mono'}, scope=str(home)))
+    assert observation['status'] == 'completed' and observation['manual_sessions'] == [], observation
+    assert all(capability['status'] == 'unknown' for capability in observation['manual_capabilities']), observation
     task_rejection = json.loads(registry.dispatch('hermes_pm_task', {'action': 'verify', 'request_id': 'unknown'}, scope=str(home)))
     assert task_rejection['status'] == 'rejected' and task_rejection['code'] == 'invalid_change'
     from lark_oapi import Client
@@ -200,6 +205,8 @@ async def exercise_gateway_lifecycle():
     await asyncio.sleep(0)
     assert registry.get_entry('hermes_pm_snapshot', scope=str(home)) is None
     assert registry.get_entry('hermes_pm_task', scope=str(home)) is None
+    assert registry.get_entry('hermes_pm_knowledge', scope=str(home)) is None
+    assert registry.get_entry('hermes_pm_observe', scope=str(home)) is None
     manager.discover_and_load(force=True)
     assert not (state / 'manager.sock').exists(), 'Rediscovery without Gateway context remains read-only.'
     restarted_gateway = GatewayFixture()

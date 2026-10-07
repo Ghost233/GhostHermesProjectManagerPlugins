@@ -86,9 +86,15 @@ def register_native(ctx):
             intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, *credentials)))
             from .codex import configured_adapter
             from .github import GitHubDeliverySource
+            from .observation import configured_observation_adapters
+            from .knowledge import configured_providers
+            observation_adapters = configured_observation_adapters(ctx.get_config('codex_observation', []), state_dir)
             codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
-                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir))
+                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters,
+                              knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {})))
+            for registration in ctx.get_config('manual_sources', []):
+                manager.register_observation_source(VerifiedIdentity(owner, 'trusted-native-source-registration'), registration)
             server = ManagementServer(manager, credentials)
             try:
                 server.start()
@@ -107,17 +113,22 @@ def register_native(ctx):
 
             ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
 
-            if codex_adapter is not None:
+            if codex_adapter is not None or observation_adapters or manager.knowledge_providers:
                 async def supervise_single_issue():
                     import asyncio
                     identity = VerifiedIdentity(owner, 'verified-manager-supervision')
                     generation = intake.generation
                     while resources is not None and not intake.closed:
-                        await asyncio.to_thread(manager.dispatch_tasks)
+                        def poll_if_active():
+                            with intake.lifecycle_lock:
+                                intake.require_active(generation)
+                                manager.refresh_manual_sessions(identity)
+                                manager.dispatch_tasks()
+                        await asyncio.to_thread(poll_if_active)
                         tasks = manager.read_snapshot(identity)['requests']
                         for record in tasks:
                             session = record.get('session')
-                            if session and session.get('thread_id') and session['generation'] == codex_adapter.generation and not record.get('repository_released'):
+                            if codex_adapter is not None and session and session.get('thread_id') and session['generation'] == codex_adapter.generation and not record.get('repository_released'):
                                 def observe_if_active(request_id=record['id']):
                                     with intake.lifecycle_lock:
                                         intake.require_active(generation)
@@ -135,6 +146,18 @@ def register_native(ctx):
                                     async with intake.lock:
                                         await intake.deliver(identity, record['id'], transport, generation)
                                     break
+                        knowledge = manager.read_snapshot(identity)['knowledge_queries']
+                        for query in knowledge:
+                            if query.get('auto_supplement') and query.get('result_received') and not query.get('supplement'):
+                                try:
+                                    manager.supplement_knowledge(VerifiedIdentity(query['requester'], 'registered-knowledge-request-delegation'), query['id'])
+                                except ManagementError:
+                                    pass
+                            for _, transport in tuple(intake.transports):
+                                try:
+                                    await intake.deliver_knowledge(VerifiedIdentity(query['requester'], 'registered-knowledge-publication'), query['id'], transport, generation)
+                                except ManagementError:
+                                    continue
                         await asyncio.sleep(5)
                 ctx.spawn_task(supervise_single_issue(), name='hermes-pm-single-issue-supervision')
 
@@ -177,6 +200,25 @@ def register_native(ctx):
                       schema={'name': 'hermes_pm_snapshot', 'description': 'Read the verified project directory; does not execute tasks.',
                               'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
                       handler=snapshot, description='Project directory and verified capability status')
+    def observe(args):
+        try:
+            if not isinstance(args, dict) or set(args) - {'scope'}:
+                raise ManagementError('invalid_change', 'Observation accepts only the registered project scope.')
+            reference = ctx.get_config('participant_credential_ref')
+            token = _credential(reference) if reference else None
+            if not state_dir or not token:
+                raise ManagementError('unauthorized', 'A configured participant bridge is required.')
+            client = ManagementClient(state_dir, token)
+            client.read_participant_snapshot()
+            return json.dumps(client.refresh_manual_sessions(args.get('scope')))
+        except ManagementError as exc:
+            return json.dumps({'status': 'rejected', 'code': exc.code, 'message': str(exc)})
+
+    ctx.register_tool(name='hermes_pm_observe', toolset='hermes_pm',
+        schema={'name': 'hermes_pm_observe', 'description': 'Read registered original Codex sources without session control.',
+            'parameters': {'type': 'object', 'properties': {'scope': {'type': 'string'}}, 'additionalProperties': False}},
+        handler=observe, description='Observe registered original executors only')
+
     def task_operation(args):
         try:
             if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan'}:
@@ -224,6 +266,36 @@ def register_native(ctx):
                                   'instruction_id': {'type': 'string'}, 'text': {'type': 'string'}, 'expected_turn_id': {'type': 'string'}, 'human_request_id': {'type': 'string'}, 'reply_id': {'type': 'string'}, 'response': {'type': 'object'}},
                                   'required': ['action', 'request_id'], 'additionalProperties': False}},
                       handler=task_operation, description='Single Issue execution and evidence')
+    def knowledge_operation(args):
+        try:
+            if not isinstance(args, dict) or set(args) - {'action', 'source_id', 'query_id', 'question', 'scope_ids', 'request_id', 'channel_id', 'auto_supplement', 'material_ids'}:
+                raise ManagementError('invalid_change', 'Knowledge input cannot assert requester, role or source authority.')
+            token = _credential(ctx.get_config('participant_credential_ref'))
+            if not state_dir or not token:
+                raise ManagementError('unauthorized', 'A distinct registered participant bridge is required.')
+            client = ManagementClient(state_dir, token)
+            client.read_participant_snapshot()
+            if args.get('action') == 'query':
+                if not args.get('request_id') or not args.get('channel_id'):
+                    raise ManagementError('forbidden', 'A participant tool query requires an original task and explicit approved public sharing channel.')
+                result = client.query_knowledge(args.get('source_id'), args.get('query_id'), args.get('question'), args.get('scope_ids'),
+                    args.get('request_id'), args.get('channel_id'), args.get('auto_supplement', False))
+            elif args.get('action') == 'supplement':
+                result = client.supplement_knowledge(args.get('query_id'), args.get('material_ids'))
+            else:
+                raise ManagementError('invalid_change', 'A participant may query or submit allowed task facts, not grant source access.')
+            return json.dumps(result)
+        except ManagementError as exc:
+            return json.dumps({'status': 'rejected', 'code': exc.code, 'message': str(exc)})
+
+    ctx.register_tool(name='hermes_pm_knowledge', toolset='hermes_pm',
+        schema={'name': 'hermes_pm_knowledge', 'description': 'Request explicitly shareable source material for an original task, or submit verified facts.',
+            'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['query', 'supplement']},
+                'source_id': {'type': 'string'}, 'query_id': {'type': 'string'}, 'question': {'type': 'string'},
+                'scope_ids': {'type': 'array', 'items': {'type': 'string'}}, 'request_id': {'type': 'string'},
+                'channel_id': {'type': 'string'}, 'auto_supplement': {'type': 'boolean'}, 'material_ids': {'type': 'array', 'items': {'type': 'string'}}},
+                'required': ['action', 'query_id'], 'additionalProperties': False}}, handler=knowledge_operation,
+        description='Scoped original-requester Wiki query and task facts')
     ctx.register_command('hermes-pm', lambda raw_args: snapshot({} if not raw_args.strip() else {'unsupported': True}),
                          description='Read project directory and runtime status')
 

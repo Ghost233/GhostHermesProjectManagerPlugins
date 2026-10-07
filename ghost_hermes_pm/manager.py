@@ -98,10 +98,12 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
+        self.knowledge_providers = dict(knowledge_providers or {})
+        self.observation_adapters = dict(observation_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -122,6 +124,8 @@ class Manager:
         with self._lock:
             if self.codex_adapter is not None:
                 self.codex_adapter.close()
+            for adapter in self.observation_adapters.values():
+                adapter.close()
             self._db.close()
 
     def __enter__(self):
@@ -138,6 +142,17 @@ class Manager:
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
         data.setdefault('intake_failures', {})
+        data.setdefault('knowledge_sources', {})
+        data.setdefault('knowledge_queries', {})
+        for query in data['knowledge_queries'].values():
+            for publication in query['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
+        from .observation import reconcile_connections
+        reconcile_connections(self, data)
         for record in data['requests'].values():
             session = record.get('session')
             for question in record.get('human_requests', []):
@@ -211,8 +226,12 @@ class Manager:
                     'availability': 'original_client_required'} for r in self.codex_adapter.server_requests(None)]
             from .collaboration import snapshot as collaboration_snapshot
             role_snapshot = collaboration_snapshot(data, principal, visible_ids)
-            return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
+            from .knowledge import snapshot_knowledge
+            return {**snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
+                    'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
+                    'manual_capabilities': [{'kind': kind, 'status': 'verified' if any(s['kind'] == kind and s['status'] == 'verified' and set(s['project_ids']) & {p['id'] for p in projects} for s in data.get('manual_sources', {}).values()) else 'unknown'} for kind in ('daemon', 'independent_cli', 'desktop')],
                     'original_interface_requests': original_interface_requests, 'collaboration': role_snapshot,
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
@@ -273,6 +292,20 @@ class Manager:
     def collaborate(self, identity, action, details):
         from .collaboration import perform
         return perform(self, identity, action, details)
+    def register_observation_source(self, identity, registration):
+        from .observation import register_source
+        return register_source(self, identity, registration)
+
+    def refresh_manual_sessions(self, identity, scope=None):
+        from .observation import refresh_manual_sessions
+        return refresh_manual_sessions(self, identity, scope)
+
+    def refresh_task_manual(self, identity, request_id):
+        with self._lock:
+            _, data = self._load()
+            from .execution import _responsible
+            record = _responsible(self, identity, request_id, data)
+            return self.refresh_manual_sessions(identity, record['project_id'])
 
     def refresh_task_source(self, identity, request_id):
         from .queue import refresh_task_source
@@ -286,7 +319,17 @@ class Manager:
         from .queue import prepare_task
         return prepare_task(self, identity, request_id, plan)
 
+    def _refresh_observations_for_task(self, identity, request_id):
+        with self._lock:
+            _, data = self._load()
+            from .execution import _responsible
+            record = _responsible(self, identity, request_id, data)
+            logical = record.get('session', {}).get('logical_repository') or record['queue']['logical_repository']
+            if any(logical in s.get('logical_repositories', {}).values() for s in data.get('manual_sources', {}).values()):
+                self.refresh_manual_sessions(identity)
+
     def start_task(self, identity, request_id):
+        self._refresh_observations_for_task(identity, request_id)
         from .execution import start_task
         return start_task(self, identity, request_id)
 
@@ -295,6 +338,8 @@ class Manager:
         return refresh_task(self, identity, request_id)
 
     def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
+        if action in {'append', 'continue'}:
+            self._refresh_observations_for_task(identity, request_id)
         from .control import control_task
         return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
 
@@ -327,6 +372,50 @@ class Manager:
     def verify_task_execution(self, identity, request_id):
         from .execution import verify_task_execution
         return verify_task_execution(self, identity, request_id)
+
+    def register_knowledge_source(self, identity, expected_version, source):
+        from .knowledge import register_source
+        return register_source(self, identity, expected_version, source)
+
+    def query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id=None, channel_id=None, auto_supplement=False):
+        from .knowledge import query_knowledge
+        return query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id, channel_id, auto_supplement)
+
+    def claim_knowledge_delivery(self, identity, query_id):
+        from .knowledge import claim_delivery
+        return claim_delivery(self, identity, query_id)
+
+    def record_knowledge_delivery(self, identity, query_id, segment_id, receipt):
+        from .knowledge import record_delivery
+        return record_delivery(self, identity, query_id, segment_id, receipt)
+
+    def receive_wiki_query(self, identity, query_id, binding_id, anchor):
+        from .knowledge import receive_wiki_query
+        return receive_wiki_query(self, identity, query_id, binding_id, anchor)
+
+    def resolve_knowledge(self, identity, query_id):
+        from .knowledge import resolve_knowledge
+        return resolve_knowledge(self, identity, query_id)
+
+    def receive_wiki_result(self, identity, query_id, binding_id, anchor, result_version):
+        from .knowledge import receive_wiki_result
+        return receive_wiki_result(self, identity, query_id, binding_id, anchor, result_version)
+
+    def supplement_knowledge(self, identity, query_id, material_ids=None):
+        from .knowledge import supplement_knowledge
+        return supplement_knowledge(self, identity, query_id, material_ids)
+
+    def knowledge_bot_allowed(self, bot, app_id, chat_id, tenant_key, open_id, native_ids):
+        from .knowledge import registered_bot_allowed
+        return registered_bot_allowed(self, bot, app_id, chat_id, tenant_key, open_id, native_ids)
+
+    def next_knowledge_delivery_binding(self, identity, query_id):
+        from .knowledge import next_delivery_binding
+        return next_delivery_binding(self, identity, query_id)
+
+    def receive_direct_knowledge_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor):
+        from .knowledge import receive_direct_query
+        return receive_direct_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',

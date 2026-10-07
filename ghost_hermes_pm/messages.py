@@ -70,6 +70,10 @@ class FeishuEntry:
                 return prepared
         if self.closed or self.settings.get('enabled') is not True or not self.settings.get('verification_ref'):
             return None
+        from .knowledge_entry import prepare_knowledge_message
+        knowledge = prepare_knowledge_message(self, event, adapter)
+        if knowledge is not None:
+            return knowledge
         try:
             source, header, raw = event.source, event.raw_message.header, event.raw_message.event
             if getattr(source.platform, 'value', source.platform) not in {'feishu', OWNED_PLATFORM} or source.is_bot is not False:
@@ -139,6 +143,8 @@ class FeishuEntry:
         if manager is None:
             return False
         snapshot = manager.read_snapshot(VerifiedIdentity(self.owner, 'verified-feishu-owner-entry'))
+        if getattr(prepared, 'knowledge_kind', None):
+            return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile for p in snapshot['profiles'])
         if re.match(r'^(回答|批准|拒绝)', prepared.command):
             return any(p['id'] == prepared.binding['profile_id'] and p['native_profile'] == runtime_profile and
                        (p['role'] == 'steward' and p['project_id'] is None and prepared.binding['project_id'] is None or
@@ -153,6 +159,9 @@ class FeishuEntry:
             generation = self.generation if generation is None else generation
             async with self.lock:
                 return await self.collaboration_entry.process(prepared, generation)
+        if getattr(prepared, 'knowledge_kind', None):
+            from .knowledge_entry import process_knowledge_message
+            return await process_knowledge_message(self, prepared, self.generation if generation is None else generation)
         identity = VerifiedIdentity(self.owner, 'verified-feishu-owner-entry')
         binding, envelope, transport = prepared.binding, prepared.envelope, prepared.transport
         generation = self.generation if generation is None else generation
@@ -277,7 +286,7 @@ class FeishuEntry:
                     receipt = {'status': 'unknown'}
                 self.manager().record_clarification_delivery(identity, result['id'], receipt)
         elif result['status'] == 'associated':
-            operations = {'执行': 'start_task', '核对执行': 'refresh_task', '核验执行能力': 'verify_task_execution', '核对Issue来源': 'refresh_task_source'}
+            operations = {'执行': 'start_task', '核对执行': 'refresh_task', '核验执行能力': 'verify_task_execution', '核对Issue来源': 'refresh_task_source', '核对手动会话': 'refresh_task_manual'}
             operation = operations.get(text)
             control = None
             preparation = re.fullmatch(r'确认基线[：:]\s*(\S+)\s+([a-f0-9]{40}|unborn)(?:\s+依赖[：:]([a-f0-9,]+))?(?:\s+保留[：:]([a-f0-9]{64}))?', text)
@@ -335,3 +344,7 @@ class FeishuEntry:
             self.manager().record_delivery(identity, request_id, segment['uuid'], receipt)
             if receipt.get('status') != 'delivered':
                 break
+
+    async def deliver_knowledge(self, identity, query_id, transport, generation=None):
+        from .knowledge_entry import deliver_knowledge
+        return await deliver_knowledge(self, identity, query_id, transport, generation)
