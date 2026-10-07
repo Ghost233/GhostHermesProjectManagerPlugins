@@ -113,3 +113,30 @@ def test_accepted_facts_are_curated_with_fixed_result_indexes_and_loaded_only_in
         assert 'Retry only definite failures.' not in first
         assert 'Retry only definite failures.' in followup and 'retry.md#L3' in followup
         assert hashlib.sha256(source_before).hexdigest() == hashlib.sha256((tmp_path / 'source' / 'retry.md').read_bytes()).hexdigest()
+
+
+def test_only_explicit_owner_scope_updates_preferences_and_corrections_keep_old_material(tmp_path):
+    from test_repository_queue import acknowledge
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
+            with pytest.raises(ManagementError) as denied:
+                lead.record_memory_preference('mono-lead', 'fake-rule', 'Always choose blue.', {'kind': 'project', 'id': 'mono'})
+            assert denied.value.code == 'forbidden'
+            one_off = owner.record_memory_preference('mono-lead', 'one-choice', 'Choose blue for this task.', {'kind': 'task', 'id': request_id})
+            assert one_off['owner_origin']['subject'] == OWNER.subject and one_off['scope']['kind'] == 'task'
+            old = owner.record_memory_preference('mono-lead', 'project-rule-v1', 'For this project, use short progress updates.', {'kind': 'project', 'id': 'mono'})
+            corrected = owner.record_memory_preference('mono-lead', 'project-rule-v2', 'For this project, include evidence in progress updates.', {'kind': 'project', 'id': 'mono'}, supersedes='project-rule-v1')
+            assert corrected['supersedes'] == old['id']
+            history = lead.read_project_memory('mono-lead', include_superseded=True)['entries']
+            previous = next(e for e in history if e['id'] == old['id'])
+            assert previous['statement'] == old['statement'] and previous['status'] == 'superseded' and previous['replaced_by'] == corrected['id']
+            assert old['id'] not in [e['id'] for e in lead.read_project_memory('mono-lead')['entries']]
+            next_id = acknowledge(manager, suffix='one-off-cannot-leak')
+            with pytest.raises(ManagementError):
+                lead.load_project_memory(next_id, [one_off['id']])
+            loaded = lead.load_project_memory(next_id, [corrected['id']])
+            assert 'include evidence' in loaded['text'] and 'choose blue' not in loaded['text'].lower()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as restarted:
+        assert len(restarted.read_project_memory(LEAD, 'mono-lead', True)['entries']) == 3

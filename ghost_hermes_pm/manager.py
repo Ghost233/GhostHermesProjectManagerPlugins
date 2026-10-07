@@ -371,6 +371,10 @@ class Manager:
         from .memory import load_project_memory
         return load_project_memory(self, identity, request_id, entry_ids)
 
+    def record_memory_preference(self, identity, profile_id, entry_id, statement, scope, supersedes=None):
+        from .memory import record_memory_preference
+        return record_memory_preference(self, identity, profile_id, entry_id, statement, scope, supersedes)
+
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
         try:

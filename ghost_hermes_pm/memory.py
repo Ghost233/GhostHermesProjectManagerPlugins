@@ -201,3 +201,28 @@ def start_context(manager, identity, task, data):
     if context['entry_versions'] != previous['entry_versions'] or context['digest'] != previous['digest']:
         raise ManagementError('binding_conflict', 'Selected memory changed; explicitly prepare the new task context before starting.')
     return context['text']
+
+
+def record_memory_preference(manager, identity, profile_id, entry_id, statement, scope, supersedes=None):
+    with manager._lock, manager._db:
+        version, data = manager._load()
+        if manager._principal(identity, data) is not None:
+            raise ManagementError('forbidden', 'Only a direct verified Owner expression can create or correct preferences; inherited material is not Owner authority.')
+        profile = _owned_profile(manager, identity, profile_id, data)
+        _public_text(statement, manager._sensitive_values())
+        if not isinstance(scope, dict) or set(scope) != {'kind', 'id'} or scope.get('kind') not in {'task', 'project', 'global'} or not isinstance(scope.get('id'), str):
+            raise ManagementError('invalid_change', 'Owner must explicitly identify task, project or global applicability; no scope is inferred from a choice.')
+        if scope['kind'] == 'project' and (scope['id'] != profile['project_id'] or profile['project_id'] is None) or scope['kind'] == 'global' and (profile['role'] != 'steward' or scope['id'] != 'global'):
+            raise ManagementError('forbidden', 'Explicit preferences stay in the responsible role own project or steward global summary.')
+        if scope['kind'] == 'task':
+            task = manager._request(identity, scope['id'], data)
+            if task['profile_id'] != profile_id:
+                raise ManagementError('forbidden', 'A task preference belongs only to its original responsible Profile.')
+        content = {'kind': 'owner_preference', 'statement': statement, 'scope': scope,
+                   'owner_origin': {'subject': identity.subject, 'source': identity.source, 'source_anchor': None},
+                   'explicit_at': _now()}
+        # Time of reception is evidence, not part of idempotency input.
+        existing = data.get('project_memory', {}).get(profile_id, {}).get(entry_id)
+        if existing:
+            content['explicit_at'] = existing.get('explicit_at')
+        return _store(manager, identity, profile, entry_id, content, data, version, supersedes)

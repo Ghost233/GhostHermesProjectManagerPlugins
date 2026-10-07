@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'details', 'profile_id', 'entry_id', 'selection', 'supersedes', 'include_superseded', 'entry_ids'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'details', 'profile_id', 'entry_id', 'selection', 'supersedes', 'include_superseded', 'entry_ids', 'statement'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -91,6 +91,8 @@ class ManagementServer:
                             result = bridge.manager.read_project_memory(identity, payload.get('profile_id'), payload.get('include_superseded', False))
                         elif payload.get('operation') == 'load_project_memory':
                             result = bridge.manager.load_project_memory(identity, payload.get('request_id'), payload.get('entry_ids'))
+                        elif payload.get('operation') == 'record_memory_preference':
+                            result = bridge.manager.record_memory_preference(identity, payload.get('profile_id'), payload.get('entry_id'), payload.get('statement'), payload.get('scope'), payload.get('supersedes'))
                         elif payload.get('operation') == 'record_task_delivery':
                             result = bridge.manager.record_task_delivery(identity, payload.get('request_id'), payload.get('report'))
                         elif payload.get('operation') == 'register_knowledge_source':
@@ -239,3 +241,6 @@ class ManagementClient:
 
     def load_project_memory(self, request_id, entry_ids):
         return self._call('load_project_memory', request_id=request_id, entry_ids=entry_ids)
+
+    def record_memory_preference(self, profile_id, entry_id, statement, scope, supersedes=None):
+        return self._call('record_memory_preference', profile_id=profile_id, entry_id=entry_id, statement=statement, scope=scope, supersedes=supersedes)
