@@ -50,8 +50,6 @@ thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 from hermes_state import SessionDB
 from run_agent import AIAgent
-from hermes_cli.plugins import get_plugin_manager
-get_plugin_manager().discover_and_load()
 db = SessionDB(db_path=home / 'state.db')
 agent = AIAgent(model='synthetic-model', provider='custom', api_mode='chat_completions',
     base_url=f'http://127.0.0.1:{server.server_address[1]}/v1', api_key='synthetic-test-key',

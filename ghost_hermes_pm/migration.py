@@ -80,6 +80,20 @@ def _old_stopped(manager, operation, data, archive_id):
     return facts
 
 
+def _archive_checkpoints(manager, identity, operation, phase):
+    results = {}
+    _, data = manager._load()
+    for source_id in operation['plan']['archive_source_ids']:
+        if data['archive_sources'][source_id].get('protection', {}).get('status') != 'verified_native_cleanup_copy':
+            raise ManagementError('capability_unverified', 'Explicit long-term original archive protection is unverified; protect source ' + source_id + ' with its existing Owner authority before retrying. Ordinary tools/external services remain unverified.')
+        result = manager.backup_archive(identity, source_id, 'migration:' + operation['digest'] + ':' + phase + ':' + digest(source_id), 'checkpoint')
+        if result['status'] != 'complete':
+            raise ManagementError('capability_unverified', 'Original archive consistency checkpoint is blocked: ' + result.get('reason', source_id))
+        results[source_id] = {'backup_id': result['id'], 'sha256': result['file_sha256'], 'source_version': result['source_version'],
+                             'coverage': result['coverage'], 'restore_scope': result['restore_scope']}
+    return results
+
+
 def _rollback(manager, operation):
     checkpoint = operation.get('checkpoint')
     if not checkpoint:
@@ -206,6 +220,7 @@ def operate(manager, identity, action, details):
                 operation.update(status='preparing')
                 _save(manager, operation)
                 try:
+                    operation['archive_checkpoints'] = _archive_checkpoints(manager, identity, operation, 'prepare')
                     result = manager.migration_host.prepare(operation)
                     operation.update(result)
                     if result['status'] == 'prepared' and not operation.get('native_checkpoint'):
@@ -238,7 +253,10 @@ def operate(manager, identity, action, details):
             operation.update(status='switching', switch_state='intent')
             _save(manager, operation)
             try:
+                if not operation['plan']['archive_source_ids']:
+                    raise ManagementError('capability_unverified', 'Final cutover needs explicit new-identity original archive grants and complete history/retention checkpoints; an empty source list is not migration acceptance.')
                 operation['old_control_receipts'] = _old_stopped(manager, operation, data, details['archive_operation_id'])
+                operation['switch_archive_checkpoints'] = _archive_checkpoints(manager, identity, operation, 'switch')
                 operation.update(manager.migration_host.check(operation, details['session_id']))
                 if operation['status'] != 'prepared' or not operation.get('session_receipt'):
                     raise ManagementError('capability_unverified', 'Every selected native write and actual new-session prompt must be verified.')

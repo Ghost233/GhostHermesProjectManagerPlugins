@@ -28,3 +28,5 @@ Hermes 分层协作与 Codex 监督插件。首版规格与决策地图已定稿
 ## 项目记忆开发切片
 
 已知事实答复沿有效原人工请求与控制入口回送；Issue 验收后各角色保存自己的精选事实、确认决定与版本／测试／PR 索引。明确 Owner 偏好保留适用范围与旧摘要替代关系；新任务只加载明确选定的所属记忆，运行更新不冒充已加载。详情见[项目记忆与实际上下文加载](docs/development/project-memory.md)。原生 SDK、公开来源往返和合成新会话已有离线验证，真实外部记忆服务与生产 Profile 加载仍未核验。
+
+选择性迁移使用本人审定的不可变计划、独立新 Profile/bot、真实 native 材料与新会话证据、原来源授权和检查点；切换受阻时保留 target gate 与可核对恢复 artifact。参见[Profile 迁移与获准验收流程](docs/development/profile-migration.md)。正式安装、新机器人和用户真实资料迁移按具体计划另行执行。

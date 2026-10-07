@@ -33,6 +33,7 @@ from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from ghost_hermes_pm.native_migration import NativeMigrationHost, verify_new_bot
 from ghost_hermes_pm.native_lifecycle import NativeMultiplexLifecycleHost
 from ghost_hermes_pm.feishu import NativeFeishuTransport
+from ghost_hermes_pm.archives import HermesArchiveProvider
 from test_directory import OWNER, make_repo, registration
 from hermes_cli.profiles import create_profile, profiles_to_serve, parked_marker_path
 from hermes_cli.plugins import get_plugin_manager
@@ -42,6 +43,8 @@ from tools.registry import registry
 from lark_oapi import AppType
 import psutil
 import yaml
+import hashlib
+from hermes_state import SessionDB
 
 (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {
     'ghost-hermes-pm': {'settings': {'state_dir': str(state), 'participant_credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN'}}}}}))
@@ -51,6 +54,12 @@ old_home = create_profile('mono-lead', no_skills=True)
 (old_home / 'SOUL.md').write_text('A careful new persona.\n\nUnselected persona stays old.')
 (old_home / '.env').write_text('OLD_FIXTURE_KEY=synthetic-only\n')
 old_secret = (old_home / '.env').read_bytes()
+old_db = SessionDB(db_path=old_home / 'state.db')
+old_db.create_session('old-original-session', 'cli', profile_name='mono-lead')
+old_db.append_message('old-original-session', 'user', 'Original history stays queryable under a new explicit grant.')
+old_db.append_message('old-original-session', 'assistant', 'Retain the complete original history; do not clone the Wiki connection.')
+old_db.close()
+archive_provider = HermesArchiveProvider(old_home / 'state.db', {'history': ['old-original-session']}, page_size=1)
 children = {component: subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'],
     env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for component in ('profile_service', 'bot', 'scheduled_entry')}
@@ -125,13 +134,27 @@ migration_host = NativeMigrationHost(home, scratch / 'native-work', verifier=lam
 lifecycle_host = NativeMultiplexLifecycleHost(home, {'mono-lead': old_home}, process_proof)
 viewer = VerifiedIdentity('fixture:new-lead', 'synthetic-native-participant')
 try:
-    with Manager(state, owner_identity_ref=OWNER.subject, migration_host=migration_host, lifecycle_host=lifecycle_host) as manager:
+    with Manager(state, owner_identity_ref=OWNER.subject, migration_host=migration_host, lifecycle_host=lifecycle_host,
+                 archive_providers={'local:original-history': archive_provider}) as manager:
         old = registration(make_repo(scratch / 'repo'))
         old['profile']['connection_refs'] = {'bot': 'identity:cli_old:ou_old', 'credential': 'native:old-credential'}
         manager.apply_directory_change(OWNER, 0, old)
         target = {**old['profile'], 'id': 'new-lead', 'native_profile': 'new-lead', 'identity_ref': viewer.subject,
                   'connection_refs': {'bot': 'identity:cli_new:ou_new', 'credential': 'native:new-credential', 'codex': 'local:new-executor'}}
         manager.apply_directory_change(OWNER, 1, {'profile': target})
+        wiki = {'id': 'wiki', 'native_profile': 'wiki', 'identity_ref': 'fixture:wiki', 'role': 'independent',
+                'capability': 'non_development', 'project_id': None, 'parent_profile_id': None,
+                'connection_refs': {'bot': 'identity:original-wiki-bot'}}
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': wiki})
+        grant = {'id': 'original-history-grant', 'name': 'Original history', 'provider_ref': 'local:original-history',
+            'wiki_profile_id': 'wiki', 'query_subjects': {OWNER.subject: ['history'], viewer.subject: ['history']},
+            'public_channels': [], 'task_profiles': [], 'wiki_bindings': []}
+        manager.register_knowledge_source(OWNER, manager.read_snapshot(OWNER)['version'], grant)
+        manager.register_archive_source(OWNER, {'id': 'original-history', 'kind': 'hermes_local', 'provider_ref': 'local:original-history',
+            'grant_source_id': grant['id'], 'new_profile_id': target['id'], 'scope_ids': ['history'], 'authorization_ref': 'owner:synthetic-30-migration'})
+        retained = manager.protect_archive(OWNER, 'original-history', 'migration-long-term-retention')
+        assert retained['status'] == 'verified_native_cleanup_copy', retained
+        old_data_digest = hashlib.sha256((old_home / 'state.db').read_bytes()).hexdigest()
         with ManagementServer(manager, {'owner': OWNER, os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN']: viewer}):
             owner = ManagementClient(state, 'owner')
             preview = owner.migrate_profile('preview', {'source_profile_id': 'mono-lead'})
@@ -140,7 +163,7 @@ try:
             plan = owner.migrate_profile('plan', {'plan_id': 'native-migration-30', 'expected_version': owner.read_snapshot()['version'],
                 'expected_profile_ids': ['mono-lead', 'new-lead'], 'source_profile_id': 'mono-lead', 'target_profile_id': 'new-lead',
                 'selection': selected, 'preferences': [{'statement': 'Use short progress updates.', 'scope': {'kind': 'project', 'id': 'mono'}}],
-                'execution': {'model': 'synthetic-model', 'provider': 'custom', 'toolsets': ['memory']}, 'archive_source_ids': [],
+                'execution': {'model': 'synthetic-model', 'provider': 'custom', 'toolsets': ['memory']}, 'archive_source_ids': ['original-history'],
                 'external_memory': {'kind': 'builtin'}, 'human_steps': ['Provision independent cli_new/ou_new native bot credentials.']})
             key = {'plan_id': plan['id'], 'digest': plan['digest']}
             assert owner.migrate_profile('prepare', key)['status'] == 'prepared'
@@ -163,6 +186,13 @@ try:
             assert owner.migrate_profile('activate', activation) == switched
             assert owner.migrate_profile('check', key) == switched
             assert owner.migrate_profile('prepare', key) == switched
+            new = ManagementClient(state, os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN'])
+            history = new.query_archive('original-history', 'new-identity-full-history', 'all', ['history'], complete=True)
+            assert history['status'] == 'complete' and history['coverage']['end_confirmed'] and history['old_entry'] == 'not_started', history
+            assert [record['text'] for record in history['records']] == ['Original history stays queryable under a new explicit grant.', 'Retain the complete original history; do not clone the Wiki connection.']
+            assert hashlib.sha256((old_home / 'state.db').read_bytes()).hexdigest() == old_data_digest
+            assert next(profile for profile in owner.read_snapshot()['profiles'] if profile['id'] == 'wiki')['connection_refs'] == wiki['connection_refs']
+            assert switched['switch_archive_checkpoints']['original-history']['coverage']['end_confirmed']
             assert 'new-lead' in peer.served_profile_names() and 'mono-lead' not in peer.served_profile_names()
             assert (old_home / '.env').read_bytes() == old_secret and parked_marker_path(old_home).exists()
             assert not parked_marker_path(home / 'profiles' / 'new-lead').exists()

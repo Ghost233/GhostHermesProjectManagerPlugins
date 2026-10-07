@@ -257,3 +257,26 @@ def test_owner_bridge_waits_for_actual_native_preparation_receipt(tmp_path):
             owner = ManagementClient(tmp_path / 'state', 'owner')
             planned = owner.migrate_profile('plan', proposal(owner))
             assert owner.migrate_profile('prepare', {'plan_id': planned['id'], 'digest': planned['digest']})['status'] == 'prepared'
+
+
+def test_persona_selection_does_not_require_an_unselected_old_memory_file(tmp_path):
+    from ghost_hermes_pm.native_migration import NativeMigrationHost
+    native = tmp_path / 'native'
+    source = native / 'profiles' / 'mono-lead'
+    source.mkdir(parents=True)
+    (source / 'SOUL.md').write_text('Selected new project persona.')
+    host = NativeMigrationHost(native, tmp_path / 'work', sdk_root=os.environ['HERMES_TEST_SDK_ROOT'])
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, migration_host=host) as manager:
+        setup(manager, tmp_path)
+        with ManagementServer(manager, {'owner': OWNER}):
+            owner = ManagementClient(tmp_path / 'state', 'owner')
+            preview = owner.migrate_profile('preview', {'source_profile_id': 'mono-lead'})
+            assert [entry['kind'] for entry in preview['materials']] == ['persona']
+            assert preview['missing_materials'] == ['memories/MEMORY.md']
+            details = proposal(owner)
+            details['selection'] = preview['materials']
+            planned = owner.migrate_profile('plan', details)
+            prepared = owner.migrate_profile('prepare', {'plan_id': planned['id'], 'digest': planned['digest']})
+            assert prepared['status'] == 'prepared', prepared
+            assert (native / 'profiles' / 'new-lead' / 'SOUL.md').read_text() == 'Selected new project persona.'
+            assert not (source / 'memories' / 'MEMORY.md').exists()

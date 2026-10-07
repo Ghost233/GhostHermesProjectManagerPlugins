@@ -24,14 +24,22 @@ def _home(root, profile):
 
 def _preview(root, source):
     home = _home(root, source)
+    if not home.is_dir():
+        raise ValueError('Registered original native material directory is unavailable.')
     materials = []
+    missing = []
     for kind, relative in (('knowledge', 'memories/MEMORY.md'), ('persona', 'SOUL.md')):
         path = home / relative
-        if path != path.resolve() or path.stat().st_size > 40000:
+        if path != path.resolve():
+            raise ValueError('Original material is an unknown alias; it was preserved.')
+        if not path.exists():
+            missing.append(relative)
+            continue
+        if not path.is_file() or path.stat().st_size > 40000:
             raise ValueError('Original material is not a bounded canonical file.')
         raw = path.read_bytes()
         materials.append({'kind': kind, 'locator': relative, 'source_version': _hash(raw), 'source_digest': _hash(raw), 'text': raw.decode('utf-8')})
-    return {'status': 'preview', 'source_profile_id': source['id'], 'materials': materials,
+    return {'status': 'preview', 'source_profile_id': source['id'], 'materials': materials, 'missing_materials': missing,
             'credentials': 'not_read', 'source_profile': 'not_modified'}
 
 
