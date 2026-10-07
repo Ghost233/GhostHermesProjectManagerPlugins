@@ -16,6 +16,8 @@ def _now():
 
 def require_active(data, profile_id, project_id):
     for obj in (data['profiles'].get(profile_id, {}), data['projects'].get(project_id, {})):
+        if obj.get('migration_gate'):
+            raise ManagementError('migration_blocked', 'Target Profile is configuring under an immutable migration plan; approve its verified cutover first.')
         if obj.get('lifecycle') not in {None, 'configuring', 'active'} or obj.get('archive_intent') not in (None, False):
             raise ManagementError('lifecycle_blocked', 'Project lifecycle prevents new work or continuation; reconcile the Owner intent.')
     if data.get('maintenance_mode') not in (None, False):

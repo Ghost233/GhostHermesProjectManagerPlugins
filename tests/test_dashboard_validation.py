@@ -5,7 +5,7 @@ import subprocess
 import pytest
 
 
-@pytest.mark.parametrize('case', ['outcome_unknown', 'repository_busy', 'evidence', 'notifications'])
+@pytest.mark.parametrize('case', ['outcome_unknown', 'repository_busy', 'evidence', 'notifications', 'migration_error', 'migration_stale'])
 def test_global_validation_operation_keeps_error_after_refresh_and_displays_complete_public_evidence(case):
     node = shutil.which('node')
     assert node is not None, 'Dashboard behavior verification requires the existing Node runtime.'

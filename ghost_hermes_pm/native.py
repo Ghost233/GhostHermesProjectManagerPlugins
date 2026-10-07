@@ -19,6 +19,8 @@ def _credential(reference):
 
 
 def register_native(ctx):
+    from .migration_capture import capture_request
+    ctx.register_hook('pre_api_request', capture_request)
     state_dir = ctx.get_config('state_dir')
     manager_profile = ctx.get_config('manager_profile')
     owner = ctx.get_config('owner_identity_ref')
@@ -96,6 +98,7 @@ def register_native(ctx):
             recovery_adapters = configured_recovery_adapters(ctx.get_config('codex_recovery', []), state_dir)
             codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
             from .native_lifecycle import configured_lifecycle_host
+            from .native_migration import configured_migration_host
             def knowledge_credential(reference):
                 value = _credential(reference)
                 if value:
@@ -105,7 +108,8 @@ def register_native(ctx):
                               codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters, control_adapters=control_adapters,
                               knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {}), credential_resolver=knowledge_credential),
                               archive_providers=configured_archives(ctx.get_config('archive_providers', {})), recovery_adapters=recovery_adapters,
-                              lifecycle_host=configured_lifecycle_host(ctx.get_config('native_profile_lifecycle'), state_dir))
+                              lifecycle_host=configured_lifecycle_host(ctx.get_config('native_profile_lifecycle'), state_dir),
+                              migration_host=configured_migration_host(ctx.get_config('native_profile_migration'), state_dir, intake))
             for registration in ctx.get_config('manual_sources', []):
                 manager.register_observation_source(VerifiedIdentity(owner, 'trusted-native-source-registration'), registration)
             server = ManagementServer(manager, credentials)
@@ -282,6 +286,17 @@ def register_native(ctx):
         schema={'name': 'hermes_pm_lifecycle', 'description': 'Read verified archive and individual restoration facts; human authorization is not a tool argument.',
             'parameters': {'type': 'object', 'properties': {'operation_id': {'type': 'string'}}, 'additionalProperties': False}},
         handler=lifecycle_status, description='Read durable project lifecycle and component verification')
+    def migration_status(args):
+        if not isinstance(args, dict) or set(args) - {'plan_id'}:
+            return json.dumps({'status': 'failed', 'code': 'invalid_change', 'message': 'Read a migration plan ID; Owner decisions are not tool arguments.'})
+        facts = json.loads(snapshot())
+        if facts.get('status') != 'completed':
+            return json.dumps(facts)
+        return json.dumps({'status': 'completed', 'version': facts['version'], 'migration_plans': [p for p in facts['migration_plans'] if not args.get('plan_id') or p['id'] == args['plan_id']]})
+    ctx.register_tool(name='hermes_pm_migration', toolset='hermes_pm',
+        schema={'name': 'hermes_pm_migration', 'description': 'Read reviewed selective migration facts, actual native receipts and concrete manual blockers.',
+                'parameters': {'type': 'object', 'properties': {'plan_id': {'type': 'string'}}, 'additionalProperties': False}},
+        handler=migration_status, description='Read immutable migration selection, preparation, switch and rollback evidence')
     def observe(args):
         try:
             if not isinstance(args, dict) or set(args) - {'scope'}:

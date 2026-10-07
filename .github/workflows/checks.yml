@@ -2,7 +2,7 @@ name: Plugin checks
 
 on:
   push:
-    branches: [main, "codex/**"]
+    branches: [main]
   pull_request:
 
 permissions:

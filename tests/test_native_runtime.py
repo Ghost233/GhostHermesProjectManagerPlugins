@@ -10,8 +10,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('wiki_mcp_smoke_runner.py', False, ''), ('lifecycle_smoke_runner.py', False, ''), ('notifications_smoke_runner.py', False, ''), ('recovery_smoke_runner.py', False, ''), ('memory_smoke_runner.py', False, ''), ('collaboration_smoke_runner.py', False, ''), ('manual_control_smoke_runner.py', False, ''), ('archive_smoke_runner.py', False, ''), ('knowledge_smoke_runner.py', False, ''), ('manual_observation_smoke_runner.py', False, ''), ('repository_queue_smoke_runner.py', False, ''), ('questions_smoke_runner.py', False, ''), ('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
-def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(runner, artifact_mismatch, unload_stage):
+@pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('wiki_mcp_smoke_runner.py', False, ''), ('migration_smoke_runner.py', False, ''), ('lifecycle_smoke_runner.py', False, ''), ('notifications_smoke_runner.py', False, ''), ('recovery_smoke_runner.py', False, ''), ('memory_smoke_runner.py', False, ''), ('collaboration_smoke_runner.py', False, ''), ('manual_control_smoke_runner.py', False, ''), ('archive_smoke_runner.py', False, ''), ('knowledge_smoke_runner.py', False, ''), ('manual_observation_smoke_runner.py', False, ''), ('repository_queue_smoke_runner.py', False, ''), ('questions_smoke_runner.py', False, ''), ('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', True, ''), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
+def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(runner, artifact_mismatch, unload_stage, migration_entity=''):
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     sdk = Path(configured) if configured else ROOT / 'tests' / 'fixtures' / 'hermes-sdk'
     if not (sdk / 'hermes_cli' / 'plugins.py').exists():
@@ -39,6 +39,13 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
         if runner == 'memory_smoke_runner.py':
             for name in ('test_project_memory.py', 'memory_fixture_server.py'):
                 shutil.copy2(ROOT / 'tests' / name, fixtures / name)
+        if runner == 'migration_smoke_runner.py':
+            fixtures = scratch / 'migration-fixtures'
+            fixtures.mkdir()
+            shutil.copy2(ROOT / 'tests' / 'test_directory.py', fixtures / 'test_directory.py')
+            if migration_entity == 'developer':
+                for name in ('recovery_service_support.py', 'recovery_service_fixture.py', 'test_requests.py', 'test_task_execution.py'):
+                    shutil.copy2(ROOT / 'tests' / name, fixtures / name)
         if runner == 'lifecycle_smoke_runner.py':
             fixtures = scratch / 'lifecycle-fixtures'
             fixtures.mkdir()
@@ -57,9 +64,15 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
             env['HERMES_TEST_OWNED_ARTIFACT_MISMATCH'] = '1'
         if unload_stage:
             env['HERMES_TEST_OWNED_UNLOAD_STAGE'] = unload_stage
-        result = subprocess.run([sys.executable, str(ROOT / 'tests' / runner), str(scratch)],
+        runtime_python = os.environ.get('HERMES_TEST_SESSION_PYTHON', sys.executable) if runner == 'migration_smoke_runner.py' else sys.executable
+        result = subprocess.run([runtime_python, str(ROOT / 'tests' / runner), str(scratch), *([migration_entity] if migration_entity else [])],
                                 cwd=scratch, env=env, text=True, capture_output=True, timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr
         assert 'native load, Dashboard bridge, restart, teardown: OK' in result.stdout
         if runner in {'archive_smoke_runner.py', 'lifecycle_smoke_runner.py'}:
             print(result.stdout)
+
+
+@pytest.mark.parametrize('entity', ['wiki', 'ghost', 'steward', 'developer'])
+def test_native_named_global_migration_preserves_single_entry_scope_and_observed_execution(entity):
+    test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources('migration_smoke_runner.py', False, '', entity)
