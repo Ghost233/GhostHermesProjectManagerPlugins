@@ -107,10 +107,11 @@ class FixtureHost:
     def start(self, context):
         import hashlib
         import sys
-        result = subprocess.run([sys.executable, '-c', 'from pathlib import Path; import sys; assert Path("child/source.py").read_text() == sys.argv[1]; print("1 test passed")', self.expected], cwd=context['repository']['worktree'], capture_output=True)
+        argv = [sys.executable, '-c', 'from pathlib import Path; import sys; assert Path("child/source.py").read_text() == sys.argv[1]; print("1 test passed")', self.expected]
+        result = subprocess.run(argv, cwd=context['repository']['worktree'], capture_output=True)
         run_id = 'run-' + context['id']
         self.runs[run_id] = {'host_id': context['boundary']['host_id'], 'generation': context['boundary']['generation'], 'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest'], 'status': 'ended',
-            'related_execution': 'ended', 'input_changes': [], 'tests': [{'id': 'unit', 'argv': ['python', '-m', 'unittest'], 'cwd': context['repository']['worktree'],
+            'related_execution': 'ended', 'input_changes': [], 'tests': [{'id': 'unit', 'argv': argv, 'cwd': context['repository']['worktree'],
                 'exit_code': result.returncode, 'output_digest': hashlib.sha256(result.stdout + result.stderr).hexdigest(), 'artifact_refs': []}], 'defects': []}
         return {'host_id': context['boundary']['host_id'], 'generation': context['boundary']['generation'], 'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest']}
 
