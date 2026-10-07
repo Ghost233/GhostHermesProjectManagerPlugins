@@ -127,8 +127,17 @@ def _inflight(manager, data):
         elif isinstance(value, list):
             for index, child in enumerate(value):
                 visit(child, path + ':' + str(index))
-    for key in ('requests', 'knowledge_queries', 'archive_queries', 'collaboration'):
+    for key in ('requests', 'knowledge_queries', 'archive_queries', 'collaboration', 'human_reply_feedback', 'notifications'):
         visit(data.get(key, {}), key)
+    for operation in data.get('lifecycle_operations', {}).values():
+        if operation['status'] == 'completed':
+            continue
+        for key, request in operation.get('entry_requests', {}).items():
+            if request.get('status') in {'intent', 'outcome_unknown', 'accepted'} and operation.get('checks', {}).get(key, {}).get('status') != 'verified':
+                pending.append('lifecycle_operations:' + operation['id'] + ':entry_requests:' + key)
+    for attempt in data.get('global_validations', {}).values():
+        if attempt.get('occupancy', {}).get('released') is False:
+            pending.append('global_validations:' + attempt['id'] + ':original_action_unreconciled')
     return pending
 
 

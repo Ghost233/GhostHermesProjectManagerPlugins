@@ -263,3 +263,122 @@ def test_snapshot_reports_actual_owner_and_reader_maintenance_permission_without
             with pytest.raises(ManagementError) as denied:
                 reader.maintenance('enter', approval(owner, 'forged-owner'))
             assert denied.value.code == 'forbidden'
+
+
+@pytest.mark.asyncio
+async def test_unknown_original_owner_reply_receipt_prevents_checkpoint_without_replaying_feedback(tmp_path):
+    from maintenance_fixture_host import MaintenanceHost
+    from test_maintenance_entry import register, approval as reviewed
+    from test_feishu_entry import CONFIG, Gateway, Transport, event
+    from ghost_hermes_pm.messages import FeishuEntry
+    class UnknownTransport(Transport):
+        async def send(self, packet):
+            self.sent.append(packet)
+            return {'status': 'unknown'}
+    host = MaintenanceHost(tmp_path / 'host')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, maintenance_host=host) as manager:
+        register(manager, make_repo(tmp_path / 'repo'))
+        adapter, transport = object(), UnknownTransport()
+        settings = {**CONFIG, 'bindings': [{**CONFIG['bindings'][0], 'profile_id': 'steward', 'project_id': None}]}
+        entry = FeishuEntry(lambda: manager, OWNER.subject, settings, lambda url: None)
+        entry.attach_transport(adapter, transport)
+        gateway = Gateway(adapter)
+        details = reviewed(manager, 'unknown-feedback', expected_release=host.release)
+        original = event('@_user_1 进入维护 ' + json.dumps(details), 'unknown-original-feedback')
+        assert await entry.receive(original, gateway) == {'action': 'skip'}
+        pending = manager.maintenance(OWNER, 'checkpoint', {'operation_id': 'unknown-feedback'})
+        assert pending['status'] == 'blocked'
+        assert pending.get('checkpoint') is None
+        assert any('human_reply_feedback' in request for request in pending['checks']['inflight_requests'])
+        assert await entry.receive(original, gateway) is None
+        assert len(transport.sent) == 1
+
+
+def test_unknown_notification_delivery_remains_a_handoff_blocker_after_original_task_stops(tmp_path):
+    from maintenance_fixture_host import MaintenanceHost
+    from test_notifications import Clock, accepted as notified_task, register_entry
+    host, clock = MaintenanceHost(tmp_path / 'host'), Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
+                 maintenance_host=host, notification_clock=clock) as manager:
+        request_id = notified_task(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, request_id)
+        manager.run_notifications(OWNER)
+        clock.advance(900)
+        summary = next(row for row in manager.run_notifications(OWNER)['notifications'] if row['kind'] == 'summary')
+        packet = manager.manage_notifications(OWNER, 'claim', {'event_id': summary['id']})
+        manager.manage_notifications(OWNER, 'receipt', {'event_id': summary['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'unknown'}})
+        manager.control_task(OWNER, request_id, 'stop', 'stop-before-checkpoint', expected_turn_id=TURN)
+        terminal_state(tmp_path)
+        assert manager.refresh_task(OWNER, request_id)['outer_task_status'] == 'stopped'
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            client.maintenance('enter', approval(client, 'unknown-notification', expected_release=host.release))
+            result = client.maintenance('checkpoint', {'operation_id': 'unknown-notification'})
+            assert result['status'] == 'blocked'
+            assert result.get('checkpoint') is None
+            assert any('notifications' in request for request in result['checks']['inflight_requests'])
+            assert next(event for event in client.read_snapshot()['notifications']['events'] if event['id'] == summary['id'])['delivery'] == 'unknown'
+
+
+def test_unresolved_native_lifecycle_request_blocks_checkpoint_but_verified_history_does_not(tmp_path):
+    from maintenance_fixture_host import MaintenanceHost
+    from test_directory import registration
+    from test_lifecycle import ProfileHost, scope_approval
+    class LostNativeAck(ProfileHost):
+        def request(self, profile, component, state, operation_id):
+            super().request(profile, component, state, operation_id)
+            return {'status': 'outcome_unknown'}
+    native, host = LostNativeAck(), MaintenanceHost(tmp_path / 'host')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=native, maintenance_host=host) as manager:
+        native.manager = manager
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        native.pending.add(('mono-lead', 'bot'))
+        archived = manager.lifecycle(OWNER, 'archive', scope_approval(manager.read_snapshot(OWNER), 'archive',
+                                      {'profile_id': 'mono-lead', 'operation_id': 'original-native-archive'}))
+        assert archived['status'] == 'processing'
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            client.maintenance('enter', approval(client, 'archive-handoff', expected_release=host.release))
+            pending = client.maintenance('checkpoint', {'operation_id': 'archive-handoff'})
+            assert pending['status'] == 'blocked'
+            assert pending.get('checkpoint') is None
+            assert any('lifecycle_operations' in request for request in pending['checks']['inflight_requests'])
+            count = len(native.calls)
+            native.pending.clear()
+            assert manager.lifecycle(OWNER, 'check', {'operation_id': 'original-native-archive'})['status'] == 'completed'
+            assert len(native.calls) == count
+            verified = client.maintenance('checkpoint', {'operation_id': 'archive-handoff'})
+            assert verified['status'] == 'checkpoint_verified'
+
+
+def test_unknown_original_global_validation_run_blocks_handoff_until_reconciled_without_replay(tmp_path):
+    from maintenance_fixture_host import MaintenanceHost
+    from test_global_validation import UnknownStartHost, combination, git, LEAD
+    from test_repository_queue import queue_adapter
+    validator, host = UnknownStartHost(), MaintenanceHost(tmp_path / 'host')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path),
+                 global_validation_host=validator, maintenance_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        validation = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'),
+                                               'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        with pytest.raises(ManagementError) as lost:
+            manager.global_validation(LEAD, 'start', {'validation_id': validation['id']})
+        assert lost.value.code == 'outcome_unknown'
+        session = next(record for record in manager.read_snapshot(OWNER)['requests'] if record['id'] == parent)['session']
+        manager.control_task(OWNER, parent, 'stop', 'stop-before-native-handoff', expected_turn_id=session['turn_id'])
+        peer_file = tmp_path / 'queue-observed.json'
+        observed = json.loads(peer_file.read_text())
+        observed[session['thread_id']] = {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'interrupted', 'itemsView': 'full', 'items': []}]}
+        peer_file.write_text(json.dumps(observed))
+        assert manager.refresh_task(OWNER, parent)['outer_task_status'] == 'stopped'
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            client.maintenance('enter', approval(client, 'validation-handoff', expected_release=host.release))
+            blocked = client.maintenance('checkpoint', {'operation_id': 'validation-handoff'})
+            assert blocked['status'] == 'blocked'
+            assert blocked.get('checkpoint') is None
+            assert any('global_validations' in request for request in blocked['checks']['inflight_requests'])
+            assert manager.global_validation(LEAD, 'reconcile', {'validation_id': validation['id']})['status'] == 'passed'
+            assert len(validator.runs) == 1
+            assert client.maintenance('checkpoint', {'operation_id': 'validation-handoff'})['status'] == 'checkpoint_verified'
