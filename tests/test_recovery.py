@@ -480,3 +480,30 @@ def test_sent_answer_without_original_resolution_prevents_automatic_continuation
         assert task['human_requests'][0]['resolution'] != 'resolved'
     assert len(replies(tmp_path)) == 1
     assert 'turn/start' not in methods(tmp_path)
+
+
+def test_new_live_natural_question_after_recovery_can_be_answered_without_reviving_history(tmp_path):
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, repo)
+        service_id = manager.start_task(OWNER, request_id)['session']['service_id']
+    original_state(tmp_path, repo)
+    peer = tmp_path / 'original' / 'original-state.json'
+    state = json.loads(peer.read_text())
+    item = {'id': 'fresh-natural-item', 'type': 'agentMessage', 'text': 'Which colour do you want?'}
+    state['thread']['turns'][0]['items'] = [item]
+    peer.write_text(json.dumps(state))
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                 recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id)}) as manager:
+        task = manager.reconcile_task(OWNER, request_id)
+        assert task.get('human_requests', []) == []
+    state['events'] = [{'method': 'item/completed', 'params': {'threadId': THREAD, 'turnId': TURN, 'item': item}}]
+    peer.write_text(json.dumps(state))
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                 recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id)}) as manager:
+        task = manager.reconcile_task(OWNER, request_id)
+        natural = task['human_requests'][0]
+        assert natural['method'] == 'natural_language'
+        assert natural['resolution'] == 'pending' and natural['control_enabled'] is True
+        manager.answer_human_request(OWNER, request_id, natural['id'], 'fresh-natural-answer', {'answers': {'answer': ['Blue']}})
+    assert len(json.loads(peer.read_text())['inputs']) == 1

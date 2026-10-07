@@ -152,8 +152,8 @@ def refresh_task(manager, identity, request_id):
                 if thread.get('id') != session['thread_id'] or thread.get('cwd') != repository['worktree']:
                     raise ManagementError('capability_unverified', 'The observation does not identify the original task and boundary.')
                 from .questions import sync_human_requests
-                sync_human_requests(manager, record, adapter, thread)
                 events = adapter.take_events(session['thread_id'])
+                sync_human_requests(manager, record, adapter, thread, live_events=events)
                 record.setdefault('service_events', []).extend({'method': e['method'], 'turn_id': e.get('params', {}).get('turnId'),
                                                               'request_id': e.get('id'), 'generation': adapter.generation}
                                                              for e in events[-100:])

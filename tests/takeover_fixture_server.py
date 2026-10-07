@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 root = Path(sys.argv[1])
 emitted = set()
+events_emitted = False
 for line in sys.stdin:
     request = json.loads(line)
     with (root / 'original-wire.jsonl').open('a') as log:
@@ -45,6 +46,10 @@ for line in sys.stdin:
         result = {'turn': turn}
     else:
         raise RuntimeError('Takeover must not create/resume/fork a thread or change daemon: ' + method)
+    if not events_emitted and state.get('events'):
+        for event in state['events']:
+            print(json.dumps(event), flush=True)
+        events_emitted = True
     for envelope in state.get('server_requests', []):
         key = (type(envelope['id']).__name__, envelope['id'])
         if key not in emitted:
