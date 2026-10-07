@@ -67,6 +67,8 @@ class ManagementServer:
                             if payload['operation'] == 'read_participant_snapshot' and identity.subject == bridge.manager.owner_identity_ref:
                                 raise ManagementError('forbidden', 'The participant entry cannot borrow owner authority.')
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
+                        elif payload.get('operation') == 'manage_notifications':
+                            result = bridge.manager.manage_notifications(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'run_notifications':
                             result = bridge.manager.run_notifications(identity)
                         elif payload.get('operation') == 'global_validation':
@@ -203,6 +205,9 @@ class ManagementClient:
         if 'error' in response:
             raise ManagementError(response['error']['code'], response['error']['message'])
         return response['result']
+
+    def manage_notifications(self, action, details):
+        return self._call('manage_notifications', action=action, details=details)
 
     def run_notifications(self):
         return self._call('run_notifications')

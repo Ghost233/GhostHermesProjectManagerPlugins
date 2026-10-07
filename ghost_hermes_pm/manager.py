@@ -285,6 +285,10 @@ class Manager:
                     'execution': 'available' if any(r.get('execution_capability', {}).get('enabled') and executor_for(self, r) and r['execution_capability'].get('connection', {}).get('generation') == executor_for(self, r).generation and not executor_for(self, r)._closed for r in requests) else 'not_enabled',
                     'needs_human': ['Capabilities require current service, permission and channel evidence.']}
 
+    def manage_notifications(self, identity, action, details):
+        from .notifications import manage
+        return manage(self, identity, action, details)
+
     def run_notifications(self, identity):
         from .notifications import run
         return run(self, identity)

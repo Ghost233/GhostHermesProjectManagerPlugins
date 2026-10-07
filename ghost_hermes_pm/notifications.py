@@ -1,19 +1,46 @@
 """Durable project notifications derived from verified management facts."""
 import hashlib
 import json
+import uuid
 
 from .manager import ManagementError
 
 
 def state(data):
-    return data.setdefault('notifications', {'events': {}, 'projects': {}, 'tasks': {}, 'health': {
+    saved = data.setdefault('notifications', {'events': {}, 'projects': {}, 'tasks': {}, 'human_requests': {}, 'health': {
         'supervision': 'unverified', 'delivery': 'unverified', 'last_checked_at': None}})
+    for key in ('human_requests', 'anchors'):
+        saved.setdefault(key, {})
+    return saved
 
 
 def snapshot(data, project_ids):
     saved = state(data)
     return {'events': [e for e in saved['events'].values() if e['project_id'] in project_ids],
             'health': dict(saved['health'])}
+
+
+def human_text(question):
+    text = '人工请求：' + question['id'] + '\n分类：' + question['category']
+    if question['category'] in {'question', 'nonblocking'}:
+        text += '\n' + '\n'.join(q['question'] for q in question.get('questions', []))
+        text += '\n本人可回复：回答 ' + question['id'] + '：答案'
+    elif question['category'] == 'approval' and question['answerable']:
+        text += '\n具体操作：' + json.dumps(question.get('operation', {}), ensure_ascii=False, sort_keys=True)
+        text += '\n操作 ID：' + str(question.get('operation_id')) + '；范围：turn（仅本回合）'
+        text += '\n本人须明确批准或拒绝并引用请求 ID、操作 ID 及范围。'
+    else:
+        text += '\n请在原服务的安全原界面处理。服务：' + question['original_interface']['service_ref']
+        text += '\n原会话：' + question['thread_id'] + '；安全链接尚不可用。不要在群里发送秘密答案。'
+    return text
+
+
+def emit(saved, kind, project_id, tasks, text, now, *, human_request_id=None, mention_owner=False, key=None):
+    key = key or hashlib.sha256(json.dumps([kind, project_id, [t['id'] for t in tasks], human_request_id, now]).encode()).hexdigest()
+    event = {'id': key, 'kind': kind, 'project_id': project_id, 'request_ids': [t['id'] for t in tasks],
+             'human_request_id': human_request_id, 'mention_owner': mention_owner, 'text': text,
+             'created_at': now, 'delivery': 'pending'}
+    return saved['events'].setdefault(key, event)
 
 
 def run(manager, identity):
@@ -28,6 +55,16 @@ def run(manager, identity):
         for task in data['requests'].values():
             if not task.get('repository_released') and task.get('outer_task_status') != 'stopped':
                 active.setdefault(task['project_id'], []).append(task)
+        for task in data['requests'].values():
+            for question in task.get('human_requests', []):
+                if question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled') or not (question.get('blocking') is True or question['category'] == 'approval'):
+                    continue
+                previous = saved['human_requests'].get(question['id'])
+                if previous is not None and now - previous < 1800:
+                    continue
+                emit(saved, 'human_request', task['project_id'], [task], human_text(question), now,
+                     human_request_id=question['id'], mention_owner=True)
+                saved['human_requests'][question['id']] = now
         for project_id in list(saved['projects']):
             if project_id not in active:
                 del saved['projects'][project_id]
@@ -44,6 +81,122 @@ def run(manager, identity):
             saved['events'][key] = {'id': key, 'kind': 'summary', 'project_id': project_id,
                 'request_ids': [t['id'] for t in tasks], 'text': text, 'created_at': now, 'delivery': 'pending'}
             schedule['summary_at'] = now
+        from .collaboration import _channel
+        entries = [c for c in data.get('collaboration', {}).get('channels', {}).values() if c['group_kind'] == 'entry']
+        target = None
+        if len(entries) == 1:
+            try:
+                target = _channel(data, entries[0]['id'])
+            except ManagementError:
+                pass
+        for event in saved['events'].values():
+            if 'target_channel' in event:
+                continue
+            event['target_channel'] = json.loads(json.dumps(target))
+            event['segments'] = [{'number': index + 1, 'uuid': str(uuid.uuid4()), 'text': event['text'][start:start + 1400],
+                'status': 'pending', 'attempts': []} for index, start in enumerate(range(0, len(event['text']), 1400))]
+            if target is None:
+                event['delivery'] = 'blocked'
         saved['health'].update(supervision='running', last_checked_at=now)
         manager._save(version, data)
         return {'status': 'completed', 'notifications': list(saved['events'].values()), 'health': saved['health']}
+
+
+def manage(manager, identity, action, details):
+    with manager._lock, manager._db:
+        version, data = manager._load()
+        if manager._principal(identity, data) is not None:
+            raise ManagementError('forbidden', 'Notification delivery uses the trusted shared manager entry.')
+        saved = state(data)
+        if not isinstance(details, dict):
+            raise ManagementError('invalid_change', 'A notification operation is required.')
+        if action == 'channel_unavailable' and not details:
+            saved['health']['delivery'] = 'unavailable'
+            manager._save(version, data)
+            return saved['health']
+        if action not in {'claim', 'receipt'} or set(details) != ({'event_id'} if action == 'claim' else {'event_id', 'uuid', 'receipt'}):
+            raise ManagementError('invalid_change', 'An exact notification delivery operation is required.')
+        event = saved['events'].get(details['event_id'])
+        if event is None:
+            raise ManagementError('invalid_change', 'Unknown notification.')
+        from .collaboration import _channel
+        frozen = event.get('target_channel')
+        if not frozen or _channel(data, frozen['id']) != frozen:
+            raise ManagementError('binding_conflict', 'The original notification entry channel changed or was unavailable.')
+        if action == 'claim':
+            if event['delivery'] not in {'pending', 'sending'}:
+                return None
+            for segment in event['segments']:
+                if segment['status'] == 'delivered':
+                    continue
+                if segment['status'] != 'pending':
+                    return None
+                anchor = saved['anchors'].get(event['project_id'])
+                if anchor and anchor['channel'] != frozen:
+                    raise ManagementError('binding_conflict', 'The project entry anchor belongs to another registered channel.')
+                packet = {**segment, 'event_id': event['id'], 'kind': event['kind'],
+                    'path': 'reply' if anchor else 'create', 'chat_id': frozen['chat_id'],
+                    'reply_to': anchor['message_id'] if anchor else None, 'thread_id': anchor.get('thread_id') if anchor else None,
+                    'mention_open_id': frozen['owner_open_id'] if event.get('mention_owner') else None, 'sender_binding': frozen}
+                segment['status'] = 'sending'
+                manager._inflight.add(segment['uuid'])
+                segment['attempts'].append({'status': 'sending', 'path': packet['path'], 'intended_chat_id': packet['chat_id'],
+                    'intended_reply_to': packet['reply_to'], 'intended_thread_id': packet['thread_id']})
+                event['delivery'] = 'sending'
+                manager._save(version, data)
+                return packet
+            return None
+        receipt = details['receipt']
+        if not isinstance(receipt, dict) or receipt.get('status') not in {'delivered', 'failed', 'unknown'} or set(receipt) - {'status', 'code', 'message_id', 'chat_id', 'parent_id', 'root_id', 'thread_id'} or any(v is not None and not isinstance(v, (str, int)) for v in receipt.values()):
+            raise ManagementError('invalid_change', 'A scalar notification receipt is required.')
+        segment = next((s for s in event['segments'] if s['uuid'] == details['uuid']), None)
+        if not segment or segment['status'] != 'sending':
+            raise ManagementError('version_conflict', 'No matching notification delivery intent.')
+        receipt = dict(receipt)
+        attempt = segment['attempts'][-1]
+        if receipt['status'] == 'delivered' and (not isinstance(receipt.get('message_id'), str) or not receipt['message_id'] or receipt.get('chat_id') != frozen['chat_id'] or attempt['path'] == 'reply' and receipt.get('parent_id') != attempt['intended_reply_to']):
+            receipt['status'] = 'unknown'
+        segment['status'] = receipt['status']
+        attempt.update(receipt)
+        manager._inflight.discard(segment['uuid'])
+        if receipt['status'] == 'delivered' and event['project_id'] not in saved['anchors']:
+            saved['anchors'][event['project_id']] = {'channel': frozen, 'message_id': receipt['message_id'], 'thread_id': receipt.get('thread_id')}
+        statuses = {s['status'] for s in event['segments']}
+        event['delivery'] = 'delivered' if statuses == {'delivered'} else receipt['status'] if receipt['status'] != 'delivered' else 'pending'
+        saved['health']['delivery'] = 'available' if event['delivery'] == 'delivered' else 'unverified'
+        manager._save(version, data)
+        return event
+
+
+async def deliver(intake, identity, generation):
+    intake.require_active(generation)
+    result = intake.manager().run_notifications(identity)
+    for event in result['notifications']:
+        if event['delivery'] not in {'pending', 'sending'} or not event.get('target_channel'):
+            continue
+        matches = []
+        for _, transport in tuple(intake.transports):
+            try:
+                recipient = await transport.verify_identity(event['target_channel'])
+                intake.require_active(generation)
+                if recipient and recipient.get('app_id') == event['target_channel']['app_id'] and recipient.get('open_id') == event['target_channel']['recipient_open_id']:
+                    matches.append(transport)
+            except Exception:
+                intake.require_active(generation)
+        if len(matches) != 1:
+            intake.manager().manage_notifications(identity, 'channel_unavailable', {})
+            continue
+        while True:
+            intake.require_active(generation)
+            packet = intake.manager().manage_notifications(identity, 'claim', {'event_id': event['id']})
+            if packet is None:
+                break
+            try:
+                receipt = await matches[0].send(packet)
+                intake.require_active(generation)
+            except Exception:
+                intake.require_active(generation)
+                receipt = {'status': 'unknown'}
+            intake.manager().manage_notifications(identity, 'receipt', {'event_id': event['id'], 'uuid': packet['uuid'], 'receipt': receipt})
+            if receipt.get('status') != 'delivered':
+                break
