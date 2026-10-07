@@ -246,7 +246,7 @@
               h('div', null, '发送：' + link.delivery + ' · 独立受理：' + link.acceptance + ' · 执行：' + (task ? task.execution : '汇报不创建开发执行')),
               h('div', null, 'Issue：' + link.issue.url + ' · 原消息锚：' + link.source_anchor.chat_id + '/' + link.source_anchor.message_id),
               h('div', null, '接收锚：' + (link.received_anchor ? link.received_anchor.chat_id + '/' + link.received_anchor.message_id : '待核对') + ' · 任务确认锚：' + (task && task.task_start_anchor ? task.task_start_anchor.message_id : '待核对')),
-              h('div', null, '集成：' + (link.integration_status || '待核对') + ' · 项目整体：待全局验证'),
+              h('div', null, '集成：' + (link.integration_status || '待核对') + ' · 项目整体：' + (link.whole_project_complete ? '已完成 · 验证 ' + link.global_validation_id : '待全局验证')),
               h('div', null, '原群身份绑定：' + (link.channel_binding || 'unverified') + (link.channel_reason ? ' · ' + link.channel_reason : '')),
               h('details', null, h('summary', null, '公开材料与逐段凭据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(link.segments, null, 2))));
           })),

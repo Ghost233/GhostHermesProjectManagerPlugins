@@ -45,6 +45,7 @@ def _inputs(attempt, data):
         result.append({'request_id': item['request_id'], 'repository': repo, 'workspace': current,
                        'tree': _git(repo['worktree'], 'rev-parse', 'HEAD^{tree}'), 'git_metadata_digest': metadata.hexdigest(),
                        'accepted_scope': task.get('accepted_scope'), 'responsibility': task.get('accepted_responsibility'),
+                       'actual_responsibility': {k: data['profiles'].get(task.get('profile_id'), {}).get(k) for k in task.get('accepted_responsibility', {})},
                        'delivery_evidence': task.get('delivery_evidence') if item['request_id'] != attempt['request_id'] else None,
                        'pr_status': task.get('pr_status') if item['request_id'] != attempt['request_id'] else None,
                        'all_source_digest': _source_digest(repo)})
@@ -71,8 +72,8 @@ def _boundary(manager, attempt):
     proof = verifier(attempt) if callable(verifier) else None
     expected = {'validation_id': attempt['id'], 'input_digest': attempt['input_digest'], 'source_access': 'read-only',
                 'git_access': 'read-only', 'artifact_roots': attempt['repository']['test_artifact_paths']}
-    checks = ('host_id', 'generation', 'platform_enforcement', 'tool_paths', 'preexisting_hardlink', 'process_paths', 'evidence_ref')
-    if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in expected.items()) or any(not isinstance(proof.get(k), str) or not proof[k] for k in checks) or not re.fullmatch(r'[a-f0-9]{64}', str(proof.get('runner_configuration_digest'))) or proof.get('scope') not in {'synthetic-fixture', 'verified-original-host'}:
+    checks = ('host_id', 'generation', 'platform_enforcement', 'tool_paths', 'preexisting_hardlink', 'process_paths', 'input_watch', 'evidence_ref')
+    if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in expected.items()) or any(not isinstance(proof.get(k), str) or not proof[k] for k in checks) or not re.fullmatch(r'[a-f0-9]{64}', str(proof.get('runner_configuration_digest'))) or not callable(getattr(host, 'read_input_changes', None)) or proof.get('scope') not in {'synthetic-fixture', 'verified-original-host'}:
         raise ManagementError('capability_unverified', 'Actual source, Git metadata, artifacts, hardlinks and all process/tool paths need independent host boundary evidence.')
     if proof['scope'] == 'verified-original-host':
         ref = proof.get('receipt')
@@ -83,8 +84,8 @@ def _boundary(manager, attempt):
             receipt = json.loads(path.read_text())
         except (OSError, ValueError) as exc:
             raise ManagementError('capability_unverified', 'Original boundary receipt is unreadable.') from exc
-        expected.update({k: proof[k] for k in ('host_id', 'generation', 'runner_configuration_digest')})
-        required = {'source_write_denied', 'child_source_write_denied', 'parent_git_write_denied', 'child_git_write_denied', 'artifact_write_allowed', 'artifact_escape_denied', 'preexisting_hardlink_write_denied', 'tool_paths_confined', 'process_paths_confined'}
+        expected.update({k: proof[k] for k in ('host_id', 'generation', 'runner_configuration_digest', 'input_watch')})
+        required = {'source_write_denied', 'child_source_write_denied', 'parent_git_write_denied', 'child_git_write_denied', 'artifact_write_allowed', 'artifact_escape_denied', 'preexisting_hardlink_write_denied', 'tool_paths_confined', 'process_paths_confined', 'input_change_observation_complete'}
         if any(receipt.get(k) != v for k, v in expected.items()) or set(receipt.get('checks', {})) != required or any(v != 'PASS' for v in receipt['checks'].values()):
             raise ManagementError('capability_unverified', 'The original-host enforcement matrix is incomplete for this exact combination.')
     return proof
@@ -138,6 +139,18 @@ def _finish(manager, identity, version, data, attempt):
         attempt.update(status='invalidating' if changed else 'unverified', reason='Original test and related execution termination are not yet verified; occupancy retained.')
         _save(manager, version, data, attempt)
         return attempt
+    events = result.get('input_changes')
+    if not isinstance(events, list):
+        return _end(manager, identity, version, data, attempt, 'blocked', 'The original input-watch coverage/result is incomplete.')
+    try:
+        latest_events = host.read_input_changes(attempt)
+    except (ManagementError, OSError):
+        latest_events = None
+    if not isinstance(latest_events, list):
+        return _end(manager, identity, version, data, attempt, 'blocked', 'Current original input-watch evidence is unavailable.')
+    if events or latest_events:
+        attempt['input_change_events'] = events + latest_events
+        changed = True
     if changed:
         return _end(manager, identity, version, data, attempt, 'invalidated', 'Actual source, parent/child version, Git metadata, worktree, accepted input or boundary changed during this round.')
     tests = result.get('tests')
@@ -274,6 +287,22 @@ def _prepare(manager, identity, details, version, data, attempt):
 
 def _reconcile(manager, identity, version, data, attempt):
     host = manager.global_validation_host
+    if attempt['status'] == 'preparation_unverified':
+        query = getattr(host, 'find_preparation', None)
+        if not callable(query):
+            raise ManagementError('capability_unverified', 'Original authorized materialization lookup remains unavailable; preparation is not replayed.')
+        authorization = attempt['preparation']['authorization']
+        scope = authorization['children']
+        result = query(attempt, authorization)
+        if not isinstance(result, dict) or result.get('validation_id') != attempt['id'] or result.get('authorization_digest') != authorization['digest'] or result.get('status') != 'ended' or result.get('related_execution') != 'ended' or result.get('operations') != scope:
+            raise ManagementError('capability_unverified', 'Original materialization and related execution remain unverified; occupancy is retained.')
+        before, after = attempt['preparation_inputs'], _inputs(attempt, data)
+        if after[0]['workspace']['head'] != before[0]['workspace']['head'] or after[0]['all_source_digest'] != before[0]['all_source_digest'] or any(i['workspace']['head'] != c['commit'] or i['workspace']['dirty_paths'] for i, c in zip(after[1:], attempt['children'])):
+            return _end(manager, identity, version, data, attempt, 'blocked', 'Original materialization ended but exact parent/child versions require a new approved preparation.')
+        attempt.update(status='ready', preparation={**attempt['preparation'], 'status': 'ended', 'receipt': result, 'ended_at': _now()})
+        attempt['occupancy'].update(released=True, released_at=_now())
+        _save(manager, version, data, attempt)
+        return attempt
     finder = getattr(host, 'find_run', None)
     if attempt.get('run'):
         return _finish(manager, identity, version, data, attempt)
@@ -300,7 +329,13 @@ def reconcile_inputs(manager, data):
             unchanged = _digest(_inputs(attempt, data)) == attempt['input_digest']
             if unchanged and manager.global_validation_host is not None:
                 proof = _boundary(manager, attempt)
-                unchanged = all(proof[k] == attempt['boundary'][k] for k in ('host_id', 'generation', 'runner_configuration_digest'))
+                unchanged = all(proof[k] == attempt['boundary'][k] for k in ('host_id', 'generation', 'runner_configuration_digest', 'input_watch'))
+                events = manager.global_validation_host.read_input_changes(attempt)
+                if not isinstance(events, list):
+                    raise ManagementError('capability_unverified', 'Original input-watch coverage is unavailable.')
+                if events:
+                    attempt['input_change_events'] = events
+                    unchanged = False
         except (ManagementError, OSError):
             unchanged = False
         if not unchanged:
@@ -392,6 +427,14 @@ def _complete(manager, identity, version, data, attempt):
         handoff = data.get('collaboration', {}).get('handoffs', {}).get(repair.get('handoff_id'), {})
         child_task = data['requests'].get(handoff.get('task_request_id'), {})
         fixed = next((c for c in attempt['children'] if c['path'] == repair['target'] and c['request_id'] == child_task.get('id')), None)
+        if repair['route'] == 'owner_decision':
+            fixed = next((c for c in attempt['children'] if c['path'] == repair['target'] and c['issue']['url'] == repair['issue']['url']), None)
+            child_task = data['requests'].get(fixed['request_id'], {}) if fixed else {}
+        if repair['route'] == 'blocked':
+            handled = next((r for r in data['requests'].values() if r['accepted_scope']['url'] == repair['issue']['url'] and r['project_id'] == task['project_id'] and r['profile_id'] == task['profile_id'] and r.get('task_delivery') == 'delivered' and r.get('delivery_evidence', {}).get('source_commit') == attempt['mono_commit']), None)
+            if handled:
+                repair.update(status='resolved', repaired_request_id=handled['id'], revalidated_by=attempt['id'])
+                continue
         if repair['route'] == 'mono_self':
             repair['status'] = 'resolved'
         elif fixed and child_task.get('task_delivery') == 'delivered':
@@ -441,7 +484,7 @@ def perform(manager, identity, action, details):
         try:
             inputs = _inputs(attempt, data)
             expected_commits = [attempt['mono_commit']] + [c['commit'] for c in attempt['children'] + attempt.get('unassigned', [])]
-            if any(i['workspace']['head'] != commit or i['workspace']['dirty_paths'] for i, commit in zip(inputs, expected_commits)):
+            if any(i['workspace']['head'] != commit or i['workspace']['dirty_paths'] or i['actual_responsibility'] != (i['responsibility'] or {}) for i, commit in zip(inputs, expected_commits)):
                 raise ManagementError('handoff_blocked', 'Actual materialized parent/child commits and preserved worktrees need approved preparation before testing.')
             attempt.update(inputs=inputs, input_digest=_digest(inputs))
             if attempt.get('preparation', {}).get('status') != 'ended':

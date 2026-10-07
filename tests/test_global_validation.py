@@ -102,7 +102,7 @@ class FixtureHost:
         return {'host_id': 'fixture:global-host', 'generation': 'fixture-generation', 'runner_configuration_digest': hashlib.sha256(self.expected.encode()).hexdigest(), 'validation_id': context['id'], 'input_digest': context['input_digest'], 'source_access': 'read-only',
                 'git_access': 'read-only', 'artifact_roots': context['repository']['test_artifact_paths'],
                 'scope': 'synthetic-fixture', 'platform_enforcement': 'fixture-only', 'tool_paths': 'fixture-only',
-                'preexisting_hardlink': 'fixture-only', 'process_paths': 'fixture-only', 'evidence_ref': 'fixture:approved-synthetic-repository'}
+                'preexisting_hardlink': 'fixture-only', 'process_paths': 'fixture-only', 'input_watch': 'fixture:watch:' + context['id'], 'evidence_ref': 'fixture:approved-synthetic-repository'}
 
     def start(self, context):
         import hashlib
@@ -110,12 +110,15 @@ class FixtureHost:
         result = subprocess.run([sys.executable, '-c', 'from pathlib import Path; import sys; assert Path("child/source.py").read_text() == sys.argv[1]; print("1 test passed")', self.expected], cwd=context['repository']['worktree'], capture_output=True)
         run_id = 'run-' + context['id']
         self.runs[run_id] = {'host_id': context['boundary']['host_id'], 'generation': context['boundary']['generation'], 'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest'], 'status': 'ended',
-            'related_execution': 'ended', 'tests': [{'id': 'unit', 'argv': ['python', '-m', 'unittest'], 'cwd': context['repository']['worktree'],
+            'related_execution': 'ended', 'input_changes': [], 'tests': [{'id': 'unit', 'argv': ['python', '-m', 'unittest'], 'cwd': context['repository']['worktree'],
                 'exit_code': result.returncode, 'output_digest': hashlib.sha256(result.stdout + result.stderr).hexdigest(), 'artifact_refs': []}], 'defects': []}
         return {'host_id': context['boundary']['host_id'], 'generation': context['boundary']['generation'], 'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest']}
 
     def read_result(self, run_id):
         return self.runs[run_id]
+
+    def read_input_changes(self, context):
+        return self.runs[context['run']['run_id']]['input_changes']
 
 
 def test_real_synthetic_test_run_blocks_new_child_work_and_releases_only_its_own_holds(tmp_path):
@@ -533,3 +536,63 @@ def test_runner_configuration_change_withdraws_a_previously_passed_combination(t
         manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
         host.expected = 'changed test contract\n'
         assert manager.read_snapshot(OWNER)['global_validations'][0]['status'] == 'invalidated'
+
+
+def test_responsibility_correction_invalidates_existing_global_evidence(tmp_path):
+    host = FixtureHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
+        snapshot = manager.read_snapshot(OWNER)
+        profile = next(p for p in snapshot['profiles'] if p['id'] == 'child-lead')
+        corrected = {k: profile[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id', 'connection_refs')}
+        corrected['capability'] = 'non_development'
+        manager.apply_directory_change(OWNER, snapshot['version'], {'profile': corrected})
+        assert manager.read_snapshot(OWNER)['global_validations'][0]['status'] == 'invalidated'
+
+
+class UnknownPreparationHost(PreparationHost):
+    def prepare(self, context, authorization):
+        self.preparation_receipt = super().prepare(context, authorization)
+        raise ManagementError('outcome_unknown', 'Preparation response lost after authorized materialization.')
+
+    def find_preparation(self, context, authorization):
+        return self.preparation_receipt
+
+
+def test_unknown_authorized_preparation_queries_original_action_without_another_checkout(tmp_path):
+    host = UnknownPreparationHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        fixed = git(child, 'rev-parse', 'HEAD')
+        subprocess.run(['git', '-C', str(child), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'other materialization'], check=True)
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        with pytest.raises(ManagementError) as unknown:
+            manager.global_validation(OWNER, 'prepare', {'validation_id': plan['id'], 'children': [{'request_id': kid, 'commit': fixed, 'path': 'child'}]})
+        assert unknown.value.code == 'outcome_unknown'
+        pending = manager.read_snapshot(OWNER)['global_validations'][0]
+        assert pending['status'] == 'preparation_unverified' and pending['occupancy']['released'] is False
+        ready = manager.global_validation(LEAD, 'reconcile', {'validation_id': plan['id']})
+        assert ready['status'] == 'ready' and ready['preparation']['status'] == 'ended'
+        assert ready['occupancy']['released'] is True and len(host.operations) == 1
+        assert git(child, 'rev-parse', 'HEAD') == fixed
+        assert manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})['status'] == 'running'
+        assert manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})['status'] == 'passed'
+
+
+def test_original_input_change_event_invalidates_even_when_ignored_bytes_are_restored(tmp_path):
+    host = FixtureHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        (child / '.git' / 'info' / 'exclude').write_text('hidden.py\n')
+        (child / 'hidden.py').write_text('original ignored input\n')
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        running = manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        (child / 'hidden.py').write_text('temporary manual input\n')
+        (child / 'hidden.py').write_text('original ignored input\n')
+        host.runs[running['run']['run_id']]['input_changes'] = [{'path': str(child / 'hidden.py'), 'kind': 'source_changed'}]
+        ended = manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
+        assert ended['status'] == 'invalidated' and ended['occupancy']['released'] is True
+        assert ended['input_change_events'][0]['path'] == str(child / 'hidden.py')

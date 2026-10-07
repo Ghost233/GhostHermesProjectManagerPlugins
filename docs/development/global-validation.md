@@ -40,13 +40,14 @@ Owner 准备走原宿主的独立 materializer；先保存精确授权和执行�
 
 管理实例的 `global_validation_host` 是可信宿主接缝，不来自群消息、HTTP 或 model-facing args。宿主提供：
 
-- `verify_boundary(round)`：实际宿主 ID/代次、runner 配置 digest、精确输入 digest、源码/Git 只读、明确产物根，以及平台、工具、进程和 preexisting-hardlink 边界证据。
+- `verify_boundary(round)`：实际宿主 ID/代次、runner 配置 digest、精确输入 digest、源码/Git 只读、明确产物根，以及平台、工具、进程、preexisting-hardlink 和持续输入变化观察证据。
 - `start(round)`：返回实际原 run ID、同一宿主/代次及输入绑定；不接受从请求正文传来的 shell command。
 - `read_result(run_id)`：原测试和相关执行终止证据、每个配置测试 ID 的 argv/cwd/exit code/输出 digest、允许产物文件 digest，以及缺陷目标和关联测试。
+- `read_input_changes(round)`：原输入观察源返回本轮关联变化事件；即使手动修改又恢复旧字节，也不能只用相等的首尾 digest 宣称稳定。快照/check 继续核对原观察源。
 - `find_run(round)`：启动响应未知时只核对原 run；不另开执行器、不重放启动。
-- 独立获准物化的 `prepare(round, authorization)`：精确 child 操作范围和原动作终止收据。
+- 独立获准物化的 `prepare(round, authorization)`：精确 child 操作范围和原动作终止收据；响应未知时 `find_preparation(round, authorization)` 只查询原动作，不重放物化。
 
-`verified-original-host` 的能力还必须有管理状态目录内不可被任务写入的固定 digest 收据，覆盖父/child 源码和 Git 写拒绝、允许产物写入/逃逸拒绝、既有 hardlink 写拒绝及全部工具/进程路径约束，并绑定本轮输入和宿主/runner 版本。只检查源码目录或一次 SBPL 探针不足以启用该能力。
+`verified-original-host` 的能力还必须有管理状态目录内不可被任务写入的固定 digest 收据，覆盖父/child 源码和 Git 写拒绝、允许产物写入/逃逸拒绝、既有 hardlink 写拒绝、全部工具/进程路径约束及输入变化观察完整性，并绑定本轮输入和宿主/runner 版本。只检查源码目录或一次 SBPL 探针不足以启用该能力。
 
 当前 native 默认未配置生产验证宿主，start 因原能力未核实显示 blocked。测试的 `synthetic-fixture` 宿主执行真实合成 Git/测试，但边界收据是受控替身；其通过仅属于该合成范围，不启用生产能力。既有 Mac preexisting-hardlink 反例、全工具/进程路径保护、真实模型服务和真实群发送仍须原能力验收。正式安装、机器人开通和资料迁移仍另案。
 
@@ -54,11 +55,11 @@ Owner 准备走原宿主的独立 materializer；先保存精确授权和执行�
 
 `finish` 核对原 run。测试运行中、相关执行未结束或原宿主失联显示 running/unverified，保留占用。启动响应未知持久化原意图；`reconcile` 只查询同一原宿主/代次的实际 run，不能用替换执行器或空列表证明结束。
 
-实际源码、ignored source、父/child commit、Git 元数据、冻结交付/职责、仓库/产物布局或 runner 配置变化使本轮失效。失效一经观察即持久化；恢复旧字节不会复活旧 pass。公共快照和 Dashboard 自动撤销旧完成状态。通过、失败、已核实结束后的失效或准备受阻释放本轮验证占用；尚未结束的 mono 原任务继续保持自身占用。未知正在运行的原动作不能被当作结束释放。
+原观察源关联变化事件，或实际源码、ignored source、父/child commit、Git 元数据、冻结交付/职责、仓库/产物布局或 runner 配置变化使本轮失效。失效一经观察即持久化；恢复旧字节不会复活旧 pass。公共快照和 Dashboard 自动撤销旧完成状态。通过、失败、已核实结束后的失效或准备受阻释放本轮验证占用；尚未结束的 mono 原任务继续保持自身占用。未知正在运行的原动作不能被当作结束释放。
 
 `rework` 带原验证 ID、测试证据中的目标及可读的明确 GitHub repair Issue URL。管理实例只通过可信 Ghost233 source 核对已有 Issue，不在此入口创建网络工单。子缺陷生成既有职责群内的真实 mention 工作交接，保存原 Owner 来源、原 mono 目标、失败验证和旧 child 请求关系；独立接收才新建 child 任务。重复返工仍是一项。mono 缺陷回原 mono 任务自行修；未分配模块交 Owner 决定；环境、权限和版本准备问题显示 blocked。
 
-child 修复按原 Issue 交付和工作区交接契约提交新固定版本。总负责人更新 gitlink 并创建新组合验证，旧验证的占用不会阻塞 child 返工。`complete` 要求 mono 原验收与固定交付满足、当前稳定组合全局测试通过、旧明确 child repair Issue 的交付已纳入新清单。普通 child 结果和 mono 单次交付始终不会自动声称项目整体完成。
+child 修复按原 Issue 交付和工作区交接契约提交新固定版本。总负责人更新 gitlink 并创建新组合验证，旧验证的占用不会阻塞 child 返工。`complete` 要求 mono 原验收与固定交付满足、当前稳定组合全局测试通过、旧明确 child repair Issue 的交付已纳入新清单。Owner 为原未分配模块明确登记负责 Profile 后，匹配原 repair Issue 的新固定 child 交付可闭合该 Owner 决策；环境/权限问题由同一 mono 负责人按明确 repair Issue 交付，并在新组合核对固定版本和原边界证据后闭合。普通 child 结果和 mono 单次交付始终不会自动声称项目整体完成。
 
 ## 群与 Dashboard
 
