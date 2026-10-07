@@ -58,9 +58,11 @@ manager = get_plugin_manager()
 manager.discover_and_load()
 info = next(p for p in manager.list_plugins() if p['name'] == 'ghost-hermes-pm')
 assert info['enabled'] and info['error'] is None, info
-assert info['commands'] == 1 and info['hooks'] == 1, info
+assert info['commands'] == 1, info
+manager.invoke_hook('pre_api_request', session_id='not-a-migration-session', model='synthetic', provider='custom',
+                    system_prompt='No migration target.', request={'method': 'POST', 'body': {}}, tool_count=0)
 from tools.registry import registry
-for tool_name in ('hermes_pm_snapshot', 'hermes_pm_task', 'hermes_pm_observe', 'hermes_pm_knowledge', 'hermes_pm_global_validation'):
+for tool_name in ('hermes_pm_snapshot', 'hermes_pm_task', 'hermes_pm_observe', 'hermes_pm_knowledge', 'hermes_pm_global_validation', 'hermes_pm_migration'):
     assert registry.get_entry(tool_name, scope=str(home)) is not None, tool_name
 assert not (state / 'manager.sock').exists(), 'Ordinary CLI discovery must not start authority.'
 assert not (state / 'manager.lock').exists(), 'Ordinary CLI discovery must not acquire the manager lease.'
@@ -207,6 +209,7 @@ async def exercise_gateway_lifecycle():
     assert registry.get_entry('hermes_pm_task', scope=str(home)) is None
     assert registry.get_entry('hermes_pm_knowledge', scope=str(home)) is None
     assert registry.get_entry('hermes_pm_observe', scope=str(home)) is None
+    assert registry.get_entry('hermes_pm_migration', scope=str(home)) is None
     manager.discover_and_load(force=True)
     assert not (state / 'manager.sock').exists(), 'Rediscovery without Gateway context remains read-only.'
     restarted_gateway = GatewayFixture()

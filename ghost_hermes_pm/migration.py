@@ -17,8 +17,9 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _binding(profile):
-    return {k: profile.get(k) for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id', 'connection_refs')}
+def _binding(profile, data):
+    return {k: profile.get(k) for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id', 'connection_refs')} | {
+        'repository_fingerprint': digest(data['projects'].get(profile['project_id'], {}).get('repo'))}
 
 
 def _save(manager, operation):
@@ -137,6 +138,9 @@ def _plan(manager, identity, details, version, data):
         return prior
     if type(details['expected_version']) is not int or version != details['expected_version']:
         raise ManagementError('version_conflict', 'Directory changed after review; keep the original confirmation version.')
+    ids = details['expected_profile_ids']
+    if not isinstance(ids, list) or len(ids) != 2 or any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != 2:
+        raise ManagementError('invalid_change', 'Review the explicit two-Profile list; objects and inferred keys cannot approve scope.')
     source = data['profiles'].get(details['source_profile_id'])
     target = data['profiles'].get(details['target_profile_id'])
     ids = sorted([details['source_profile_id'], details['target_profile_id']])
@@ -172,7 +176,7 @@ def _plan(manager, identity, details, version, data):
     _public_text(json.dumps(details), manager._sensitive_values())
     operation = {'id': details['plan_id'], 'digest': digest(details), 'plan': json.loads(json.dumps(details)),
         'approved_scope': {'expected_version': version, 'expected_profile_ids': ids},
-        'bindings': {p['id']: _binding(p) for p in (source, target)}, 'owner_origin': {'subject': identity.subject, 'source': identity.source},
+        'bindings': {p['id']: _binding(p, data) for p in (source, target)}, 'owner_origin': {'subject': identity.subject, 'source': identity.source},
         'status': 'planned', 'native_state': 'not_created', 'created_at': _now(), 'selection_ledger': [],
         'needs_human': list(details['human_steps']), 'rollback': {'status': 'not_requested', 'old_entry': 'not_started', 'old_tasks': 'not_resumed', 'repositories': 'not_modified'}}
     operation['archive_bindings'] = _archives(manager, operation, data)
@@ -202,7 +206,7 @@ def operate(manager, identity, action, details):
         operation = data.get('migration_plans', {}).get(details['plan_id'])
         if not operation or operation['digest'] != details['digest']:
             raise ManagementError('binding_conflict', 'Original migration plan digest does not match.')
-        if operation['bindings'] != {i: _binding(data['profiles'][i]) for i in operation['bindings']} or operation['archive_bindings'] != _archives(manager, operation, data):
+        if operation['bindings'] != {i: _binding(data['profiles'][i], data) for i in operation['bindings']} or operation['archive_bindings'] != _archives(manager, operation, data):
             raise ManagementError('binding_conflict', 'Original Profile or source authorization binding changed; review a new plan.')
         if operation['status'] == 'switched' and action in {'prepare', 'check', 'activate'}:
             if action == 'activate' and {k: details.get(k) for k in ('expected_version', 'expected_profile_ids', 'archive_operation_id', 'session_id')} != operation['switch_approval']:
@@ -246,7 +250,7 @@ def operate(manager, identity, action, details):
         if action == 'activate':
             if set(details) != allowed or type(details['expected_version']) is not int or details['expected_version'] != version:
                 raise ManagementError('version_conflict', 'Switch requires the originally reviewed current version and exact target scope.')
-            if sorted(details['expected_profile_ids']) != operation['approved_scope']['expected_profile_ids']:
+            if not isinstance(details['expected_profile_ids'], list) or any(not isinstance(i, str) for i in details['expected_profile_ids']) or sorted(details['expected_profile_ids']) != operation['approved_scope']['expected_profile_ids']:
                 raise ManagementError('binding_conflict', 'Switch Profile scope differs from the reviewed migration.')
             approval = {k: details[k] for k in ('expected_version', 'expected_profile_ids', 'archive_operation_id', 'session_id')}
             operation['switch_approval'] = approval

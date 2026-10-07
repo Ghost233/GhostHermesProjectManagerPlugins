@@ -19,21 +19,46 @@ if (process.argv[3] === 'notifications') snapshot.notifications = {
   ]};
 const React = {Fragment: 'fragment',
   createElement(type, props, ...children) {return {type, props: props || {}, children};},
-  useState(initial) {const i = cursor++; if (!(i in states)) states[i] = initial; return [states[i], value => {states[i] = value;}];},
+  useState(initial) {const i = cursor++; if (!(i in states)) states[i] = initial; return [states[i], value => {states[i] = typeof value === 'function' ? value(states[i]) : value;}];},
   useEffect(effect) {if (!initialized) effects.push(effect);}};
 const window = {__HERMES_PLUGIN_SDK__: {React, async fetchJSON(url, options) {
   requests.push({url, options});
   if (options && options.method === 'POST') throw new Error(process.argv[3] + ': original fixture operation rejected');
-  return snapshot;
+  return JSON.parse(JSON.stringify(snapshot));
 }}, __HERMES_PLUGINS__: {register(id, value) {assert.equal(id, 'ghost-hermes-pm'); component = value;}}};
 vm.runInNewContext(fs.readFileSync(process.argv[2], 'utf8'), {window, console});
 function render() {cursor = 0; const tree = component(); initialized = true; return tree;}
 function nodes(tree) {return Array.isArray(tree) ? tree.flatMap(nodes) : tree && typeof tree === 'object' ? [tree, ...tree.children.flatMap(nodes)] : [];}
 function text(tree) {return Array.isArray(tree) ? tree.map(text).join('') : tree && typeof tree === 'object' ? tree.children.map(text).join('') : tree == null || tree === false ? '' : String(tree);}
 function find(tree, predicate) {const node = nodes(tree).find(predicate); assert.ok(node, 'Public rendered control not found'); return node;}
+function section(tree, title) {return find(tree, node => node.type === 'section' && nodes(node).some(child => child.type === 'h2' && text(child) === title));}
 (async () => {
   render(); await Promise.all(effects.map(effect => effect())); await new Promise(resolve => setImmediate(resolve)); let tree = render();
-  if (process.argv[3] === 'notifications') {
+  if (process.argv[3].startsWith('migration_')) {
+    let migration = section(tree, '选择性迁移到新 Profile');
+    const stale = process.argv[3] === 'migration_stale';
+    find(migration, node => node.type === 'select').props.onChange({target: {value: stale ? 'plan' : 'prepare'}}); tree = render();
+    migration = section(tree, '选择性迁移到新 Profile');
+    const details = {plan_id: 'fixture-migration', digest: 'a'.repeat(64)};
+    if (stale) details.expected_profile_ids = ['old', 'new'];
+    find(migration, node => node.type === 'textarea').props.onChange({target: {value: JSON.stringify(details)}}); tree = render();
+    find(section(tree, '选择性迁移到新 Profile'), node => node.type === 'form').props.onSubmit({preventDefault() {}}); tree = render();
+    if (stale) {
+      assert.ok(text(section(tree, '选择性迁移到新 Profile')).includes('"expected_version": 1'));
+      snapshot.version = 2;
+      await find(tree, node => node.type === 'button' && text(node) === '刷新目录').props.onClick(); tree = render();
+      assert.ok(!nodes(section(tree, '选择性迁移到新 Profile')).some(node => node.type === 'button' && text(node) === '本人确认迁移操作'));
+      assert.ok(!requests.some(request => request.options && request.options.method === 'POST'), 'Stale Owner preview must not send any action');
+    } else {
+      await find(section(tree, '选择性迁移到新 Profile'), node => node.type === 'button' && text(node) === '本人确认迁移操作').props.onClick(); tree = render();
+      const alert = find(tree, node => node.props.role === 'alert');
+      assert.ok(text(alert).includes('migration_error') && text(alert).includes('fixture-migration'));
+      const post = requests.find(request => request.options && request.options.method === 'POST');
+      assert.ok(post.url.endsWith('/migration'));
+      assert.deepEqual(JSON.parse(post.options.body), {action: 'prepare', details});
+      assert.ok(requests.at(-1).url.endsWith('/snapshot'));
+    }
+  } else if (process.argv[3] === 'notifications') {
     const section = find(tree, node => node.type === 'section' && text(node).includes('通知与监督健康'));
     assert.ok(text(section).includes('unavailable') && text(section).includes('unverified'));
     assert.ok(text(section).includes('Which colour? 原请求 fixture-q') && text(section).includes('unknown'));
@@ -46,7 +71,7 @@ function find(tree, predicate) {const node = nodes(tree).find(predicate); assert
     assert.ok(text(evidence).includes('b'.repeat(40)), 'Unassigned fixed commit is missing from public evidence');
     assert.ok(text(evidence).includes('fixture-preparation-receipt'), 'Original preparation receipt is missing from public evidence');
   } else {
-    find(tree, node => node.type === 'select' && node.props.value === 'plan').props.onChange({target: {value: 'start'}}); tree = render();
+    find(section(tree, 'mono 全局验证'), node => node.type === 'select' && node.props.value === 'plan').props.onChange({target: {value: 'start'}}); tree = render();
     find(tree, node => node.type === 'textarea' && node.props['aria-label'] === '本轮验证操作 JSON').props.onChange({target: {value: '{"validation_id":"fixture-round"}'}}); tree = render();
     find(tree, node => node.type === 'button' && text(node) === '核对本轮操作').props.onClick(); tree = render();
     await find(tree, node => node.type === 'button' && text(node) === '执行这条已核对操作').props.onClick(); tree = render();

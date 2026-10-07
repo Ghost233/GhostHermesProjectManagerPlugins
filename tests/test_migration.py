@@ -280,3 +280,32 @@ def test_persona_selection_does_not_require_an_unselected_old_memory_file(tmp_pa
             assert prepared['status'] == 'prepared', prepared
             assert (native / 'profiles' / 'new-lead' / 'SOUL.md').read_text() == 'Selected new project persona.'
             assert not (source / 'memories' / 'MEMORY.md').exists()
+
+
+def test_reviewed_migration_cannot_silently_follow_a_changed_repository_binding(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        setup(manager, tmp_path)
+        with ManagementServer(manager, {'owner': OWNER}):
+            owner = ManagementClient(tmp_path / 'state', 'owner')
+            planned = owner.migrate_profile('plan', proposal(owner))
+            project = registration(make_repo(tmp_path / 'other-repository'))['project']
+            owner.apply_directory_change(owner.read_snapshot()['version'], {'project': project})
+            with pytest.raises(ManagementError) as changed:
+                owner.migrate_profile('prepare', {'plan_id': planned['id'], 'digest': planned['digest']})
+            assert changed.value.code == 'binding_conflict'
+            current = owner.read_snapshot()['migration_plans'][0]
+            assert current['status'] == 'planned' and current['native_state'] == 'not_created'
+            assert 'checkpoint' not in current
+
+
+def test_profile_scope_must_be_an_explicit_list_before_a_plan_can_gate_the_target(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        setup(manager, tmp_path)
+        with ManagementServer(manager, {'owner': OWNER}):
+            owner = ManagementClient(tmp_path / 'state', 'owner')
+            details = proposal(owner)
+            details['expected_profile_ids'] = {'mono-lead': True, 'new-lead': True}
+            with pytest.raises(ManagementError) as malformed:
+                owner.migrate_profile('plan', details)
+            assert malformed.value.code == 'invalid_change'
+            assert owner.read_snapshot()['migration_plans'] == []
