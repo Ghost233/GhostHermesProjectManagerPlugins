@@ -11,13 +11,20 @@ class DirectoryChange(BaseModel):
     change: dict
 
 
+
+class TaskOperation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: str
+    request_id: str
+    report: dict | None = None
+
 def create_router(authenticated_client):
     router = APIRouter()
     last_snapshot = None
 
     def failure(exc):
         status = {'unauthorized': 403, 'forbidden': 403, 'version_conflict': 409,
-                  'binding_conflict': 409, 'unavailable': 503}.get(exc.code, 422)
+                  'binding_conflict': 409, 'repository_busy': 409, 'unavailable': 503}.get(exc.code, 422)
         return HTTPException(status, {'code': exc.code, 'message': str(exc)})
 
     @router.get('/snapshot')
@@ -38,6 +45,19 @@ def create_router(authenticated_client):
         client = authenticated_client(request)
         try:
             return client.apply_directory_change(body.expected_version, body.change)
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
+    @router.post('/task')
+    def task(body: TaskOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            if body.action == 'delivery':
+                return client.record_task_delivery(body.request_id, body.report)
+            operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task'}.get(body.action)
+            if operation is None or body.report is not None:
+                raise ManagementError('invalid_change', 'Select verify, start, refresh or evidence-based delivery.')
+            return getattr(client, operation)(body.request_id)
         except ManagementError as exc:
             raise failure(exc) from exc
 

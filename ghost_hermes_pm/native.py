@@ -71,7 +71,11 @@ def register_native(ctx):
                     raise ManagementError('invalid_change', 'Participant credentials must be distinct from the owner bridge.')
                 credentials[participant_token] = VerifiedIdentity(entry['identity_ref'], 'configured-native-profile-bridge')
             intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, *credentials)))
-            manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values)
+            from .codex import configured_adapter
+            from .github import GitHubDeliverySource
+            codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
+            manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
+                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir))
             server = ManagementServer(manager, credentials)
             try:
                 server.start()
@@ -89,6 +93,36 @@ def register_native(ctx):
                     close()
 
             ctx.spawn_task(gateway_lifetime(), name='hermes-pm-gateway-lifetime')
+
+            if codex_adapter is not None:
+                async def supervise_single_issue():
+                    import asyncio
+                    identity = VerifiedIdentity(owner, 'verified-manager-supervision')
+                    generation = intake.generation
+                    while resources is not None and not intake.closed:
+                        tasks = manager.read_snapshot(identity)['requests']
+                        for record in tasks:
+                            session = record.get('session')
+                            if session and session.get('thread_id') and session['generation'] == codex_adapter.generation and not record.get('repository_released'):
+                                def observe_if_active(request_id=record['id']):
+                                    with intake.lifecycle_lock:
+                                        intake.require_active(generation)
+                                        return manager.refresh_task(identity, request_id)
+                                await asyncio.to_thread(observe_if_active)
+                            anchor = record['source_anchor']
+                            bindings = [b for b in intake.settings.get('bindings', []) if b.get('profile_id') == record['profile_id']
+                                and all(b.get(k) == anchor.get(k) for k in ('app_id', 'chat_id', 'recipient_open_id', 'recipient_tenant_key', 'transport_tenant_key'))]
+                            if len(bindings) != 1:
+                                continue
+                            for _, transport in tuple(intake.transports):
+                                intake.require_active(generation)
+                                recipient = await transport.verify_identity(bindings[0])
+                                if recipient and recipient.get('app_id') == anchor['app_id'] and recipient.get('open_id') == anchor['recipient_open_id']:
+                                    async with intake.lock:
+                                        await intake.deliver(identity, record['id'], transport, generation)
+                                    break
+                        await asyncio.sleep(5)
+                ctx.spawn_task(supervise_single_issue(), name='hermes-pm-single-issue-supervision')
 
     async def dispatch(event=None, gateway=None):
         await start_for_gateway(event, gateway)
@@ -129,6 +163,34 @@ def register_native(ctx):
                       schema={'name': 'hermes_pm_snapshot', 'description': 'Read the verified project directory; does not execute tasks.',
                               'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
                       handler=snapshot, description='Project directory and verified capability status')
+    def task_operation(args):
+        try:
+            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report'}:
+                raise ManagementError('invalid_change', 'Task input cannot assert actor, permission or capability.')
+            reference = ctx.get_config('participant_credential_ref')
+            token = _credential(reference) if reference else None
+            if not state_dir or not token:
+                raise ManagementError('unauthorized', 'A configured participant bridge is required.')
+            client = ManagementClient(state_dir, token)
+            client.read_participant_snapshot()  # Reject owner aliases at the authoritative bridge.
+            action = args.get('action')
+            if action == 'delivery':
+                result = client.record_task_delivery(args.get('request_id'), args.get('report'))
+            else:
+                operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task'}.get(action)
+                if operation is None or args.get('report') is not None:
+                    raise ManagementError('invalid_change', 'Unsupported task operation.')
+                result = getattr(client, operation)(args.get('request_id'))
+            return json.dumps(result)
+        except ManagementError as exc:
+            return json.dumps({'status': 'rejected', 'code': exc.code, 'message': str(exc)})
+
+    ctx.register_tool(name='hermes_pm_task', toolset='hermes_pm',
+                      schema={'name': 'hermes_pm_task', 'description': 'Verify, start, observe or record evidence for one accepted Issue.',
+                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery']},
+                                  'request_id': {'type': 'string'}, 'report': {'type': 'object'}},
+                                  'required': ['action', 'request_id'], 'additionalProperties': False}},
+                      handler=task_operation, description='Single Issue execution and evidence')
     ctx.register_command('hermes-pm', lambda raw_args: snapshot({} if not raw_args.strip() else {'unsupported': True}),
                          description='Read project directory and runtime status')
 

@@ -47,6 +47,12 @@
       catch (e) { setError(String(e.message || e)); }
       finally { setSaving(false); }
     }
+    async function taskAction(action, requestId) {
+      setSaving(true);
+      try { await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify({ action: action, request_id: requestId }) }); await refresh(); }
+      catch (e) { setError(String(e.message || e)); }
+      finally { setSaving(false); }
+    }
     function editProject(project) {
       const profile = snapshot.profiles.find(function (p) { return p.project_id === project.id; });
       setForm(Object.assign({}, blank, { projectId: project.id, name: project.name, repoPath: project.repo.worktree,
@@ -83,7 +89,7 @@
             h('div', null, '待验证：原生身份、新机器人、连接、凭据引用、执行接口和仓库权限。'));
         })),
         h('h2', null, '已受理请求'),
-        h('p', null, '受理记录来自同一管理实例。消息送达与等待执行分别显示，当前不会启动 Codex。'),
+        h('p', null, '任务与原群消息共用管理实例。执行能力按当前连接和权限证据核验；轮次结束、验收交付与 PR 状态分别显示。'),
         !(snapshot.requests || []).length && h('p', null, '尚无核实的受理记录。'),
         h('ul', null, (snapshot.requests || []).map(function (r) {
           const source = r.source_anchor;
@@ -92,7 +98,14 @@
             h('strong', null, r.project_id + ' · 负责人：' + r.profile_id),
             h('div', null, h('a', { href: r.accepted_scope.url, target: '_blank', rel: 'noreferrer' }, r.accepted_scope.title)),
             h('div', null, '受理：' + r.acceptance + ' · 消息送达：' + r.delivery + ' · 执行：' + r.execution),
-            h('div', null, '未执行原因：' + r.unexecuted_reason),
+            r.unexecuted_reason && h('div', null, '待核对原因：' + r.unexecuted_reason),
+            h('div', null, '交付：' + (r.task_delivery || 'unmet') + ' · PR：' + (r.pr_status || 'none')),
+            r.session && h('div', null, '原 Codex 会话：' + (r.session.thread_id || '创建待核对') + ' · 轮次：' + (r.session.turn_id || '启动待核对') + ' · 控制：' + r.session.control),
+            r.last_execution_verified_at && h('div', null, '执行最后核实：' + r.last_execution_verified_at),
+            h('button', { style: button, onClick: function () { taskAction('verify', r.id); }, disabled: saving || snapshot.status !== 'completed' }, '核验执行能力'),
+            h('button', { style: button, onClick: function () { taskAction(r.session ? 'refresh' : 'start', r.id); }, disabled: saving || snapshot.status !== 'completed' || !r.task_start_anchor }, r.session ? '核对原执行' : '启动已受理 Issue'),
+            r.execution_capability && h('div', null, '启动能力：' + r.execution_capability.status + (r.execution_capability.reason ? ' · ' + r.execution_capability.reason : '')),
+            r.delivery_evidence && h('details', null, h('summary', null, '验收与测试／Git／PR 证据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(r.delivery_evidence, null, 2))),
             h('div', null, '请求 ID：' + r.id),
             h('div', null, '来源群 / 消息：' + source.chat_id + ' / ' + source.message_id),
             h('div', null, '任务起始锚：' + (anchor ? anchor.chat_id + ' / ' + anchor.message_id : '待核对')),
