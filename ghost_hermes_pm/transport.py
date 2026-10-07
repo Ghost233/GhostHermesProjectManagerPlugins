@@ -66,6 +66,8 @@ class ManagementServer:
                             if payload['operation'] == 'read_participant_snapshot' and identity.subject == bridge.manager.owner_identity_ref:
                                 raise ManagementError('forbidden', 'The participant entry cannot borrow owner authority.')
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
+                        elif payload.get('operation') == 'global_validation':
+                            result = bridge.manager.global_validation(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'collaborate':
                             result = bridge.manager.collaborate(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'register_observation_source':
@@ -168,6 +170,9 @@ class ManagementClient:
 
     def read_participant_snapshot(self):
         return self._call('read_participant_snapshot')
+
+    def global_validation(self, action, details):
+        return self._call('global_validation', action=action, details=details)
 
     def collaborate(self, action, details):
         return self._call('collaborate', action=action, details=details)

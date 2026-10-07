@@ -98,10 +98,11 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, global_validation_host=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
+        self.global_validation_host = global_validation_host
         self.knowledge_providers = dict(knowledge_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
@@ -234,6 +235,7 @@ class Manager:
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_capabilities': [{'kind': kind, 'status': 'verified' if any(s['kind'] == kind and s['status'] == 'verified' and set(s['project_ids']) & {p['id'] for p in projects} for s in data.get('manual_sources', {}).values()) else 'unknown'} for kind in ('daemon', 'independent_cli', 'desktop')],
                     'original_interface_requests': original_interface_requests, 'collaboration': role_snapshot,
+                    'global_validations': [a for a in data.get('global_validations', {}).values() if a['profile_id'] in visible_ids],
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
@@ -292,6 +294,10 @@ class Manager:
         if principal and principal['role'] != 'steward' and record['profile_id'] not in self._visible_profile_ids(principal, data):
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
+
+    def global_validation(self, identity, action, details):
+        from .global_validation import perform
+        return perform(self, identity, action, details)
 
     def collaborate(self, identity, action, details):
         from .collaboration import perform
