@@ -359,6 +359,18 @@ class Manager:
         from .memory import answer_from_knowledge
         return answer_from_knowledge(self, identity, request_id, human_request_id, query_id, material_ids)
 
+    def curate_project_memory(self, identity, profile_id, entry_id, request_id, selection, supersedes=None):
+        from .memory import curate_project_memory
+        return curate_project_memory(self, identity, profile_id, entry_id, request_id, selection, supersedes)
+
+    def read_project_memory(self, identity, profile_id, include_superseded=False):
+        from .memory import read_project_memory
+        return read_project_memory(self, identity, profile_id, include_superseded)
+
+    def load_project_memory(self, identity, request_id, entry_ids):
+        from .memory import load_project_memory
+        return load_project_memory(self, identity, request_id, entry_ids)
+
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
         try:
