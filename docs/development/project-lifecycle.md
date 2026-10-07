@@ -2,7 +2,7 @@
 
 统一入口是 `Manager.lifecycle(identity, action, details)`，认证 bridge、Dashboard `/lifecycle` 和已核验本人群消息复用该入口。责任角色不能代作生命周期授权；原生 `hermes_pm_lifecycle` 工具只读取当前 participant 可见事实，不接收 Owner、路径或执行操作。Profile.role 仍为插件目录职责，不冒充 Hermes 原生字段。
 
-`archive` 使用稳定 `operation_id` 和 `profile_id`。封存总负责人时冻结该 Profile 和全部显式子负责人、长期项目/仓库/native identity 绑定；Wiki、Ghost 和总管在树外。先把 `archiving` 和 `archive_intent` 连同 OwnerOrigin 事务保存，再请求停止原执行及入口。重复 ID 只返回原操作，内容不同拒绝；`check` 才核对当前事实，未知请求结果只读对账而不重放。
+`archive`/`restore` 使用稳定 `operation_id`、`profile_id`、原预览的 `expected_version` 和明确 `expected_profile_ids`。提交时版本或当前子树不同即拒绝，不用新版本扩大旧决定；群消息在 prepare 时冻结同一范围，重复 ID 保留原 approved_scope。封存总负责人时冻结该 Profile 和全部显式子负责人、长期项目/仓库/native identity 绑定；Wiki、Ghost 和总管在树外。先把 `archiving` 和 `archive_intent` 连同 OwnerOrigin 事务保存，再请求停止原执行及入口。重复 ID 只返回原操作，内容不同拒绝；`check` 才核对当前事实，未知请求结果只读对账而不重放。
 
 目录修正保留已有生命周期意图；封存期间不能新挂子负责人绕过范围。原 native identity、责任、父关系或仓库边界改变时处理受阻，不能停止另一身份。新受理、派发、追加、继续和新手动接管均检查项目/Profile 意图。未启动旧请求停止且取消其自动队列意图；恢复后它仍需新的明确工作请求。
 

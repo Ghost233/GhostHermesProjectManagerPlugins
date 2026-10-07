@@ -29,7 +29,9 @@
     const [lifecycleReview, setLifecycleReview] = React.useState(null);
     const [observerForm, setObserverForm] = React.useState({ id: '', kind: 'daemon', projects: '', adapter_ref: '' });
     async function refresh() {
-      try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
+      try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError('');
+        setLifecycleReview(function (current) { return current && current.details.expected_version !== undefined && current.details.expected_version !== value.version ? null : current; });
+        return value; }
       catch (e) { setError(String(e.message || e)); }
     }
     React.useEffect(function () { refresh(); }, []);
@@ -249,7 +251,10 @@
           h('form', { onSubmit: function (e) {
             e.preventDefault();
             const details = lifecycleForm.action === 'check' ? { operation_id: lifecycleForm.target.trim(), handled_manual_session_ids: lifecycleForm.manual.split(',').map(function (id) { return id.trim(); }).filter(Boolean) } :
-              { profile_id: lifecycleForm.target.trim(), operation_id: window.crypto.randomUUID() };
+              { profile_id: lifecycleForm.target.trim(), operation_id: window.crypto.randomUUID(), expected_version: snapshot.version,
+                expected_profile_ids: [lifecycleForm.target.trim()].concat(lifecycleForm.action === 'archive' ? snapshot.profiles.filter(function (p) {
+                  return p.parent_profile_id === lifecycleForm.target.trim();
+                }).map(function (p) { return p.id; }) : []).sort() };
             setLifecycleReview({ action: lifecycleForm.action, details: details });
           } },
             h('select', { value: lifecycleForm.action, onChange: function (e) { setLifecycleForm(Object.assign({}, lifecycleForm, { action: e.target.value })); setLifecycleReview(null); } },

@@ -3,8 +3,24 @@ import asyncio
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 
 from .manager import ManagementError
+from .messages import PreparedMessage
+
+
+@dataclass(frozen=True)
+class PreparedLifecycleMessage(PreparedMessage):
+    lifecycle_details: dict
+
+
+def reviewed(snapshot, command):
+    action, details = parse(command)
+    if action != 'check':
+        target = details['profile_id']
+        ids = [target] + ([p['id'] for p in snapshot['profiles'] if p.get('parent_profile_id') == target] if action == 'archive' else [])
+        details.update(expected_version=snapshot['version'], expected_profile_ids=sorted(ids))
+    return details
 
 
 def parse(command):
@@ -30,7 +46,8 @@ def allowed(snapshot, binding, command):
 
 
 async def process(entry, identity, prepared, generation):
-    action, details = parse(prepared.command)
+    action, _ = parse(prepared.command)
+    details = dict(prepared.lifecycle_details)
     if action != 'check':
         details['operation_id'] = 'group-' + hashlib.sha256(json.dumps(prepared.envelope, sort_keys=True).encode()).hexdigest()
     def call():

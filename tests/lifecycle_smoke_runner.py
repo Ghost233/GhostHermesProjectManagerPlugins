@@ -31,7 +31,7 @@ from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from ghost_hermes_pm.dashboard import create_router
 from ghost_hermes_pm.native_lifecycle import NativeMultiplexLifecycleHost, configured_lifecycle_host
 from test_directory import OWNER, make_repo, registration
-from test_lifecycle import tree
+from test_lifecycle import tree, scope_approval, decide
 from hermes_cli.plugins import get_plugin_manager
 from hermes_cli.profiles import get_profile_dir, parked_marker_path, profiles_to_serve
 from gateway.control_socket import GatewayControlServer
@@ -134,7 +134,7 @@ try:
     unknown = configured_lifecycle_host({'host_home': str(home), 'profile_homes': {'mono-lead': str(get_profile_dir('mono-lead'))}}, scratch / 'unsupported')
     with Manager(scratch / 'unsupported', owner_identity_ref=OWNER.subject, lifecycle_host=unknown) as blocked:
         blocked.apply_directory_change(OWNER, 0, registration(make_repo(scratch / 'unsupported-repo')))
-        result = blocked.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'native-unknown'})
+        result = decide(blocked, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'native-unknown'})
         assert result['status'] == 'blocked' and blocked.read_snapshot(OWNER)['lifecycle_events'] == []
         assert runner.effects == [] and all(child.poll() is None for child in processes.children.values())
         assert not parked_marker_path(get_profile_dir('mono-lead')).exists(), 'Missing capability must not mutate native admission.'
@@ -146,7 +146,7 @@ try:
         with ManagementServer(authority, {os.environ['HERMES_FIXTURE_OWNER_TOKEN']: OWNER, os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN']: participant}):
             client = ManagementClient(state, os.environ['HERMES_FIXTURE_OWNER_TOKEN'])
             app = FastAPI(); app.include_router(create_router(lambda _: client)); browser = TestClient(app)
-            result = browser.post('/lifecycle', json={'action': 'archive', 'details': {'profile_id': 'mono-lead', 'operation_id': 'native-archive'}}).json()
+            result = browser.post('/lifecycle', json={'action': 'archive', 'details': scope_approval(client.read_snapshot(), 'archive', {'profile_id': 'mono-lead', 'operation_id': 'native-archive'})}).json()
             assert result['status'] == 'completed', result
             native = json.loads(registry.dispatch('hermes_pm_lifecycle', {}, scope=str(home)))
             assert native['lifecycle_events'][0]['kind'] == 'archive_completed', native
@@ -158,10 +158,10 @@ try:
         with ManagementServer(authority, {os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN']: participant, os.environ['HERMES_FIXTURE_OWNER_TOKEN']: OWNER}):
             client = ManagementClient(state, os.environ['HERMES_FIXTURE_OWNER_TOKEN'])
             assert len(client.read_snapshot()['lifecycle_events']) == 1
-            client.lifecycle('restore', {'profile_id': 'mono-lead', 'operation_id': 'native-parent'})
+            client.lifecycle('restore', scope_approval(client.read_snapshot(), 'restore', {'profile_id': 'mono-lead', 'operation_id': 'native-parent'}))
             served = {n for n, _ in profiles_to_serve(True)}
             assert 'mono-lead' in served and 'child-lead' not in served
-            client.lifecycle('restore', {'profile_id': 'child-lead', 'operation_id': 'native-child'})
+            client.lifecycle('restore', scope_approval(client.read_snapshot(), 'restore', {'profile_id': 'child-lead', 'operation_id': 'native-child'}))
             assert {'mono-lead', 'child-lead', 'wiki', 'ghost', 'default'} <= {n for n, _ in profiles_to_serve(True)}
             assert client.read_snapshot()['requests'] == []
             assert all(processes.children[key].pid == pid and processes.children[key].poll() is None for key, pid in independent.items())

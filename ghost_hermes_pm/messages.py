@@ -131,7 +131,11 @@ class FeishuEntry:
                     duplicate = next((o for o in snapshot['lifecycle_operations'] if o['id'] == operation_id), None)
                     if duplicate is None and not lifecycle_allowed(snapshot, binding, command):
                         return None
-                    return PreparedMessage(event, adapter, transport, binding, envelope, command, None)
+                    from .lifecycle_entry import PreparedLifecycleMessage, reviewed
+                    details = reviewed(snapshot, command)
+                    if duplicate:
+                        details.update(duplicate['approved_scope'])
+                    return PreparedLifecycleMessage(event, adapter, transport, binding, envelope, command, None, details)
                 human_reply = bool(re.match(r'^(回答|批准|拒绝)', command))
                 if human_reply:
                     if manager is None:

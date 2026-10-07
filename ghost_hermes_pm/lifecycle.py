@@ -64,8 +64,16 @@ def _verified_fact(manager, fact, expected):
 
 
 def operate(manager, identity, action, details):
-    if action not in {'archive', 'check', 'restore'} or not isinstance(details, dict) or set(details) - {'operation_id', 'profile_id', 'handled_manual_session_ids'} or not isinstance(details.get('operation_id'), str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}', details['operation_id']):
+    if action not in {'archive', 'check', 'restore'} or not isinstance(details, dict) or set(details) - {'operation_id', 'profile_id', 'handled_manual_session_ids', 'expected_version', 'expected_profile_ids'} or not isinstance(details.get('operation_id'), str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}', details['operation_id']):
         raise ManagementError('invalid_change', 'Select an explicit lifecycle action, stable operation ID and registered Profile.')
+    approved = None
+    if action != 'check':
+        ids = details.get('expected_profile_ids')
+        if type(details.get('expected_version')) is not int or details['expected_version'] < 0 or not isinstance(ids, list) or not ids or any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
+            raise ManagementError('invalid_change', 'Lifecycle confirmation requires the originally reviewed directory version and explicit Profile scope.')
+        approved = {'expected_version': details['expected_version'], 'expected_profile_ids': sorted(ids)}
+    elif 'expected_version' in details or 'expected_profile_ids' in details:
+        raise ManagementError('invalid_change', 'Check reconciles the already frozen operation; it cannot approve a new Profile scope.')
     handled = details.get('handled_manual_session_ids', [])
     if not isinstance(handled, list) or any(not isinstance(i, str) for i in handled) or action != 'check' and handled:
         raise ManagementError('invalid_change', 'Owner manual handling belongs to an explicit archive check.')
@@ -79,10 +87,12 @@ def operate(manager, identity, action, details):
             if operation is None or details.get('profile_id') not in (None, operation['profile_id']):
                 raise ManagementError('binding_conflict', 'Check must identify the original lifecycle operation.')
         elif operation:
-            if operation['action'] != action or operation['profile_id'] != details.get('profile_id'):
+            if operation['action'] != action or operation['profile_id'] != details.get('profile_id') or operation.get('approved_scope') != approved:
                 raise ManagementError('binding_conflict', 'Lifecycle operation ID already names another Owner decision.')
             return operation
         else:
+            if version != approved['expected_version']:
+                raise ManagementError('version_conflict', 'Directory changed after lifecycle preview; review the new explicit scope before confirmation.')
             profile = data['profiles'].get(details.get('profile_id'))
             if not profile or profile['role'] not in {'project_lead', 'subproject_lead'}:
                 raise ManagementError('invalid_change', 'Lifecycle target must be a registered project responsible Profile.')
@@ -97,12 +107,15 @@ def operate(manager, identity, action, details):
                 if parent and parent.get('lifecycle') != 'active':
                     raise ManagementError('lifecycle_blocked', 'Restore the project lead before each child.')
             project_ids = sorted({data['profiles'][i]['project_id'] for i in ids})
+            if sorted(ids) != approved['expected_profile_ids']:
+                raise ManagementError('binding_conflict', 'Current lifecycle subtree differs from the originally reviewed Profile scope; nothing was changed.')
             if any(o['status'] != 'completed' and set(o['profile_ids']) & set(ids) for o in operations.values()):
                 raise ManagementError('binding_conflict', 'An earlier lifecycle decision still requires reconciliation.')
             operation = {'id': details['operation_id'], 'action': action, 'profile_id': profile['id'],
                 'profile_ids': ids, 'project_ids': project_ids, 'status': 'processing', 'created_at': _now(),
                 'owner_origin': {'subject': identity.subject, 'source': identity.source}, 'checks': {},
                 'scope_bindings': {i: _scope_binding(data, i) for i in ids},
+                'approved_scope': approved,
                 'entry_requests': {}, 'manual_required': [], 'manual_handled': [], 'needs_human': [], 'evidence': []}
             operations[operation['id']] = operation
             intent = {'operation_id': operation['id'], 'action': action, 'owner_origin': operation['owner_origin']}

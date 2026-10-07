@@ -12,6 +12,21 @@ from test_task_execution import accepted, adapter_for
 from test_task_control import TURN, wire
 
 
+def scope_approval(snapshot, action, details):
+    if action == 'check':
+        return details
+    prior = next((o for o in snapshot['lifecycle_operations'] if o['id'] == details['operation_id']), None)
+    if prior:
+        return {**details, **prior['approved_scope']}
+    target = details['profile_id']
+    ids = [target] + ([p['id'] for p in snapshot['profiles'] if p.get('parent_profile_id') == target] if action == 'archive' else [])
+    return {**details, 'expected_version': snapshot['version'], 'expected_profile_ids': sorted(ids)}
+
+
+def decide(manager, action, details):
+    return manager.lifecycle(OWNER, action, scope_approval(manager.read_snapshot(OWNER), action, details))
+
+
 class ProfileHost:
     """Trusted synthetic host; each fact is scoped to one native Profile."""
     def __init__(self):
@@ -62,7 +77,8 @@ def test_owner_archive_blocks_parent_and_child_until_original_execution_and_ever
         host.pending.add(('child-lead', 'bot'))
         with ManagementServer(manager, {'owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'owner')
-            operation = client.lifecycle('archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-29'})
+            approval = scope_approval(client.read_snapshot(), 'archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-29'})
+            operation = client.lifecycle('archive', approval)
             assert operation['status'] == 'processing'
             snapshot = client.read_snapshot()
             assert {p['id']: p['lifecycle'] for p in snapshot['profiles']} == {
@@ -82,7 +98,7 @@ def test_owner_archive_blocks_parent_and_child_until_original_execution_and_ever
             assert done['status'] == 'completed'
             assert all(p['lifecycle'] == 'archived' for p in client.read_snapshot()['projects'])
             assert client.read_snapshot()['lifecycle_events'][0]['kind'] == 'archive_completed'
-            client.lifecycle('archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-29'})
+            client.lifecycle('archive', approval)
         assert len([r for r in wire(tmp_path) if r['method'] == 'turn/interrupt']) == 1
         assert len(host.calls) == 6
 
@@ -93,12 +109,12 @@ def test_archive_cancels_unstarted_queue_and_restore_only_parent_keeps_old_work_
         host.manager = manager
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         tree(manager, tmp_path)
-        manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-queued'})
+        decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-queued'})
         with pytest.raises(ManagementError, match='lifecycle'):
             manager.start_task(OWNER, request_id)
         with pytest.raises(ManagementError, match='lead'):
-            manager.lifecycle(OWNER, 'restore', {'profile_id': 'child-lead', 'operation_id': 'child-early'})
-        restored = manager.lifecycle(OWNER, 'restore', {'profile_id': 'mono-lead', 'operation_id': 'parent-restore'})
+            decide(manager, 'restore', {'profile_id': 'child-lead', 'operation_id': 'child-early'})
+        restored = decide(manager, 'restore', {'profile_id': 'mono-lead', 'operation_id': 'parent-restore'})
         assert restored['status'] == 'completed'
         snapshot = manager.read_snapshot(OWNER)
         assert {p['id']: p['lifecycle'] for p in snapshot['profiles']} == {
@@ -107,7 +123,7 @@ def test_archive_cancels_unstarted_queue_and_restore_only_parent_keeps_old_work_
         assert manager.dispatch_tasks() == []
         with pytest.raises(ManagementError, match='archived'):
             manager.start_task(OWNER, request_id)
-        manager.lifecycle(OWNER, 'restore', {'profile_id': 'child-lead', 'operation_id': 'child-restore'})
+        decide(manager, 'restore', {'profile_id': 'child-lead', 'operation_id': 'child-restore'})
         new = manager.accept_request(OWNER, 'mono', 'mono-lead', {**MESSAGE, 'message_id': 'fresh'}, ISSUE)
         assert new['request']['id'] != request_id
         assert len([p for p in manager.read_snapshot(OWNER)['profiles'] if p['project_id'] == 'child']) == 1
@@ -124,13 +140,13 @@ def test_observe_only_execution_needs_explicit_owner_handling_and_current_termin
         manager.register_observation_source(OWNER, source())
         manager.refresh_manual_sessions(OWNER)
         manual_id = manager.read_snapshot(OWNER)['manual_sessions'][0]['id']
-        archived = manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-manual'})
+        archived = decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-manual'})
         assert archived['status'] != 'completed'
         assert archived['manual_required'] == [manual_id]
         assert manager.read_snapshot(OWNER)['control_grants'] == []
         manual_state(peer, repo, 'idle')
-        assert manager.lifecycle(OWNER, 'check', {'operation_id': 'archive-manual'})['status'] != 'completed'
-        checked = manager.lifecycle(OWNER, 'check', {'operation_id': 'archive-manual', 'handled_manual_session_ids': [manual_id]})
+        assert decide(manager, 'check', {'operation_id': 'archive-manual'})['status'] != 'completed'
+        checked = decide(manager, 'check', {'operation_id': 'archive-manual', 'handled_manual_session_ids': [manual_id]})
         assert checked['status'] == 'completed'
         messages = [json.loads(line) for line in (peer / 'manual-wire.jsonl').read_text().splitlines()]
         assert all(m['method'] in READ_ONLY for m in messages)
@@ -140,7 +156,7 @@ def test_unknown_native_lifecycle_is_durably_blocked_and_directory_correction_ca
     repo = make_repo(tmp_path / 'repo')
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
         manager.apply_directory_change(OWNER, 0, registration(repo))
-        result = manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-unknown'})
+        result = decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'archive-unknown'})
         assert result['status'] == 'blocked'
         manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], registration(repo))
         assert manager.read_snapshot(OWNER)['profiles'][0]['lifecycle'] == 'archiving'
@@ -161,7 +177,7 @@ def test_archive_never_creates_a_new_manual_control_grant_even_when_owner_has_a_
                  observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
         host.manager = manager
         request_id, observed = setup(manager, repo)
-        manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'observe-archive'})
+        decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'observe-archive'})
         with pytest.raises(ManagementError, match='lifecycle'):
             manager.take_over_session(OWNER, request_id, observed['id'], 'new-archive-grant', ORIGINAL_TURN)
         assert manager.read_snapshot(OWNER)['control_grants'] == []
@@ -193,7 +209,7 @@ async def test_group_owner_archive_and_dashboard_restore_show_the_same_durable_l
             app.include_router(create_router(lambda _: client))
             browser = TestClient(app)
             assert browser.get('/snapshot').json() == client.read_snapshot()
-            restored = browser.post('/lifecycle', json={'action': 'restore', 'details': {'profile_id': 'mono-lead', 'operation_id': 'dashboard-restore'}})
+            restored = browser.post('/lifecycle', json={'action': 'restore', 'details': scope_approval(client.read_snapshot(), 'restore', {'profile_id': 'mono-lead', 'operation_id': 'dashboard-restore'})})
             assert restored.status_code == 200 and restored.json()['status'] == 'completed'
             assert browser.get('/snapshot').json()['profiles'][1]['lifecycle'] == 'archived'
             assert browser.post('/lifecycle', json={'action': 'archive', 'details': {'profile_id': 'mono-lead', 'operation_id': 'forged', 'owner': True}}).status_code == 422
@@ -220,7 +236,7 @@ def test_public_archive_then_restart_reconciles_the_original_real_process_withou
             os.kill(pid, 0)
             # Lose the actual original connection after the service applied its interrupt.
             (peer / 'drop.json').write_text(json.dumps(['turn/interrupt']))
-            archive = manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'process-archive'})
+            archive = decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'process-archive'})
             assert archive['status'] != 'completed'
             assert manager.read_snapshot(OWNER)['requests'][0]['repository_released'] is False
         (peer / 'drop.json').write_text('[]')
@@ -230,9 +246,9 @@ def test_public_archive_then_restart_reconciles_the_original_real_process_withou
             task = restarted.reconcile_task(OWNER, request_id)
             assert task['recovery']['status'] == 'explicit_stop_preserved'
             assert task['execution'] == 'stopped' and task['repository_released'] is True
-            assert restarted.lifecycle(OWNER, 'check', {'operation_id': 'process-archive'})['status'] == 'completed'
+            assert decide(restarted, 'check', {'operation_id': 'process-archive'})['status'] == 'completed'
             assert len(restarted.read_snapshot(OWNER)['lifecycle_events']) == 1
-            assert restarted.lifecycle(OWNER, 'restore', {'profile_id': 'mono-lead', 'operation_id': 'process-restore'})['status'] == 'completed'
+            assert decide(restarted, 'restore', {'profile_id': 'mono-lead', 'operation_id': 'process-restore'})['status'] == 'completed'
             assert restarted.dispatch_tasks() == []
             assert restarted.read_snapshot(OWNER)['requests'][0]['execution'] == 'stopped'
         execution = json.loads((peer / 'execution.json').read_text())
@@ -312,13 +328,13 @@ def test_new_descendant_and_current_work_takeover_cannot_reopen_archiving_scope(
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host) as manager:
         host.manager = manager
         manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
-        manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'frozen-tree'})
+        decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'frozen-tree'})
         child = registration(make_repo(tmp_path / 'new-child'), 'late-child', 'late-child-lead')
         child['profile'].update(identity_ref='fixture:late', role='subproject_lead', parent_profile_id='mono-lead')
         with pytest.raises(ManagementError, match='lifecycle'):
             manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], child)
         with pytest.raises(ManagementError, match='Owner'):
-            manager.lifecycle(VerifiedIdentity('fixture:lead', 'registered-bot'), 'restore', {'profile_id': 'mono-lead', 'operation_id': 'bot-authority'})
+            manager.lifecycle(VerifiedIdentity('fixture:lead', 'registered-bot'), 'restore', scope_approval(manager.read_snapshot(OWNER), 'restore', {'profile_id': 'mono-lead', 'operation_id': 'bot-authority'}))
         assert len(manager.read_snapshot(OWNER)['projects']) == 1
 
 
@@ -331,19 +347,19 @@ def test_restore_keeps_consistent_manager_checkpoint_and_blocks_changed_original
         repo = make_repo(tmp_path / 'repo')
         manager.apply_directory_change(OWNER, 0, registration(repo))
         host.pending.add(('mono-lead', 'bot'))
-        manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'binding-archive'})
+        decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'binding-archive'})
         correction = registration(repo)['profile']
         correction['native_profile'] = 'different-native'
         manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': correction})
         calls = list(host.calls)
-        blocked = manager.lifecycle(OWNER, 'check', {'operation_id': 'binding-archive'})
+        blocked = decide(manager, 'check', {'operation_id': 'binding-archive'})
         assert blocked['status'] == 'blocked'
         assert host.calls == calls
         correction['native_profile'] = 'mono-lead'
         manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': correction})
         host.pending.clear()
-        assert manager.lifecycle(OWNER, 'check', {'operation_id': 'binding-archive'})['status'] == 'completed'
-        restored = manager.lifecycle(OWNER, 'restore', {'profile_id': 'mono-lead', 'operation_id': 'checkpoint-restore'})
+        assert decide(manager, 'check', {'operation_id': 'binding-archive'})['status'] == 'completed'
+        restored = decide(manager, 'restore', {'profile_id': 'mono-lead', 'operation_id': 'checkpoint-restore'})
         assert restored['checkpoint']['status'] == 'verified_manager_directory'
         artifact = manager.state_dir / restored['checkpoint']['artifact_ref']
         with sqlite3.connect(Path(artifact).as_uri() + '?mode=ro', uri=True) as db:
@@ -362,7 +378,51 @@ def test_unknown_or_host_wide_native_control_capability_does_not_request_a_profi
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host) as manager:
         host.manager = manager
         manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
-        result = manager.lifecycle(OWNER, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'no-host-stop'})
+        result = decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'no-host-stop'})
         assert result['status'] == 'blocked'
         assert host.calls == []
         assert manager.read_snapshot(OWNER)['profiles'][0]['lifecycle'] == 'archiving'
+
+
+def test_archive_confirmation_binds_reviewed_version_and_explicit_subtree_without_silent_expansion(tmp_path):
+    host = ProfileHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host) as manager:
+        host.manager = manager
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        reviewed = {'profile_id': 'mono-lead', 'operation_id': 'reviewed-tree',
+                    'expected_version': manager.read_snapshot(OWNER)['version'], 'expected_profile_ids': ['mono-lead']}
+        tree(manager, tmp_path)
+        with pytest.raises(ManagementError) as stale:
+            manager.lifecycle(OWNER, 'archive', reviewed)
+        assert stale.value.code == 'version_conflict'
+        with pytest.raises(ManagementError) as scope:
+            manager.lifecycle(OWNER, 'archive', {**reviewed, 'expected_version': manager.read_snapshot(OWNER)['version']})
+        assert scope.value.code == 'binding_conflict'
+        assert host.calls == [] and manager.read_snapshot(OWNER)['lifecycle_operations'] == []
+        assert manager.read_snapshot(OWNER)['profiles'][0]['lifecycle'] == 'configuring'
+        accepted = {**reviewed, 'expected_version': manager.read_snapshot(OWNER)['version'],
+                    'expected_profile_ids': ['child-lead', 'mono-lead']}
+        result = manager.lifecycle(OWNER, 'archive', accepted)
+        assert result['status'] == 'completed'
+        assert result['approved_scope'] == {'expected_version': accepted['expected_version'], 'expected_profile_ids': ['child-lead', 'mono-lead']}
+        assert manager.lifecycle(OWNER, 'archive', accepted) == result
+
+
+def test_slow_scoped_native_lifecycle_response_stays_on_original_durable_operation(tmp_path):
+    import time
+    class SlowHost(ProfileHost):
+        def request(self, profile, component, state, operation_id):
+            result = super().request(profile, component, state, operation_id)
+            if component == 'profile_service':
+                time.sleep(3.2)
+            return result
+    host = SlowHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host) as manager:
+        host.manager = manager
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            approved = scope_approval(client.read_snapshot(), 'archive', {'profile_id': 'mono-lead', 'operation_id': 'slow-native'})
+            result = client.lifecycle('archive', approved)
+            assert result['status'] == 'completed'
+            assert client.read_snapshot()['lifecycle_operations'][0]['id'] == 'slow-native'
