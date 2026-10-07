@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -66,6 +66,10 @@ class ManagementServer:
                             if payload['operation'] == 'read_participant_snapshot' and identity.subject == bridge.manager.owner_identity_ref:
                                 raise ManagementError('forbidden', 'The participant entry cannot borrow owner authority.')
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
+                        elif payload.get('operation') == 'register_observation_source':
+                            result = bridge.manager.register_observation_source(identity, payload.get('registration'))
+                        elif payload.get('operation') == 'refresh_manual_sessions':
+                            result = bridge.manager.refresh_manual_sessions(identity, payload.get('scope'))
                         elif payload.get('operation') == 'apply_directory_change':
                             result = bridge.manager.apply_directory_change(identity, payload.get('expected_version'), payload.get('change'))
                         elif payload.get('operation') == 'prepare_task':
@@ -144,7 +148,7 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
@@ -165,6 +169,12 @@ class ManagementClient:
 
     def apply_directory_change(self, expected_version, change):
         return self._call('apply_directory_change', expected_version=expected_version, change=change)
+
+    def register_observation_source(self, registration):
+        return self._call('register_observation_source', registration=registration)
+
+    def refresh_manual_sessions(self, scope=None):
+        return self._call('refresh_manual_sessions', scope=scope)
 
     def refresh_task_source(self, request_id):
         return self._call('refresh_task_source', request_id=request_id)
