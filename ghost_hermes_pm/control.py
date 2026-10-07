@@ -127,7 +127,10 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
                 if result.get('turnId') != session['turn_id']:
                     raise ManagementError('outcome_unknown', 'The service did not confirm the expected original turn.')
             else:
-                result = adapter.start_idle_turn(session['thread_id'], session['turn_id'], text, instruction_id,
+                execution_text = text
+                if action == 'continue':
+                    execution_text += '\nConfirmed continuation baseline and dependencies: ' + str(record['preparation']['plan']) + '\nPreserve these user paths without modification: ' + str(record['preparation']['preserved_files'])
+                result = adapter.start_idle_turn(session['thread_id'], session['turn_id'], execution_text, instruction_id,
                                                  expected_cwd=session['repository']['worktree'], known_turn_ids=known_turn_ids)
                 session['turn_id'] = result['turn']['id']
                 known_turn_ids.append(session['turn_id'])
@@ -205,10 +208,15 @@ def refresh_stop(manager, identity, request_id):
             if related:
                 stop['reason'] = 'Related execution remains active or lacks complete terminal evidence.'
             else:
+                from .queue import workspace
+                stop['handoff'] = {'workspace': workspace(session['repository']), 'verified_at': _now()}
                 stop.update(status='confirmed', confirmed_at=_now(), reason=None)
                 for instruction in record.get('controls', []):
                     if instruction['id'] == stop['instruction_id']:
                         instruction['phase'] = 'stop_confirmed'
+                for arrangement in record.get('execution_arrangements', []):
+                    if arrangement['id'] == record.get('current_arrangement_id'):
+                        arrangement.update(phase='stopped', ended_at=stop['confirmed_at'])
                 record.update(execution='stopped', outer_task_status='stopped', repository_released=True, unexecuted_reason=None)
         except ManagementError as exc:
             stop.update(reason=str(exc), last_verification_attempt_at=_now())

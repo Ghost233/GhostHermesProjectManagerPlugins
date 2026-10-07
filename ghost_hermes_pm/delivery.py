@@ -183,10 +183,13 @@ def record_task_delivery(manager, identity, request_id, report):
         if merge_required and (not pr or pr['state'] != 'merged' or not sync or pr.get('base_branch') not in branches):
             raise ManagementError('evidence_missing', 'This Issue requires a verified merge and synchronized local/remote branches.')
         pr_status = 'merged' if pr and pr['state'] == 'merged' else 'awaiting_merge' if pr and pr.get('review') == 'approved' else 'awaiting_review' if pr else 'none'
-        record.update(task_delivery='delivered', pr_status=pr_status, repository_released=True,
+        record.update(task_delivery='delivered', pr_status=pr_status, repository_released=True, handoff_reason=None, outer_task_status='delivered',
                       test_evidence=list(tests.values()), delivery_evidence={'issue_updated_at': scope['updated_at'], 'criteria': criteria,
                       'source_commit': commit or current['head'], 'source_changed': source_changed, 'execution_end': execution_end, 'leftover_changes': current['workspace_status'], 'workspace': current, 'artifacts': artifacts,
                       'pr': pr, 'sync': sync, 'verified_at': datetime.now(timezone.utc).isoformat()})
+        for arrangement in record.get('execution_arrangements', []):
+            if arrangement['id'] == record.get('current_arrangement_id'):
+                arrangement.update(phase='delivered', ended_at=record['delivery_evidence']['verified_at'])
         with manager._db:
             manager._save(version, data)
         manager.publish_request_message(identity, request_id, 'result', '已按冻结 Issue 验收交付：' + scope['url'] +

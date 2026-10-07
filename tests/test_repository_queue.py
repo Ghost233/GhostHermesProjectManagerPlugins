@@ -229,3 +229,110 @@ def test_linked_worktree_alias_cannot_bypass_manually_loaded_repository_executio
             assert records[first]['queue']['logical_repository'] == records[second]['queue']['logical_repository'] == str(repo / '.git')
             assert records[first]['queue']['status'] == 'external_unknown'
             assert not any(json.loads(line)['method'] in {'thread/start', 'turn/start'} for line in (tmp_path / 'wire.jsonl').read_text().splitlines())
+
+
+def test_existing_issue17_durable_session_retains_occupancy_when_queue_schema_is_added(tmp_path):
+    import sqlite3
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+    # A legacy on-disk fixture, not an assertion through private manager internals.
+    with sqlite3.connect(tmp_path / 'state' / 'manager.sqlite3') as db:
+        payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
+        payload.pop('queue_sequence', None)
+        record = payload['requests'][request_id]
+        for field in ('queue', 'preparation', 'accepted_repository'):
+            record.pop(field, None)
+        db.execute('UPDATE directory SET payload=?', (json.dumps(payload),))
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as restarted:
+        with ManagementServer(restarted, {'queue-owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'queue-owner')
+            task = client.read_snapshot()['requests'][0]
+            assert task['queue']['status'] == 'occupied'
+            assert task['session']['thread_id']
+            assert task['repository_released'] is False
+            assert task['execution'] == 'unverified'
+        second = acknowledge(restarted)
+        with pytest.raises(ManagementError) as busy:
+            restarted.start_task(OWNER, second)
+        assert busy.value.code == 'repository_busy'
+
+
+def test_unmerged_delivery_is_not_implicitly_reused_as_next_issue_baseline(tmp_path):
+    import hashlib
+    repo, baseline = commit_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+        first = accepted(manager, repo)
+        with ManagementServer(manager, {'queue-owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'queue-owner')
+            session = client.start_task(first)['session']
+            subprocess.run(['git', '-C', str(repo), 'checkout', '-qb', 'unmerged-first'], check=True)
+            (repo / 'source.py').write_text('first fixed delivery\n')
+            subprocess.run(['git', '-C', str(repo), 'add', 'source.py'], check=True)
+            subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'first delivery'], check=True)
+            fixed = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+            (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'],
+                'status': 'completed', 'itemsView': 'full', 'items': []}]}}))
+            delivered = client.record_task_delivery(first, {'source_commit': fixed, 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'],
+                'artifact_refs': [{'path': str(repo / 'source.py'), 'sha256': hashlib.sha256((repo / 'source.py').read_bytes()).hexdigest()}]}]})
+            assert delivered['task_delivery'] == 'delivered'
+            assert delivered['delivery_evidence']['source_commit'] == fixed
+            second = acknowledge(manager)
+            plan = {'branch': 'unmerged-first', 'commit': fixed, 'dependencies': [], 'issue_updated_at': ISSUE['updated_at']}
+            with pytest.raises(ManagementError) as inherited:
+                client.prepare_task(second, plan)
+            assert inherited.value.code == 'handoff_blocked'
+            assert 'unmerged delivery' in str(inherited.value)
+            assert (repo / 'source.py').read_text() == 'first fixed delivery\n'
+            ready = client.prepare_task(second, {**plan, 'dependencies': [first]})
+            assert ready['preparation']['status'] == 'ready'
+            assert ready['preparation']['plan']['dependencies'] == [first]
+            assert ready.get('session') is None
+
+
+@pytest.mark.asyncio
+async def test_group_and_dashboard_share_preparation_queue_reason_and_frozen_source_difference(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from ghost_hermes_pm.dashboard import create_router
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import CONFIG, Gateway, Transport, event
+    from test_task_execution import execution_registration
+    class Source:
+        def read_issue(self, url):
+            return {**ISSUE, 'url': url, 'body': ISSUE['body'] + '\nNew source context.', 'updated_at': '2026-10-07T04:00:00Z'}
+    repo, head = commit_repo(tmp_path / 'repo')
+    surface, transport = object(), Transport()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), delivery_source=Source()) as manager:
+        manager.apply_directory_change(OWNER, 0, execution_registration(repo))
+        intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda _: ISSUE)
+        intake.attach_transport(surface, transport)
+        await intake.receive(event(), Gateway(surface))
+        first = manager.read_snapshot(OWNER)['requests'][0]
+        async def command(record, text, message_id):
+            incoming = event(text, message_id)
+            incoming.raw_message.event.message.parent_id = record['task_start_anchor']['message_id']
+            return await intake.receive(incoming, Gateway(surface))
+        await command(first, '确认基线：main ' + head, 'om_prepare_first')
+        with ManagementServer(manager, {'queue-owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'queue-owner')
+            app = FastAPI()
+            app.include_router(create_router(lambda request: client))
+            browser = TestClient(app)
+            assert browser.post('/task', json={'action': 'start', 'request_id': first['id']}).json()['status'] == 'running'
+            await intake.receive(event(message_id='om_second_group'), Gateway(surface))
+            second = next(r for r in client.read_snapshot()['requests'] if r['id'] != first['id'])
+            await command(second, '确认基线：main ' + head, 'om_prepare_second')
+            await command(second, '执行', 'om_execute_second')
+            await command(second, '核对Issue来源', 'om_source_second')
+            snapshot = browser.get('/snapshot').json()
+            assert snapshot == client.read_snapshot()
+            record = next(r for r in snapshot['requests'] if r['id'] == second['id'])
+            assert record['queue']['status'] == 'queued' and record['queue']['blocked_by'] == [first['id']]
+            assert record['preparation']['status'] == 'ready'
+            assert record['issue_source']['status'] == 'changed'
+            assert record['accepted_scope'] == ISSUE
+            relevant = [s for s in transport.sent if s['reply_to'] == second['task_start_anchor']['message_id']]
+            assert any('仓库排队' in s['text'] for s in relevant)
+            assert any('来源变化' in s['text'] for s in relevant)
+            assert all(s['mention_open_id'] == 'ou_owner' for s in relevant)

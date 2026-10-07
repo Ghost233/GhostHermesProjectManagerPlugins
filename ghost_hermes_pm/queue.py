@@ -56,7 +56,9 @@ def workspace(repository):
     from .delivery import source_state
     from .manager import _git
     current = source_state(repository)
-    current['branch'] = _git(repository['worktree'], 'symbolic-ref', '--quiet', '--short', 'HEAD')
+    import subprocess
+    branch = subprocess.run(['git', '-C', repository['worktree'], 'symbolic-ref', '--quiet', '--short', 'HEAD'], capture_output=True, text=True)
+    current['branch'] = branch.stdout.strip() if branch.returncode == 0 else None
     raw = _git(repository['worktree'], 'status', '--porcelain=v1', '-z').split('\0')
     names, index = [], 0
     while index < len(raw):
@@ -219,3 +221,15 @@ def logical_repository(path):
     if not isinstance(path, str) or not Path(path).is_absolute():
         raise ManagementError('capability_unverified', 'Loaded execution repository identity is incomplete.')
     return str(Path(_git(Path(path).resolve(), 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve())
+
+
+def ensure_queues(data):
+    """Upgrade only the durable accepted records, never infer work from service scans."""
+    changed = False
+    for record in sorted(data['requests'].values(), key=lambda r: (r['accepted_at'], r['id'])):
+        if record.get('queue'):
+            continue
+        repository = record.get('session', {}).get('repository') or data['projects'][record['project_id']]['repo']
+        enroll(data, record, repository)
+        changed = True
+    return changed

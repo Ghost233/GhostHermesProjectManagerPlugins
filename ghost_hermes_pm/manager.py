@@ -112,6 +112,11 @@ class Manager:
         self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 1, 0, ?)',
                          (json.dumps({'projects': {}, 'profiles': {}, 'last_verified_at': None}),))
         self._db.commit()
+        version, data = self._load()
+        from .queue import ensure_queues
+        if ensure_queues(data):
+            with self._db:
+                self._save(version, data)
 
     def close(self):
         with self._lock:
@@ -263,7 +268,21 @@ class Manager:
 
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
-        return record_task_delivery(self, identity, request_id, report)
+        try:
+            return record_task_delivery(self, identity, request_id, report)
+        except ManagementError as exc:
+            with self._lock, self._db:
+                version, data = self._load()
+                record = self._request(identity, request_id, data)
+                # Report only an authorized task operation; visibility is not authority.
+                from .execution import _responsible
+                _responsible(self, identity, request_id, data)
+                if record.get('session') and not record.get('repository_released'):
+                    record.update(handoff_reason=str(exc))
+                    self._save(version, data)
+            if record.get('session') and not record.get('repository_released'):
+                self.publish_request_message(identity, request_id, 'progress', '交付交接受阻；仓库占用保留：' + str(exc))
+            raise
 
     def verify_task_execution(self, identity, request_id):
         from .execution import verify_task_execution

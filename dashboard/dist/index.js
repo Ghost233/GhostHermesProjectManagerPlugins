@@ -159,6 +159,7 @@
               preparationField(r, 'dependencies', '依赖请求 ID（逗号分隔）'), preparationField(r, 'workspace_digest', '遗留内容保留摘要（有未提交内容时填写）'),
               h('button', { style: button, onClick: function () { prepareAction(r); }, disabled: saving || snapshot.status !== 'completed' }, '确认基线'),
               r.preparation && h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(r.preparation, null, 2))),
+            r.handoff_reason && h('div', null, '交付交接受阻：' + r.handoff_reason),
             h('div', null, '交付：' + (r.task_delivery || 'unmet') + ' · PR：' + (r.pr_status || 'none')),
             r.session && h('div', null, '原 Codex 会话：' + (r.session.thread_id || '创建待核对') + ' · 轮次：' + (r.session.turn_id || '启动待核对') + ' · 控制：' + r.session.control),
             r.last_execution_verified_at && h('div', null, '执行最后核实：' + r.last_execution_verified_at),
