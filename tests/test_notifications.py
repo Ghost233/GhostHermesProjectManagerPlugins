@@ -212,3 +212,54 @@ def test_active_background_and_unknown_process_coverage_explain_or_block_stall_j
         (tmp_path / 'background.json').write_text(json.dumps({'': {'data': [{'itemId': 'bg', 'processId': 'registered-background', 'command': 'python -m pytest'}], 'nextCursor': None}}))
         clock.advance(900)
         assert not any(e['kind'] == 'suspected_stall' for e in manager.run_notifications(OWNER)['notifications'])
+
+
+def test_restart_does_not_catch_up_ticks_or_replay_unknown_delivery_and_offline_health_is_visible(tmp_path):
+    from test_recovery import original_state, recovery_adapter
+    clock = Clock()
+    repo = make_repo(tmp_path / 'repo')
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, repo)
+        register_entry(manager)
+        service_id = manager.start_task(OWNER, task_id)['session']['service_id']
+        manager.run_notifications(OWNER)
+        clock.advance(900)
+        event = next(e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'summary')
+        packet = manager.manage_notifications(OWNER, 'claim', {'event_id': event['id']})
+        assert packet is not None
+    original_state(tmp_path, repo)
+    clock.advance(9000)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id)}, notification_clock=clock) as manager:
+        before = manager.read_snapshot(OWNER)['notifications']
+        assert before['health']['supervision'] == 'unavailable'
+        manager.reconcile_task(OWNER, task_id)
+        events = manager.run_notifications(OWNER)['notifications']
+        summaries = [e for e in events if e['kind'] == 'summary']
+        assert len(summaries) == 1 and summaries[0]['delivery'] == 'unknown'
+        assert manager.manage_notifications(OWNER, 'claim', {'event_id': event['id']}) is None
+        clock.advance(899)
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'summary']) == 1
+        clock.advance(1)
+        assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'summary']) == 2
+
+
+def test_nonblocking_questions_wait_for_summary_and_pending_alerts_expire_before_send(tmp_path):
+    from test_questions import question_adapter, emit, user_question
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question(blocking=False))
+        manager.refresh_task(OWNER, task_id)
+        assert not any('人工请求' in s['text'] for p in manager.read_snapshot(OWNER)['requests'][0]['outbox'] for s in p['segments'])
+        assert not any(e['kind'] == 'human_request' for e in manager.run_notifications(OWNER)['notifications'])
+        clock.advance(900)
+        summary = next(e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'summary')
+        assert 'colour' in summary['text']
+        emit(tmp_path, user_question(rpc_id=9))
+        question = next(q for q in manager.refresh_task(OWNER, task_id)['human_requests'] if q['rpc_id'] == 9)
+        alert = next(e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request')
+        manager.answer_human_request(OWNER, task_id, question['id'], 'resolved-before-send', {'answers': {'colour': ['Blue']}})
+        assert manager.manage_notifications(OWNER, 'claim', {'event_id': alert['id']}) is None
+        assert next(e for e in manager.read_snapshot(OWNER)['notifications']['events'] if e['id'] == alert['id'])['delivery'] == 'expired'

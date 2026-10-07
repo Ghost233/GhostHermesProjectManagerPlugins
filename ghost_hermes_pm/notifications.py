@@ -2,6 +2,7 @@
 import hashlib
 import json
 import uuid
+import os
 
 from .manager import ManagementError
 
@@ -15,10 +16,21 @@ def state(data):
     return saved
 
 
-def snapshot(data, project_ids):
+def snapshot(manager, data, project_ids):
     saved = state(data)
+    health = dict(saved['health'])
+    path = manager.state_dir / 'notification-health.json'
+    if path.exists():
+        try:
+            external = json.loads(path.read_text())
+            if external.get('generation') == manager._notification_generation and external.get('supervision') == 'unavailable':
+                health.update(external)
+        except (OSError, ValueError):
+            health.update(supervision='unverified', delivery='unverified')
+    if saved.get('generation') and saved['generation'] != manager._notification_generation:
+        health.update(supervision='unavailable', delivery='unverified')
     return {'events': [e for e in saved['events'].values() if e['project_id'] in project_ids],
-            'health': dict(saved['health'])}
+            'health': health}
 
 
 def human_text(question):
@@ -98,6 +110,19 @@ def run(manager, identity):
             raise ManagementError('forbidden', 'Only the manager supervision entry schedules global notifications.')
         now = manager.notification_clock()
         saved = state(data)
+        if saved.get('generation') != manager._notification_generation:
+            for schedule in saved['projects'].values():
+                schedule['summary_at'] = now
+            for tracker in saved['tasks'].values():
+                tracker['progress_at'] = now
+                if 'disconnected_at' in tracker:
+                    tracker['disconnected_at'] = now
+            for question_id in saved['human_requests']:
+                saved['human_requests'][question_id] = now
+            for event in saved['events'].values():
+                if event['kind'] == 'summary' and event['delivery'] == 'pending':
+                    event['delivery'] = 'expired'
+            saved['generation'] = manager._notification_generation
         active = {}
         for task in data['requests'].values():
             if not task.get('repository_released') and task.get('outer_task_status') != 'stopped':
@@ -154,7 +179,7 @@ def run(manager, identity):
             text = '项目汇总：' + project_id + '\n' + '\n'.join(
                 '负责人：' + t['profile_id'] + '；状态：' + t['execution'] + '\n进展：无新进展；交付：' + t.get('task_delivery', 'unmet') +
                 '；PR：' + t.get('pr_status', 'none') + '\n阻塞：' + (t.get('unexecuted_reason') or '无已核实阻塞') +
-                '\n待处理：' + ', '.join(q['id'] for q in t.get('human_requests', []) if q['resolution'] == 'pending') +
+                '\n待处理：' + '\n'.join(human_text(q) for q in t.get('human_requests', []) if q['resolution'] == 'pending' and not q.get('reply')) +
                 '\n下一步：核对原服务与当前有效请求\nIssue：' + t['accepted_scope']['url'] for t in tasks)
             key = hashlib.sha256(json.dumps(['summary', project_id, now]).encode()).hexdigest()
             saved['events'][key] = {'id': key, 'kind': 'summary', 'project_id': project_id,
@@ -178,6 +203,7 @@ def run(manager, identity):
                 event['delivery'] = 'blocked'
         saved['health'].update(supervision='running', last_checked_at=now)
         manager._save(version, data)
+        persist_health(manager, saved['health'])
         return {'status': 'completed', 'notifications': list(saved['events'].values()), 'health': saved['health']}
 
 
@@ -203,6 +229,12 @@ def manage(manager, identity, action, details):
         if not frozen or _channel(data, frozen['id']) != frozen:
             raise ManagementError('binding_conflict', 'The original notification entry channel changed or was unavailable.')
         if action == 'claim':
+            if event.get('human_request_id'):
+                question = next((q for task_id in event['request_ids'] for q in data['requests'][task_id].get('human_requests', []) if q['id'] == event['human_request_id']), None)
+                if not question or question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled'):
+                    event['delivery'] = 'expired'
+                    manager._save(version, data)
+                    return None
             if event['delivery'] not in {'pending', 'sending'}:
                 return None
             for segment in event['segments']:
@@ -249,7 +281,12 @@ def manage(manager, identity, action, details):
 
 async def deliver(intake, identity, generation):
     intake.require_active(generation)
-    result = intake.manager().run_notifications(identity)
+    import asyncio
+    def poll_if_active():
+        with intake.lifecycle_lock:
+            intake.require_active(generation)
+            return intake.manager().run_notifications(identity)
+    result = await asyncio.to_thread(poll_if_active)
     for event in result['notifications']:
         if event['delivery'] not in {'pending', 'sending'} or not event.get('target_channel'):
             continue
@@ -279,3 +316,28 @@ async def deliver(intake, identity, generation):
             intake.manager().manage_notifications(identity, 'receipt', {'event_id': event['id'], 'uuid': packet['uuid'], 'receipt': receipt})
             if receipt.get('status') != 'delivered':
                 break
+
+
+def reconcile(manager, data):
+    saved = state(data)
+    for event in saved['events'].values():
+        for segment in event.get('segments', []):
+            if segment['status'] == 'sending' and segment['uuid'] not in manager._inflight:
+                segment['status'] = 'unknown'
+                segment['attempts'][-1]['status'] = 'unknown'
+                event['delivery'] = 'unknown'
+
+
+def persist_health(manager, health):
+    temporary = manager.state_dir / ('.notification-health-' + str(uuid.uuid4()))
+    temporary.write_text(json.dumps({'generation': manager._notification_generation, **health}))
+    os.replace(temporary, manager.state_dir / 'notification-health.json')
+
+
+def shutdown(manager):
+    persist_health(manager, {'supervision': 'unavailable', 'delivery': 'unverified', 'stopped_at': manager.notification_clock()})
+
+
+def component_unavailable(manager):
+    persist_health(manager, {'supervision': 'unavailable', 'delivery': 'unverified',
+        'checked_at': manager.notification_clock(), 'reason': 'supervision_component_unavailable'})

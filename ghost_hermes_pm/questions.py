@@ -295,6 +295,8 @@ def notify_human_requests(manager, identity, request_id):
         _, data = manager._load()
         record = manager._request(identity, request_id, data)
         for question in record.get('human_requests', []):
+            if question['category'] == 'nonblocking' and question['resolution'] == 'pending' and not question.get('reply'):
+                continue
             reply = question.get('reply') or {}
             state = [question['resolution'], reply.get('sent'), question['execution_result']]
             if question.get('notification_state') == state:

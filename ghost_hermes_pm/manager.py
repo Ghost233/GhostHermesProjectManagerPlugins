@@ -101,6 +101,7 @@ class Manager:
     def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, notification_clock=None):
         import time
         self.notification_clock = notification_clock or time.time
+        self._notification_generation = str(uuid.uuid4())
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
@@ -129,6 +130,8 @@ class Manager:
                 self._save(version, data)
 
     def close(self):
+        from .notifications import shutdown
+        shutdown(self)
         with self._lock:
             if self.codex_adapter is not None:
                 self.codex_adapter.close()
@@ -151,6 +154,8 @@ class Manager:
         if schema != 1:
             raise ManagementError('unknown_version', 'Directory schema requires a verified upgrade.')
         data = json.loads(payload)
+        from .notifications import reconcile as reconcile_notifications
+        reconcile_notifications(self, data)
         data.setdefault('requests', {})
         data.setdefault('clarifications', {})
         data.setdefault('intake_failures', {})
@@ -269,7 +274,7 @@ class Manager:
             from .archives import snapshot_archives
             return {**snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
-                    'notifications': notification_snapshot(data, {p['id'] for p in projects}),
+                    'notifications': notification_snapshot(self, data, {p['id'] for p in projects}),
                     'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
@@ -717,7 +722,7 @@ class Manager:
                     self._save(version, data)
                     return {**segment, 'kind': publication['kind'], 'chat_id': anchor['chat_id'],
                             'reply_to': anchor['message_id'], 'thread_id': anchor.get('thread_id'),
-                            'mention_open_id': record['source_anchor']['sender_open_id']}
+                            'mention_open_id': record['source_anchor']['sender_open_id'] if publication['kind'] == 'confirmation' else None}
             return None
 
     def retry_delivery(self, identity, request_id):
