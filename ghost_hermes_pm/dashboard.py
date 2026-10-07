@@ -40,6 +40,20 @@ class KnowledgeOperation(BaseModel):
     auto_supplement: bool = False
     material_ids: list[str] | None = None
 
+class ArchiveOperation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: str
+    registration: dict | None = None
+    source_id: str | None = None
+    query_id: str | None = None
+    question: str | None = None
+    scope_ids: list[str] | None = None
+    complete: bool = False
+    backup_id: str | None = None
+    restore_id: str | None = None
+    protection_id: str | None = None
+    kind: str = 'checkpoint'
+
 class ObservationOperation(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: str
@@ -73,6 +87,24 @@ def create_router(authenticated_client):
         client = authenticated_client(request)
         try:
             return client.apply_directory_change(body.expected_version, body.change)
+        except ManagementError as exc:
+            raise failure(exc) from exc
+
+    @router.post('/archives')
+    def archives(body: ArchiveOperation, request: Request):
+        client = authenticated_client(request)
+        try:
+            if body.action == 'register':
+                return client.register_archive_source(body.registration)
+            if body.action == 'query':
+                return client.query_archive(body.source_id, body.query_id, body.question, body.scope_ids, body.complete)
+            if body.action == 'protect':
+                return client.protect_archive(body.source_id, body.protection_id)
+            if body.action == 'backup':
+                return client.backup_archive(body.source_id, body.backup_id, body.kind)
+            if body.action == 'restore':
+                return client.restore_archive(body.backup_id, body.restore_id)
+            raise ManagementError('invalid_change', 'Select a registered archive query, explicit protection, checkpoint or data-only restore.')
         except ManagementError as exc:
             raise failure(exc) from exc
 

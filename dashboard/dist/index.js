@@ -338,6 +338,22 @@
               query.supplement && h('div', null, '原会话事实补充：' + query.supplement.status + ' · ' + (query.supplement.reason || '执行结果仍需核对')),
               h('details', null, h('summary', null, '公开查询与逐段凭据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(query.outbox || [], null, 2))));
           }))),
+        h('h2', null, '旧档案与数据检查点'),
+        h('p', null, '查询仅按登记迁移和共享范围读取。原入口保持停用；外部服务恢复能力须单独核验。'),
+        h('ul', null, (snapshot.archive_sources || []).map(function (source) {
+          return h('li', { key: source.id }, source.id + ' · ' + source.kind + ' · 迁移 Profile：' + source.new_profile_id,
+            h('details', null, h('summary', null, '授权与原生清理保护'), h('pre', null, JSON.stringify(source, null, 2))));
+        })),
+        h('ul', null, (snapshot.archive_queries || []).map(function (query) {
+          return h('li', { key: query.id }, query.id + ' · ' + query.source_id + ' · ' + query.status,
+            h('div', null, query.reason || ''),
+            h('pre', null, JSON.stringify(query.coverage || {}, null, 2)),
+            h('ul', null, (query.records || []).map(function (row) {
+              return h('li', { key: row.locator }, row.locator + ' · ' + row.timestamp + ' · ' + query.source_version, h('p', null, row.text));
+            })), h('details', null, h('summary', null, '原提问与逐段反馈凭据'), h('pre', null, JSON.stringify(query.outbox || [], null, 2))));
+        })),
+        h('details', null, h('summary', null, '每日副本、长期基线与恢复后查询'),
+          h('pre', null, JSON.stringify({ backups: snapshot.archive_backups || [], restores: snapshot.archive_restores || [] }, null, 2))),
         h('h2', null, '登记或修正'),
         h('p', null, '这里只保存非敏感引用；不创建原生 Profile、机器人、仓库或 worktree。项目身份不能改绑到新项目。'),
         h('form', { onSubmit: preview },

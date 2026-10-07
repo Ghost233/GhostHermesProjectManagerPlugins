@@ -152,6 +152,13 @@ class Manager:
                         segment['status'] = 'unknown'
                         if segment['attempts']:
                             segment['attempts'][-1]['status'] = 'unknown'
+        for query in data.get('archive_queries', {}).values():
+            for publication in query.get('outbox', []):
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
         from .observation import reconcile_connections
         reconcile_connections(self, data)
         for record in data['requests'].values():
@@ -403,13 +410,31 @@ class Manager:
         from .knowledge import receive_direct_query
         return receive_direct_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor)
 
+    def backup_archive(self, identity, source_id, backup_id, kind='checkpoint'):
+        from .archive_backups import backup
+        if kind not in {'baseline', 'checkpoint'}:
+            raise ManagementError('invalid_change', 'Public backup requests select baseline or checkpoint; daily dates belong to the native scheduler.')
+        return backup(self, identity, source_id, backup_id, kind)
+
+    def restore_archive(self, identity, backup_id, restore_id):
+        from .archive_backups import restore
+        return restore(self, identity, backup_id, restore_id)
+
+    def protect_archive(self, identity, source_id, protection_id):
+        from .archive_backups import protect
+        return protect(self, identity, source_id, protection_id)
+
+    def run_archive_daily(self, day=None):
+        from .archive_backups import daily
+        return daily(self, day)
+
     def register_archive_source(self, identity, registration):
         from .archives import register_source
         return register_source(self, identity, registration)
 
-    def query_archive(self, identity, source_id, query_id, question, scope_ids, complete=False):
+    def query_archive(self, identity, source_id, query_id, question, scope_ids, complete=False, channel_id=None, anchor=None):
         from .archives import query_archive
-        return query_archive(self, identity, source_id, query_id, question, scope_ids, complete)
+        return query_archive(self, identity, source_id, query_id, question, scope_ids, complete, channel_id, anchor)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',

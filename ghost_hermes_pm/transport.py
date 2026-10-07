@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'complete'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'complete', 'backup_id', 'restore_id', 'protection_id', 'kind'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -91,6 +91,12 @@ class ManagementServer:
                             result = bridge.manager.resolve_knowledge(identity, payload.get('query_id'))
                         elif payload.get('operation') == 'supplement_knowledge':
                             result = bridge.manager.supplement_knowledge(identity, payload.get('query_id'), payload.get('material_ids'))
+                        elif payload.get('operation') == 'backup_archive':
+                            result = bridge.manager.backup_archive(identity, payload.get('source_id'), payload.get('backup_id'), payload.get('kind', 'checkpoint'))
+                        elif payload.get('operation') == 'restore_archive':
+                            result = bridge.manager.restore_archive(identity, payload.get('backup_id'), payload.get('restore_id'))
+                        elif payload.get('operation') == 'protect_archive':
+                            result = bridge.manager.protect_archive(identity, payload.get('source_id'), payload.get('protection_id'))
                         elif payload.get('operation') == 'register_archive_source':
                             result = bridge.manager.register_archive_source(identity, payload.get('registration'))
                         elif payload.get('operation') == 'query_archive':
@@ -223,3 +229,12 @@ class ManagementClient:
 
     def query_archive(self, source_id, query_id, question, scope_ids, complete=False):
         return self._call('query_archive', source_id=source_id, query_id=query_id, question=question, scope_ids=scope_ids, complete=complete)
+
+    def backup_archive(self, source_id, backup_id, kind='checkpoint'):
+        return self._call('backup_archive', source_id=source_id, backup_id=backup_id, kind=kind)
+
+    def restore_archive(self, backup_id, restore_id):
+        return self._call('restore_archive', backup_id=backup_id, restore_id=restore_id)
+
+    def protect_archive(self, source_id, protection_id):
+        return self._call('protect_archive', source_id=source_id, protection_id=protection_id)
