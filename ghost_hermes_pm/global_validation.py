@@ -9,7 +9,6 @@ import uuid
 
 from .manager import ManagementError, _git, _repository
 from .queue import workspace
-from .codex import repository_fingerprint
 
 
 def _now():
@@ -151,6 +150,9 @@ def _save(manager, version, data, attempt):
 
 def _end(manager, identity, version, data, attempt, status, reason=None):
     attempt.update(status=status, reason=reason, whole_project_complete=False)
+    task = data['requests'][attempt['request_id']]
+    if task.get('global_validation_id') == attempt['id']:
+        task['whole_project_complete'] = False
     attempt.setdefault('occupancy', {})['released'] = True
     attempt['occupancy']['released_at'] = _now()
     _save(manager, version, data, attempt)
@@ -240,6 +242,98 @@ def _prepare(manager, identity, details, version, data, attempt):
         raise
 
 
+def _check(manager, identity, version, data, attempt):
+    if attempt['status'] not in {'passed', 'complete'}:
+        return attempt
+    try:
+        current = _inputs(attempt, data)
+        unchanged = _digest(current) == attempt['input_digest']
+    except (ManagementError, OSError):
+        unchanged = False
+    if not unchanged:
+        return _end(manager, identity, version, data, attempt, 'invalidated', 'Previously validated inputs changed; a new stable combination must be tested.')
+    return attempt
+
+
+def _rework(manager, identity, details, version, data, attempt):
+    from .manager import _public_text
+    from .collaboration import _new_handoff
+    if attempt['status'] != 'failed' or set(details) != {'validation_id', 'target', 'issue_url'}:
+        raise ManagementError('invalid_change', 'Return one failed-round defect using its exact target and a concrete repair Issue.')
+    target = details['target']
+    defects = [d for d in attempt.get('defects', []) if isinstance(d, dict) and d.get('target') == target and set(d.get('test_ids', [])) <= set(attempt['test_ids']) and d.get('description')]
+    if not defects:
+        raise ManagementError('evidence_missing', 'This target has no defect evidence in the original failed tests.')
+    if not isinstance(details['issue_url'], str) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', details['issue_url']):
+        raise ManagementError('invalid_change', 'A concrete GitHub repair Issue is required; the manager never creates unapproved network work.')
+    existing = next((r for r in attempt['rework'] if r['target'] == target and r['issue']['url'] == details['issue_url']), None)
+    if existing:
+        return attempt
+    reader = getattr(manager.delivery_source, 'read_issue', None)
+    issue = reader(details['issue_url']) if callable(reader) else None
+    if not isinstance(issue, dict) or issue.get('url') != details['issue_url'] or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
+        raise ManagementError('evidence_missing', 'Repair Issue scope and current locator require the trusted Ghost233 source.')
+    _public_text(issue['title'] + '\n' + issue['body'], manager._sensitive_values())
+    repair = {'target': target, 'issue': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')}, 'defects': defects,
+              'validation_id': attempt['id'], 'status': 'awaiting_repair', 'created_at': _now()}
+    task = data['requests'][attempt['request_id']]
+    child = next((c for c in attempt['children'] if c['path'] == target), None)
+    if target in {'environment', 'permission', 'version_preparation'}:
+        repair.update(route='blocked', profile_id=None, status='blocked')
+    elif target == 'mono':
+        repair.update(route='mono_self', profile_id=attempt['profile_id'], request_id=attempt['request_id'])
+    elif child:
+        profile = data['profiles'].get(child['profile_id'], {})
+        if profile.get('parent_profile_id') != attempt['profile_id'] or profile.get('project_id') != child['project_id']:
+            raise ManagementError('binding_conflict', 'The child responsibility changed; repair requires reconciliation.')
+        actor = task.get('accepted_actor', {})
+        origin = task.get('actor_provenance', {}).get('owner_origin')
+        if origin is None and actor.get('subject') == manager.owner_identity_ref:
+            origin = {**actor, 'source_anchor': task['source_anchor']}
+        if not origin:
+            raise ManagementError('evidence_missing', 'Original Owner authorization provenance is unavailable.')
+        try:
+            handoff = _new_handoff(manager, data, data['profiles'][attempt['profile_id']], profile, issue['url'], origin,
+                                   task['task_start_anchor'] or task['source_anchor'], task.get('actor_provenance', {}).get('delegation_id') or attempt['request_id'])
+            handoff.update(rework_validation_id=attempt['id'], rework_child_request_id=child['request_id'])
+            repair.update(route='child', profile_id=child['profile_id'], handoff_id=handoff['id'])
+        except ManagementError as exc:
+            repair.update(route='child', profile_id=child['profile_id'], status='blocked', reason=str(exc))
+    else:
+        repair.update(route='owner_decision', profile_id=None, status='needs_owner')
+    attempt['rework'].append(repair)
+    _save(manager, version, data, attempt)
+    manager.publish_request_message(identity, attempt['request_id'], 'material', '全局验证返工：' + target +
+        '\n明确 Issue：' + issue['url'] + ' @ ' + issue['updated_at'] + '\n责任：' + str(repair['profile_id']) +
+        '\n处理：' + repair['route'] + '\n原验证：' + attempt['id'] + '\n本轮占用已释放；修复后提交固定交付并新建重验。')
+    return attempt
+
+
+def _complete(manager, identity, version, data, attempt):
+    attempt = _check(manager, identity, version, data, attempt)
+    task = data['requests'][attempt['request_id']]
+    if attempt['status'] not in {'passed', 'complete'} or task.get('task_delivery') != 'delivered' or task.get('delivery_evidence', {}).get('source_commit') != attempt['mono_commit']:
+        raise ManagementError('evidence_missing', 'Original mono acceptance and this current stable combination global tests must both be complete.')
+    pending_repairs = [r for a in data.get('global_validations', {}).values() if a['request_id'] == attempt['request_id'] and a['id'] != attempt['id'] for r in a.get('rework', []) if r['status'] not in {'resolved'}]
+    for repair in pending_repairs:
+        handoff = data.get('collaboration', {}).get('handoffs', {}).get(repair.get('handoff_id'), {})
+        child_task = data['requests'].get(handoff.get('task_request_id'), {})
+        fixed = next((c for c in attempt['children'] if c['path'] == repair['target'] and c['request_id'] == child_task.get('id')), None)
+        if repair['route'] == 'mono_self':
+            repair['status'] = 'resolved'
+        elif fixed and child_task.get('task_delivery') == 'delivered':
+            repair.update(status='resolved', repaired_request_id=child_task['id'], revalidated_by=attempt['id'])
+        else:
+            raise ManagementError('evidence_missing', 'An earlier concrete repair Issue still lacks its fixed delivery in this revalidation combination.')
+    attempt.update(status='complete', whole_project_complete=True, completed_at=_now())
+    task.update(global_validation_id=attempt['id'], whole_project_complete=True)
+    _save(manager, version, data, attempt)
+    manager.publish_request_message(identity, attempt['request_id'], 'result', '项目任务全局验证完成。\n验证：' + attempt['id'] +
+        '\n父版本：' + attempt['mono_commit'] + '\n固定子交付：' + json.dumps([{k: c[k] for k in ('request_id', 'path', 'commit')} for c in attempt['children']], ensure_ascii=False) +
+        '\n验证范围：' + attempt['boundary_scope'] + '\n测试输出摘要：' + json.dumps(attempt['tests'], ensure_ascii=False))
+    return attempt
+
+
 def perform(manager, identity, action, details):
     if not isinstance(details, dict):
         raise ManagementError('invalid_change', 'A bounded global validation operation is required.')
@@ -247,12 +341,18 @@ def perform(manager, identity, action, details):
         version, data = manager._load()
         if action == 'plan':
             return _plan(manager, identity, details, version, data)
-        if action != 'prepare' and set(details) != {'validation_id'}:
+        if action not in {'prepare', 'rework'} and set(details) != {'validation_id'}:
             raise ManagementError('invalid_change', 'Operate on one fixed validation attempt.')
         attempt = data.get('global_validations', {}).get(details['validation_id'])
         if not attempt:
             raise ManagementError('invalid_change', 'Unknown global validation attempt.')
         _task(manager, identity, attempt['request_id'], data)
+        if action == 'check':
+            return _check(manager, identity, version, data, attempt)
+        if action == 'complete':
+            return _complete(manager, identity, version, data, attempt)
+        if action == 'rework':
+            return _rework(manager, identity, details, version, data, attempt)
         if action == 'prepare':
             return _prepare(manager, identity, details, version, data, attempt)
         if action == 'finish':

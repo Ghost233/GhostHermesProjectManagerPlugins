@@ -68,6 +68,7 @@ class FixtureHost:
     """Trusted substitute: executes real tests; its enforcement is explicitly synthetic."""
     def __init__(self):
         self.runs = {}
+        self.expected = 'baseline\n'
 
     def verify_boundary(self, context):
         return {'validation_id': context['id'], 'input_digest': context['input_digest'], 'source_access': 'read-only',
@@ -78,7 +79,7 @@ class FixtureHost:
     def start(self, context):
         import hashlib
         import sys
-        result = subprocess.run([sys.executable, '-c', 'from pathlib import Path; assert Path("child/source.py").read_text() == "baseline\\n"; print("1 test passed")'], cwd=context['repository']['worktree'], capture_output=True)
+        result = subprocess.run([sys.executable, '-c', 'from pathlib import Path; import sys; assert Path("child/source.py").read_text() == sys.argv[1]; print("1 test passed")', self.expected], cwd=context['repository']['worktree'], capture_output=True)
         run_id = 'run-' + context['id']
         self.runs[run_id] = {'run_id': run_id, 'validation_id': context['id'], 'input_digest': context['input_digest'], 'status': 'ended',
             'related_execution': 'ended', 'tests': [{'id': 'unit', 'argv': ['python', '-m', 'unittest'], 'cwd': context['repository']['worktree'],
@@ -179,3 +180,63 @@ def test_preparation_preserves_user_changes_and_never_calls_materializer_when_di
         assert (child / 'source.py').read_text() == 'owner uncommitted work\n'
         ended = manager.read_snapshot(OWNER)['global_validations'][0]
         assert ended['status'] == 'blocked' and ended['occupancy']['released'] is True
+
+
+class IssueReadSource:
+    def read_issue(self, url):
+        return {**ISSUE, 'url': url, 'title': 'Repair integration contract', 'body': '- [ ] Child supports mono integration'}
+
+
+class FailedHost(FixtureHost):
+    def __init__(self):
+        super().__init__()
+        self.expected = 'repaired integration\n'
+
+    def start(self, context):
+        run = super().start(context)
+        self.runs[run['run_id']]['defects'] = [{'target': 'child', 'description': 'Child supports mono integration', 'test_ids': ['unit']}]
+        return run
+
+
+def test_failed_child_has_an_explicit_verified_issue_and_a_public_rework_handoff(tmp_path):
+    from test_collaboration import channel
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=FailedHost(), delivery_source=IssueReadSource()) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        lead_channel, kid_channel = channel('mono-lead'), channel('child-lead')
+        lead_channel['bot_sources'] = []
+        kid_channel['bot_sources'] = []
+        lead_channel['bot_sources'].append({'profile_id': 'child-lead', 'open_id': 'child-seen-lead', 'tenant_key': 'child-tenant', 'native_ids': ['child-native']})
+        kid_channel['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-child', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-native']})
+        manager.collaborate(OWNER, 'register_channels', {'channels': [lead_channel, kid_channel]})
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        assert manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})['status'] == 'failed'
+        returned = manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})
+        assert returned['rework'][0]['route'] == 'child' and returned['rework'][0]['profile_id'] == 'child-lead'
+        assert returned['rework'][0]['issue']['url'].endswith('/issues/28')
+        handoff = returned['rework'][0]['handoff_id']
+        packet = manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': handoff})
+        assert packet['mention_open_id'] == 'child-seen-lead' and '/issues/28' in packet['text']
+        assert returned['occupancy']['released'] is True
+        assert manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})['rework'] == returned['rework']
+
+
+def test_final_completion_requires_original_mono_acceptance_and_fresh_stable_validation(tmp_path):
+    host = FixtureHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
+        manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
+        manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
+        with pytest.raises(ManagementError) as own_unmet:
+            manager.global_validation(LEAD, 'complete', {'validation_id': plan['id']})
+        assert own_unmet.value.code == 'evidence_missing'
+        task = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == parent)
+        session = task['session']
+        (tmp_path / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'}, 'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'OK'}]}]}}))
+        manager.record_task_delivery(LEAD, parent, {'source_commit': git(mono, 'rev-parse', 'HEAD'), 'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['mono-test']}]})
+        completed = manager.global_validation(LEAD, 'complete', {'validation_id': plan['id']})
+        assert completed['whole_project_complete'] is True and completed['status'] == 'complete'
+        (child / 'source.py').write_text('late manual input\n')
+        invalid = manager.global_validation(LEAD, 'check', {'validation_id': plan['id']})
+        assert invalid['whole_project_complete'] is False and invalid['status'] == 'invalidated'

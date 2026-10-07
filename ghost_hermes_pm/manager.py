@@ -272,6 +272,7 @@ class Manager:
                       'accepted_responsibility': {k: profile.get(k) for k in ('id', 'identity_ref', 'project_id', 'capability', 'role', 'parent_profile_id')},
                       'accepted_codex_ref': profile.get('connection_refs', {}).get('codex'),
                       'accepted_repository_fingerprint': hashlib.sha256(json.dumps(data['projects'][project_id]['repo'], sort_keys=True).encode()).hexdigest(),
+                      'accepted_actor': {'subject': identity.subject, 'source': identity.source},
                       'acceptance': 'accepted', 'accepted_at': datetime.now(timezone.utc).isoformat(),
                       'execution': 'waiting', 'unexecuted_reason': 'Codex execution is not enabled.',
                       'delivery': 'pending', 'messages': [], 'outbox': []}
