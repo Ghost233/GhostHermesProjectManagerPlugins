@@ -271,7 +271,8 @@ def perform(manager, identity, action, details):
                 raise ManagementError('forbidden', 'Only an assigned role reports its original Issue delivery.')
             if 'request_id' in details:
                 task = data['requests'].get(details['request_id'])
-                if principal['role'] != 'subproject_lead' or not task or task.get('actor_provenance', {}).get('owner_origin', {}).get('subject') != manager.owner_identity_ref or any(task['accepted_responsibility'].get(k) != principal.get(k) for k in task['accepted_responsibility']):
+                provenance = (task or {}).get('actor_provenance', {})
+                if principal['role'] != 'subproject_lead' or not task or provenance.get('actor', {}).get('subject') != manager.owner_identity_ref or provenance.get('new_owner_decision') is not True or provenance.get('owner_origin', {}).get('subject') != manager.owner_identity_ref or any(task['accepted_responsibility'].get(k) != principal.get(k) for k in task['accepted_responsibility']):
                     raise ManagementError('forbidden', 'Direct child results require the original Owner request and unchanged responsible binding.')
                 direct = state['handoffs'].get(task.get('parent_sync_handoff_id'), {})
                 original = {'id': task['id'], 'received_anchor': task['source_anchor'], 'owner_origin': task['actor_provenance']['owner_origin'],

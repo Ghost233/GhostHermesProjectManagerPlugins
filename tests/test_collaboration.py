@@ -258,6 +258,8 @@ def test_child_result_uses_original_issue_delivery_and_parent_only_reports_pendi
         (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full',
             'items': [{'type': 'commandExecution', 'id': 'pytest-child', 'command': 'python -m pytest tests/test_fixture.py -q', 'cwd': str(tmp_path / 'child'), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed'}]}]}))
         manager.record_task_delivery(CHILD, task_id, {'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['pytest-child']}], 'source_commit': None, 'pr_url': None, 'sync_branches': []})
+        with pytest.raises(Exception):
+            manager.collaborate(CHILD, 'report_result', {'request_id': task_id})
         result = manager.collaborate(CHILD, 'report_result', {'handoff_id': h['id']})
         assert result['kind'] == 'result' and result['sender_profile_id'] == 'child' and result['target_profile_id'] == 'mono-lead'
         packet = manager.collaborate(CHILD, 'claim_delivery', {'handoff_id': result['id']})
