@@ -196,6 +196,8 @@ class FeishuEntry:
             self.manager().publish_request_message(identity, record['id'], 'material', '已受理范围：\n' + scope['body'])
             self.require_active(generation)
             await self.deliver(identity, record['id'], transport, generation)
+            if record.get('parent_sync_handoff_id') and self.collaboration_entry:
+                await self.collaboration_entry.deliver(record['parent_sync_handoff_id'], generation)
             return {'action': 'skip'}
 
     async def receive(self, event, gateway):

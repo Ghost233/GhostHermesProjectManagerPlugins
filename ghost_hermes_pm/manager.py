@@ -277,6 +277,9 @@ class Manager:
             data['requests'][key] = record
             from .queue import enroll
             enroll(data, record, data['projects'][project_id]['repo'])
+            if delegation_id is None:
+                from .collaboration import synchronize_direct_request
+                synchronize_direct_request(self, identity, data, record, profile)
             self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
             return {'status': 'accepted', 'duplicate': False, 'request': record}
 

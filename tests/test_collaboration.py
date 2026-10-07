@@ -270,3 +270,47 @@ def test_child_result_uses_original_issue_delivery_and_parent_only_reports_pendi
         assert received['acceptance'] == 'accepted' and len(manager.read_snapshot(OWNER)['requests']) == before
         parent = next(x for x in manager.read_snapshot(OWNER)['collaboration']['handoffs'] if x['id'] == parent_id)
         assert parent['integration_status'] == 'awaiting_integration' and parent['whole_project_complete'] is False
+        summary = manager.collaborate(LEAD, 'report_summary', {'handoff_id': parent_id})
+        assert summary['kind'] == 'summary' and summary['target_profile_id'] == 'steward'
+        summary_packet = manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': summary['id']})
+        assert summary_packet['mention_open_id'] == 'steward-seen-mono-lead'
+        assert '待集成' in summary_packet['text'] and h['issue']['url'] in summary_packet['text']
+        manager.collaborate(LEAD, 'record_delivery', {'handoff_id': summary['id'], 'uuid': summary_packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_lead_summary', 'chat_id': 'oc_project'}})
+        steward_channel = next(c for c in channels if c['profile_id'] == 'steward' and c['group_kind'] == 'project')
+        steward_source = source(steward_channel, 'bot', 'om_lead_summary')
+        steward_source.update(tenant_key='lead-tenant', sender_open_id='lead-seen-steward')
+        steward_ingress = VerifiedIdentity(STEWARD.subject, 'native-collaboration-ingress')
+        received_summary = manager.collaborate(steward_ingress, 'ingest', {'channel_id': steward_channel['id'], 'source_anchor': steward_source, 'text': summary_packet['text']})
+        owner_summary = manager.collaborate(STEWARD, 'publish_owner_summary', {'handoff_id': received_summary['id']})
+        packet = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': owner_summary['id']})
+        assert packet['path'] == 'reply' and packet['reply_to'] == 'om_owner_goal'
+        assert packet['chat_id'] == 'oc_entry' and packet['mention_open_id'] == 'owner-steward'
+        assert '全局验证' in packet['text'] and owner_summary['whole_project_complete'] is False
+        manager.collaborate(STEWARD, 'record_delivery', {'handoff_id': owner_summary['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_owner_summary', 'chat_id': 'oc_entry'}})
+        assert manager.collaborate(STEWARD, 'publish_owner_summary', {'handoff_id': received_summary['id']})['duplicate']
+        assert len(manager.read_snapshot(OWNER)['requests']) == before
+
+
+def test_owner_direct_child_issue_replies_to_owner_and_publicly_synchronizes_parent(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        parent_id, child = accepted_parent(manager, tmp_path)
+        direct = source(child, message_id='om_direct_child')
+        task = manager.accept_request(OWNER, 'child-project', 'child', direct, ISSUE)['request']
+        manager.publish_request_message(OWNER, task['id'], 'confirmation', '已受理本人明确子 Issue')
+        answer = manager.claim_delivery(OWNER, task['id'])
+        assert answer['reply_to'] == 'om_direct_child' and answer['mention_open_id'] == child['owner_open_id']
+        sync = next(h for h in manager.read_snapshot(OWNER)['collaboration']['handoffs'] if h.get('direct_task_id') == task['id'])
+        assert sync['kind'] == 'progress' and sync['target_profile_id'] == 'mono-lead'
+        assert sync['parent_handoff_id'] == parent_id and sync['owner_origin']['subject'] == OWNER.subject
+        assert task['actor_provenance']['actor']['subject'] == OWNER.subject
+        packet = manager.collaborate(CHILD, 'claim_delivery', {'handoff_id': sync['id']})
+        assert packet['mention_open_id'] == 'lead-seen-child'
+        manager.collaborate(CHILD, 'record_delivery', {'handoff_id': sync['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_direct_sync', 'chat_id': 'oc_project'}})
+        lead_channel = next(c for c in manager.read_snapshot(OWNER)['collaboration']['channels'] if c['profile_id'] == 'mono-lead')
+        observed = source(lead_channel, 'bot', 'om_direct_sync')
+        observed.update(tenant_key='child-tenant', sender_open_id='child-seen-lead')
+        before = len(manager.read_snapshot(OWNER)['requests'])
+        result = manager.collaborate(INGRESS, 'ingest', {'channel_id': lead_channel['id'], 'source_anchor': observed, 'text': packet['text']})
+        assert result['acceptance'] == 'accepted' and len(manager.read_snapshot(OWNER)['requests']) == before
+        assert manager.accept_request(OWNER, 'child-project', 'child', direct, ISSUE)['duplicate']
+        assert len([h for h in manager.read_snapshot(OWNER)['collaboration']['handoffs'] if h.get('direct_task_id') == task['id']]) == 1
