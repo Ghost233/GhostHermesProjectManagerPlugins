@@ -8,6 +8,9 @@ from .codex import repository_fingerprint
 
 
 KINDS = ('platform_enforcement', 'tool_paths', 'task_start', 'manual_execution_coverage')
+CONTROL_METHODS = {'thread/read', 'turn/steer', 'turn/start', 'turn/interrupt', 'thread/backgroundTerminals/list', 'thread/loaded/list'}
+CONTROL_CHECKS = {'active_append', 'idle_input', 'interrupt', 'stop_verification', 'explicit_continue', 'wrong_turn',
+                  'duplicate_instruction', 'disconnect', 'background_pagination', 'related_children', 'exclusive_input'}
 ALLOWED = {'mono_source_write', 'mono_git_index', 'mono_git_commit', 'mono_gitlink', 'test_artifact_write'}
 DENIED = {'child_source_write', 'child_git_write', 'child_root_rename', 'ancestor_rename', 'atomic_replace',
           'symlink_alias', 'preexisting_hardlink_alias', 'new_hardlink_alias', 'unregistered_path_write',
@@ -18,7 +21,7 @@ TOOLS = {'model_files', 'shell_git', 'test_process', 'code_mode', 'local_mcp', '
 
 def validate_receipts(report, connection, repository, command, env, state_dir):
     receipts = report.get('receipts') if isinstance(report, dict) else None
-    if not isinstance(receipts, dict) or set(receipts) != set(KINDS):
+    if not isinstance(receipts, dict) or set(receipts) not in (set(KINDS), set(KINDS) | {'task_control'}):
         raise ManagementError('capability_unverified', 'Hashed current-service enforcement, tool, startup and executor-coverage receipts are required.')
     binary_digest = hashlib.sha256(Path(command[0]).read_bytes()).hexdigest()
     configuration_digest = hashlib.sha256(json.dumps({'command': command, 'environment': env}, sort_keys=True).encode()).hexdigest()
@@ -27,7 +30,8 @@ def validate_receipts(report, connection, repository, command, env, state_dir):
                 'platform': connection['platform'], 'binary_sha256': binary_digest, 'configuration_sha256': configuration_digest}
     verified = {}
     evidence_root = (Path(state_dir) / 'validation-evidence').resolve()
-    for kind in KINDS:
+    control = None
+    for kind in (*KINDS, *(['task_control'] if 'task_control' in receipts else [])):
         reference = receipts[kind]
         if not isinstance(reference, dict) or set(reference) != {'path', 'sha256'}:
             raise ManagementError('capability_unverified', 'Each validation receipt needs a fixed local digest.')
@@ -58,13 +62,29 @@ def validate_receipts(report, connection, repository, command, env, state_dir):
         elif kind == 'task_start':
             if receipt.get('actual_methods') != ['initialize', 'initialized', 'permissionProfile/list', 'thread/start', 'turn/start', 'thread/read'] or receipt.get('runtime_roots') != report.get('runtime_roots') or receipt.get('permission_profile') != report.get('permission_profile') or not receipt.get('thread_id') or not receipt.get('turn_id'):
                 raise ManagementError('capability_unverified', 'Actual controlled task-start receipts are incomplete.')
+        elif kind == 'task_control':
+            methods, checks = receipt.get('actual_methods'), receipt.get('checks')
+            if not isinstance(methods, list) or any(not isinstance(m, str) for m in methods) or set(methods) != CONTROL_METHODS or not isinstance(checks, dict) or set(checks) != CONTROL_CHECKS or any(v != 'PASS' for v in checks.values()) or not receipt.get('thread_id') or not receipt.get('turn_id') or not receipt.get('new_turn_id') or receipt['turn_id'] == receipt['new_turn_id']:
+                raise ManagementError('capability_unverified', 'Actual task control, exclusive idle input and related-execution coverage are incomplete.')
+            control = receipt
         elif receipt.get('registered_executors_complete') is not True or receipt.get('competing_execution') != 'none':
             raise ManagementError('capability_unverified', 'Other execution in this logical repository cannot be excluded.')
         verified[kind] = reference['sha256']
     # Persist only necessary provenance; no full configuration or raw test outputs.
-    return {k: report[k] for k in ('generation', 'service_id', 'repository_fingerprint', 'permission_profile',
+    result = {k: report[k] for k in ('generation', 'service_id', 'repository_fingerprint', 'permission_profile',
                                    'runtime_roots', 'policy_digest', 'model')} | {
         'platform_enforcement': 'receipt:' + verified['platform_enforcement'],
         'tool_paths': 'receipt:' + verified['tool_paths'], 'task_start': 'receipt:' + verified['task_start'],
         'manual_execution_coverage': 'receipt:' + verified['manual_execution_coverage'],
         'binary_sha256': binary_digest, 'configuration_sha256': configuration_digest}
+
+    if control is not None:
+        digest = 'receipt:' + verified['task_control']
+        result['task_control'] = {action: digest for action in ('append', 'stop', 'continue', 'related_execution', 'idle_input')}
+        if control.get('unregistered_process_paths') == 'disabled_and_verified':
+            result['process_coverage'] = {'kind': 'no_unregistered_process_paths', 'evidence': digest}
+        elif isinstance(control.get('process_coverage'), dict):
+            coverage = control['process_coverage']
+            if coverage.get('kind') == 'task_processes_stopped' and coverage.get('thread_id') == control['thread_id'] and coverage.get('turn_id') == control['turn_id'] and coverage.get('all_registered_processes_exited') is True:
+                result['process_coverage'] = {**coverage, 'evidence': digest}
+    return result

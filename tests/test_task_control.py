@@ -1,5 +1,6 @@
 """Task controls through the public bridge and synthetic JSONL subprocess peer."""
 import json
+import pytest
 
 from ghost_hermes_pm import Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
@@ -248,3 +249,237 @@ def test_unknown_append_is_not_replayed_with_same_or_new_instruction_id(tmp_path
             assert second.value.code == 'binding_conflict'
             assert client.read_snapshot()['requests'][0]['repository_released'] is False
         assert len([r for r in wire(tmp_path) if r['method'] == 'turn/steer']) == 1
+
+
+@pytest.mark.parametrize('case', ['wrong_expected', 'changed_active_turn', 'unverified_idle_input', 'other_profile'])
+def test_mismatched_or_unauthorized_append_never_sends_input(tmp_path, case):
+    from ghost_hermes_pm import ManagementError, VerifiedIdentity
+    from test_directory import registration
+    proof = {'task_control': {'append': 'synthetic-peer-only'}} if case == 'unverified_idle_input' else None
+    adapter = adapter_for(tmp_path, control_proof=proof)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        identity = OWNER
+        if case == 'other_profile':
+            change = registration(make_repo(tmp_path / 'other'), 'other', 'other-lead')
+            change['profile']['identity_ref'] = 'fixture:other'
+            manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], change)
+            identity = VerifiedIdentity('fixture:other', 'fixture-authenticated-participant')
+        manager.start_task(OWNER, request_id)
+        if case == 'changed_active_turn':
+            (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'active', 'activeFlags': []},
+                'turns': [{'id': 'other-turn', 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}))
+        if case == 'unverified_idle_input':
+            terminal_state(tmp_path)
+        with ManagementServer(manager, {'fixture-entry': identity}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            with pytest.raises(ManagementError):
+                client.control_task(request_id, 'append', 'denied', text='Add a check.', expected_turn_id='wrong-turn' if case == 'wrong_expected' else TURN)
+        assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+        assert not any(r['method'] == 'turn/steer' for r in wire(tmp_path))
+
+
+@pytest.mark.parametrize('pages', [{'': {'data': []}}, {'': {'data': [], 'nextCursor': 'loop'}, 'loop': {'data': [], 'nextCursor': 'loop'}},
+    {'': {'data': None, 'nextCursor': None}}])
+def test_incomplete_background_coverage_keeps_stop_and_occupancy(tmp_path, pages):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            client.control_task(request_id, 'stop', 'stop-1', expected_turn_id=TURN)
+            terminal_state(tmp_path)
+            (tmp_path / 'background.json').write_text(json.dumps(pages))
+            pending = client.refresh_task(request_id)
+            assert pending['execution'] == 'stopping'
+            assert pending['repository_released'] is False
+            assert pending['stop']['reason']
+
+
+def test_directory_correction_does_not_broaden_old_control_or_erase_occupancy(tmp_path):
+    from ghost_hermes_pm import ManagementError, VerifiedIdentity
+    from test_directory import registration
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        original = make_repo(tmp_path / 'repo')
+        corrected = make_repo(tmp_path / 'corrected')
+        request_id = accepted(manager, original)
+        manager.start_task(OWNER, request_id)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'project': registration(corrected)['project']})
+        with ManagementServer(manager, {'fixture-owner': OWNER, 'fixture-lead': VerifiedIdentity('fixture:lead', 'fixture-authenticated-participant')}):
+            lead = ManagementClient(tmp_path / 'state', 'fixture-lead')
+            with pytest.raises(ManagementError):
+                lead.control_task(request_id, 'append', 'new-directory-control', text='Change the new repository.', expected_turn_id=TURN)
+            owner = ManagementClient(tmp_path / 'state', 'fixture-owner')
+            stopping = owner.control_task(request_id, 'stop', 'original-stop', expected_turn_id=TURN)
+            assert stopping['execution'] == 'stopping'
+            record = owner.read_snapshot()['requests'][0]
+            assert record['session']['repository']['worktree'] == str(original)
+            assert record['repository_released'] is False
+
+
+def write_host_receipts(root, config, connection, repository, include_control=False):
+    """Artificial host receipts test integrity parsing, never actual service acceptance."""
+    import hashlib
+    from pathlib import Path
+    from ghost_hermes_pm.codex import repository_fingerprint
+    evidence = root / 'state' / 'validation-evidence'
+    evidence.mkdir(exist_ok=True)
+    report = {'generation': connection['generation'], 'service_id': connection['service_id'],
+        'repository_fingerprint': repository_fingerprint(repository), 'policy_digest': 'synthetic-fixed-policy',
+        'permission_profile': 'fixture-boundary', 'runtime_roots': [repository['worktree']], 'model': 'fixture-model', 'receipts': {}}
+    binding = {k: report[k] for k in ('generation', 'service_id', 'repository_fingerprint', 'policy_digest')}
+    binding.update(platform=connection['platform'], binary_sha256=hashlib.sha256(Path(config['command'][0]).read_bytes()).hexdigest(),
+        configuration_sha256=hashlib.sha256(json.dumps({'command': config['command'], 'environment': config['environment']}, sort_keys=True).encode()).hexdigest())
+    allowed = ['mono_source_write', 'mono_git_index', 'mono_git_commit', 'mono_gitlink', 'test_artifact_write']
+    denied = ['child_source_write', 'child_git_write', 'child_root_rename', 'ancestor_rename', 'atomic_replace', 'symlink_alias',
+        'preexisting_hardlink_alias', 'new_hardlink_alias', 'unregistered_path_write', 'test_source_write', 'test_git_write', 'descendant_process_escape']
+    documents = {
+        'platform_enforcement': {'checks': [{'operation': name, 'outcome': 'allowed'} for name in allowed] +
+            [{'operation': name, 'outcome': 'denied', 'before_sha256': 'fixture-preserved', 'after_sha256': 'fixture-preserved'} for name in denied]},
+        'tool_paths': {'paths': {name: 'enforced' for name in ['model_files', 'shell_git', 'test_process', 'code_mode', 'local_mcp', 'dynamic_tools', 'filesystem_rpc', 'process_spawn', 'thread_shell']}},
+        'task_start': {'actual_methods': ['initialize', 'initialized', 'permissionProfile/list', 'thread/start', 'turn/start', 'thread/read'],
+            'runtime_roots': report['runtime_roots'], 'permission_profile': 'fixture-boundary', 'thread_id': THREAD, 'turn_id': TURN},
+        'manual_execution_coverage': {'registered_executors_complete': True, 'competing_execution': 'none'}}
+    if include_control:
+        documents['task_control'] = {'actual_methods': ['thread/read', 'turn/steer', 'turn/start', 'turn/interrupt', 'thread/backgroundTerminals/list', 'thread/loaded/list'],
+            'checks': {name: 'PASS' for name in ['active_append', 'idle_input', 'interrupt', 'stop_verification', 'explicit_continue', 'wrong_turn', 'duplicate_instruction', 'disconnect', 'background_pagination', 'related_children', 'exclusive_input']},
+            'thread_id': THREAD, 'turn_id': TURN, 'new_turn_id': '00000000-0000-7000-8000-000000000018',
+            'unregistered_process_paths': 'disabled_and_verified'}
+    for kind, document in documents.items():
+        raw = json.dumps({'kind': kind, 'result': 'PASS', **binding, **document}).encode()
+        path = evidence / (kind + '.json')
+        path.write_bytes(raw)
+        report['receipts'][kind] = {'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
+    (root / 'state' / 'codex-validation.json').write_text(json.dumps(report))
+
+
+def test_configured_controls_require_separate_hashed_host_receipt(tmp_path):
+    import sys
+    from pathlib import Path
+    from ghost_hermes_pm import ManagementError
+    from ghost_hermes_pm.codex import configured_adapter
+    config = {'command': [sys.executable, str(Path(__file__).with_name('codex_fixture_server.py')), str(tmp_path)],
+        'cwd': str(tmp_path), 'environment': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(tmp_path / 'codex-home')}, 'service_ref': 'local:fixture-stdio'}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=configured_adapter(config, tmp_path / 'state')) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            initial = client.verify_task_execution(request_id)
+            repository = client.read_snapshot()['projects'][0]['repo']
+            write_host_receipts(tmp_path, config, initial['connection'], repository)
+            client.start_task(request_id)
+            with pytest.raises(ManagementError):
+                client.control_task(request_id, 'append', 'before-control-receipt', text='Add a check.', expected_turn_id=TURN)
+            write_host_receipts(tmp_path, config, initial['connection'], repository, include_control=True)
+            assert client.control_task(request_id, 'append', 'after-control-receipt', text='Add a check.', expected_turn_id=TURN)['status'] == 'accepted'
+
+
+def test_active_turn_race_is_rejected_by_protocol_precondition_without_wrong_delivery(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            (tmp_path / 'behavior.json').write_text(json.dumps({'steer_active_turn': 'raced-turn'}))
+            with pytest.raises(ManagementError) as rejected:
+                client.control_task(request_id, 'append', 'racing-input', text='Add a check.', expected_turn_id=TURN)
+            assert rejected.value.code == 'service_rejected'
+            assert client.read_snapshot()['requests'][0]['controls'][0]['phase'] == 'rejected'
+        assert not (tmp_path / 'applied-inputs.jsonl').exists()
+        steer = next(r for r in wire(tmp_path) if r['method'] == 'turn/steer')
+        assert steer['params']['expectedTurnId'] == TURN
+
+
+def test_unsupported_background_method_cannot_confirm_stop(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            client.control_task(request_id, 'stop', 'stop-1', expected_turn_id=TURN)
+            terminal_state(tmp_path)
+            (tmp_path / 'behavior.json').write_text(json.dumps({'rpc_error': 'thread/backgroundTerminals/list'}))
+            result = client.refresh_task(request_id)
+            assert result['execution'] == 'stopping'
+            assert result['repository_released'] is False
+            assert 'rejected thread/backgroundTerminals/list' in result['stop']['reason']
+
+
+def test_continue_obeys_current_repository_occupancy_and_never_auto_restarts(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    from test_requests import MESSAGE, ISSUE
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            client.control_task(request_id, 'stop', 'stop-1', expected_turn_id=TURN)
+            terminal_state(tmp_path)
+            assert client.refresh_task(request_id)['execution'] == 'stopped'
+            before = len([r for r in wire(tmp_path) if r['method'] == 'turn/start'])
+            assert client.refresh_task(request_id)['execution'] == 'stopped'
+            assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == before
+            second = manager.accept_request(OWNER, 'mono', 'mono-lead', {**MESSAGE, 'message_id': 'om_next'}, ISSUE)['request']['id']
+            manager.publish_request_message(OWNER, second, 'confirmation', '已受理后续任务')
+            segment = manager.claim_delivery(OWNER, second)
+            manager.record_delivery(OWNER, second, segment['uuid'], {'status': 'delivered', 'chat_id': 'oc_project', 'message_id': 'om_next_ack'})
+            client.start_task(second)
+            with pytest.raises(ManagementError) as busy:
+                client.control_task(request_id, 'continue', 'continue-busy', text='Continue the original work.', expected_turn_id=TURN)
+            assert busy.value.code == 'repository_busy'
+            original = next(r for r in client.read_snapshot()['requests'] if r['id'] == request_id)
+            assert original['stop_records'][0]['status'] == 'confirmed'
+            assert original.get('execution_arrangements', []) == []
+
+
+def test_idle_status_does_not_hide_an_unfinished_other_turn_in_original_thread(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            client.control_task(request_id, 'stop', 'stop-1', expected_turn_id=TURN)
+            (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [
+                {'id': TURN, 'status': 'interrupted', 'itemsView': 'full', 'items': []},
+                {'id': 'raced-other-turn', 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}))
+            result = client.refresh_task(request_id)
+            assert result['execution'] == 'stopping'
+            assert result['repository_released'] is False
+
+
+def test_idle_input_rejects_an_unregistered_intervening_turn(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [
+                {'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': []},
+                {'id': 'foreign-completed-turn', 'status': 'completed', 'itemsView': 'full', 'items': []}]}))
+            with pytest.raises(ManagementError) as mismatched:
+                client.control_task(request_id, 'append', 'idle-stale', text='Add a check.', expected_turn_id=TURN)
+            assert mismatched.value.code == 'binding_conflict'
+        assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+
+
+def test_delivered_task_cannot_reuse_expired_control_after_releasing_repository(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    from test_requests import ISSUE
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+        repo = make_repo(tmp_path / 'repo')
+        request_id = accepted(manager, repo)
+        with ManagementServer(manager, {'fixture-entry': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'fixture-entry')
+            client.start_task(request_id)
+            (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [
+                {'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': [{'type': 'commandExecution', 'id': 'pytest-final',
+                    'command': 'python -m pytest tests/test_fixture.py -q', 'cwd': str(repo), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed'}]}]}))
+            report = {'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['pytest-final']}],
+                'source_commit': None, 'pr_url': None, 'sync_branches': []}
+            assert client.record_task_delivery(request_id, report)['repository_released'] is True
+            with pytest.raises(ManagementError):
+                client.control_task(request_id, 'append', 'expired-control', text='Start more work.', expected_turn_id=TURN)
+        assert not any(r['method'] == 'turn/steer' for r in wire(tmp_path))
+        assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1

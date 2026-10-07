@@ -197,20 +197,22 @@ class CodexStdioAdapter:
             'input': [{'type': 'text', 'text': text, 'text_elements': []}], 'clientUserMessageId': instruction_id})
 
     @staticmethod
-    def verify_idle(thread, previous_turn_id):
+    def verify_idle(thread, previous_turn_id, known_turn_ids):
         turns = thread.get('turns', [])
         previous = next((t for t in turns if t.get('id') == previous_turn_id), None)
+        if any(t.get('id') not in known_turn_ids for t in turns):
+            raise ManagementError('binding_conflict', 'Unregistered intervening turns require reconciliation before input.')
         if thread.get('status', {}).get('type') != 'idle' or any(t.get('status') == 'inProgress' for t in turns) or not previous or previous.get('status') not in {'completed', 'failed', 'interrupted'} or previous.get('itemsView') != 'full':
             raise ManagementError('binding_conflict', 'The original thread is not verified idle at the expected prior turn.')
 
-    def start_idle_turn(self, thread_id, previous_turn_id, text, instruction_id):
+    def start_idle_turn(self, thread_id, previous_turn_id, text, instruction_id, *, expected_cwd, known_turn_ids):
         # turn/start has no expected-idle precondition. A host receipt must prove
         # an exclusive input path; this lock serializes the owned adapter writers.
         with self._rpc_lock:
             thread = self.read_thread(thread_id)
-            if thread.get('id') != thread_id or thread.get('canAcceptDirectInput') is not True:
+            if thread.get('id') != thread_id or thread.get('cwd') != expected_cwd or thread.get('canAcceptDirectInput') is not True:
                 raise ManagementError('binding_conflict', 'The original idle input target changed.')
-            self.verify_idle(thread, previous_turn_id)
+            self.verify_idle(thread, previous_turn_id, known_turn_ids)
             result = self._call('turn/start', {'threadId': thread_id, 'clientUserMessageId': instruction_id,
                 'input': [{'type': 'text', 'text': text, 'text_elements': []}]})
             turn = result.get('turn', {})

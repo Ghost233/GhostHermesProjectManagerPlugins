@@ -16,6 +16,10 @@ for line in sys.stdin:
         log.write(json.dumps(request) + '\n')
     method = request['method']
     params = request.get('params', {})
+    behavior = json.loads((root / 'behavior.json').read_text()) if (root / 'behavior.json').exists() else {}
+    if behavior.get('rpc_error') == method:
+        print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported fixture method'}}), flush=True)
+        continue
     if method == 'initialized':
         continue
     if method == 'initialize':
@@ -46,12 +50,17 @@ for line in sys.stdin:
         thread['status'] = {'type': 'active', 'activeFlags': []}
         thread['turns'] = [value['turn']]
     elif method == 'turn/steer':
+        if behavior.get('steer_active_turn'):
+            turn_id = behavior['steer_active_turn']
+            thread['turns'] = [{'id': turn_id, 'status': 'inProgress', 'itemsView': 'full', 'items': []}]
         with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
             payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
         assert any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in payload['requests'].values() for c in r.get('controls', []))
         if params['threadId'] != thread_id or params['expectedTurnId'] != turn_id:
             print(json.dumps({'id': request['id'], 'error': {'code': -32000, 'message': 'Wrong active turn'}}), flush=True)
             continue
+        with (root / 'applied-inputs.jsonl').open('a') as applied:
+            applied.write(json.dumps({'thread_id': thread_id, 'turn_id': turn_id, 'instruction_id': params['clientUserMessageId']}) + '\n')
         value = {'turnId': turn_id}
     elif method == 'turn/interrupt':
         with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:

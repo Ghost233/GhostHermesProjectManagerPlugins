@@ -13,8 +13,10 @@
     const [form, setForm] = React.useState(blank);
     const [review, setReview] = React.useState(null);
     const [saving, setSaving] = React.useState(false);
+    const [controlTexts, setControlTexts] = React.useState({});
+    const [controlIntents, setControlIntents] = React.useState({});
     async function refresh() {
-      try { setSnapshot(await sdk.fetchJSON(api + '/snapshot')); setError(''); }
+      try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
       catch (e) { setError(String(e.message || e)); }
     }
     React.useEffect(function () { refresh(); }, []);
@@ -52,6 +54,32 @@
       try { await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify({ action: action, request_id: requestId }) }); await refresh(); }
       catch (e) { setError(String(e.message || e)); }
       finally { setSaving(false); }
+    }
+    async function controlAction(action, record) {
+      const key = record.id + ':' + action;
+      const body = controlIntents[key] || { action: action, request_id: record.id,
+        instruction_id: window.crypto.randomUUID(), expected_turn_id: record.session.turn_id,
+        text: action === 'stop' ? null : controlTexts[record.id] || '' };
+      setControlIntents(Object.assign({}, controlIntents, { [key]: body }));
+      setSaving(true);
+      try {
+        const result = await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify(body) });
+        await refresh();
+        if (result.status === 'outcome_unknown' || result.instruction.phase === 'rpc_intent') {
+          setError('控制结果待核对，保留指令 ID：' + body.instruction_id);
+        } else {
+          setControlIntents(Object.assign({}, controlIntents, { [key]: null }));
+          if (action !== 'stop') setControlTexts(Object.assign({}, controlTexts, { [record.id]: '' }));
+        }
+      } catch (e) {
+        const observed = await refresh();
+        const task = observed && observed.requests.find(function (r) { return r.id === record.id; });
+        const instruction = task && (task.controls || []).find(function (c) { return c.id === body.instruction_id; });
+        if (task && (!instruction || instruction.phase === 'rejected')) {
+          setControlIntents(Object.assign({}, controlIntents, { [key]: null }));
+        }
+        setError(String(e.message || e) + ' · 指令 ID：' + body.instruction_id);
+      } finally { setSaving(false); }
     }
     function editProject(project) {
       const profile = snapshot.profiles.find(function (p) { return p.project_id === project.id; });
@@ -104,6 +132,22 @@
             r.last_execution_verified_at && h('div', null, '执行最后核实：' + r.last_execution_verified_at),
             h('button', { style: button, onClick: function () { taskAction('verify', r.id); }, disabled: saving || snapshot.status !== 'completed' }, '核验执行能力'),
             h('button', { style: button, onClick: function () { taskAction(r.session ? 'refresh' : 'start', r.id); }, disabled: saving || snapshot.status !== 'completed' || !r.task_start_anchor }, r.session ? '核对原执行' : '启动已受理 Issue'),
+            r.session && h('section', { style: { marginTop: '8px' } },
+              h('div', null, '仓库占用：' + (r.repository_released ? '已释放' : '保留') + ' · 外层任务：' + (r.outer_task_status || '运行安排中')),
+              h('label', null, '追加或明确继续的要求', h('input', { value: controlTexts[r.id] || '',
+                onChange: function (e) { setControlTexts(Object.assign({}, controlTexts, { [r.id]: e.target.value })); },
+                style: { margin: '6px', padding: '7px', color: 'inherit', background: 'transparent', border: '1px solid #8886' } })),
+              h('button', { style: button, onClick: function () { controlAction('append', r); },
+                disabled: saving || snapshot.status !== 'completed' || !r.session.turn_id || !String(controlTexts[r.id] || '').trim() || ['stopping', 'stopped'].includes(r.execution) }, '追加到原会话'),
+              h('button', { style: button, onClick: function () { controlAction('stop', r); },
+                disabled: saving || snapshot.status !== 'completed' || !r.session.turn_id || ['stopping', 'stopped'].includes(r.execution) }, '结束当前任务'),
+              h('button', { style: button, onClick: function () { controlAction('continue', r); },
+                disabled: saving || snapshot.status !== 'completed' || r.execution !== 'stopped' || !String(controlTexts[r.id] || '').trim() }, '明确继续原工作'),
+              r.stop && h('div', null, '停止：' + r.stop.status + ' · 中断 RPC：' + r.stop.rpc_status +
+                ' · 最后核实：' + (r.stop.last_verified_at || '待核对') + (r.stop.reason ? ' · ' + r.stop.reason : '')),
+              (r.stop_records || []).length > 0 && h('details', null, h('summary', null, '停止记录、相关执行与继续安排'),
+                h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ stops: r.stop_records,
+                  arrangements: r.execution_arrangements || [], controls: r.controls || [] }, null, 2)))),
             r.execution_capability && h('div', null, '启动能力：' + r.execution_capability.status + (r.execution_capability.reason ? ' · ' + r.execution_capability.reason : '')),
             r.delivery_evidence && h('details', null, h('summary', null, '验收与测试／Git／PR 证据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(r.delivery_evidence, null, 2))),
             h('div', null, '请求 ID：' + r.id),

@@ -14,12 +14,12 @@ def _now():
 def _authorize(manager, identity, request_id, data):
     record = _responsible(manager, identity, request_id, data)
     session = record.get('session')
-    if not session or not session.get('thread_id') or session.get('control') != 'assigned_task':
+    if not session or not session.get('thread_id') or session.get('control') != 'assigned_task' or record.get('task_delivery') == 'delivered':
         raise ManagementError('forbidden', 'No effective original-task control authorization is available.')
     if manager._principal(identity, data) is not None:
         profile = data['profiles'].get(record['profile_id'], {})
         accepted = record.get('accepted_responsibility')
-        if not isinstance(accepted, dict) or any(profile.get(k) != v for k, v in accepted.items()):
+        if not isinstance(accepted, dict) or any(profile.get(k) != v for k, v in accepted.items()) or profile.get('connection_refs', {}).get('codex') != record.get('accepted_codex_ref') or record.get('accepted_repository_fingerprint') != repository_fingerprint(data['projects'][record['project_id']]['repo']):
             raise ManagementError('forbidden', 'The original task control responsibility is no longer current.')
     return record, session
 
@@ -83,9 +83,10 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
         method = 'turn/steer' if thread['status'].get('type') == 'active' else 'turn/start'
         if method == 'turn/steer' and (len(active) != 1 or active[0].get('id') != session['turn_id']):
             raise ManagementError('binding_conflict', 'The expected original active turn does not match; nothing was sent.')
+        known_turn_ids = session.setdefault('known_turn_ids', [session['turn_id']])
         if method == 'turn/start':
             adapter.verify_control(session['repository'], 'idle_input')
-            adapter.verify_idle(thread, session['turn_id'])
+            adapter.verify_idle(thread, session['turn_id'], known_turn_ids)
         instruction = {'id': instruction_id, **request, 'thread_id': session['thread_id'], 'turn_id': session['turn_id'],
                        'generation': session['generation'], 'method': method, 'previous_turn_id': session['turn_id'],
                        'phase': 'rpc_intent', 'accepted_at': _now()}
@@ -107,8 +108,10 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
                 if result.get('turnId') != session['turn_id']:
                     raise ManagementError('outcome_unknown', 'The service did not confirm the expected original turn.')
             else:
-                result = adapter.start_idle_turn(session['thread_id'], session['turn_id'], text, instruction_id)
+                result = adapter.start_idle_turn(session['thread_id'], session['turn_id'], text, instruction_id,
+                                                 expected_cwd=session['repository']['worktree'], known_turn_ids=known_turn_ids)
                 session['turn_id'] = result['turn']['id']
+                known_turn_ids.append(session['turn_id'])
                 instruction['turn_id'] = session['turn_id']
                 record.update(execution='running', outer_task_status='running', repository_released=False)
                 if arrangement is not None:
@@ -177,7 +180,7 @@ def refresh_stop(manager, identity, request_id):
             turn = next((t for t in thread.get('turns', []) if t.get('id') == stop['turn_id']), None)
             if not turn or turn.get('status') not in {'completed', 'failed', 'interrupted'} or turn.get('itemsView') != 'full' or thread['status'].get('type') != 'idle':
                 raise ManagementError('capability_unverified', 'The original turn has no complete terminal evidence.')
-            pending = [(thread, [turn])]
+            pending = [(thread, thread['turns'])]
             seen, related, evidence = set(), [], []
             loaded = adapter.loaded_threads()
             if any(not isinstance(t, str) or not t for t in loaded):
