@@ -5,9 +5,7 @@ import hashlib
 import json
 import sqlite3
 
-from .manager import _public_text
-
-from .manager import ManagementError
+from .manager import ManagementError, _public_text
 
 
 def _now():
@@ -35,11 +33,9 @@ def operate(manager, identity, action, details):
             raise ManagementError('forbidden', 'Maintenance requires the verified Owner entry.')
         if action not in {'enter', 'deactivate'}:
             if action not in {'reenable', 'switch', 'rollback'} and set(details) - {'operation_id', 'handled_manual_session_ids'}:
-
-
                 raise ManagementError('invalid_change', 'Check the original immutable maintenance plan by ID.')
             plan = data.get('maintenance_plans', {}).get(details['operation_id'])
-            if not plan or data.get('maintenance_mode', {}).get('operation_id') != plan['id']:
+            if not plan or (data.get('maintenance_mode') or {}).get('operation_id') != plan['id']:
                 raise ManagementError('binding_conflict', 'No active original maintenance plan matches this ID.')
             handled = details.get('handled_manual_session_ids', [])
             if not isinstance(handled, list) or any(not isinstance(i, str) for i in handled) or set(handled) - set(plan.get('manual_required', [])):
@@ -51,10 +47,11 @@ def operate(manager, identity, action, details):
             if action == 'reenable':
                 return _reenable(manager, identity, plan, details, version, data)
             return _advance(manager, identity, plan, action)
+        _public_text(json.dumps(details), manager._sensitive_values())
         approved = {'expected_version': details.get('expected_version'), 'expected_profile_ids': details.get('expected_profile_ids')}
         existing = data.setdefault('maintenance_plans', {}).get(details['operation_id'])
         if existing:
-            if existing['approved_scope'] != approved:
+            if existing['approved_scope'] != approved or existing['intent'] != ('deactivation' if action == 'deactivate' else 'maintenance') or existing.get('expected_release') != details.get('expected_release') or existing.get('target_release') != details.get('target_release'):
                 raise ManagementError('binding_conflict', 'Operation ID already belongs to another reviewed decision.')
             return existing
         if type(approved['expected_version']) is not int or approved['expected_version'] != version:
@@ -96,6 +93,8 @@ def _runtime(manager):
     fact = manager.maintenance_host.current()
     if not isinstance(fact, dict) or fact.get('status') != 'verified' or fact.get('loaded') is not True or any(not isinstance(fact.get(k), str) or not fact[k] for k in ('plugin_version', 'sdk_version', 'service_id', 'generation', 'evidence')) or any(not re.fullmatch(r'[a-f0-9]{64}', str(fact.get(k))) for k in ('source_digest', 'sdk_source_digest')):
         raise ManagementError('unknown_version', 'Current loaded plugin/SDK version and code source cannot be independently verified.')
+    if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)+(?:[-+][A-Za-z0-9_.-]+)?', fact['plugin_version']) or fact['sdk_version'] in {'unknown', 'unverified', '0.0.0'}:
+        raise ManagementError('unknown_version', 'Current native plugin/SDK version is unknown; no migration or new execution is permitted.')
     _fresh(manager, fact)
     return fact
 
@@ -306,6 +305,8 @@ def _target(plan):
     target = plan.get('target_release')
     if not isinstance(target, dict) or set(target) != {'id', 'plugin_version', 'source_digest'} or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}', str(target.get('id'))) or not re.fullmatch(r'[0-9]+(?:\.[0-9]+)+(?:[-+][A-Za-z0-9_.-]+)?', str(target.get('plugin_version'))) or not re.fullmatch(r'[a-f0-9]{64}', str(target.get('source_digest'))):
         raise ManagementError('unknown_version', 'Switch requires a registered fixed target version and exact code-source digest.')
+    if not isinstance(plan.get('expected_release'), dict) or set(plan['expected_release']) != {'plugin_version', 'source_digest', 'sdk_version', 'sdk_source_digest'}:
+        raise ManagementError('unknown_version', 'The original reviewed SDK/plugin release is incomplete.')
     return {**plan['expected_release'], 'plugin_version': target['plugin_version'], 'source_digest': target['source_digest']}
 
 

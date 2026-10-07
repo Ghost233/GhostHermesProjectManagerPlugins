@@ -117,6 +117,9 @@ class Manager:
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        bind_maintenance = getattr(self.maintenance_host, 'bind_manager_state', None)
+        if callable(bind_maintenance):
+            bind_maintenance(self.state_dir)
         self._lock = threading.RLock()
         self._inflight = set()
         from .recovery import verify_directory
@@ -219,6 +222,13 @@ class Manager:
             version += 1
             if not already_in_transaction:
                 self._db.commit()
+        if self.maintenance_host is not None:
+            from .maintenance import _runtime
+            try:
+                current = _runtime(self)
+                data['native_runtime_version_gate'] = {'status': 'verified', 'plugin_version': current['plugin_version'], 'verified_at': current['verified_at']}
+            except (ManagementError, OSError) as exc:
+                data['native_runtime_version_gate'] = {'status': 'unverified', 'reason': str(exc)}
         from .queue import refresh
         refresh(data)
         return version, data
@@ -383,6 +393,11 @@ class Manager:
         return operate(self, identity, action, details)
 
     def migrate_profile(self, identity, action, details):
+        if action not in {'check', 'rollback'}:
+            with self._lock:
+                _, current = self._load()
+                if current.get('native_runtime_version_gate', {}).get('status') == 'unverified':
+                    raise ManagementError('unknown_version', 'Current native version is unknown; no migration is permitted.')
         from .migration import operate
         return operate(self, identity, action, details)
 

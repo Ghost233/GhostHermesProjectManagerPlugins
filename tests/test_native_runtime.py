@@ -1,5 +1,6 @@
 """Explicit native SDK smoke, using pristine staged SDK sources and an artificial home."""
 import os
+import hashlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -60,16 +61,28 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
                'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'), 'PYTHONDONTWRITEBYTECODE': '1',
                'PYTHONPATH': str(staged), 'HERMES_FIXTURE_OWNER_TOKEN': 'synthetic-owner-credential',
                'HERMES_FIXTURE_PARTICIPANT_TOKEN': 'synthetic-participant-credential'}
+        if runner == 'maintenance_smoke_runner.py':
+            fixtures = scratch / 'maintenance-fixtures'
+            fixtures.mkdir()
+            shutil.copy2(ROOT / 'tests' / 'native_fixture_boundary.py', fixtures / 'native_fixture_boundary.py')
+            # These Python bytes were independently matched to the prescribed
+            # official tree. An archive fixture need not contain Git metadata.
+            for name, expected in {
+                'hermes_cli/plugins.py': '31c99f61f61732557bb84429d014e943d2d51a753b2541ab5de3b196a893bf9a',
+                'gateway/control_socket.py': '5acbcf998b3ed5adf6e6e9c5c608d9cc91f5e9da58bc4c564ea613fb6b038f94',
+                'gateway/run_plugin_rewire.py': 'b56ecc5118f7ff2666b56d928d6951b0efa58d1469b8b83ad91009892fddd16b'}.items():
+                assert hashlib.sha256((sdk / name).read_bytes()).hexdigest() == expected
+            env['HERMES_TEST_SDK_COMMIT'] = 'bd0affe5e5f723579df8902852f5d0c47795f355'
         if artifact_mismatch:
             env['HERMES_TEST_OWNED_ARTIFACT_MISMATCH'] = '1'
         if unload_stage:
             env['HERMES_TEST_OWNED_UNLOAD_STAGE'] = unload_stage
         runtime_python = os.environ.get('HERMES_TEST_SESSION_PYTHON', sys.executable) if runner in {'migration_smoke_runner.py', 'maintenance_smoke_runner.py'} else sys.executable
         result = subprocess.run([runtime_python, str(ROOT / 'tests' / runner), str(scratch), *([migration_entity] if migration_entity else [])],
-                                cwd=scratch, env=env, text=True, capture_output=True, timeout=60)
+                                cwd=scratch, env=env, text=True, capture_output=True, timeout=120 if runner == 'maintenance_smoke_runner.py' else 60)
         assert result.returncode == 0, result.stdout + result.stderr
         assert 'native load, Dashboard bridge, restart, teardown: OK' in result.stdout
-        if runner in {'archive_smoke_runner.py', 'lifecycle_smoke_runner.py'}:
+        if runner in {'archive_smoke_runner.py', 'lifecycle_smoke_runner.py', 'maintenance_smoke_runner.py'}:
             print(result.stdout)
 
 

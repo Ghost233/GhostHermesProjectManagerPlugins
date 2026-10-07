@@ -56,7 +56,7 @@ def loaded_fact(ctx, entry_function):
     if manifest is None or not getattr(manifest, 'path', None):
         return {'status': 'unverified', 'plugin_version': 'unknown', 'reason': 'No actual native manifest registration.'}
     root = _ordinary(Path(manifest.path), True)
-    compiled = compile((root / 'ghost_hermes_pm' / 'native.py').read_text(), str(root / 'ghost_hermes_pm' / 'native.py'), 'exec')
+    compiled = compile(_ordinary(root / 'ghost_hermes_pm' / 'native.py').read_text(), str(root / 'ghost_hermes_pm' / 'native.py'), 'exec')
     expected = next(code for code in compiled.co_consts if isinstance(code, types.CodeType) and code.co_name == 'register_native')
     import uuid
     return {'status': 'registered', 'plugin_version': manifest.version, 'source_digest': source_digest(root),
@@ -78,6 +78,13 @@ class NativeMaintenanceHost:
             raise ManagementError('capability_unverified', 'Explicit unique configuration/data/archive backup coverage is required.')
         self.verifier = verifier
         self._reloads = {}
+
+    def bind_manager_state(self, state_dir):
+        base = Path(state_dir).resolve()
+        protected = {base / name for name in ('manager.sqlite3', 'manager.sqlite3-wal', 'manager.sqlite3-shm',
+                                              'notification-health.json', 'manager-runtime.json', 'manager.sock')}
+        if any(Path(entry['path']) in protected for entry in self.files.values()):
+            raise ManagementError('capability_unverified', 'Native restore scope must exclude live Manager authority, runtime ownership and notification health.')
 
     def _binding(self, phase, plan=None):
         import gateway.control_socket as control
@@ -128,7 +135,7 @@ class NativeMaintenanceHost:
         registered = next((plugin for plugin in get_plugin_manager().list_plugins() if plugin['name'] == PLUGIN), None)
         entry = registry.get_entry('hermes_pm_loaded_version', scope=str(self.profile_home))
         actual = entry.handler.__globals__.get('register_native') if entry else None
-        compiled = compile((self.installed_path / 'ghost_hermes_pm' / 'native.py').read_text(), str(self.installed_path / 'ghost_hermes_pm' / 'native.py'), 'exec')
+        compiled = compile(_ordinary(self.installed_path / 'ghost_hermes_pm' / 'native.py').read_text(), str(self.installed_path / 'ghost_hermes_pm' / 'native.py'), 'exec')
         expected = next(code for code in compiled.co_consts if isinstance(code, types.CodeType) and code.co_name == 'register_native')
         if not isinstance(actual, types.FunctionType) or Path(actual.__globals__.get('__file__', '')).resolve() != self.installed_path / 'ghost_hermes_pm' / 'native.py' or code_digest(actual.__code__) != code_digest(expected):
             raise ManagementError('unknown_version', 'Actual SDK registry callback reaches stale or different native entry code; reload acknowledgement is insufficient.')
@@ -192,7 +199,7 @@ class NativeMaintenanceHost:
         thread = threading.Thread(target=request, name='hermes-maintenance-' + phase, daemon=True)
         self._reloads[key] = thread
         thread.start()
-        return {'status': 'accepted'}
+        return {'status': 'outcome_unknown'}
 
     def switch(self, plan):
         target = self.releases.get(plan['target_release']['id'])
