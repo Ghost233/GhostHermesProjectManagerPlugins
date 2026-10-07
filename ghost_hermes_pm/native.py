@@ -96,9 +96,14 @@ def register_native(ctx):
             recovery_adapters = configured_recovery_adapters(ctx.get_config('codex_recovery', []), state_dir)
             codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
             from .native_lifecycle import configured_lifecycle_host
+            def knowledge_credential(reference):
+                value = _credential(reference)
+                if value:
+                    intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, value)))
+                return value
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
                               codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters, control_adapters=control_adapters,
-                              knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {})),
+                              knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {}), credential_resolver=knowledge_credential),
                               archive_providers=configured_archives(ctx.get_config('archive_providers', {})), recovery_adapters=recovery_adapters,
                               lifecycle_host=configured_lifecycle_host(ctx.get_config('native_profile_lifecycle'), state_dir))
             for registration in ctx.get_config('manual_sources', []):
