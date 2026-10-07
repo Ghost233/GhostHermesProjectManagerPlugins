@@ -166,6 +166,10 @@ def require_preparation(manager, identity, record, version, data):
 
 
 def dispatch_tasks(manager):
+    with manager._lock:
+        _, current = manager._load()
+        if current.get('maintenance_mode') not in (None, False):
+            return []
     """Start only persisted, authorized requests whose own preparation still matches."""
     from .manager import VerifiedIdentity
     with manager._lock:

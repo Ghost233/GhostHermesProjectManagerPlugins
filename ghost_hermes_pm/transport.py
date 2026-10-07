@@ -75,6 +75,8 @@ class ManagementServer:
                             result = bridge.manager.global_validation(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'lifecycle':
                             result = bridge.manager.lifecycle(identity, payload.get('action'), payload.get('details'))
+                        elif payload.get('operation') == 'maintenance':
+                            result = bridge.manager.maintenance(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'migrate_profile':
                             result = bridge.manager.migrate_profile(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'take_over_session':
@@ -327,6 +329,9 @@ class ManagementClient:
 
     def manage_memory(self, action, details):
         return self._call('manage_memory', action=action, details=details)
+
+    def maintenance(self, action, details):
+        return self._call('maintenance', action=action, details=details)
 
     def migrate_profile(self, action, details):
         return self._call('migrate_profile', action=action, details=details)

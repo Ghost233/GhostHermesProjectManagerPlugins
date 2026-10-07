@@ -274,7 +274,8 @@ class Manager:
             from .knowledge import snapshot_knowledge
             from .notifications import snapshot as notification_snapshot
             from .archives import snapshot_archives
-            return {**snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
+            from .maintenance import snapshot as maintenance_snapshot
+            return {'maintenance': maintenance_snapshot(self, data, principal), **snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
                     'notifications': notification_snapshot(self, data, {p['id'] for p in projects}),
                     'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
@@ -367,6 +368,10 @@ class Manager:
             from .notifications import on_rework
             on_rework(self, result)
         return result
+
+    def maintenance(self, identity, action, details):
+        from .maintenance import operate
+        return operate(self, identity, action, details)
 
     def lifecycle(self, identity, action, details):
         from .lifecycle import operate
