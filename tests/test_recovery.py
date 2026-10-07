@@ -1,6 +1,7 @@
 """Restart recovery through the authoritative public management bridge."""
 import json
 import sys
+import pytest
 from pathlib import Path
 
 from ghost_hermes_pm import Manager, ManagementError
@@ -482,7 +483,8 @@ def test_sent_answer_without_original_resolution_prevents_automatic_continuation
     assert 'turn/start' not in methods(tmp_path)
 
 
-def test_new_live_natural_question_after_recovery_can_be_answered_without_reviving_history(tmp_path):
+@pytest.mark.parametrize('turn_status', ['inProgress', 'completed'])
+def test_new_live_natural_question_after_recovery_can_be_answered_without_reviving_history(tmp_path, turn_status):
     repo = make_repo(tmp_path / 'repo')
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
@@ -491,7 +493,8 @@ def test_new_live_natural_question_after_recovery_can_be_answered_without_revivi
     peer = tmp_path / 'original' / 'original-state.json'
     state = json.loads(peer.read_text())
     item = {'id': 'fresh-natural-item', 'type': 'agentMessage', 'text': 'Which colour do you want?'}
-    state['thread']['turns'][0]['items'] = [item]
+    state['thread']['turns'][0].update(items=[item], status=turn_status)
+    state['thread']['status'] = {'type': 'active' if turn_status == 'inProgress' else 'idle', 'activeFlags': []}
     peer.write_text(json.dumps(state))
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
                  recovery_adapters={'local:fixture-stdio': recovery_adapter(tmp_path, service_id)}) as manager:
@@ -506,4 +509,4 @@ def test_new_live_natural_question_after_recovery_can_be_answered_without_revivi
         assert natural['method'] == 'natural_language'
         assert natural['resolution'] == 'pending' and natural['control_enabled'] is True
         manager.answer_human_request(OWNER, request_id, natural['id'], 'fresh-natural-answer', {'answers': {'answer': ['Blue']}})
-    assert len(json.loads(peer.read_text())['inputs']) == 1
+    assert methods(tmp_path).count('turn/steer' if turn_status == 'inProgress' else 'turn/start') == 1

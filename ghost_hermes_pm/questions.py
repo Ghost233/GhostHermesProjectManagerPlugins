@@ -167,7 +167,7 @@ def _natural_question(manager, record, thread, live_events=()):
         return
     if session.get('recovery_ref'):
         fresh = any(e.get('method') == 'item/completed' and e.get('params', {}).get('threadId') == session['thread_id'] and e['params'].get('turnId') == session['turn_id'] and isinstance(e['params'].get('item'), dict) and e['params']['item'].get('type') == 'agentMessage' and e['params']['item'].get('id') == item['id'] and e['params']['item'].get('text') == text for e in live_events)
-        if not fresh or turn.get('status') != 'inProgress' or thread.get('canAcceptDirectInput') is not True:
+        if not fresh or turn.get('status') not in {'inProgress', 'completed', 'failed', 'interrupted'} or thread.get('canAcceptDirectInput') is not True:
             return  # Current connection activity is required; matching history is insufficient.
     key = hashlib.sha256(json.dumps([session['service_id'], session['generation'], session['thread_id'], session['turn_id'], 'natural_language', item['id']]).encode()).hexdigest()
     if any(q['id'] == key for q in record['human_requests']):
