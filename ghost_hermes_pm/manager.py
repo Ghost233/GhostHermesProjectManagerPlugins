@@ -179,6 +179,8 @@ class Manager:
                 if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
                     segment['status'] = 'unknown'
                     segment['attempts'][-1]['status'] = 'unknown'
+        from .global_validation import reconcile_inputs
+        reconcile_inputs(data)
         from .queue import refresh
         refresh(data)
         return version, data

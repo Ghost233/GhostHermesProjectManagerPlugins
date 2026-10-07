@@ -21,6 +21,8 @@
     const [preparationPlans, setPreparationPlans] = React.useState({});
     const [roleForm, setRoleForm] = React.useState({ sender: '', target: '', issue: '', anchor: '', channels: '' });
     const [roleReview, setRoleReview] = React.useState(null);
+    const [validationForm, setValidationForm] = React.useState({ action: 'plan', details: '' });
+    const [validationReview, setValidationReview] = React.useState(null);
     const [observerForm, setObserverForm] = React.useState({ id: '', kind: 'daemon', projects: '', adapter_ref: '' });
     async function refresh() {
       try { const value = await sdk.fetchJSON(api + '/snapshot'); setSnapshot(value); setError(''); return value; }
@@ -167,6 +169,16 @@
         setError(String(e.message || e) + ' · 指令 ID：' + body.instruction_id);
       } finally { setSaving(false); }
     }
+    function previewValidation() {
+      try { setValidationReview({ action: validationForm.action, details: JSON.parse(validationForm.details) }); }
+      catch (e) { setError('请填写本轮明确版本、子交付或验证 ID 的 JSON 对象。'); }
+    }
+    async function submitValidation() {
+      setSaving(true);
+      try { await sdk.fetchJSON(api + '/global-validation', { method: 'POST', body: JSON.stringify(validationReview) }); setValidationReview(null); await refresh(); }
+      catch (e) { setError(String(e.message || e)); await refresh(); }
+      finally { setSaving(false); }
+    }
     function editProject(project) {
       const profile = snapshot.profiles.find(function (p) { return p.project_id === project.id; });
       setForm(Object.assign({}, blank, { projectId: project.id, name: project.name, repoPath: project.repo.worktree,
@@ -225,6 +237,26 @@
             h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: function () { previewRole('project_goal'); } }, '核对公开项目交接'),
             roleReview && h('div', null, h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(roleReview, null, 2)),
               h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: applyRole }, '提交这条公开协作操作')))),
+        h('section', null,
+        h('h2', null, 'mono 全局验证'),
+        h('p', null, '固定本轮子 Issue 交付版本。独立获准准备结束后验证；输入变化使本轮失效，返工使用明确 Issue。'),
+        h('ul', null, (snapshot.global_validations || []).map(function (round) {
+          return h('li', { key: round.id, style: { margin: '12px 0', overflowWrap: 'anywhere' } },
+            h('strong', null, round.status + ' · ' + round.id),
+            h('div', null, 'mono 原任务：' + round.request_id + ' · 父版本：' + round.mono_commit),
+            h('div', null, '准备：' + ((round.preparation || {}).status || '尚未结束') + ' · 实际边界范围：' + (round.boundary_scope || 'unverified')),
+            h('div', null, '本轮占用：' + (round.occupancy.released ? '已释放' : '保持') + ' · 项目整体：' + (round.whole_project_complete ? '已完成' : '待核对')),
+            round.reason && h('div', null, round.reason),
+            h('details', null, h('summary', null, '固定子交付、实际输入、Git 元数据、测试与返工证据'),
+              h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify({ children: round.children, inputs: round.inputs, occupancy: round.occupancy, tests: round.tests, rework: round.rework }, null, 2))));
+        })),
+        h('details', null, h('summary', null, '提交一条明确验证操作'),
+          h('select', { value: validationForm.action, onChange: function (e) { setValidationForm(Object.assign({}, validationForm, { action: e.target.value })); setValidationReview(null); } },
+            ['plan', 'prepare', 'start', 'finish', 'check', 'rework', 'complete'].map(function (action) { return h('option', { key: action, value: action }, action); })),
+          h('textarea', { value: validationForm.details, 'aria-label': '本轮验证操作 JSON', style: { width: '100%' }, onChange: function (e) { setValidationForm(Object.assign({}, validationForm, { details: e.target.value })); setValidationReview(null); } }),
+          h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: previewValidation }, '核对本轮操作'),
+          validationReview && h('div', null, h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(validationReview, null, 2)),
+            h('button', { style: button, disabled: saving || snapshot.status === 'unverified', onClick: submitValidation }, '执行这条已核对操作')))),
         h('section', null,
         h('h2', null, '手动 Codex 只观察'),
         h('p', null, '只读取已登记原执行器，保留手动会话；daemon、独立 CLI 与桌面分别核验，其他服务活动仍未知。'),

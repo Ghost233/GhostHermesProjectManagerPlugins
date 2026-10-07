@@ -242,6 +242,25 @@ def _prepare(manager, identity, details, version, data, attempt):
         raise
 
 
+def reconcile_inputs(data):
+    """Every public read withdraws stale completion, without controlling manual execution."""
+    for attempt in data.get('global_validations', {}).values():
+        if attempt['status'] not in {'passed', 'complete'}:
+            continue
+        try:
+            unchanged = _digest(_inputs(attempt, data)) == attempt['input_digest']
+        except (ManagementError, OSError):
+            unchanged = False
+        if not unchanged:
+            attempt.update(status='invalidated', whole_project_complete=False, reason='Actual validation input changed after its verified test run.')
+            task = data['requests'][attempt['request_id']]
+            if task.get('global_validation_id') == attempt['id']:
+                task['whole_project_complete'] = False
+            for handoff in data.get('collaboration', {}).get('handoffs', {}).values():
+                if handoff.get('global_validation_id') == attempt['id']:
+                    handoff.update(whole_project_complete=False, integration_status='invalidated')
+
+
 def _check(manager, identity, version, data, attempt):
     if attempt['status'] not in {'passed', 'complete'}:
         return attempt
@@ -382,6 +401,7 @@ def perform(manager, identity, action, details):
                 raise ManagementError('outcome_unknown', 'Original validation test start was not confirmed; do not replay.')
             attempt.update(run=run, status='running', started_at=_now())
             _save(manager, version, data, attempt)
+            manager.publish_request_message(identity, attempt['request_id'], 'progress', '全局验证已运行。\n验证：' + attempt['id'] + '\n固定父版本：' + attempt['mono_commit'] + '\n相关验证占用：' + json.dumps(attempt['occupancy'], ensure_ascii=False) + '\n子交付清单：' + json.dumps([{k: c[k] for k in ('request_id', 'path', 'commit')} for c in attempt['children']], ensure_ascii=False))
             return attempt
         except ManagementError as exc:
             if attempt['status'] == 'start_intent':

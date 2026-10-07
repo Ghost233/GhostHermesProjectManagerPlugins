@@ -240,3 +240,39 @@ def test_final_completion_requires_original_mono_acceptance_and_fresh_stable_val
         (child / 'source.py').write_text('late manual input\n')
         invalid = manager.global_validation(LEAD, 'check', {'validation_id': plan['id']})
         assert invalid['whole_project_complete'] is False and invalid['status'] == 'invalidated'
+
+
+@pytest.mark.asyncio
+async def test_dashboard_and_native_group_share_versions_evidence_and_round_holds(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from test_feishu_entry import CONFIG, Gateway, Transport, event
+    from ghost_hermes_pm.messages import FeishuEntry
+    from ghost_hermes_pm.dashboard import create_router
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=FixtureHost()) as manager:
+        mono, child, parent, kid = combination(manager, tmp_path)
+        with ManagementServer(manager, {'owner': OWNER}):
+            client = ManagementClient(tmp_path / 'state', 'owner')
+            app = FastAPI()
+            app.include_router(create_router(lambda request: client))
+            with TestClient(app) as browser:
+                body = {'action': 'plan', 'details': {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']}}
+                response = browser.post('/global-validation', json=body)
+                assert response.status_code == 200
+                plan = response.json()
+                assert browser.post('/global-validation', json={**body, 'actor': 'owner'}).status_code == 422
+                transport, adapter = Transport(), object()
+                intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda url: None)
+                intake.attach_transport(adapter, transport)
+                incoming = event('@_user_1 全局验证 start：' + json.dumps({'validation_id': plan['id']}), 'om_global_start')
+                incoming.raw_message.event.message.parent_id = 'om_ack_mono'
+                assert await intake.receive(incoming, Gateway(adapter)) == {'action': 'skip'}
+                running = browser.get('/snapshot').json()['global_validations'][0]
+                assert running['status'] == 'running' and running['occupancy']['released'] is False
+                assert browser.post('/global-validation', json={'action': 'finish', 'details': {'validation_id': plan['id']}}).json()['status'] == 'passed'
+                current = browser.get('/snapshot').json()['global_validations'][0]
+                assert current['tests'][0]['output_digest'] and current['children'][0]['commit'] == git(child, 'rev-parse', 'HEAD')
+                assert any('全局验证' in packet['text'] for packet in transport.sent)
+                (child / 'source.py').write_text('manual invalidation\n')
+                changed = browser.get('/snapshot').json()['global_validations'][0]
+                assert changed['status'] == 'invalidated' and changed['whole_project_complete'] is False
