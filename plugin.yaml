@@ -9,3 +9,4 @@ provides_hooks:
   - pre_gateway_dispatch
 python_dependencies:
   - fastapi
+  - requests

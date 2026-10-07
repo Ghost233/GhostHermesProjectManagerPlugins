@@ -134,10 +134,21 @@ def register_source(manager, identity, expected_version, source):
         _source_bindings(source, data, manager.owner_identity_ref)
         _public_text(json.dumps(source), manager._sensitive_values())
         registered = {**json.loads(json.dumps(source)), 'wiki_identity_ref': wiki['identity_ref'], 'registered_by': identity.subject, 'registered_at': _now()}
-        registered['revision'] = _digest(source | {'wiki_identity_ref': wiki['identity_ref']})
+        binding = getattr(manager.knowledge_providers.get(source['provider_ref']), 'binding_digest', None)
+        if source['provider_ref'].startswith('mcp:') and not binding:
+            raise ManagementError('source_unavailable', 'Configure the original MCP corpus before granting its source access.')
+        if binding:
+            registered['provider_binding'] = binding
+        registered['revision'] = _digest(source | {'wiki_identity_ref': wiki['identity_ref']} | ({'provider_binding': binding} if binding else {}))
         data.setdefault('knowledge_sources', {})[source['id']] = registered
         manager._save(version, data)
         return {'status': 'registered', 'source': registered, 'version': version + 1}
+
+
+def _check_provider_binding(manager, source):
+    binding = source.get('provider_binding')
+    if (binding is not None or source['provider_ref'].startswith('mcp:')) and binding != getattr(manager.knowledge_providers.get(source['provider_ref']), 'binding_digest', None):
+        raise ManagementError('source_denied', 'The original source connection changed; Owner must reconcile its corpus grants.')
 
 
 def _query_scope(manager, identity, source_id, scope_ids, data):
@@ -145,6 +156,7 @@ def _query_scope(manager, identity, source_id, scope_ids, data):
     source = data.get('knowledge_sources', {}).get(source_id)
     if not source or not isinstance(scope_ids, list) or not scope_ids or any(not isinstance(s, str) for s in scope_ids) or len(set(scope_ids)) != len(scope_ids):
         raise ManagementError('forbidden', 'The requested source or explicit material scope is not registered.')
+    _check_provider_binding(manager, source)
     allowed = source['query_subjects'].get(identity.subject, [])
     if not set(scope_ids) <= set(allowed):
         raise ManagementError('forbidden', 'The original requester lacks this source scope; Wiki or superior privileges cannot substitute it.')
@@ -259,6 +271,7 @@ def _visible_query(manager, identity, query_id, data):
     source = data['knowledge_sources'].get(query['source_id'])
     if not source:
         raise ManagementError('source_denied', 'The original source grant is unavailable.')
+    _check_provider_binding(manager, source)
     permitted = identity.subject in {query['requester'], source['wiki_identity_ref']}
     if query.get('channel_id'):
         channel = _channel(source, query['channel_id'], query['requester'], query['scope_ids'])
@@ -499,16 +512,20 @@ def registered_bot_allowed(manager, bot, app_id, chat_id, tenant_key, open_id, n
             for source in data['knowledge_sources'].values() for b in source['wiki_bindings'])
 
 
-def configured_providers(config):
+def configured_providers(config, credential_resolver=None):
     if not config:
         return {}
     if not isinstance(config, dict):
         raise ManagementError('invalid_change', 'Knowledge providers require explicit trusted references.')
     providers = {}
     for reference, value in config.items():
-        if not isinstance(reference, str) or not reference.startswith('local:') or not isinstance(value, dict) or set(value) != {'root', 'documents'}:
-            raise ManagementError('invalid_change', 'Configure local knowledge with an explicit approved root and document manifest.')
-        providers[reference] = LocalKnowledgeProvider(value['root'], value['documents'])
+        if isinstance(reference, str) and reference.startswith('mcp:'):
+            from .wiki_mcp import ConsoWikiMCPProvider
+            providers[reference] = ConsoWikiMCPProvider(value, credential_resolver)
+        elif isinstance(reference, str) and reference.startswith('local:') and isinstance(value, dict) and set(value) == {'root', 'documents'}:
+            providers[reference] = LocalKnowledgeProvider(value['root'], value['documents'])
+        else:
+            raise ManagementError('invalid_change', 'Configure an explicit local manifest or original readonly MCP corpus reference.')
     return providers
 
 

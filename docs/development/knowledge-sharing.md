@@ -1,6 +1,6 @@
 # Wiki 来源查询与原任务事实补充（#25）
 
-这是实际来源 adapter、公共管理入口、注册群消息与原会话输入的实施契约。离线演示读取登记的合成 local 资料，真实 Lark SDK builder/model 与自有 JSONL peer 都有证据；尚未安装或验收真实 Wiki／群／模型服务，不能将这些夹具作为实际连接通过。
+这是实际来源 adapter、公共管理入口、注册群消息与原会话输入的实施契约。离线演示使用登记的 local 资料和与实际 ConsoWiki schema 一致的 MCP peer，真实 Lark SDK builder/model、原会话 JSONL peer 与 pristine Hermes SDK 的生产配置启动都有证据。获准原 MCP 的只读预检已核对 initialize/list、wiki_status 和一次 budget=500 context-pack 的结构；公开群／模型／原会话的真实服务验收仍单独记录。
 
 ## 授权与来源
 
@@ -14,7 +14,25 @@
 
 Dashboard `/knowledge` 共用 register/query/supplement 操作，body 不接受 actor/requester/role 或 verifier。普通 Profile 的 `hermes_pm_knowledge` 工具先通过独立 participant bridge；owner token alias 拒绝。工具查询必须关联原任务与明确公开 channel，不能把私有查询结果返回到没有原提问者／共享目标证据的群 agent 上下文。本人经可信 Dashboard 入口可按自己的显式来源范围进行独立查询。
 
-原生 `knowledge_providers` 来自可信配置，只接受明确 local reference、登记 root 和 document manifest。`LocalKnowledgeProvider` 不扫描全部知识库，也没有写 API；仅按获准 scope 与查询词读取配置的普通文件，拒绝路径越界、symlink 别名和过大资料。新的来源／超范围必须由本人明确登记，不能从资料正文导入授权。
+原生 `knowledge_providers` 来自可信配置，接受明确 local reference、登记 root 和 document manifest，或下述原 MCP 完整 corpus reference。`LocalKnowledgeProvider` 不扫描全部知识库，也没有写 API；仅按获准 scope 与查询词读取配置的普通文件，拒绝路径越界、symlink 别名和过大资料。新的来源／超范围必须由本人明确登记，不能从资料正文导入授权。
+
+## 原 Wiki MCP 连接
+
+现有 ConsoWiki 原连接保持为只读服务，不复制为各 Profile 的记忆库。可信管理 Profile settings 可登记：
+
+```yaml
+knowledge_providers:
+  mcp:conso-knowledge:
+    url: http://127.0.0.1:18641/mcp
+    corpus_scope_id: conso-corpus
+    credential_ref: native:HERMES_WIKI_TOKEN
+```
+
+`credential_ref` 是现有 SDK `agent.secret_scope.get_secret` 的名称引用，仅在 Gateway 的管理 Profile/home/secret-scope 校验通过后解析，按 Bearer 使用并留在 RAM；配置和记录不接收秘密原值。明确无需认证的端点可将该引用设为 null。Owner 的 SourceGrant 必须另行授予**原提问者** `conso-corpus`，公开回传还需给具体 channel/binding 登记完整同一范围。它表示该连接的**全部 corpus**，不能拿一个小范围名称冒充可过滤子库。现有工具只接受 `prompt/budget`，没有 requester、scope 或可证明的远端 ACL：适配器仅在实际请求 scope 恰为登记 corpus 时调用，子范围拒绝且不发出网络请求，不以 prompt 伪装访问控制。Owner 登记时冻结 URL/corpus/secret-reference 的非敏感 binding digest；同 reference 改指其他语料须重新登记授权。
+
+每次查询只执行 MCP 2025-03-26 initialize、initialized、tools/list 及 `get_context_pack(prompt, budget=500)`，核对 ConsoKnowledge 0.1.0 与获准只读工具的实际 descriptor/schema；支持 JSON 和 POST SSE 响应。不请求原文窗口，不枚举其他工具、不处理 server instructions、不写原库。HTTP 响应上限 1 MiB，整次查询设 20 秒预算与每次连接/读取超时，清理只针对本次 initialize 返回的 owned session，连接/读取各最多 3 秒且不读取清理响应正文。公共 query/resolve bridge 最多等 30 秒；结果未知先从 snapshot 核对同一 durable query ID，不盲重试或另造 query ID。
+
+context-pack 的 primary/secondary 相关 summary/excerpt 随真实 citation source/start/end 返回。引用区间的单位未独立核实，所以 locator 保留源给出的数值，不宣称是行号。材料 `version=result-snapshot-sha256:…` 是返回包快照摘要，`updated_at` 是本次本地观察时间；可取得的 artifact repoRef/commit/observedAt/updatedAt 在文字中明确标为 **reported artifact version，source revision unverified**，不编造原文件版本。freshness 的 contradicted/stale/archived 优先分类为冲突／过时；显式 fact/inference/suggestion 分类保留，未知编译 artifact 类型按 inference 展示，不能自动补充为事实。无引用、无法核实结果、工具或协议变化、源拒绝及已知秘密仅留下固定状态与原获准范围。
 
 ## 实际资料与定位
 
@@ -48,6 +66,6 @@ outbox 每段先登记 UUID/意图，再发真实 Lark post/@/reply；保存 del
 
 Dashboard 展示来源授权、实际 requester/scope、原任务关联、fact/inference/suggestion/conflict/stale、定位／版本／时间、原群 result 锚、逐段凭据与补充状态。当前来源登记／查询／补充有 HTTP API，页面是展示；不将未执行的 UI 按钮点击称为已验证。
 
-`tests/test_knowledge.py` 从公共 token/API 与实际原始 Lark text/post 事件驱动 readonly local provider、真实 SDK builder 和 stdio peer，覆盖查询／@回传／原任务 facts 一条链，另有权限拒绝、上级/Wiki 无替代权、重复、scope 撤销、资料字段注入、命名空间伪装、实际拒绝／冲突／秘密、idle/错回合/停止/归还/只观察/失联矩阵。`knowledge_smoke_runner.py` 使用 pristine SDK registry 和独立 participant bridge，拒绝真实 .hermes/.codex 与网络，验证工具拒绝私有上下文替代及稳定原会话补充。
+`tests/test_knowledge.py` 从公共 token/API 与实际原始 Lark text/post 事件驱动 readonly local provider、真实 SDK builder 和 stdio peer，覆盖查询／@回传／原任务 facts 一条链，另有权限拒绝、上级/Wiki 无替代权、重复、scope 撤销、资料字段注入、命名空间伪装、实际拒绝／冲突／秘密、idle/错回合/停止/归还/只观察/失联矩阵。`test_wiki_mcp.py` 在公共 token/Manager/client 与实际 HTTP/SSE peer 处核对完整 corpus、连接换绑、协议/工具/引用拒绝、慢响应、秘密与不重试，并驱动原有真实 SDK @/回传/原 active turn 补充链。`wiki_mcp_smoke_runner.py` 用固定 pristine Hermes SDK 的真实 PluginContext/settings/secret scope/Gateway hook 构建生产 provider，普通加载不连服务，原 Unix bridge 线程可使用 RAM 凭据，关闭仅清理自己的资源。`knowledge_smoke_runner.py` 使用 pristine SDK registry 和独立 participant bridge，拒绝真实 .hermes/.codex 与网络，验证工具拒绝私有上下文替代及稳定原会话补充。
 
-真实验收仍需获准 Source/Wiki 连接、app/tenant/群与真实 @/消息关联、原服务模型预算及 #16/#17/#18 的全部写入／控制／后台边界。生产 gate 保持关闭，不重复已失败权限研究、不降级 full access、不读取真实旧 Wiki 作测试，不自动安装／开机器人／迁移资料。
+真实验收仍需获准 Source/Wiki 连接、app/tenant/群与真实 @/消息关联、原服务模型预算及 #16/#17/#18 的全部写入／控制／后台边界。生产 gate 保持关闭，不重复已失败权限研究、不降级 full access、实际原 Wiki 仅按当次本人授权做有界只读核验，不自动安装／开机器人／迁移资料。
