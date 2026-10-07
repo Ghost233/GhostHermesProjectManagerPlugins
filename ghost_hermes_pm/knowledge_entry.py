@@ -104,6 +104,19 @@ async def process_knowledge_message(entry, prepared, generation):
     entry.require_active(generation)
     async with entry.lock:
         manager = entry.manager()
+        if prepared.knowledge_kind == 'archive':
+            from .archive_delivery import deliver
+            parsed = re.fullmatch(r'(查档案|完整档案)\s+([A-Za-z0-9_.:-]+)\s+([A-Za-z0-9_,.-]+)[：:]\s*(.+)', prepared.command, re.DOTALL)
+            def read_archive_if_active():
+                with entry.lifecycle_lock:
+                    entry.require_active(generation)
+                    return manager.query_archive(prepared.sender_identity, parsed.group(2), prepared.query_id,
+                        parsed.group(4), parsed.group(3).split(','), parsed.group(1) == '完整档案',
+                        prepared.knowledge_binding_id, prepared.envelope)
+            await asyncio.to_thread(read_archive_if_active)
+            entry.require_active(generation)
+            await deliver(entry, prepared.sender_identity, prepared.query_id, prepared.transport, generation)
+            return {'action': 'skip'}
         if prepared.knowledge_kind in {'query', 'direct'}:
             snapshot = manager.read_snapshot(VerifiedIdentity(entry.owner, 'trusted-knowledge-source'))
             receiver = next(p for p in snapshot['profiles'] if p['id'] == prepared.binding['profile_id'])
@@ -180,12 +193,17 @@ def _prepare_owner_query(entry, event, adapter):
     if len(mentions) != 1:
         return None
     text = text.replace(mentions[0].key, '').strip()
-    parsed = re.fullmatch(r'查询\s+([A-Za-z0-9_.:-]+)\s+([A-Za-z0-9_,.-]+)[：:]\s*(.+)', text, re.DOTALL)
+    parsed = re.fullmatch(r'(查询|查档案|完整档案)\s+([A-Za-z0-9_.:-]+)\s+([A-Za-z0-9_,.-]+)[：:]\s*(.+)', text, re.DOTALL)
     if not parsed:
         return None
+    archive = parsed.group(1) != '查询'
     snapshot = entry.manager().read_snapshot(VerifiedIdentity(entry.owner, 'trusted-source-policy'))
-    grant = next((s for s in snapshot['knowledge_sources'] if s['id'] == parsed.group(1)), None)
-    channel = next((c for c in grant['public_channels'] if c['profile_id'] == grant['wiki_profile_id'] and all(c[k] == owner[k] for k in NAMESPACE)), None) if grant else None
+    original = next((s for s in snapshot['archive_sources'] if s['id'] == parsed.group(2)), None) if archive else None
+    grant_id = original['grant_source_id'] if original else parsed.group(2)
+    if archive and original is None:
+        return None
+    grant = next((s for s in snapshot['knowledge_sources'] if s['id'] == grant_id), None)
+    channel = next((c for c in grant['public_channels'] if c['profile_id'] == (owner['profile_id'] if archive else grant['wiki_profile_id']) and all(c[k] == owner[k] for k in NAMESPACE)), None) if grant else None
     if not channel:
         return None
     envelope = {k: owner[k] for k in NAMESPACE} | {'tenant_key': sender.tenant_key, 'sender_open_id': ids.open_id,
@@ -194,5 +212,12 @@ def _prepare_owner_query(entry, event, adapter):
     transport = next((t for a, t in entry.transports if a is adapter), None)
     if transport is None:
         return None
-    return PreparedKnowledgeMessage(event, adapter, transport, owner, envelope, text, None, 'direct',
-        _digest(envelope), channel['id'], VerifiedIdentity(entry.owner, 'verified-original-human-wiki-query'))
+    query_id = _digest(envelope)
+    if archive:
+        keys = NAMESPACE + ('tenant_key', 'sender_open_id', 'message_id')
+        namespace = {k: envelope[k] for k in keys}
+        existing = next((q for q in snapshot['archive_queries'] if q.get('source_anchor') and q['requester'] == entry.owner
+            and all(q['source_anchor'].get(k) == namespace[k] for k in keys)), None)
+        query_id = existing['id'] if existing else _digest(namespace)
+    return PreparedKnowledgeMessage(event, adapter, transport, owner, envelope, text, None, 'archive' if archive else 'direct',
+        query_id, channel['id'], VerifiedIdentity(entry.owner, 'verified-original-human-wiki-query'))

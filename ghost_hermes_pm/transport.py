@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'manual_session_id', 'grant_id', 'details'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'manual_session_id', 'grant_id', 'complete', 'backup_id', 'restore_id', 'protection_id', 'kind', 'details'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -97,6 +97,16 @@ class ManagementServer:
                             result = bridge.manager.resolve_knowledge(identity, payload.get('query_id'))
                         elif payload.get('operation') == 'supplement_knowledge':
                             result = bridge.manager.supplement_knowledge(identity, payload.get('query_id'), payload.get('material_ids'))
+                        elif payload.get('operation') == 'backup_archive':
+                            result = bridge.manager.backup_archive(identity, payload.get('source_id'), payload.get('backup_id'), payload.get('kind', 'checkpoint'))
+                        elif payload.get('operation') == 'restore_archive':
+                            result = bridge.manager.restore_archive(identity, payload.get('backup_id'), payload.get('restore_id'))
+                        elif payload.get('operation') == 'protect_archive':
+                            result = bridge.manager.protect_archive(identity, payload.get('source_id'), payload.get('protection_id'))
+                        elif payload.get('operation') == 'register_archive_source':
+                            result = bridge.manager.register_archive_source(identity, payload.get('registration'))
+                        elif payload.get('operation') == 'query_archive':
+                            result = bridge.manager.query_archive(identity, payload.get('source_id'), payload.get('query_id'), payload.get('question'), payload.get('scope_ids'), payload.get('complete', False))
                         else:
                             raise ManagementError('unsupported', 'This management operation is not enabled.')
                         response = {'result': result}
@@ -154,12 +164,14 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'collaborate'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
                     response = _read_frame(reader)
         except (OSError, ValueError) as exc:
+            if operation in {'query_archive', 'protect_archive', 'backup_archive', 'restore_archive'}:
+                raise ManagementError('outcome_unknown', 'The archive operation response was not confirmed; inspect the same durable query/protection/backup/restore ID before retrying. Original entries remain inactive.') from exc
             if operation in {'start_task', 'control_task', 'answer_human_request'}:
                 raise ManagementError('outcome_unknown', 'Task start response was not confirmed; read the same durable request before retrying. Repository occupancy is retained.') from exc
             raise ManagementError('unavailable', 'The management instance is unavailable; no operation was confirmed.') from exc
@@ -228,3 +240,18 @@ class ManagementClient:
 
     def supplement_knowledge(self, query_id, material_ids=None):
         return self._call('supplement_knowledge', query_id=query_id, material_ids=material_ids)
+
+    def register_archive_source(self, registration):
+        return self._call('register_archive_source', registration=registration)
+
+    def query_archive(self, source_id, query_id, question, scope_ids, complete=False):
+        return self._call('query_archive', source_id=source_id, query_id=query_id, question=question, scope_ids=scope_ids, complete=complete)
+
+    def backup_archive(self, source_id, backup_id, kind='checkpoint'):
+        return self._call('backup_archive', source_id=source_id, backup_id=backup_id, kind=kind)
+
+    def restore_archive(self, backup_id, restore_id):
+        return self._call('restore_archive', backup_id=backup_id, restore_id=restore_id)
+
+    def protect_archive(self, source_id, protection_id):
+        return self._call('protect_archive', source_id=source_id, protection_id=protection_id)

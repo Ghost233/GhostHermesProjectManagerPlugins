@@ -98,11 +98,12 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
         self.knowledge_providers = dict(knowledge_providers or {})
+        self.archive_providers = dict(archive_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
         self.control_adapters = dict(control_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
@@ -127,6 +128,10 @@ class Manager:
                 self.codex_adapter.close()
             for adapter in (*self.observation_adapters.values(), *self.control_adapters.values()):
                 adapter.close()
+            from .archive_sources import CodexArchiveProvider
+            for provider in self.archive_providers.values():
+                if isinstance(provider, CodexArchiveProvider):
+                    provider.close()
             self._db.close()
 
     def __enter__(self):
@@ -147,6 +152,13 @@ class Manager:
         data.setdefault('knowledge_queries', {})
         for query in data['knowledge_queries'].values():
             for publication in query['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
+        for query in data.get('archive_queries', {}).values():
+            for publication in query.get('outbox', []):
                 for segment in publication['segments']:
                     if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
                         segment['status'] = 'unknown'
@@ -237,7 +249,8 @@ class Manager:
             from .collaboration import snapshot as collaboration_snapshot
             role_snapshot = collaboration_snapshot(data, principal, visible_ids)
             from .knowledge import snapshot_knowledge
-            return {**snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
+            from .archives import snapshot_archives
+            return {**snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
                     'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
@@ -447,6 +460,32 @@ class Manager:
     def receive_direct_knowledge_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor):
         from .knowledge import receive_direct_query
         return receive_direct_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor)
+
+    def backup_archive(self, identity, source_id, backup_id, kind='checkpoint'):
+        from .archive_backups import backup
+        if kind not in {'baseline', 'checkpoint'}:
+            raise ManagementError('invalid_change', 'Public backup requests select baseline or checkpoint; daily dates belong to the native scheduler.')
+        return backup(self, identity, source_id, backup_id, kind)
+
+    def restore_archive(self, identity, backup_id, restore_id):
+        from .archive_backups import restore
+        return restore(self, identity, backup_id, restore_id)
+
+    def protect_archive(self, identity, source_id, protection_id):
+        from .archive_backups import protect
+        return protect(self, identity, source_id, protection_id)
+
+    def run_archive_daily(self, day=None):
+        from .archive_backups import daily
+        return daily(self, day)
+
+    def register_archive_source(self, identity, registration):
+        from .archives import register_source
+        return register_source(self, identity, registration)
+
+    def query_archive(self, identity, source_id, query_id, question, scope_ids, complete=False, channel_id=None, anchor=None):
+        from .archives import query_archive
+        return query_archive(self, identity, source_id, query_id, question, scope_ids, complete, channel_id, anchor)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',
