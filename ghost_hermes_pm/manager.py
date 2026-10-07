@@ -136,7 +136,7 @@ class Manager:
         for record in data['requests'].values():
             session = record.get('session')
             if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
-                record['execution'] = 'unverified'
+                record['execution'] = 'stopping' if record.get('stop', {}).get('status') == 'processing' else 'unverified'
                 record['unexecuted_reason'] = 'Original executor generation unavailable; reconciliation required.'
             for publication in record['outbox']:
                 for segment in publication['segments']:
@@ -240,6 +240,10 @@ class Manager:
     def refresh_task(self, identity, request_id):
         from .execution import refresh_task
         return refresh_task(self, identity, request_id)
+
+    def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
+        from .control import control_task
+        return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
 
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery

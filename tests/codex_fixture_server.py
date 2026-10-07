@@ -9,12 +9,17 @@ root = Path(sys.argv[1])
 thread_id = '00000000-0000-7000-8000-000000000016'
 turn_id = '00000000-0000-7000-8000-000000000017'
 thread = None
+turn_sequence = 17
 for line in sys.stdin:
     request = json.loads(line)
     with (root / 'wire.jsonl').open('a') as log:
         log.write(json.dumps(request) + '\n')
     method = request['method']
     params = request.get('params', {})
+    behavior = json.loads((root / 'behavior.json').read_text()) if (root / 'behavior.json').exists() else {}
+    if behavior.get('rpc_error') == method:
+        print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported fixture method'}}), flush=True)
+        continue
     if method == 'initialized':
         continue
     if method == 'initialize':
@@ -24,7 +29,7 @@ for line in sys.stdin:
     elif method == 'permissionProfile/list':
         value = {'data': [{'id': 'fixture-boundary', 'description': 'Synthetic verified policy', 'allowed': True}], 'nextCursor': None}
     elif method == 'thread/loaded/list':
-        value = {'data': [], 'nextCursor': None}
+        value = json.loads((root / 'loaded.json').read_text()) if (root / 'loaded.json').exists() else {'data': [], 'nextCursor': None}
     elif method == 'thread/list':
         value = {'data': [], 'nextCursor': None, 'backwardsCursor': None}
     elif method == 'thread/start':
@@ -37,13 +42,39 @@ for line in sys.stdin:
         with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
             payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
         assert any(r.get('session', {}).get('thread_id') == thread_id for r in payload['requests'].values()), 'thread must be durable before turn/start'
+        if params.get('clientUserMessageId'):
+            assert any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in payload['requests'].values() for c in r.get('controls', []))
+            turn_sequence += 1
+            turn_id = '00000000-0000-7000-8000-' + str(turn_sequence).zfill(12)
         value = {'turn': {'id': turn_id, 'status': 'inProgress', 'items': [], 'itemsView': 'full'}}
         thread['status'] = {'type': 'active', 'activeFlags': []}
         thread['turns'] = [value['turn']]
+    elif method == 'turn/steer':
+        if behavior.get('steer_active_turn'):
+            turn_id = behavior['steer_active_turn']
+            thread['turns'] = [{'id': turn_id, 'status': 'inProgress', 'itemsView': 'full', 'items': []}]
+        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
+            payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
+        assert any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in payload['requests'].values() for c in r.get('controls', []))
+        if params['threadId'] != thread_id or params['expectedTurnId'] != turn_id:
+            print(json.dumps({'id': request['id'], 'error': {'code': -32000, 'message': 'Wrong active turn'}}), flush=True)
+            continue
+        with (root / 'applied-inputs.jsonl').open('a') as applied:
+            applied.write(json.dumps({'thread_id': thread_id, 'turn_id': turn_id, 'instruction_id': params['clientUserMessageId']}) + '\n')
+        value = {'turnId': turn_id}
+    elif method == 'turn/interrupt':
+        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
+            payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
+        assert any(r.get('stop', {}).get('status') == 'processing' for r in payload['requests'].values())
+        value = {}
+    elif method == 'thread/backgroundTerminals/list':
+        pages = json.loads((root / 'background.json').read_text()) if (root / 'background.json').exists() else {'': {'data': [], 'nextCursor': None}}
+        value = pages[params.get('cursor', '')]
     elif method == 'thread/read':
         state = json.loads((root / 'observed.json').read_text()) if (root / 'observed.json').exists() else {}
         thread.update(state)
-        value = {'thread': thread}
+        others = json.loads((root / 'threads.json').read_text()) if (root / 'threads.json').exists() else {}
+        value = {'thread': thread if params['threadId'] == thread_id else others.get(params['threadId'])}
     else:
         print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported fixture method'}}), flush=True)
         continue

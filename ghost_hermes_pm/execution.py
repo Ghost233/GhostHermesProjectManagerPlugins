@@ -105,6 +105,11 @@ def refresh_task(manager, identity, request_id):
     with manager._lock:
         version, data = manager._load()
         record = _responsible(manager, identity, request_id, data)
+        if record.get('stop', {}).get('status') == 'processing':
+            from .control import refresh_stop
+            return refresh_stop(manager, identity, request_id)
+        if record.get('outer_task_status') == 'stopped':
+            return record
         session = record.get('session')
         adapter = manager.codex_adapter
         if not session or not session.get('thread_id'):

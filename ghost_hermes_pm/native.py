@@ -165,7 +165,7 @@ def register_native(ctx):
                       handler=snapshot, description='Project directory and verified capability status')
     def task_operation(args):
         try:
-            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report'}:
+            if not isinstance(args, dict) or set(args) - {'action', 'request_id', 'report', 'instruction_id', 'text', 'expected_turn_id'}:
                 raise ManagementError('invalid_change', 'Task input cannot assert actor, permission or capability.')
             reference = ctx.get_config('participant_credential_ref')
             token = _credential(reference) if reference else None
@@ -174,7 +174,13 @@ def register_native(ctx):
             client = ManagementClient(state_dir, token)
             client.read_participant_snapshot()  # Reject owner aliases at the authoritative bridge.
             action = args.get('action')
-            if action == 'delivery':
+            if action in {'append', 'stop', 'continue'}:
+                if args.get('report') is not None:
+                    raise ManagementError('invalid_change', 'Control cannot assert delivery evidence.')
+                result = client.control_task(args.get('request_id'), action, args.get('instruction_id'), args.get('text'), args.get('expected_turn_id'))
+            elif any(args.get(k) is not None for k in ('instruction_id', 'text', 'expected_turn_id')):
+                raise ManagementError('invalid_change', 'Control fields require a control action.')
+            elif action == 'delivery':
                 result = client.record_task_delivery(args.get('request_id'), args.get('report'))
             else:
                 operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task'}.get(action)
@@ -187,8 +193,9 @@ def register_native(ctx):
 
     ctx.register_tool(name='hermes_pm_task', toolset='hermes_pm',
                       schema={'name': 'hermes_pm_task', 'description': 'Verify, start, observe or record evidence for one accepted Issue.',
-                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery']},
-                                  'request_id': {'type': 'string'}, 'report': {'type': 'object'}},
+                              'parameters': {'type': 'object', 'properties': {'action': {'type': 'string', 'enum': ['verify', 'start', 'refresh', 'delivery', 'append', 'stop', 'continue']},
+                                  'request_id': {'type': 'string'}, 'report': {'type': 'object'},
+                                  'instruction_id': {'type': 'string'}, 'text': {'type': 'string'}, 'expected_turn_id': {'type': 'string'}},
                                   'required': ['action', 'request_id'], 'additionalProperties': False}},
                       handler=task_operation, description='Single Issue execution and evidence')
     ctx.register_command('hermes-pm', lambda raw_args: snapshot({} if not raw_args.strip() else {'unsupported': True}),

@@ -118,7 +118,7 @@ class CodexStdioAdapter:
                 while key not in self._responses:
                     remaining = deadline - time.monotonic()
                     if self._closed or remaining <= 0:
-                        raise ManagementError('outcome_unknown' if method in {'thread/start', 'turn/start'} else 'unavailable',
+                        raise ManagementError('outcome_unknown' if method in {'thread/start', 'turn/start', 'turn/steer', 'turn/interrupt'} else 'unavailable',
                                               self._failure_reason or 'Codex response was not confirmed; mutating requests are never replayed.')
                     self._condition.wait(remaining)
                 response = self._responses.pop(key)
@@ -135,6 +135,8 @@ class CodexStdioAdapter:
             if not isinstance(result.get('data'), list):
                 raise ManagementError('capability_unverified', 'Codex list coverage could not be verified.')
             items.extend(result['data'])
+            if 'nextCursor' not in result:
+                raise ManagementError('capability_unverified', 'Codex list pagination coverage is missing.')
             cursor = result.get('nextCursor')
             if cursor is None:
                 return items
@@ -180,6 +182,67 @@ class CodexStdioAdapter:
 
     def start_turn(self, thread_id, prompt):
         return self._call('turn/start', {'threadId': thread_id, 'input': [{'type': 'text', 'text': prompt, 'text_elements': []}]})
+
+    def verify_control(self, repository, action, expected_capability):
+        self._alive()
+        if self.verifier is None or self.connection is None:
+            raise ManagementError('capability_unverified', 'Current-service task control receipts are missing.')
+        proof = self.verifier(dict(self.connection), json.loads(json.dumps(repository)))
+        if not isinstance(proof, dict) or proof.get('generation') != self.generation or proof.get('service_id') != self.connection['service_id'] or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']] or not isinstance(proof.get('task_control'), dict) or not isinstance(proof['task_control'].get(action), str) or not proof['task_control'][action]:
+            raise ManagementError('capability_unverified', 'This task control has not been verified on the original service and boundary.')
+        if any(proof.get(k) != expected_capability.get(k) for k in ('permission_profile', 'policy_digest', 'runtime_roots')):
+            raise ManagementError('capability_unverified', 'The fresh control proof does not match the original task permission boundary.')
+        return proof
+
+    def steer_turn(self, thread_id, turn_id, text, instruction_id):
+        return self._call('turn/steer', {'threadId': thread_id, 'expectedTurnId': turn_id,
+            'input': [{'type': 'text', 'text': text, 'text_elements': []}], 'clientUserMessageId': instruction_id})
+
+    @staticmethod
+    def verify_idle(thread, previous_turn_id, known_turn_ids):
+        turns = thread.get('turns', [])
+        previous = next((t for t in turns if t.get('id') == previous_turn_id), None)
+        if any(t.get('id') not in known_turn_ids for t in turns):
+            raise ManagementError('binding_conflict', 'Unregistered intervening turns require reconciliation before input.')
+        if thread.get('status', {}).get('type') != 'idle' or any(t.get('status') == 'inProgress' for t in turns) or not previous or previous.get('status') not in {'completed', 'failed', 'interrupted'} or previous.get('itemsView') != 'full':
+            raise ManagementError('binding_conflict', 'The original thread is not verified idle at the expected prior turn.')
+
+    def start_idle_turn(self, thread_id, previous_turn_id, text, instruction_id, *, expected_cwd, known_turn_ids):
+        # turn/start has no expected-idle precondition. A host receipt must prove
+        # an exclusive input path; this lock serializes the owned adapter writers.
+        with self._rpc_lock:
+            thread = self.read_thread(thread_id)
+            if thread.get('id') != thread_id or thread.get('cwd') != expected_cwd or thread.get('canAcceptDirectInput') is not True:
+                raise ManagementError('binding_conflict', 'The original idle input target changed.')
+            self.verify_idle(thread, previous_turn_id, known_turn_ids)
+            result = self._call('turn/start', {'threadId': thread_id, 'clientUserMessageId': instruction_id,
+                'input': [{'type': 'text', 'text': text, 'text_elements': []}]})
+            turn = result.get('turn', {})
+            if not isinstance(turn, dict) or not isinstance(turn.get('id'), str) or not turn['id'] or turn['id'] in {t.get('id') for t in thread.get('turns', [])} or turn.get('status') != 'inProgress':
+                raise ManagementError('outcome_unknown', 'A distinct original-thread new turn was not confirmed; do not replay.')
+            return result
+
+    def interrupt_turn(self, thread_id, turn_id):
+        return self._call('turn/interrupt', {'threadId': thread_id, 'turnId': turn_id})
+
+    def verify_process_coverage(self, session, stop):
+        proof = self.verify_control(session['repository'], 'related_execution', session['capability'])
+        coverage = proof.get('process_coverage')
+        if not isinstance(coverage, dict) or not isinstance(coverage.get('evidence'), str) or not coverage['evidence']:
+            raise ManagementError('capability_unverified', 'Host process coverage is missing; empty native background lists cannot prove all related processes stopped.')
+        if coverage.get('kind') == 'task_processes_stopped':
+            if coverage.get('thread_id') != session['thread_id'] or coverage.get('turn_id') != stop['turn_id'] or coverage.get('all_registered_processes_exited') is not True:
+                raise ManagementError('capability_unverified', 'Host process exit evidence does not identify the original task and turn.')
+        elif coverage.get('kind') != 'no_unregistered_process_paths':
+            raise ManagementError('capability_unverified', 'Unregistered child process execution paths remain unverified.')
+        return {**coverage, 'generation': session['generation'], 'service_id': session['service_id'],
+                'repository_fingerprint': proof['repository_fingerprint']}
+
+    def background_terminals(self, thread_id):
+        return self._pages('thread/backgroundTerminals/list', {'threadId': thread_id, 'limit': 100})
+
+    def loaded_threads(self):
+        return self._pages('thread/loaded/list', {'limit': 100})
 
     def read_thread(self, thread_id):
         self.connect()

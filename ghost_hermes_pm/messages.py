@@ -220,10 +220,23 @@ class FeishuEntry:
         elif result['status'] == 'associated':
             operations = {'执行': 'start_task', '核对执行': 'refresh_task', '核验执行能力': 'verify_task_execution'}
             operation = operations.get(text)
-            if operation:
+            control = None
+            explicit = re.fullmatch(r'(追加|继续)[：:]\s*(.*)', text, re.DOTALL)
+            if text in {'停止', '结束当前任务'}:
+                control = ('stop', None)
+            elif text in {'明确继续', '继续原工作'}:
+                control = ('continue', 'Continue the original accepted Issue within the existing scope.')
+            elif explicit:
+                control = ('append' if explicit.group(1) == '追加' else 'continue', explicit.group(2))
+            if operation or control:
                 def call_if_active():
                     with self.lifecycle_lock:
                         self.require_active(generation)
+                        if control:
+                            record = next(r for r in self.manager().read_snapshot(identity)['requests'] if r['id'] == result['request_id'])
+                            previous = next((c for c in record.get('controls', []) if c['id'] == result['id']), None)
+                            expected = previous['expected_turn_id'] if previous else record.get('session', {}).get('turn_id')
+                            return self.manager().control_task(identity, result['request_id'], control[0], result['id'], control[1], expected)
                         return getattr(self.manager(), operation)(identity, result['request_id'])
                 try:
                     outcome = await asyncio.to_thread(call_if_active)
