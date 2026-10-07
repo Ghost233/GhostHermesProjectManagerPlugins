@@ -419,6 +419,10 @@ class Manager:
         from .memory import supplement_project_memory
         return supplement_project_memory(self, identity, request_id, entry_ids, expected_turn_id)
 
+    def manage_memory(self, identity, action, details):
+        from .memory import perform
+        return perform(self, identity, action, details)
+
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
         try:

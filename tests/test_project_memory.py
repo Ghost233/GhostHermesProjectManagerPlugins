@@ -295,3 +295,52 @@ def test_memory_update_requires_explicit_effective_original_control_to_affect_ru
         assert not (tmp_path / 'wire.jsonl').exists()
         methods = [r.get('method') for r in map(json.loads, (peer / 'original-wire.jsonl').read_text().splitlines())]
         assert methods.count('turn/steer') == 1 and 'turn/start' not in methods and 'thread/start' not in methods
+
+
+def test_dashboard_and_participant_memory_actions_share_identity_scope_and_loading_rules(tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from ghost_hermes_pm.dashboard import create_router
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path)) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            app = FastAPI()
+            app.include_router(create_router(lambda request: ManagementClient(tmp_path / 'state', request.headers.get('x-fixture-entry', 'invalid'))))
+            browser = TestClient(app)
+            body = {'action': 'preference', 'details': {'profile_id': 'mono-lead', 'entry_id': 'dashboard-rule',
+                'statement': 'For this project, include tested versions.', 'scope': {'kind': 'project', 'id': 'mono'}}}
+            response = browser.post('/memory', json=body, headers={'x-fixture-entry': 'owner'})
+            assert response.status_code == 200, response.text
+            assert browser.post('/memory', json=body, headers={'x-fixture-entry': 'lead'}).status_code == 403
+            forged = {**body, 'details': {**body['details'], 'actor': OWNER.subject}}
+            assert browser.post('/memory', json=forged, headers={'x-fixture-entry': 'lead'}).status_code == 422
+            read = browser.post('/memory', json={'action': 'read', 'details': {'profile_id': 'mono-lead'}}, headers={'x-fixture-entry': 'lead'})
+            assert read.status_code == 200 and read.json()['external_memory'] == 'unverified'
+            assert browser.post('/memory', json={'action': 'load', 'details': {'request_id': request_id, 'entry_ids': ['dashboard-rule'], 'role': 'steward'}}, headers={'x-fixture-entry': 'lead'}).status_code == 422
+            loaded = browser.post('/memory', json={'action': 'load', 'details': {'request_id': request_id, 'entry_ids': ['dashboard-rule']}}, headers={'x-fixture-entry': 'lead'})
+            assert loaded.status_code == 200 and loaded.json()['status'] == 'prepared'
+
+
+@pytest.mark.parametrize('kind', ['inference', 'suggestion', 'stale', 'conflict'])
+def test_unaccepted_classifications_and_sensitive_or_temporary_content_never_become_long_term_facts(tmp_path, kind):
+    provider = local_provider(tmp_path)
+    provider.documents[0]['kind'] = kind
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
+                 knowledge_providers={'local:fixture-wiki': provider}) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        manager.start_task(OWNER, request_id)
+        manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
+            query = prepared_facts(manager, owner, lead, request_id)
+            completed_delivery(tmp_path, owner, request_id)
+            with pytest.raises(ManagementError) as rejected:
+                lead.curate_project_memory('mono-lead', 'unverified-material', request_id,
+                    {'facts': [{'query_id': query, 'material_ids': ['retry:3']}], 'decisions': [], 'include_delivery': True})
+            assert rejected.value.code == 'evidence_missing'
+            with pytest.raises(ManagementError):
+                owner.record_memory_preference('mono-lead', 'unsafe-preference', 'API_KEY=synthetic-sensitive-value', {'kind': 'project', 'id': 'mono'})
+            with pytest.raises(ManagementError):
+                lead.curate_project_memory('mono-lead', 'temporary-status', request_id,
+                    {'facts': [], 'decisions': [], 'include_delivery': True, 'temporary_status': 'Codex claims complete'})
+            assert lead.read_project_memory('mono-lead')['entries'] == []

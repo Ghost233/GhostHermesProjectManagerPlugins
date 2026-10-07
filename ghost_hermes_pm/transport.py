@@ -99,6 +99,8 @@ class ManagementServer:
                             result = bridge.manager.record_memory_preference(identity, payload.get('profile_id'), payload.get('entry_id'), payload.get('statement'), payload.get('scope'), payload.get('supersedes'))
                         elif payload.get('operation') == 'supplement_project_memory':
                             result = bridge.manager.supplement_project_memory(identity, payload.get('request_id'), payload.get('entry_ids'), payload.get('expected_turn_id'))
+                        elif payload.get('operation') == 'manage_memory':
+                            result = bridge.manager.manage_memory(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'record_task_delivery':
                             result = bridge.manager.record_task_delivery(identity, payload.get('request_id'), payload.get('report'))
                         elif payload.get('operation') == 'register_knowledge_source':
@@ -176,7 +178,7 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate'} else 3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery', 'control_task', 'answer_human_request', 'prepare_task', 'refresh_task_source', 'refresh_manual_sessions', 'take_over_session', 'return_session_control', 'query_archive', 'protect_archive', 'backup_archive', 'restore_archive', 'collaborate', 'answer_from_knowledge', 'supplement_project_memory', 'manage_memory'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
@@ -184,7 +186,7 @@ class ManagementClient:
         except (OSError, ValueError) as exc:
             if operation in {'query_archive', 'protect_archive', 'backup_archive', 'restore_archive'}:
                 raise ManagementError('outcome_unknown', 'The archive operation response was not confirmed; inspect the same durable query/protection/backup/restore ID before retrying. Original entries remain inactive.') from exc
-            if operation in {'start_task', 'control_task', 'answer_human_request'}:
+            if operation in {'start_task', 'control_task', 'answer_human_request', 'answer_from_knowledge', 'supplement_project_memory', 'manage_memory'}:
                 raise ManagementError('outcome_unknown', 'Task start response was not confirmed; read the same durable request before retrying. Repository occupancy is retained.') from exc
             raise ManagementError('unavailable', 'The management instance is unavailable; no operation was confirmed.') from exc
         if 'error' in response:
@@ -286,3 +288,6 @@ class ManagementClient:
 
     def supplement_project_memory(self, request_id, entry_ids, expected_turn_id):
         return self._call('supplement_project_memory', request_id=request_id, entry_ids=entry_ids, expected_turn_id=expected_turn_id)
+
+    def manage_memory(self, action, details):
+        return self._call('manage_memory', action=action, details=details)
