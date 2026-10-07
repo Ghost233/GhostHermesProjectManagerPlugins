@@ -11,3 +11,4 @@ provides_hooks:
   - pre_api_request
 python_dependencies:
   - fastapi
+  - requests
