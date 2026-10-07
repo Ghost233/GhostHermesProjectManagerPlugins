@@ -98,7 +98,9 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, notification_clock=None):
+        import time
+        self.notification_clock = notification_clock or time.time
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
@@ -263,9 +265,11 @@ class Manager:
             from .collaboration import snapshot as collaboration_snapshot
             role_snapshot = collaboration_snapshot(data, principal, visible_ids)
             from .knowledge import snapshot_knowledge
+            from .notifications import snapshot as notification_snapshot
             from .archives import snapshot_archives
             return {**snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'notifications': notification_snapshot(data, {p['id'] for p in projects}),
                     'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
@@ -280,6 +284,10 @@ class Manager:
                         'compatibility': 'unverified', 'real_connect': 'unverified', 'real_group_acceptance': 'unverified'}),
                     'execution': 'available' if any(r.get('execution_capability', {}).get('enabled') and executor_for(self, r) and r['execution_capability'].get('connection', {}).get('generation') == executor_for(self, r).generation and not executor_for(self, r)._closed for r in requests) else 'not_enabled',
                     'needs_human': ['Capabilities require current service, permission and channel evidence.']}
+
+    def run_notifications(self, identity):
+        from .notifications import run
+        return run(self, identity)
 
     def accept_request(self, identity, project_id, profile_id, message, issue, *, delegation_id=None):
         """Accept an Issue snapshot from a trusted message entry; never start Codex."""
