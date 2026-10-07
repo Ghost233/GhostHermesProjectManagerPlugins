@@ -67,8 +67,10 @@ def delivery_requirements(body):
             optional_pattern = r'\b(?:not required|not necessary|does not need)\b.{0,40}?\bmerg(?:e|ed|ing)\b|(?:不是必须|并非必须|非必须|未要求).{0,30}?合并|\b(?:no|without)\s+(?:PR\s+)?merg(?:e|ing)\b|\bmerg(?:e|ed|ing)\b.{0,40}?\b(?:not required|optional)\b|\b(?:may|can|could|optional)\b.{0,40}?\bmerg(?:e|ed)\b|(?:无需|不要求|不需要|可选|酌情|可以).{0,30}?合并|合并.{0,20}(?:可选|不作要求|不作为交付条件)'
             optional = re.search(optional_pattern, clause, re.IGNORECASE)
             affirmative = re.sub(optional_pattern, ' ', clause, flags=re.IGNORECASE)
+            # Status-bearing noun phrases are subjects/objects, not merge commands.
+            affirmative = re.sub(r'\bmerg(?:e|ed|ing)\s+(?:status|state)\b|合并\s*(?:(?:此|本|该)?\s*(?:PR|拉取请求|代码|变更|提交))?\s*(?:的)?\s*(?:当前|相关|最终)?\s*状态', ' ', affirmative, flags=re.IGNORECASE)
             obligation = re.search(r'\b(?:must|shall|has to|have to|needs to|is required to)\s+(?:be\s+)?merg(?:e|ed)\b|\bmerg(?:e|ed|ing)\b.{0,40}\b(?:is required|is mandatory)\b|^\s*merge\b|(?:必须|务必|须|应当|需要|要求)\s*(?:先|完成\s*(?:此|本|该)?\s*PR\s*)?合并|^\s*(?:合并(?:此|本|该)?\s*PR|将.+合并到)|完成\s*PR\s*合并(?:后|之后).{0,20}(?:交付|验收)', affirmative, re.IGNORECASE)
-            reporting = re.search(r'\b(?:show|display|report|list|record|track|describe)\b|展示|显示|呈现|记录|列出|跟踪', clause, re.IGNORECASE) and re.search(r'\b(?:status|state|whether)\b|状态|是否|待审查|待合并|已合并', clause, re.IGNORECASE)
+            reporting = re.search(r'\b(?:show(?:n|s|ing)?|display(?:ed|s|ing)?|report(?:ed|s|ing)?|list(?:ed|s|ing)?|record(?:ed|s|ing)?|track(?:ed|s|ing)?|describe(?:d|s)?)\b|展示|显示|呈现|记录|列出|跟踪', clause, re.IGNORECASE) and re.search(r'\b(?:status|state|whether)\b|状态|是否|待审查|待合并|已合并', clause, re.IGNORECASE)
             conditional = re.search(r'\b(?:if|unless)\b|(?:如果|若|除非)', clause, re.IGNORECASE)
             if optional and obligation:
                 unclear.append(criterion)
@@ -84,13 +86,17 @@ def delivery_requirements(body):
                 unclear.append(criterion)
     if required and forbidden:
         unclear.extend(required + forbidden)
-    return {'version': 2, 'merge_required': bool(required), 'merge_forbidden': bool(forbidden),
+    return {'version': 3, 'merge_required': bool(required), 'merge_forbidden': bool(forbidden),
             'merge_criteria': list(dict.fromkeys(required)), 'clarification_criteria': list(dict.fromkeys(unclear))}
 
 
-def frozen_delivery_requirements(record):
+def frozen_delivery_requirements(record, manager=None, data=None):
     value = record.get('delivery_requirements', {})
-    return value if value.get('version') == 2 else delivery_requirements(record['accepted_scope']['body'])
+    original = value if value.get('version') == 3 else delivery_requirements(record['accepted_scope']['body'])
+    if manager is None or data is None:
+        return original
+    from .scope_interpretations import apply_owner_interpretations
+    return apply_owner_interpretations(manager, record, data, original)
 
 
 def acceptance_criteria(body):
@@ -224,7 +230,7 @@ def record_task_delivery(manager, identity, request_id, report):
             if not re.fullmatch(r'[a-f0-9]{40}', local) or remote != local:
                 raise ManagementError('evidence_missing', 'A involved local branch is not synchronized with its actual remote hash.')
             sync.append({'branch': branch, 'local_commit': local, 'remote_commit': remote, 'source': 'local_git_and_github_read'})
-        requirements = frozen_delivery_requirements(record)
+        requirements = frozen_delivery_requirements(record, manager, data)
         if requirements['clarification_criteria']:
             raise ManagementError('needs_clarification', 'The accepted Issue does not uniquely define its merge obligation; confirm the original acceptance scope with the Owner before delivery.')
         if requirements['merge_forbidden'] and pr and pr['state'] == 'merged':
@@ -238,7 +244,7 @@ def record_task_delivery(manager, identity, request_id, report):
         record.update(task_delivery='delivered', pr_status=pr_status, repository_released=True, handoff_reason=None, outer_task_status='delivered',
                       test_evidence=list(tests.values()), delivery_evidence={'issue_updated_at': scope['updated_at'], 'criteria': criteria,
                       'source_commit': commit or current['head'], 'source_changed': source_changed, 'execution_end': execution_end, 'leftover_changes': current['workspace_status'], 'workspace': current, 'artifacts': artifacts,
-                      'pr': pr, 'sync': sync, 'verified_at': datetime.now(timezone.utc).isoformat()})
+                      'pr': pr, 'sync': sync, 'owner_interpretation_ids': requirements.get('owner_interpretation_ids', []), 'verified_at': datetime.now(timezone.utc).isoformat()})
         from .takeover import complete_grant
         complete_grant(manager, record, data)
         for arrangement in record.get('execution_arrangements', []):

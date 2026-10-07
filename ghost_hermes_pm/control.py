@@ -148,6 +148,9 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
                 if arrangement is not None:
                     arrangement.update(turn_id=session['turn_id'], phase='running')
             instruction.update(phase='rpc_accepted', rpc_accepted_at=_now())
+            if action == 'append':
+                from .scope_interpretations import record_owner_interpretation
+                record_owner_interpretation(manager, identity, record, instruction, data)
         except ManagementError as exc:
             instruction.update(phase='rejected' if exc.code == 'service_rejected' else 'outcome_unknown', reason=str(exc))
             if arrangement is not None:
