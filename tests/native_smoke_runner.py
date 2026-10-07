@@ -52,6 +52,8 @@ sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 import ghost_hermes_pm.feishu as issue_source
 issue_source.read_github_issue = lambda url: {'url': url, 'title': 'Native Issue fixture',
     'body': 'Accepted fixture material.\n' + 'A' * 4000, 'updated_at': '2026-10-07T00:00:00Z'}
+from native_fixture_boundary import install
+install(home / 'plugins' / 'ghost-hermes-pm', {'feishu': lambda module: setattr(module, 'read_github_issue', issue_source.read_github_issue)})
 from hermes_cli.plugins import get_plugin_manager
 from hermes_cli.web_server_dashboard import _discover_dashboard_plugins, _mount_plugin_api_routes
 manager = get_plugin_manager()
@@ -215,7 +217,9 @@ async def exercise_gateway_lifecycle():
     restarted_gateway = GatewayFixture()
     assert await ainvoke_hook('pre_gateway_dispatch', event=event, gateway=restarted_gateway) == []
     again = browser.get(base + '/snapshot', headers=headers).json()
-    assert again['version'] == verified_version and len(again['profiles']) == 1 and len(again['requests']) == 1, again
+    assert again['version'] == verified_version + 1 and len(again['profiles']) == 1 and len(again['requests']) == 1, again
+    assert again['maintenance']['events'][-1]['status'] == 'pending_verification'
+    assert again['maintenance']['events'][-1]['execution_stopped'] is False
     assert manager.unload('ghost-hermes-pm')
     await asyncio.sleep(0)
     assert not (state / 'manager.sock').exists()
