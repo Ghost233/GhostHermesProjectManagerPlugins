@@ -66,6 +66,9 @@ class CodexArchiveProvider:
             raise ManagementError('invalid_change','Codex archives require an original-executor read-only adapter and explicit thread scopes.')
         self.adapter,self.thread_scopes=adapter,dict(thread_scopes)
 
+    def close(self):
+        self.adapter.close()
+
     def query(self,requester,scope_ids,question,complete=False):
         adapter=self.adapter
         proof=adapter.proof()

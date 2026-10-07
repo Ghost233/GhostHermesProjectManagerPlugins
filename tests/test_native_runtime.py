@@ -48,3 +48,5 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
                                 cwd=scratch, env=env, text=True, capture_output=True, timeout=60)
         assert result.returncode == 0, result.stdout + result.stderr
         assert 'native load, Dashboard bridge, restart, teardown: OK' in result.stdout
+        if runner == 'archive_smoke_runner.py':
+            print(result.stdout)

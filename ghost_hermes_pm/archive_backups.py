@@ -7,7 +7,7 @@ import shutil
 import uuid
 
 from .manager import ManagementError, VerifiedIdentity
-from .archives import HermesArchiveProvider, _source, _now, _digest
+from .archives import HermesArchiveProvider, _source, _now, _digest, provider_binding
 
 
 def _owner(manager,identity,data):
@@ -19,11 +19,16 @@ def _provider(manager,source):
     provider=manager.archive_providers.get(source['provider_ref'])
     if not isinstance(provider,HermesArchiveProvider):
         raise ManagementError('capability_unverified','This external original data service has no verified local backup/restore or native-retention capability.')
+    if provider_binding(provider)!=source.get('provider_binding'):
+        raise ManagementError('binding_conflict','The original archive provider binding changed; protection/backup requires owner reconciliation.')
     return provider
 
 
 def _location(manager,category,identifier):
-    base=(manager.state_dir/category).resolve()
+    supplied=manager.state_dir/category
+    if supplied!=supplied.resolve():
+        raise ManagementError('invalid_change','Archive artifacts must remain in the owned ordinary Manager directory.')
+    base=supplied.resolve()
     base.mkdir(parents=True,exist_ok=True)
     path=base/(_digest(identifier)+'.sqlite')
     if path.is_symlink():
@@ -204,7 +209,7 @@ def protect(manager,identity,source_id,protection_id):
             if source['protection']['id']!=protection_id:
                 raise ManagementError('binding_conflict','Protection already has a durable operation; reconcile its state first.')
             return source['protection']
-        evidence={'id':protection_id,'status':'pin_intent','created_at':_now(),'old_entry':'not_started'}
+        evidence={'id':protection_id,'status':'pin_intent','created_at':_now(),'old_entry':'not_started','permanent_protection':'unverified','ordinary_tool_read_write_delete_boundary':'unverified','original_source_cleanup':'not_run'}
         source['protection']=evidence
         with manager._db: manager._save(version,data)
         try:

@@ -127,6 +127,10 @@ class Manager:
                 self.codex_adapter.close()
             for adapter in self.observation_adapters.values():
                 adapter.close()
+            from .archive_sources import CodexArchiveProvider
+            for provider in self.archive_providers.values():
+                if isinstance(provider, CodexArchiveProvider):
+                    provider.close()
             self._db.close()
 
     def __enter__(self):

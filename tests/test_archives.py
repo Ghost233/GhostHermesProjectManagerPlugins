@@ -180,6 +180,7 @@ def test_codex_archive_full_turn_item_pagination_is_original_read_only_and_compa
             assert result['coverage']['pages']==5
             assert len(result['records'])==3
             assert 'pre-compaction' in result['coverage']['missing'][0]
+        assert adapter._closed, 'Manager lifecycle must close the owned read-only archive proxy.'
         wire=[json.loads(line)['method'] for line in (tmp_path/'archive-wire.jsonl').read_text().splitlines()]
         assert set(wire)<={'initialize','initialized','thread/read','thread/turns/list','thread/items/list'}
     finally:
@@ -269,11 +270,13 @@ def test_sealed_local_materials_are_consistent_data_backups_and_restore_actually
     manager,viewer,path=setup_archive(tmp_path)
     sealed=tmp_path/'migration-notes.md';sealed.write_text('Original migration decision: preserve every uncertain result.\n')
     provider=HermesArchiveProvider(path,{'public':['old-root']},files={'public':[{'id':'notes','path':str(sealed)}]})
-    manager.archive_providers['local:old-hermes']=provider
+    manager.archive_providers['local:sealed']=provider
     with manager:
-        first=manager.query_archive(viewer,'old-hermes','sealed','migration',['public'],True)
+        registration=migration_registration();registration.update(id='old-sealed',provider_ref='local:sealed')
+        manager.register_archive_source(OWNER,registration)
+        first=manager.query_archive(viewer,'old-sealed','sealed','migration',['public'],True)
         assert first['records'][-1]['locator']=='archive-file:notes'
-        baseline=manager.backup_archive(OWNER,'old-hermes','sealed-baseline','baseline')
+        baseline=manager.backup_archive(OWNER,'old-sealed','sealed-baseline','baseline')
         assert baseline['status']=='complete'
         sealed.write_text('New notes must not replace the fixed checkpoint.\n')
         restored=manager.restore_archive(OWNER,'sealed-baseline','sealed-restore')
@@ -313,3 +316,91 @@ def test_narrow_archive_grant_cannot_copy_ungranted_sibling_database_or_restore_
         artifact.write_bytes(b'tampered')
         restored=manager.restore_archive(OWNER,'intact-baseline','bad-restore')
         assert restored['status']=='blocked' and 'hash changed' in restored['reason']
+
+
+def test_missing_compression_ancestor_and_changed_provider_binding_are_not_complete_or_new_authority(tmp_path):
+    manager,viewer,path=setup_archive(tmp_path)
+    with manager:
+        moved=tmp_path/'other-history.db'
+        with sqlite3.connect(path) as src,sqlite3.connect(moved) as dst:
+            src.backup(dst)
+        manager.archive_providers['local:old-hermes']=HermesArchiveProvider(moved,{'public':['old-root']})
+        changed=manager.query_archive(viewer,'old-hermes','changed-source','retry',['public'],True)
+        assert changed['status']=='blocked' and 'binding' in changed['reason']
+        manager.archive_providers['local:old-hermes']=HermesArchiveProvider(path,{'public':['old-root']})
+        with sqlite3.connect(path) as db:
+            db.execute('UPDATE sessions SET parent_session_id=? WHERE id=?',('missing-ancestor','old-root'))
+        missing=manager.query_archive(viewer,'old-hermes','missing-ancestor','retry',['public'],True)
+        assert missing['status']=='incomplete'
+        assert 'parent-session-unavailable' in missing['coverage']['missing'][0]
+
+
+def test_owned_backup_directory_cannot_redirect_copy_outside_manager_state(tmp_path):
+    manager,viewer,path=setup_archive(tmp_path)
+    other=tmp_path/'unrelated';other.mkdir()
+    (manager.state_dir/'archive-backups').symlink_to(other,target_is_directory=True)
+    with manager:
+        result=manager.backup_archive(OWNER,'old-hermes','redirected','baseline')
+        assert result['status']=='blocked' and 'owned' in result['reason']
+        assert list(other.iterdir())==[]
+
+
+def test_unknown_group_archive_delivery_keeps_original_uuid_and_never_replays(tmp_path):
+    import asyncio
+    from ghost_hermes_pm.messages import FeishuEntry
+    from test_feishu_entry import CONFIG,Gateway,event
+    from ghost_hermes_pm.archive_delivery import deliver
+    manager,viewer,path=setup_archive(tmp_path)
+    channel={'id':'archive-public','profile_id':'new-profile','app_id':'cli_fixture','transport_tenant_key':'tenant-transport',
+        'recipient_tenant_key':'tenant-bot','recipient_open_id':'ou_lead','chat_id':'oc_project','scope_ids':['public'],
+        'view_subjects':[OWNER.subject,viewer.subject],'wiki_mention_open_id':'ou_unused'}
+    grant=source_grant();grant['query_subjects'][viewer.subject]=['public'];grant['public_channels']=[channel]
+    class Unknown:
+        sent=[]
+        async def verify_identity(self,binding):
+            return {'app_id':'cli_fixture','open_id':'ou_lead'}
+        async def send(self,segment):
+            self.sent.append(segment)
+            return {'status':'unknown'}
+    adapter=object();transport=Unknown()
+    with manager:
+        manager.register_knowledge_source(OWNER,manager.read_snapshot(OWNER)['version'],grant)
+        intake=FeishuEntry(lambda:manager,OWNER.subject,{**CONFIG,'bindings':[{**CONFIG['bindings'][0],'profile_id':'new-profile','project_id':None}]},lambda url:None)
+        intake.attach_transport(adapter,transport)
+        message=event('@_user_1 查档案 old-hermes public：retry','om_unknown_archive')
+        assert asyncio.run(intake.receive(message,Gateway(adapter)))=={'action':'skip'}
+        result=manager.read_snapshot(OWNER)['archive_queries'][0]
+        segment=result['outbox'][0]['segments'][0]
+        assert segment['status']=='unknown'
+        asyncio.run(deliver(intake,OWNER,result['id'],transport))
+        assert asyncio.run(intake.receive(message,Gateway(adapter)))=={'action':'skip'}
+        assert len(transport.sent)==1
+        assert transport.sent[0]['uuid']==segment['uuid']
+
+
+def test_live_wal_checkpoint_includes_committed_changes_without_copying_stale_main_file(tmp_path):
+    manager,viewer,path=setup_archive(tmp_path)
+    with manager,sqlite3.connect(path) as writer:
+        writer.execute('PRAGMA journal_mode=WAL')
+        writer.execute('UPDATE messages SET content=? WHERE id=4',('Committed data still in the live WAL',))
+        writer.commit()
+        assert path.with_name(path.name+'-wal').exists()
+        baseline=manager.backup_archive(OWNER,'old-hermes','wal-baseline','baseline')
+        assert baseline['status']=='complete'
+        restored=manager.restore_archive(OWNER,'wal-baseline','wal-restore')
+        assert restored['status']=='verified'
+        assert restored['query']['records'][3]['text']=='Committed data still in the live WAL'
+
+
+def test_public_archive_read_can_finish_after_old_three_second_bridge_budget(tmp_path):
+    import time
+    class Slow(HermesArchiveProvider):
+        def query(self,*args,**kwargs):
+            time.sleep(3.1)
+            return super().query(*args,**kwargs)
+    manager,viewer,path=setup_archive(tmp_path)
+    manager.archive_providers['local:old-hermes']=Slow(path,{'public':['old-root']})
+    with manager,ManagementServer(manager,{'new':viewer}):
+        result=ManagementClient(tmp_path/'state','new').query_archive('old-hermes','slow-history','retry',['public'],True)
+        assert result['status']=='complete'
+        assert ManagementClient(tmp_path/'state','new').read_snapshot()['archive_queries'][0]['id']=='slow-history'

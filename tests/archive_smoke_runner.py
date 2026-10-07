@@ -46,7 +46,12 @@ native.end_session('old-tip','user_close')
 native._write_sql('UPDATE sessions SET ended_at=1,started_at=1,archived=1')
 native._write_sql('UPDATE messages SET active=0,compacted=1 WHERE id=?',(first,))
 native.close()
-provider=HermesArchiveProvider(path,{'public':['old-tip']},page_size=1)
+sessions_dir=original/'sessions';sessions_dir.mkdir()
+for sid in ('old-root','old-tip'):
+    (sessions_dir/(sid+'.jsonl')).write_text('Synthetic original transcript '+sid)
+provider=HermesArchiveProvider(path,{'public':['old-tip']},page_size=1,files={'public':[
+    {'id':'root-transcript','path':str(sessions_dir/'old-root.jsonl')},
+    {'id':'tip-transcript','path':str(sessions_dir/'old-tip.jsonl')}]})
 viewer=VerifiedIdentity(NEW['identity_ref'],'native-explicit-migration')
 with Manager(state,owner_identity_ref=OWNER.subject,archive_providers={'local:old-hermes':provider}) as authority:
     authority.apply_directory_change(OWNER,0,{'profile':WIKI})
@@ -71,9 +76,7 @@ with Manager(state,owner_identity_ref=OWNER.subject,archive_providers={'local:ol
         assert protection['status']=='verified_native_cleanup_copy',protection
         assert protection['archived_unpinned_control']=='deleted',protection
         # Actual source auto-cleanup, with on-disk transcripts: pin, not archived, is the protection.
-        sessions_dir=original/'sessions';sessions_dir.mkdir()
-        for sid in ('old-root','old-tip','unprotected-archived'):
-            (sessions_dir/(sid+'.jsonl')).write_text('Synthetic original transcript '+sid)
+        (sessions_dir/'unprotected-archived.jsonl').write_text('Synthetic unprotected control transcript')
         native=SessionDB(path)
         native.create_session('unprotected-archived','cli')
         native.end_session('unprotected-archived','user_close')
@@ -92,7 +95,20 @@ with Manager(state,owner_identity_ref=OWNER.subject,archive_providers={'local:ol
         restored=owner.restore_archive('native-baseline','native-restored')
         assert restored['status']=='verified' and restored['query']['source_version']==baseline['source_version'],restored
         assert restored['query']['records'][0]['text']=='Original retry requirement',restored
+        assert restored['query']['records'][-1]['text']=='Synthetic original transcript old-tip'
         assert owner.read_snapshot()['requests']==[]
+        assert owner.read_snapshot()['archive_sources'][0]['protection']['current_native_pins']=='verified'
+        native=SessionDB(path)
+        native.set_session_pinned('old-tip',False)  # explicit synthetic native Owner change, outside the archive tool
+        native.close()
+        current=owner.read_snapshot()['archive_sources'][0]['protection']
+        assert current['current_native_pins']=='unverified' and current['permanent_protection']=='unverified',current
+        assert current['status']=='verified_native_cleanup_copy',current
+        print(json.dumps({'source':'pristine SDK / isolated synthetic original data', 'cleanup_copy':protection,
+            'synthetic_original_auto_cleanup':cleanup,'protected_transcripts':'preserved','archived_unpinned_control_transcript':'deleted',
+            'baseline':{'status':baseline['status'],'source_version':baseline['source_version'],'consistency':baseline['consistency']},
+            'restore':{'status':restored['status'],'source_version':restored['query']['source_version'],'actual_original_rows':restored['query']['coverage']['original_rows']},
+            'current_native_unpin_detected':current['current_native_pins'],'ordinary_tool_boundary':'unverified','permanent_original_protection':'unverified'},sort_keys=True))
         assert plugin_manager.unload('ghost-hermes-pm')
         assert registry.get_entry('hermes_pm_archive',scope=str(home)) is None
 print('native archive: actual pinned compression/compaction+transcripts survived automatic prune; archived unpinned control deleted; SQLite checkpoint restored and queried: OK')

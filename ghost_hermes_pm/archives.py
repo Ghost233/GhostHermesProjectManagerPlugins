@@ -20,6 +20,21 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def provider_binding(provider):
+    if isinstance(provider,HermesArchiveProvider):
+        stat=provider.path.stat()
+        return _digest({'kind':provider.kind,'path':str(provider.path),'file_identity':[stat.st_dev,stat.st_ino],
+            'sessions':provider.session_scopes,'files':provider.files})
+    from .archive_sources import FeishuArchiveProvider,CodexArchiveProvider
+    if isinstance(provider,FeishuArchiveProvider):
+        return _digest({'kind':provider.kind,'binding':provider.binding,'chats':provider.chat_scopes})
+    if isinstance(provider,CodexArchiveProvider):
+        adapter=provider.adapter
+        return _digest({'kind':provider.kind,'threads':provider.thread_scopes,'service_ref':adapter.service_ref,
+            'endpoint_ref':adapter.endpoint_ref,'source_kind':adapter.source_kind})
+    return None
+
+
 def _fork(row):
     """Match native _is_explicit_fork_child_row(include_reset=True), without SDK startup."""
     if row.get('source') == 'tool':
@@ -79,6 +94,8 @@ class HermesArchiveProvider:
                         break
                     seen.add(sid)
                     parent = db.execute('SELECT * FROM sessions WHERE id=?', (row.get('parent_session_id'),)).fetchone()
+                    if row.get('parent_session_id') and parent is None and not _fork(row):
+                        missing.append(sid+':parent-session-unavailable')
                     if not _fork(row) and parent is not None and parent['end_reason']=='compression':
                         sid = parent['id']
                     else:
@@ -134,7 +151,8 @@ class HermesArchiveProvider:
                 if not path.is_absolute() or path!=path.resolve() or not path.is_file():
                     raise ManagementError('archive_incomplete','An explicitly registered sealed file is missing or changed its ordinary-file binding.')
                 before=path.stat()
-                raw=path.read_bytes()
+                with path.open('rb') as stream:
+                    raw=stream.read(10*1024*1024+1)
                 after=path.stat()
                 if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns):
                     raise ManagementError('archive_incomplete','A sealed file changed during its bounded read; consistent coverage is unverified.')
@@ -182,7 +200,7 @@ def register_source(manager, identity, registration):
             if any(existing.get(k)!=v for k,v in registration.items()):
                 raise ManagementError('binding_conflict','An archive source ID cannot silently rebind migration or source authority.')
             return existing
-        sources[registration['id']]={**registration,'new_identity_ref':profile['identity_ref'],'registered_at':_now(),
+        sources[registration['id']]={**registration,'new_identity_ref':profile['identity_ref'],'registered_at':_now(),'provider_binding':provider_binding(manager.archive_providers.get(registration['provider_ref'])),
             'protection':{'status':'unverified','reason':'Native automatic cleanup protection has not been proved.'},
             'external_restore':{'status':'unverified','reason':'No original external-service restore capability has been verified.'}}
         manager._save(version,data)
@@ -229,7 +247,11 @@ def query_archive(manager,identity,source_id,query_id,question,scope_ids,complet
     try:
         if provider is None or provider.kind!=source['kind']:
             raise ManagementError('archive_unavailable','The exact registered archive adapter is unavailable; no old entry was started.')
+        if provider_binding(provider)!=source.get('provider_binding'):
+            raise ManagementError('binding_conflict','The registered original archive provider binding changed; owner reconciliation is required.')
         result=_validate_result(manager,provider.query(identity.subject,scope_ids,question,complete),source,query)
+        if provider_binding(provider)!=source.get('provider_binding'):
+            raise ManagementError('binding_conflict','The original archive binding changed during the read.')
     except Exception as exc:
         result={'status':'blocked','records':[],'reason':str(exc) if isinstance(exc,ManagementError) else 'Archive read failed; complete coverage remains unverified.',
             'kind':source['kind'],'old_entry':'not_started'}
@@ -270,7 +292,27 @@ def snapshot_archives(manager,identity,data):
         if query['requester']!=identity.subject and not public:
             continue
         queries.append(query if public or allowed else {k:query[k] for k in ('id','source_id','requester','scope_ids','created_at')}|{'status':'grant_revoked','records':[]})
-    return {'archive_sources':[s for sid,s in sources.items() if sid in visible_ids],'archive_queries':queries,
+    visible_sources=[]
+    for sid,source in sources.items():
+        if sid not in visible_ids:
+            continue
+        protection=dict(source['protection'])
+        protection.update(permanent_protection='unverified',ordinary_tool_read_write_delete_boundary='unverified',original_source_cleanup='not_run',current_native_pins='unverified')
+        if protection.get('status')=='verified_native_cleanup_copy':
+            try:
+                _source(manager,identity,sid,source['scope_ids'],data)
+                provider=manager.archive_providers.get(source['provider_ref'])
+                if not isinstance(provider,HermesArchiveProvider) or provider_binding(provider)!=source.get('provider_binding'):
+                    raise ManagementError('binding_conflict','The current original source binding is unverified.')
+                _,sessions,coverage,_=provider.read(source['scope_ids'])
+                if coverage['end_confirmed'] and all(row.get('pinned') for row in sessions):
+                    protection['current_native_pins']='verified'
+                else:
+                    protection['reason']='Current native pin coverage changed; the past cleanup-copy proof cannot establish present protection.'
+            except Exception:
+                protection['reason']='Current native pin/source/grant coverage is unavailable; original protection remains unverified.'
+        visible_sources.append(source|{'protection':protection})
+    return {'archive_sources':visible_sources,'archive_queries':queries,
         'archive_backups':[b for b in data.get('archive_backups',{}).values() if identity.subject==manager.owner_identity_ref],
         'archive_restores':[r for r in data.get('archive_restores',{}).values() if identity.subject==manager.owner_identity_ref]}
 
