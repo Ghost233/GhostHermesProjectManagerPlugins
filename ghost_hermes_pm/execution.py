@@ -57,6 +57,8 @@ def start_task(manager, identity, request_id):
         baseline = require_preparation(manager, identity, record, version, data)
         from .memory import start_context
         memory_text = start_context(manager, identity, record, data)
+        version, data = manager._load()
+        record = _responsible(manager, identity, request_id, data)
         occupation = record['queue'].get('external_occupancy')
         if occupation and occupation.get('generation') != adapter.generation:
             raise ManagementError('capability_unverified', 'The original external occupancy generation is unavailable; reconciliation is required.')

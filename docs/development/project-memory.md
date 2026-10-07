@@ -12,7 +12,7 @@
 
 ## 验收后精选
 
-`curate` 接受 `profile_id/entry_id/request_id/selection`，可用 `supersedes` 明确纠正旧摘要。`selection` 仅含明确 `facts` 查询／材料 ID、`decisions` 原人工请求 ID 和 `include_delivery` 结果索引意图。已核验冻结 Issue 交付及验收时间是必要条件；Wiki 回答、模型完成陈述和轮次结束本身没有验收效力。
+`curate` 接受 `profile_id/entry_id/request_id/selection`，可用 `supersedes` 明确纠正旧摘要。`selection` 仅含明确 `facts` 查询／材料 ID、`decisions` 原人工请求 ID 和 `include_delivery` 结果索引意图，可另选公开全局结果的 `global_validation_id`。已核验冻结 Issue 交付及验收时间是必要条件；Wiki 回答、模型完成陈述和轮次结束本身没有验收效力。
 
 只保存精选已验收事实、已确认 Owner 决定与最小测试／PR 索引。每条材料保留来源定位、来源版本／时间、查询范围及授权修订；每条摘要保留冻结 Issue 版本、固定源码提交／源摘要与验收时间。测试只保留命令、条目定位、退出状态和输出 digest，PR 只保留真实位置、版本和审查／合并状态。完整聊天、执行日志和资料库不被复制。
 
@@ -21,6 +21,14 @@
 `read` 接受所属 `profile_id` 与可选 `include_superseded`。同一 entry ID 绑定不可变内容，重复写入返回原条目；不同内容拒绝。纠正保留旧文本、版本、时间和 `supersedes/replaced_by` 双向关系，活动查询排除旧条目，显式历史查询可查旧摘要。原资料库、旧档案与历史不被重写。
 
 临时状态、未证实推断、建议、冲突、过期资料、待批请求和秘密不能成为长期事实。资料中继承的 Owner origin 不代表当前 Profile 是 Owner，也不能创建偏好或批准执行。
+
+## 当前有效的全局验证结果索引
+
+总负责人可明确选取同一原 mono 请求的 `global_validation_id`，总管可在自己的必要摘要中引用公开可见结果。回写前沿 #27 的公开 `global_validation check`（总管沿最新公开 snapshot）核对实际职责、输入与来源，要求当前 `status=complete`、`whole_project_complete=true`、可核实 `completed_at` 与明确边界 scope；`passed`、缺原持续 watch／host、失联、未核实或失效结果都不能成为已验收项目事实。
+
+只保存轮次与原请求定位、mono／相关子提交、完成时间、输入及测试输出 digest 和边界 scope，不复制原内部 inputs、Git 元数据、工作树快照或测试输出。合成 host 的索引明确保留 `synthetic-fixture` 和 `production_acceptance=false`，不能声称生产验收。
+
+每次后续 read、load 和补入当前任务都重新查公开来源。输入或持续验证来源变化会撤销旧结果，恢复字节不能复活已失效的 round。重启后无法核实原持续来源时，旧完成降为未核实，旧记忆不能加载。公共来源对账可能持久化状态，记忆写入前重新取得当前管理状态，防止覆盖来源的失效记录。
 
 ## 明确偏好与实际加载
 
