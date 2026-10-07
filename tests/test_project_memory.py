@@ -13,6 +13,13 @@ LEAD = VerifiedIdentity('fixture:lead', 'synthetic-participant')
 QUESTION = 'What is the retry delivery policy?'
 
 
+def memory_adapter(root):
+    from pathlib import Path
+    adapter = question_adapter(root)
+    adapter.command[1] = str(Path(__file__).with_name('memory_fixture_server.py'))
+    return adapter
+
+
 def prepared_facts(manager, owner, requester, request_id, query_id='known-policy', question=QUESTION):
     source = public_grant()
     source['query_subjects'][LEAD.subject] = ['public']
@@ -39,7 +46,7 @@ def prepared_facts(manager, owner, requester, request_id, query_id='known-policy
 
 def test_responsible_lead_answers_actual_fact_request_with_sources_once(tmp_path):
     provider = local_provider(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': provider}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -77,7 +84,7 @@ def test_accepted_facts_are_curated_with_fixed_result_indexes_and_loaded_only_in
     from test_repository_queue import acknowledge
     provider = local_provider(tmp_path)
     source_before = (tmp_path / 'source' / 'retry.md').read_bytes()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': provider}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -106,7 +113,9 @@ def test_accepted_facts_are_curated_with_fixed_result_indexes_and_loaded_only_in
             owner.start_task(next_id)
             loaded = next(r for r in owner.read_snapshot()['requests'] if r['id'] == next_id)['memory_context']
             assert loaded['status'] == 'loaded' and loaded['profile_id'] == 'mono-lead'
-            assert loaded['turn_id'] and loaded['input_digest']
+            old_session = next(r for r in owner.read_snapshot()['requests'] if r['id'] == request_id)['session']
+            assert loaded['turn_id'] != old_session['turn_id'] and loaded['thread_id'] != old_session['thread_id']
+            assert loaded['input_digest']
         inputs = [r for r in map(json.loads, (tmp_path / 'wire.jsonl').read_text().splitlines()) if r.get('method') == 'turn/start']
         assert len(inputs) == 2
         first, followup = [r['params']['input'][0]['text'] for r in inputs]
@@ -117,7 +126,7 @@ def test_accepted_facts_are_curated_with_fixed_result_indexes_and_loaded_only_in
 
 def test_only_explicit_owner_scope_updates_preferences_and_corrections_keep_old_material(tmp_path):
     from test_repository_queue import acknowledge
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path)) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
             owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
@@ -148,7 +157,7 @@ def test_only_explicit_owner_scope_updates_preferences_and_corrections_keep_old_
     'Can we authorize running retry delivery commands?', 'What is the missing delivery date?',
 ])
 def test_decisions_new_work_owner_only_and_unverifiable_questions_stay_with_owner(tmp_path, text):
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -167,7 +176,7 @@ def test_decisions_new_work_owner_only_and_unverifiable_questions_stay_with_owne
 
 def test_expired_idle_fact_cannot_start_execution_and_original_owner_decision_can_be_curated(tmp_path):
     from test_questions import TURN
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -194,7 +203,7 @@ def test_role_memories_remain_separate_and_superiors_keep_only_necessary_result_
     from test_directory import registration
     child = VerifiedIdentity('fixture:child', 'synthetic-child')
     steward = VerifiedIdentity('fixture:steward', 'synthetic-steward')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path)) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
         change = registration(make_repo(tmp_path / 'child'), 'child', 'child-lead')
@@ -227,7 +236,7 @@ def test_role_memories_remain_separate_and_superiors_keep_only_necessary_result_
 
 def test_unrelated_returned_fact_and_source_grant_revocation_cannot_answer_or_load(tmp_path):
     from test_repository_queue import acknowledge
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -254,3 +263,35 @@ def test_unrelated_returned_fact_and_source_grant_revocation_cannot_answer_or_lo
                 lead.read_project_memory('mono-lead')
             with pytest.raises(ManagementError):
                 lead.load_project_memory(next_id, ['accepted-facts'])
+
+
+def test_memory_update_requires_explicit_effective_original_control_to_affect_running_work(tmp_path):
+    from test_task_execution import adapter_for
+    from test_manual_control import original_state, adapters, setup, ORIGINAL_TURN
+    repo = make_repo(tmp_path / 'repo')
+    peer = tmp_path / 'original'
+    original_state(peer, repo)
+    read, control = adapters(peer)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+        request_id, observed = setup(manager, repo)
+        with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
+            owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
+            owner.take_over_session(request_id, observed['id'], 'memory-current-grant', ORIGINAL_TURN)
+            owner.record_memory_preference('mono-lead', 'current-rule', 'For this project, cite evidence.', {'kind': 'project', 'id': 'mono'})
+            before = json.loads((peer / 'original-state.json').read_text())
+            assert before.get('inputs', []) == []
+            with pytest.raises(ManagementError):
+                lead.load_project_memory(request_id, ['current-rule'])
+            supplied = lead.supplement_project_memory(request_id, ['current-rule'], ORIGINAL_TURN)
+            assert supplied['status'] == 'accepted' and supplied['control_grant_id'] == 'memory-current-grant'
+            assert lead.supplement_project_memory(request_id, ['current-rule'], ORIGINAL_TURN)['duplicate'] is True
+            owner.return_session_control(request_id, 'memory-current-grant')
+            owner.record_memory_preference('mono-lead', 'late-rule', 'For this project, include locations.', {'kind': 'project', 'id': 'mono'})
+            with pytest.raises(ManagementError):
+                lead.supplement_project_memory(request_id, ['late-rule'], ORIGINAL_TURN)
+        after = json.loads((peer / 'original-state.json').read_text())
+        assert len(after['inputs']) == 1 and 'cite evidence' in after['inputs'][0]['input'][0]['text']
+        assert not (tmp_path / 'wire.jsonl').exists()
+        methods = [r.get('method') for r in map(json.loads, (peer / 'original-wire.jsonl').read_text().splitlines())]
+        assert methods.count('turn/steer') == 1 and 'turn/start' not in methods and 'thread/start' not in methods

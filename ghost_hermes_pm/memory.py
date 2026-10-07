@@ -44,11 +44,18 @@ def _source_supports(question, facts):
     return bool(anchors) and all(anchor in material for anchor in anchors)
 
 
+def _original_query_target(query, record):
+    target = query.get('target_session')
+    return bool(target and record.get('session') and all(record['session'].get(k) == v for k, v in target.items())
+                and record.get('current_arrangement_id') == query.get('target_arrangement_id')
+                and record.get('control_grant_id') == query.get('target_control_grant_id'))
+
+
 def validate_factual_response(manager, identity, record, question, evidence, response, data):
     if not isinstance(evidence, dict) or set(evidence) != {'query_id', 'source_revision', 'result_version', 'material_ids'}:
         raise ManagementError('forbidden', 'Factual response authority requires the actual original query evidence.')
     query, source, facts = _facts(manager, identity, evidence['query_id'], evidence['material_ids'], record['id'], record['profile_id'], data)
-    if not _factual_question(question) or query['question'] != question['questions'][0]['question'] or not _source_supports(query['question'], facts) or evidence['source_revision'] != source['revision'] or evidence['result_version'] != query['result_version']:
+    if not _original_query_target(query, record) or not _factual_question(question) or query['question'] != question['questions'][0]['question'] or not _source_supports(query['question'], facts) or evidence['source_revision'] != source['revision'] or evidence['result_version'] != query['result_version']:
         raise ManagementError('forbidden', 'Source evidence cannot replace Owner decisions or unrelated answers.')
     if response != {'answers': {question['questions'][0]['id']: [_fact_text(facts)]}}:
         raise ManagementError('forbidden', 'A factual responder cannot replace source quotations with new instructions or authorization.')
@@ -65,7 +72,7 @@ def answer_from_knowledge(manager, identity, request_id, human_request_id, query
         record, session, adapter = _binding(manager, identity, request_id, data, 'human_response')
         query, source, facts = _facts(manager, identity, query_id, material_ids, request_id, record['profile_id'], data)
         question = next((q for q in record.get('human_requests', []) if q['id'] == human_request_id), None)
-        if not question or not _factual_question(question) or query['question'] != question['questions'][0]['question'] or not _source_supports(query['question'], facts):
+        if not question or not _original_query_target(query, record) or not _factual_question(question) or query['question'] != question['questions'][0]['question'] or not _source_supports(query['question'], facts):
             return {'status': 'owner_required', 'reason': 'New work, choices, authorization, explicit Owner answers and unverifiable questions remain with Owner.'}
         thread = _thread(adapter, session, require_input=False)
         active = [t for t in thread.get('turns', []) if t.get('status') == 'inProgress']
@@ -250,3 +257,38 @@ def record_memory_preference(manager, identity, profile_id, entry_id, statement,
         if existing:
             content['explicit_at'] = existing.get('explicit_at')
         return _store(manager, identity, profile, entry_id, content, data, version, supersedes)
+
+
+def supplement_project_memory(manager, identity, request_id, entry_ids, expected_turn_id):
+    with manager._lock:
+        version, data = manager._load()
+        task, session, adapter = _binding(manager, identity, request_id, data, 'append')
+        context = _selected_context(manager, identity, task, entry_ids, data)
+        thread = _thread(adapter, session)
+        active = [t for t in thread.get('turns', []) if t.get('status') == 'inProgress']
+        if expected_turn_id != session['turn_id'] or thread.get('status', {}).get('type') != 'active' or len(active) != 1 or active[0]['id'] != expected_turn_id:
+            raise ManagementError('binding_conflict', 'Selected memory can only supplement the actual matching active turn; it cannot create idle execution.')
+        grant_id = task.get('control_grant_id')
+        instruction_id = 'project-memory:' + _digest([request_id, expected_turn_id, session['generation'], grant_id, context['digest']])
+        ledger = task.setdefault('memory_supplements', {})
+        existing = ledger.get(instruction_id)
+        if existing:
+            return {**existing, 'duplicate': True}
+        supplement = {k: context[k] for k in ('profile_id', 'project_id', 'entry_ids', 'entry_versions', 'digest')}
+        supplement.update(instruction_id=instruction_id, status='submission_intent', authorized_by=identity.subject,
+                          turn_id=expected_turn_id, generation=session['generation'], control_grant_id=grant_id, created_at=_now())
+        ledger[instruction_id] = supplement
+        with manager._db:
+            manager._save(version, data)
+        try:
+            outcome = manager.control_task(identity, request_id, 'append', instruction_id, context['text'], expected_turn_id)
+            status = outcome['status']
+        except ManagementError as exc:
+            status = 'outcome_unknown' if exc.code in {'outcome_unknown', 'unavailable'} else 'blocked'
+            supplement['reason'] = str(exc)
+        version, data = manager._load()
+        stored = data['requests'][request_id]['memory_supplements'][instruction_id]
+        stored.update(supplement | {'status': status, 'sent_at': _now()})
+        with manager._db:
+            manager._save(version, data)
+        return stored

@@ -97,6 +97,8 @@ class ManagementServer:
                             result = bridge.manager.load_project_memory(identity, payload.get('request_id'), payload.get('entry_ids'))
                         elif payload.get('operation') == 'record_memory_preference':
                             result = bridge.manager.record_memory_preference(identity, payload.get('profile_id'), payload.get('entry_id'), payload.get('statement'), payload.get('scope'), payload.get('supersedes'))
+                        elif payload.get('operation') == 'supplement_project_memory':
+                            result = bridge.manager.supplement_project_memory(identity, payload.get('request_id'), payload.get('entry_ids'), payload.get('expected_turn_id'))
                         elif payload.get('operation') == 'record_task_delivery':
                             result = bridge.manager.record_task_delivery(identity, payload.get('request_id'), payload.get('report'))
                         elif payload.get('operation') == 'register_knowledge_source':
@@ -281,3 +283,6 @@ class ManagementClient:
 
     def protect_archive(self, source_id, protection_id):
         return self._call('protect_archive', source_id=source_id, protection_id=protection_id)
+
+    def supplement_project_memory(self, request_id, entry_ids, expected_turn_id):
+        return self._call('supplement_project_memory', request_id=request_id, entry_ids=entry_ids, expected_turn_id=expected_turn_id)
