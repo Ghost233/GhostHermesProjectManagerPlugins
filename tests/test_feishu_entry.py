@@ -2,6 +2,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from test_directory import OWNER, make_repo, registration
 from test_requests import ISSUE
 

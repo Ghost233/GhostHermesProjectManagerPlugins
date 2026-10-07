@@ -7,6 +7,7 @@ import time
 import pytest
 
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.knowledge import configured_providers
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER

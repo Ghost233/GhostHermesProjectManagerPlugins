@@ -1,4 +1,4 @@
-# mono 稳定组合全局验证（#27）
+# mono 稳定组合全局验证（[验证 mono 交付组合并按 Issue 返工](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/27)）
 
 `Manager.global_validation(identity, action, details)`、令牌 bridge 的 `ManagementClient.global_validation(action, details)`、Dashboard `POST /global-validation` 与 `hermes_pm_global_validation` 共用一个权威管理实例。身份来自原入口；请求不接受 actor、权限或测试通过声明。原生 participant 工具只允许本人的既定 mono 职责，不能借 Owner credential 或运行 child 物化。
 
@@ -49,7 +49,9 @@ Owner 准备走原宿主的独立 materializer；先保存精确授权和执行�
 
 `verified-original-host` 的能力还必须有管理状态目录内不可被任务写入的固定 digest 收据，覆盖父/child 源码和 Git 写拒绝、允许产物写入/逃逸拒绝、既有 hardlink 写拒绝、全部工具/进程路径约束及输入变化观察完整性，并绑定本轮输入和宿主/runner 版本。只检查源码目录或一次 SBPL 探针不足以启用该能力。
 
-当前 native 默认未配置生产验证宿主，start 因原能力未核实显示 blocked。测试的 `synthetic-fixture` 宿主执行真实合成 Git/测试，但边界收据是受控替身；其通过仅属于该合成范围，不启用生产能力。既有 Mac preexisting-hardlink 反例、全工具/进程路径保护、真实模型服务和真实群发送仍须原能力验收。正式安装、机器人开通和资料迁移仍另案。
+正式 native 可配置 `global_validation_host={host_id,generation,runner,watcher,tests,environment}`：`runner` 是获准已存在的原宿主隔离 runner 完整 argv 前缀，`tests` 将固定测试 ID 映射到固定 argv 后缀，公开操作不能带 shell command；`watcher` 是已存在的原生连续观察程序 argv（例如 `fswatch -0 -r`），宿主附加准确父子 worktree 与 Git common-dir，读取 NUL 分隔的原输入路径事件。`environment` 明确独立环境。插件自带 `NativeGlobalValidationHost` 和单独 `native_global_worker` 实际执行获准 child 固定版本准备及测试进程，查询原 preparation/run/result，无未知启动重放；检测相关进程组未结束时保持 unverified。
+
+独立宿主必须在 `global-validation-host.json` 为确切 validation ID 登记位于 `validation-evidence/` 的文件引用与 SHA256。原证明绑定本轮 input digest、宿主代次、整个 runner 配置、runner/watcher 实际二进制 SHA256 与完整 enforcement matrix；原持续观察在独立 Owner prepare 结束后建立，prepare 返回实际固定输入 digest。原证明还必须匹配 `validation-native/` 下该轮 watch-binding 的实际 `watcher_pid` 与随机 `input_watch`，并给出原能力探针结束后的 `watch_event_cursor`；其后的所有输入事件都使本轮失效。原持续观察实际连接须保持存活，重新启动的观察器不能证明旧轮覆盖。当前 Mac 物理边界反例仍未被解决，因此本机无这些真实原证明时 start 保持 blocked。测试的 `synthetic-fixture` 宿主执行真实合成 Git/测试，但边界收据是受控替身；其通过仅属于该合成范围，不启用生产能力。既有 Mac preexisting-hardlink 反例、全工具/进程路径保护、真实模型服务和真实群发送仍须原能力验收。正式安装、机器人开通和资料迁移仍另案。
 
 ## 结束、失效和返工
 

@@ -36,17 +36,38 @@ def source_state(repository):
 
 
 
-def _direct_test_command(command):
+def executed_tests(command, output):
     if any(character in command for character in '|;&<>\n'):
         return False
     try:
         args = shlex.split(command)
     except ValueError:
         return False
-    if not args or any(a in {'--help', '-h', '--version', '--collect-only', '--co'} for a in args):
-        return False
+    if not args or any(a.split('=')[0] in {'--help', '-h', '--version', '--collect-only', '--co', '--fixtures', '--fixtures-per-test', '--markers', '--setup-plan', '--setup-only'} for a in args):
+        return 0
     name = Path(args[0]).name
-    return (name == 'pytest' or (re.fullmatch(r'python(?:[0-9.]+)?', name) and args[1:3] in [['-m', 'pytest'], ['-m', 'unittest']]))
+    output = re.sub(r'\x1b\[[0-9;]*m', '', output)
+    if name == 'pytest' or re.fullmatch(r'python(?:[0-9.]+)?', name) and args[1:3] == ['-m', 'pytest']:
+        counts = re.findall(r'(?<![\w.])(\d+) passed(?:[, =]|$)', output)
+        return int(counts[-1]) if counts else 0
+    if re.fullmatch(r'python(?:[0-9.]+)?', name) and args[1:3] == ['-m', 'unittest']:
+        counts = re.findall(r'Ran (\d+) tests? in ', output)
+        skips = re.findall(r'OK \(skipped=(\d+)\)', output)
+        return max(0, int(counts[-1]) - (int(skips[-1]) if skips else 0)) if counts and re.search(r'^OK(?: \(skipped=\d+\))?$', output, re.MULTILINE) else 0
+    return 0
+
+def delivery_requirements(body):
+    # Freeze the requirement from the accepted Issue; a later report cannot waive it.
+    clauses = acceptance_criteria(body)
+    required = []
+    for clause in clauses:
+        if not re.search(r'\bmerg(?:e|ed|es|ing)\b|合并', clause, re.IGNORECASE):
+            continue
+        if re.search(r'\b(?:no|without)\s+(?:PR\s+)?merg(?:e|ing)\b|\bmerg(?:e|ing)\s+(?:is\s+)?(?:not required|optional)\b|(?:无需|不要求|不需要)\s*(?:PR\s*)?合并', clause, re.IGNORECASE):
+            continue
+        required.append(clause)
+    return {'merge_required': bool(required), 'merge_criteria': required}
+
 
 def acceptance_criteria(body):
     checks = re.findall(r'^\s*[-*]\s+\[[ xX]\]\s+(.+)$', body, re.MULTILINE)
@@ -130,7 +151,7 @@ def record_task_delivery(manager, identity, request_id, report):
                 if fixed_digest != after.get(name):
                     raise ManagementError('evidence_missing', 'A changed source file is absent from the supplied fixed commit; user content was preserved.')
         for item_id, test in tests.items():
-            if not source_changed and _direct_test_command(test['command']):
+            if not source_changed and test.get('executed_tests', 0) > 0:
                 continue
             reader = getattr(manager.delivery_source, 'read_test_version', None)
             if reader is None:
@@ -141,7 +162,7 @@ def record_task_delivery(manager, identity, request_id, report):
                 'output_digest': test['output_digest'], 'exit_code': 0, 'before_source_digest': current['source_digest'],
                 'after_source_digest': current['source_digest'], 'source_access': 'read-only', 'git_access': 'read-only',
                 'artifact_roots': repository['test_artifact_paths']}
-            if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in expected_receipt.items()):
+            if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in expected_receipt.items()) or type(receipt.get('executed_tests')) is not int or receipt['executed_tests'] < 1:
                 raise ManagementError('evidence_missing', 'The test runner receipt does not verify this stable delivery source and test-only write boundary.')
             tests[item_id] = {**test, 'tested_source_digest': current['source_digest'], 'version_source': 'trusted_host_test_runner'}
         pr_url = report.get('pr_url')
@@ -179,7 +200,7 @@ def record_task_delivery(manager, identity, request_id, report):
             if not re.fullmatch(r'[a-f0-9]{40}', local) or remote != local:
                 raise ManagementError('evidence_missing', 'A involved local branch is not synchronized with its actual remote hash.')
             sync.append({'branch': branch, 'local_commit': local, 'remote_commit': remote, 'source': 'local_git_and_github_read'})
-        merge_required = any(re.search(r'^(?:merge\b|合并(?:此|本|该)?\s*PR|将.+合并到)', c, re.IGNORECASE) for c in expected)
+        merge_required = record.get('delivery_requirements', delivery_requirements(scope['body']))['merge_required']
         if any(c.get('pr_evidence') is True for c in criteria) and pr is None:
             raise ManagementError('evidence_missing', 'PR acceptance requires an actual PR read result.')
         if merge_required and (not pr or pr['state'] != 'merged' or not sync or pr.get('base_branch') not in branches):

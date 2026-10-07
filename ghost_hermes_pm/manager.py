@@ -98,7 +98,7 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None, migration_host=None, maintenance_host=None, notification_clock=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, profile_readiness_host=None, lifecycle_host=None, migration_host=None, maintenance_host=None, notification_clock=None):
         import time
         self.notification_clock = notification_clock or time.time
         self._notification_generation = str(uuid.uuid4())
@@ -106,6 +106,7 @@ class Manager:
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
         self.global_validation_host = global_validation_host
+        self.profile_readiness_host = profile_readiness_host
         self.lifecycle_host = lifecycle_host
         self.migration_host = migration_host
         self.maintenance_host = maintenance_host
@@ -147,6 +148,9 @@ class Manager:
             for provider in self.archive_providers.values():
                 if isinstance(provider, CodexArchiveProvider):
                     provider.close()
+            close_global_host = getattr(self.global_validation_host, 'close', None)
+            if callable(close_global_host):
+                close_global_host()
             self._db.close()
 
     def __enter__(self):
@@ -340,7 +344,9 @@ class Manager:
                 raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
             _public_text(issue['title'], self._sensitive_values())
             _public_text(issue['body'], self._sensitive_values())
+            from .delivery import delivery_requirements
             record = {'id': key, 'project_id': project_id, 'profile_id': profile_id,
+                      'delivery_requirements': delivery_requirements(issue['body']),
                       'accepted_scope': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')},
                       'source_anchor': dict(message), 'task_start_anchor': None,
                       'accepted_responsibility': {k: profile.get(k) for k in ('id', 'identity_ref', 'project_id', 'capability', 'role', 'parent_profile_id')},
@@ -906,7 +912,7 @@ class Manager:
             principal = self._principal(identity, data)
             if version != expected_version:
                 raise ManagementError('version_conflict', 'Directory changed; read the current version first.')
-            if not isinstance(change, dict) or set(change) - {'project', 'profile'} or not change:
+            if not isinstance(change, dict) or set(change) - {'project', 'profile', 'enable_profile'} or not change:
                 raise ManagementError('invalid_change', 'Expected project and/or profile changes.')
             audit_changes = []
             if 'project' in change:
@@ -929,17 +935,26 @@ class Manager:
                 if parent_id and (existing is None or existing.get('parent_profile_id') != parent_id):
                     from .lifecycle import require_active
                     parent = data['profiles'][parent_id]
-                    require_active(data, parent_id, parent['project_id'])
+                    require_active(data, parent_id, parent['project_id'], configuration=True)
                 if existing and existing['project_id'] != value['project_id']:
                     raise ManagementError('binding_conflict', 'Profile has a long-term project binding; create a new Profile.')
                 value.update(lifecycle='configuring', can_execute=False,
                              capabilities={'execution': {'enabled': False, 'reason': 'Not verified by an execution adapter.'}})
                 if existing:
-                    value.update({k: existing[k] for k in ('lifecycle', 'archive_intent', 'migration_gate') if k in existing})
+                    value.update({k: existing[k] for k in ('lifecycle', 'archive_intent', 'migration_gate', 'readiness') if k in existing})
                 self._authorize_change(principal, 'profile', value, data)
                 from .collaboration import _binding
                 audit_changes.append({'kind': 'profile', 'id': value['id'], 'before': _binding(existing) if existing else None, 'after': _binding(value)})
                 data['profiles'][value['id']] = value
+            if 'enable_profile' in change:
+                if principal is not None:
+                    raise ManagementError('forbidden', 'Profile enablement requires the verified Owner and current native receipts.')
+                profile = data['profiles'].get(change['enable_profile']) if isinstance(change['enable_profile'], str) else None
+                if not profile or profile.get('migration_gate') or profile.get('archive_intent') or profile.get('lifecycle') not in {'configuring', 'active'}:
+                    raise ManagementError('lifecycle_blocked', 'Only the exact configured Profile may be enabled; migration and archive decisions remain separate.')
+                from .readiness import enable_profile
+                enable_profile(self, profile)
+                audit_changes.append({'kind': 'profile_enablement', 'id': profile['id'], 'evidence_ref': profile['readiness']['evidence_ref']})
             data['last_verified_at'] = datetime.now(timezone.utc).isoformat()
             data.setdefault('directory_audit', []).append({'version': version + 1, 'at': data['last_verified_at'],
                 'actor': {'subject': identity.subject, 'source': identity.source, 'profile_id': principal['id'] if principal else None}, 'changes': audit_changes})

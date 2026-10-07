@@ -4,6 +4,7 @@ import json
 import sqlite3
 
 from ghost_hermes_pm import Manager, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.archives import HermesArchiveProvider
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER

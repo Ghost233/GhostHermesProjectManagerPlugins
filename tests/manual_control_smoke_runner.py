@@ -6,6 +6,7 @@ import sys
 import yaml
 
 scratch = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(scratch / 'readiness-fixtures'))
 protected = [Path.home() / '.hermes', Path.home() / '.codex']
 
 def audit(event, args):
@@ -26,6 +27,7 @@ settings = {'state_dir': str(state), 'participant_credential_ref': 'native:HERME
     'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 from ghost_hermes_pm import Manager, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementServer
 sys.path.insert(0, str(scratch / 'takeover-fixtures'))
 from test_task_execution import accepted, adapter_for

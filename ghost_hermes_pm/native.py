@@ -114,6 +114,8 @@ def register_native(ctx):
             from .native_lifecycle import configured_lifecycle_host
             from .native_migration import configured_migration_host
             from .native_maintenance import configured_maintenance_host
+            from .readiness import configured_readiness_host
+            from .native_global_validation import configured_global_validation_host
             def knowledge_credential(reference):
                 value = _credential(reference)
                 if value:
@@ -122,7 +124,9 @@ def register_native(ctx):
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
                               codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters, control_adapters=control_adapters,
                               knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {}), credential_resolver=knowledge_credential),
-                              archive_providers=configured_archives(ctx.get_config('archive_providers', {})), recovery_adapters=recovery_adapters,
+                              archive_providers=configured_archives(ctx.get_config('archive_providers', {}), state_dir=state_dir, credential_resolver=knowledge_credential), recovery_adapters=recovery_adapters,
+                              global_validation_host=configured_global_validation_host(ctx.get_config('global_validation_host'), state_dir),
+                              profile_readiness_host=configured_readiness_host(ctx.get_config('profile_readiness', {}), intake, _credential),
                               maintenance_host=configured_maintenance_host(ctx.get_config('native_maintenance'), state_dir),
                               lifecycle_host=configured_lifecycle_host(ctx.get_config('native_profile_lifecycle'), state_dir),
                               migration_host=configured_migration_host(ctx.get_config('native_profile_migration'), state_dir, intake))
@@ -342,43 +346,8 @@ def register_native(ctx):
                 raise ManagementError('unauthorized', 'A configured participant bridge is required.')
             client = ManagementClient(state_dir, token)
             client.read_participant_snapshot()  # Reject owner aliases at the authoritative bridge.
-            action = args.get('action')
-            if action not in {'takeover', 'return'} and any(args.get(k) is not None for k in ('manual_session_id', 'grant_id')):
-                raise ManagementError('invalid_change', 'Manual grant fields require takeover or return.')
-            if action != 'answer' and any(args.get(k) is not None for k in ('human_request_id', 'reply_id', 'response')):
-                raise ManagementError('invalid_change', 'Human response fields require answer action.')
-            if action != 'prepare' and args.get('plan') is not None:
-                raise ManagementError('invalid_change', 'Baseline plan requires preparation.')
-            if action in {'takeover', 'return'}:
-                if any(args.get(k) is not None for k in ('report', 'plan', 'instruction_id', 'text', 'human_request_id', 'reply_id', 'response')):
-                    raise ManagementError('invalid_change', 'Current-work grant fields cannot carry another operation.')
-                if action == 'takeover':
-                    result = client.take_over_session(args.get('request_id'), args.get('manual_session_id'), args.get('grant_id'), args.get('expected_turn_id'))
-                else:
-                    if args.get('manual_session_id') is not None or args.get('expected_turn_id') is not None:
-                        raise ManagementError('invalid_change', 'Return accepts the existing grant only.')
-                    result = client.return_session_control(args.get('request_id'), args.get('grant_id'))
-            elif action == 'answer':
-                if any(args.get(k) is not None for k in ('report', 'instruction_id', 'text', 'expected_turn_id')):
-                    raise ManagementError('invalid_change', 'Human response fields cannot carry other operations.')
-                result = client.answer_human_request(args.get('request_id'), args.get('human_request_id'), args.get('reply_id'), args.get('response'))
-            elif action == 'prepare':
-                if args.get('report') is not None or any(args.get(k) is not None for k in ('instruction_id', 'text', 'expected_turn_id')):
-                    raise ManagementError('invalid_change', 'Preparation accepts only the explicit baseline plan.')
-                result = client.prepare_task(args.get('request_id'), args.get('plan'))
-            elif action in {'append', 'stop', 'continue'}:
-                if args.get('report') is not None:
-                    raise ManagementError('invalid_change', 'Control cannot assert delivery evidence.')
-                result = client.control_task(args.get('request_id'), action, args.get('instruction_id'), args.get('text'), args.get('expected_turn_id'))
-            elif any(args.get(k) is not None for k in ('instruction_id', 'text', 'expected_turn_id')):
-                raise ManagementError('invalid_change', 'Control fields require a control action.')
-            elif action == 'delivery':
-                result = client.record_task_delivery(args.get('request_id'), args.get('report'))
-            else:
-                operation = {'verify': 'verify_task_execution', 'start': 'start_task', 'refresh': 'refresh_task', 'reconcile': 'reconcile_task', 'source': 'refresh_task_source'}.get(action)
-                if operation is None or args.get('report') is not None:
-                    raise ManagementError('invalid_change', 'Unsupported task operation.')
-                result = getattr(client, operation)(args.get('request_id'))
+            from .task_entry import dispatch_task
+            result = dispatch_task(client, args)
             return json.dumps(result)
         except ManagementError as exc:
             return json.dumps({'status': 'rejected', 'code': exc.code, 'message': str(exc)})

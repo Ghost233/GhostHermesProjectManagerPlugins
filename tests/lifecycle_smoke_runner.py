@@ -27,6 +27,7 @@ home, state = scratch / 'home', scratch / 'state'
 sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 sys.path.insert(0, str(scratch / 'lifecycle-fixtures'))
 from ghost_hermes_pm import Manager, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from ghost_hermes_pm.dashboard import create_router
 from ghost_hermes_pm.native_lifecycle import NativeMultiplexLifecycleHost, configured_lifecycle_host

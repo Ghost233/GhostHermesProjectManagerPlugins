@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from ghost_hermes_pm import Manager, ManagementError
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo, registration
 from test_requests import MESSAGE, ISSUE
@@ -82,7 +83,7 @@ def test_owner_archive_blocks_parent_and_child_until_original_execution_and_ever
             assert operation['status'] == 'processing'
             snapshot = client.read_snapshot()
             assert {p['id']: p['lifecycle'] for p in snapshot['profiles']} == {
-                'mono-lead': 'archiving', 'child-lead': 'archiving', 'wiki': 'configuring', 'ghost': 'configuring'}
+                'mono-lead': 'archiving', 'child-lead': 'archiving', 'wiki': 'active', 'ghost': 'active'}
             assert snapshot['requests'][0]['stop']['rpc_status'] == 'accepted'
             assert snapshot['requests'][0]['repository_released'] is False
             assert snapshot['lifecycle_events'] == []
@@ -118,7 +119,7 @@ def test_archive_cancels_unstarted_queue_and_restore_only_parent_keeps_old_work_
         assert restored['status'] == 'completed'
         snapshot = manager.read_snapshot(OWNER)
         assert {p['id']: p['lifecycle'] for p in snapshot['profiles']} == {
-            'mono-lead': 'active', 'child-lead': 'archived', 'wiki': 'configuring', 'ghost': 'configuring'}
+            'mono-lead': 'active', 'child-lead': 'archived', 'wiki': 'active', 'ghost': 'active'}
         assert snapshot['requests'][0]['execution'] == 'stopped'
         assert manager.dispatch_tasks() == []
         with pytest.raises(ManagementError, match='archived'):
@@ -399,7 +400,7 @@ def test_archive_confirmation_binds_reviewed_version_and_explicit_subtree_withou
             manager.lifecycle(OWNER, 'archive', {**reviewed, 'expected_version': manager.read_snapshot(OWNER)['version']})
         assert scope.value.code == 'binding_conflict'
         assert host.calls == [] and manager.read_snapshot(OWNER)['lifecycle_operations'] == []
-        assert manager.read_snapshot(OWNER)['profiles'][0]['lifecycle'] == 'configuring'
+        assert manager.read_snapshot(OWNER)['profiles'][0]['lifecycle'] == 'active'
         accepted = {**reviewed, 'expected_version': manager.read_snapshot(OWNER)['version'],
                     'expected_profile_ids': ['child-lead', 'mono-lead']}
         result = manager.lifecycle(OWNER, 'archive', accepted)

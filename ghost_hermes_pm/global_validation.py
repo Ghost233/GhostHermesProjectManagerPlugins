@@ -211,7 +211,8 @@ def _plan(manager, identity, details, version, data):
         commit = evidence.get('source_commit')
         if profile.get('parent_profile_id') != task['profile_id'] or profile.get('role') != 'subproject_lead' or child.get('task_delivery') != 'delivered' or not re.fullmatch(r'[a-f0-9]{40}', str(commit)) or not evidence.get('criteria') or not evidence.get('execution_end'):
             raise ManagementError('evidence_missing', 'A related child has not delivered its fixed source and frozen acceptance evidence.')
-        if child.get('pr_status') in {'awaiting_merge', 'awaiting_review'} and any(re.search(r'^(?:merge\b|合并(?:此|本|该)?\s*PR|将.+合并到)', c['text'], re.I) for c in evidence['criteria']):
+        from .delivery import delivery_requirements
+        if child.get('delivery_requirements', delivery_requirements(child['accepted_scope']['body']))['merge_required'] and child.get('pr_status') != 'merged':
             raise ManagementError('evidence_missing', 'A child required merge remains unmet.')
         child_repo = child['accepted_repository']
         path = Path(repo['worktree']) / supplied['path']
@@ -272,7 +273,7 @@ def _prepare(manager, identity, details, version, data, attempt):
         after = _inputs(attempt, data)
         if after[0]['workspace']['head'] != before[0]['workspace']['head'] or after[0]['all_source_digest'] != before[0]['all_source_digest'] or any(i['workspace']['head'] != c['commit'] or i['workspace']['dirty_paths'] for i, c in zip(after[1:], attempt['children'])):
             raise ManagementError('handoff_blocked', 'Materialization changed mono source or did not provide the exact clean child versions.')
-        attempt.update(status='ready', preparation={'status': 'ended', 'authorization': authorization, 'receipt': result, 'ended_at': _now()})
+        attempt.update(status='ready', prepared_inputs=after, input_digest=_digest(after), preparation={'status': 'ended', 'authorization': authorization, 'receipt': result, 'ended_at': _now()})
         attempt['occupancy']['released'] = True
         _save(manager, version, data, attempt)
         return attempt
@@ -299,7 +300,7 @@ def _reconcile(manager, identity, version, data, attempt):
         before, after = attempt['preparation_inputs'], _inputs(attempt, data)
         if after[0]['workspace']['head'] != before[0]['workspace']['head'] or after[0]['all_source_digest'] != before[0]['all_source_digest'] or any(i['workspace']['head'] != c['commit'] or i['workspace']['dirty_paths'] for i, c in zip(after[1:], attempt['children'])):
             return _end(manager, identity, version, data, attempt, 'blocked', 'Original materialization ended but exact parent/child versions require a new approved preparation.')
-        attempt.update(status='ready', preparation={**attempt['preparation'], 'status': 'ended', 'receipt': result, 'ended_at': _now()})
+        attempt.update(status='ready', prepared_inputs=after, input_digest=_digest(after), preparation={**attempt['preparation'], 'status': 'ended', 'receipt': result, 'ended_at': _now()})
         attempt['occupancy'].update(released=True, released_at=_now())
         _save(manager, version, data, attempt)
         return attempt

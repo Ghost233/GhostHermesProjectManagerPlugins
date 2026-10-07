@@ -5,6 +5,7 @@ import sys
 import time
 
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementServer
 from test_directory import OWNER
 

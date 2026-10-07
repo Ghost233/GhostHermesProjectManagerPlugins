@@ -3,6 +3,7 @@ import json
 import pytest
 
 from ghost_hermes_pm import Manager, ManagementError, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo
 from test_task_execution import accepted, adapter_for

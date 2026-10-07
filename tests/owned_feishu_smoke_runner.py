@@ -151,7 +151,7 @@ async def main():
     await plugins.ainvoke_hook('pre_gateway_dispatch', event=object(), gateway=runner)
     from ghost_hermes_pm.transport import ManagementClient
     client = ManagementClient(state, 'synthetic-owner-credential')
-    client.apply_directory_change(0, {'project': {'id': 'mono', 'name': 'Fixture', 'repo_path': str(repo)},
+    client.apply_directory_change(0, {'enable_profile': 'lead', 'project': {'id': 'mono', 'name': 'Fixture', 'repo_path': str(repo)},
         'profile': {'id': 'lead', 'native_profile': 'fixture-runtime', 'identity_ref': 'fixture:lead',
             'role': 'project_lead', 'capability': 'development', 'project_id': 'mono'}})
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'verify':
@@ -345,7 +345,7 @@ async def main():
     owner_task.cancel()
     await asyncio.gather(owner_task, return_exceptions=True)
     adapter._active_sessions.clear(); adapter._session_tasks.clear()
-    client.apply_directory_change(client.read_snapshot()['version'], {'profile': {'id': 'collab', 'native_profile': 'fixture-collab',
+    client.apply_directory_change(client.read_snapshot()['version'], {'enable_profile': 'collab', 'profile': {'id': 'collab', 'native_profile': 'fixture-collab',
         'identity_ref': 'fixture:collab', 'role': 'subproject_lead', 'capability': 'development', 'project_id': 'mono', 'parent_profile_id': 'lead'}})
     bot_adapter = runner._create_adapter(platform, PlatformConfig(enabled=True, extra={**config.extra, 'allow_bots': 'all'}))
     runner.adapters[platform] = bot_adapter

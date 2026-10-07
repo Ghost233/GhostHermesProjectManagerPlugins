@@ -3,6 +3,7 @@ import json
 import pytest
 
 from ghost_hermes_pm import Manager, ManagementError
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER
 from test_requests import ISSUE
@@ -16,7 +17,7 @@ def accept_mono(root, manager, client, mono, request_id):
     (root / 'queue-observed.json').write_text(json.dumps({session['thread_id']: {'status': {'type': 'idle'},
         'turns': [{'id': session['turn_id'], 'status': 'completed', 'itemsView': 'full', 'items': [
             {'type': 'commandExecution', 'id': 'mono-test', 'command': 'python -m unittest', 'cwd': str(mono),
-             'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'OK; raw output is not memory'}]}]}}))
+             'status': 'completed', 'exitCode': 0, 'aggregatedOutput': 'Ran 1 test in 0.01s\n\nOK\nraw output is not memory'}]}]}}))
     client.record_task_delivery(request_id, {'source_commit': git(mono, 'rev-parse', 'HEAD'),
         'issue_updated_at': ISSUE['updated_at'], 'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['mono-test']}]})
 

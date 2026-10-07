@@ -5,6 +5,7 @@ import tempfile
 import pytest
 
 from ghost_hermes_pm import Manager
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.messages import FeishuEntry
 from maintenance_fixture_host import MaintenanceHost
 from test_directory import OWNER, make_repo, registration

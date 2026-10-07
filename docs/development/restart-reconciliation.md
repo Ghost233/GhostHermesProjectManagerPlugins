@@ -14,13 +14,13 @@
 
 对账先消费已有停止记录和目录意图，再连接原服务。`request.stop` 是已有任务控制入口先持久化的停止决定；当前 turn 的停止、仍 processing 或原目标不完整的停止决定均抑制自动继续。已确认的旧停止对应后来显式继续的其他 turn 时，保留历史而不把它当作新的停止决定。
 
-#29 的生命周期入口在执行外部动作前持久化以下管理字段，公共 `archive → restart` 回归通过独立原协议服务的实际任务子进程证明其消费顺序；细节见 `project-lifecycle.md`：
+[封存父子项目并逐个恢复负责人](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/29) 的生命周期入口在执行外部动作前持久化以下管理字段，公共 `archive → restart` 回归通过独立原协议服务的实际任务子进程证明其消费顺序；细节见 `project-lifecycle.md`：
 
 - `profiles[profile_id].lifecycle` / `projects[project_id].lifecycle`：`archiving`、`archived`、`disabled`、`deactivating`、`maintenance` 或 `restoring` 都抑制自动继续。未知生命周期同样要求人工核对；目前可核实工作使用 `configuring` 或 `active`。
 - 同一 Profile/项目的 `archive_intent`：明确停止自动续跑的意图；存在的非 `false`/`null` 值均抑制恢复执行，包括内容尚未完整的意图对象。
 - 目录的 `maintenance_mode`：存在的非 `false`/`null` 值抑制自动继续。
 
-这些字段缺省表示目录没有记录该项主动意图，不能替代原执行、授权和未完成状态的当前证明。当前证据缺失或未知仍 blocked/unverified。#29 的真实公共封存路径先保留原占用，在丢失 interrupt 回执并重启后，通过同一原服务对账核实停止才释放；父先恢复和子逐个恢复均不自动续跑旧工作。
+这些字段缺省表示目录没有记录该项主动意图，不能替代原执行、授权和未完成状态的当前证明。当前证据缺失或未知仍 blocked/unverified。[封存父子项目并逐个恢复负责人](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/29) 的真实公共封存路径先保留原占用，在丢失 interrupt 回执并重启后，通过同一原服务对账核实停止才释放；父先恢复和子逐个恢复均不自动续跑旧工作。
 
 ## 原生接入与能力证据
 

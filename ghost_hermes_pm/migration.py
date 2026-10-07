@@ -291,7 +291,8 @@ def operate(manager, identity, action, details):
                     version, current = manager._load()
                     target = current['profiles'][operation['plan']['target_profile_id']]
                     target.pop('migration_gate', None)
-                    target.update(lifecycle='active', can_execute=False)
+                    from .readiness import profile_digest
+                    target.update(lifecycle='active', can_execute=False, readiness={'status': 'verified', 'profile_id': target['id'], 'native_profile': target['native_profile'], 'identity_ref': target['identity_ref'], 'configuration_digest': profile_digest(target), 'channels': operation['identity_receipt'].get('bots', []), 'evidence_ref': 'verified_native_cutover:' + operation['digest']})
                     if target['project_id']:
                         current['projects'][target['project_id']].update(lifecycle='active', archive_intent=False)
                     current['migration_plans'][operation['id']] = operation

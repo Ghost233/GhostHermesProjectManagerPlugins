@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from ghost_hermes_pm import Manager, VerifiedIdentity
+from readiness_support import ReadyManager as Manager
 from ghost_hermes_pm.knowledge import LocalKnowledgeProvider
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER
