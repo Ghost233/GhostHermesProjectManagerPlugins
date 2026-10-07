@@ -346,6 +346,12 @@ class FeishuEntry:
                 control = ('continue', 'Continue the original accepted Issue within the existing scope.')
             elif explicit:
                 control = ('append' if explicit.group(1) == '追加' else 'continue', explicit.group(2))
+            elif not (operation or preparation or validation or takeover or returning) and identity.subject == self.owner:
+                from .scope_interpretations import owner_scope_answer
+                record = next(r for r in self.manager().read_snapshot(identity)['requests'] if r['id'] == result['request_id'])
+                answer = owner_scope_answer(record, text)
+                if answer and answer['status'] == 'resolved':
+                    control = ('append', text)
             if operation or control or preparation or validation or takeover or returning:
                 def call_if_active():
                     with self.lifecycle_lock:

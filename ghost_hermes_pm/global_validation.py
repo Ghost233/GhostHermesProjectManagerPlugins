@@ -212,7 +212,7 @@ def _plan(manager, identity, details, version, data):
         if profile.get('parent_profile_id') != task['profile_id'] or profile.get('role') != 'subproject_lead' or child.get('task_delivery') != 'delivered' or not re.fullmatch(r'[a-f0-9]{40}', str(commit)) or not evidence.get('criteria') or not evidence.get('execution_end'):
             raise ManagementError('evidence_missing', 'A related child has not delivered its fixed source and frozen acceptance evidence.')
         from .delivery import frozen_delivery_requirements
-        requirements = frozen_delivery_requirements(child)
+        requirements = frozen_delivery_requirements(child, manager, data)
         if requirements['clarification_criteria']:
             raise ManagementError('needs_clarification', 'Confirm this frozen child acceptance scope with the Owner before global validation.')
         if requirements['merge_forbidden'] and child.get('pr_status') == 'merged':
