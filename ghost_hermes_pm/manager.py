@@ -98,12 +98,13 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, lifecycle_host=None, migration_host=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
         self.global_validation_host = global_validation_host
         self.lifecycle_host = lifecycle_host
+        self.migration_host = migration_host
         self.knowledge_providers = dict(knowledge_providers or {})
         self.archive_providers = dict(archive_providers or {})
         self.observation_adapters = dict(observation_adapters or {})
@@ -277,6 +278,7 @@ class Manager:
                     'global_validations': [a for a in data.get('global_validations', {}).values() if a['profile_id'] in visible_ids],
                     'lifecycle_operations': [a for a in data.get('lifecycle_operations', {}).values() if a['profile_id'] in visible_ids],
                     'lifecycle_events': [a for a in data.get('lifecycle_events', {}).values() if a['profile_id'] in visible_ids],
+                    'migration_plans': [a for a in data.get('migration_plans', {}).values() if principal is None or a['plan']['target_profile_id'] in visible_ids],
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
@@ -347,6 +349,10 @@ class Manager:
 
     def lifecycle(self, identity, action, details):
         from .lifecycle import operate
+        return operate(self, identity, action, details)
+
+    def migrate_profile(self, identity, action, details):
+        from .migration import operate
         return operate(self, identity, action, details)
 
     def take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id):
@@ -880,7 +886,7 @@ class Manager:
                 value.update(lifecycle='configuring', can_execute=False,
                              capabilities={'execution': {'enabled': False, 'reason': 'Not verified by an execution adapter.'}})
                 if existing:
-                    value.update({k: existing[k] for k in ('lifecycle', 'archive_intent') if k in existing})
+                    value.update({k: existing[k] for k in ('lifecycle', 'archive_intent', 'migration_gate') if k in existing})
                 self._authorize_change(principal, 'profile', value, data)
                 from .collaboration import _binding
                 audit_changes.append({'kind': 'profile', 'id': value['id'], 'before': _binding(existing) if existing else None, 'after': _binding(value)})
