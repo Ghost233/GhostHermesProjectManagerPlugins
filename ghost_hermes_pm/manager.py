@@ -98,10 +98,11 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, observation_adapters=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
         self.delivery_source = delivery_source
+        self.observation_adapters = dict(observation_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -122,6 +123,8 @@ class Manager:
         with self._lock:
             if self.codex_adapter is not None:
                 self.codex_adapter.close()
+            for adapter in self.observation_adapters.values():
+                adapter.close()
             self._db.close()
 
     def __enter__(self):
@@ -192,6 +195,8 @@ class Manager:
                         capability.update(enabled=False, status='blocked', reason=str(exc))
             return {'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
                     'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'manual_sources': [s for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
+                    'manual_sessions': [s for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
@@ -241,6 +246,14 @@ class Manager:
         if principal and principal['role'] != 'steward' and record['profile_id'] not in self._visible_profile_ids(principal, data):
             raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
         return record
+
+    def register_observation_source(self, identity, registration):
+        from .observation import register_source
+        return register_source(self, identity, registration)
+
+    def refresh_manual_sessions(self, identity, scope=None):
+        from .observation import refresh_manual_sessions
+        return refresh_manual_sessions(self, identity, scope)
 
     def refresh_task_source(self, identity, request_id):
         from .queue import refresh_task_source

@@ -41,6 +41,8 @@ def require_turn(manager, identity, record, version, data):
     queue = record.get('queue')
     if queue:
         queue['requested_by'] = identity.subject
+    from .observation import guard_repository
+    guard_repository(manager, identity, record, version, data)
     if queue and queue['blocked_by']:
         record.update(unexecuted_reason=queue['reason'])
         if not queue.get('pending_continuation'):
