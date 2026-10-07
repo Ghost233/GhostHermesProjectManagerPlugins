@@ -127,6 +127,8 @@ def reconcile_task(manager, identity, request_id):
                     adapter = manager.recovery_adapters.get(session['service_ref'])
                     if adapter is None or adapter._closed or adapter.service_ref != session['service_ref']:
                         raise ManagementError('capability_unverified', 'The original executor has no verified reconnect path; inspect its original interface.')
+                    if any(session.get(k) and session[k] != getattr(adapter, k) for k in ('endpoint_ref', 'source_kind')):
+                        raise ManagementError('binding_conflict', 'The registered original endpoint or source kind changed; no recovery writes or input are permitted.')
                     context = {'request_id': request_id, 'service_id': session['service_id'], 'previous_generation': session['generation'],
                         'thread_id': session['thread_id'], 'turn_id': session['turn_id'], 'control': session['control'],
                         'accepted_scope_digest': hashlib.sha256(json.dumps(record['accepted_scope'], sort_keys=True).encode()).hexdigest()}
