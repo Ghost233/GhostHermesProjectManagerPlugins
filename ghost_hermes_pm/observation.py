@@ -180,13 +180,14 @@ def refresh_manual_sessions(manager, identity, scope=None):
                     previous = sessions.get(key, {})
                     status = thread['status'].get('type')
                     turns = thread.get('turns', [])
+                    active_turn_ids = [t.get('id') for t in turns if isinstance(t, dict) and t.get('status') == 'inProgress'] if isinstance(turns, list) else []
                     active = thread_id in loaded and status == 'active'
                     ended = thread_id in loaded and status == 'idle' and _ended(adapter, thread, proof, {data['projects'][p]['repo']['logical_id'] for p in project_ids})
                     state = 'active' if active else 'inactive_verified' if ended else 'last_known' if thread_id not in loaded else 'unknown'
                     sessions[key] = {**previous, 'id': key, 'source_id': source['id'], 'source_kind': source['kind'], 'thread_id': thread_id,
                         'original_executor_id': binding['executor'], 'generation': binding['generation'], 'project_ids': matches,
                         'logical_repository': logical, 'cwd': thread['cwd'], 'recorded_thread_source': thread.get('source') if isinstance(thread.get('source'), str) else 'structured_or_unknown', 'state': state, 'thread_status': status,
-                        'control': 'observe_only', 'last_verified_at': _now(), 'last_known_state': 'active' if active else 'inactive_verified' if ended else previous.get('last_known_state'),
+                        'control': 'observe_only', 'current_turn_id': active_turn_ids[0] if len(active_turn_ids) == 1 else None, 'last_verified_at': _now(), 'last_known_state': 'active' if active else 'inactive_verified' if ended else previous.get('last_known_state'),
                         'last_known_state_at': _now() if active or ended else previous.get('last_known_state_at'),
                         'blocks_repository': active or not ended, 'reason': None if active or ended else 'Readable history or idle metadata does not prove execution ended on the original service.'}
                 for record in sessions.values():
@@ -223,7 +224,9 @@ def refresh_manual_sessions(manager, identity, scope=None):
 
 def guard_repository(manager, identity, record, version, data):
     logical = record.get('session', {}).get('logical_repository') or record.get('queue', {}).get('logical_repository')
-    blockers = [s['id'] for s in data.get('manual_sessions', {}).values() if s['logical_repository'] == logical and s['blocks_repository']]
+    grant = data.get('control_grants', {}).get(record.get('control_grant_id'), {})
+    own_manual = grant.get('manual_session_id') if grant.get('status') == 'active' else None
+    blockers = [s['id'] for s in data.get('manual_sessions', {}).values() if s['logical_repository'] == logical and s['blocks_repository'] and s['id'] != own_manual]
     unknown = [s['id'] for s in data.get('manual_sources', {}).values() if logical in s.get('logical_repositories', {}).values() and s['status'] != 'verified']
     if blockers or unknown:
         reason = '手动执行或原服务观察范围待核对；同仓库新任务等待。'

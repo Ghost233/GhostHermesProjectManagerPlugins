@@ -292,6 +292,8 @@ class FeishuEntry:
             operation = operations.get(text)
             control = None
             validation = re.fullmatch(r'全局验证\s+(plan|prepare|start|finish|reconcile|check|rework|complete)[：:]\s*(\{.*\})', text, re.DOTALL)
+            takeover = re.fullmatch(r'接管本次工作[：:]\s*([a-f0-9]{64})\s+回合[：:]\s*(\S+)', text)
+            returning = text == '归还本次控制'
             preparation = re.fullmatch(r'确认基线[：:]\s*(\S+)\s+([a-f0-9]{40}|unborn)(?:\s+依赖[：:]([a-f0-9,]+))?(?:\s+保留[：:]([a-f0-9]{64}))?', text)
             explicit = re.fullmatch(r'(追加|继续)[：:]\s*(.*)', text, re.DOTALL)
             if text in {'停止', '结束当前任务'}:
@@ -300,7 +302,7 @@ class FeishuEntry:
                 control = ('continue', 'Continue the original accepted Issue within the existing scope.')
             elif explicit:
                 control = ('append' if explicit.group(1) == '追加' else 'continue', explicit.group(2))
-            if operation or control or preparation or validation:
+            if operation or control or preparation or validation or takeover or returning:
                 def call_if_active():
                     with self.lifecycle_lock:
                         self.require_active(generation)
@@ -319,6 +321,11 @@ class FeishuEntry:
                                 if not attempt or attempt['request_id'] != result['request_id']:
                                     raise ManagementError('binding_conflict', 'The validation round belongs to another original task.')
                             return self.manager().global_validation(identity, validation.group(1), details)
+                        if takeover:
+                            return self.manager().take_over_session(identity, result['request_id'], takeover.group(1), result['id'], takeover.group(2))
+                        if returning:
+                            record = next(r for r in self.manager().read_snapshot(identity)['requests'] if r['id'] == result['request_id'])
+                            return self.manager().return_session_control(identity, result['request_id'], record.get('control_grant_id'))
                         if preparation:
                             record = next(r for r in self.manager().read_snapshot(identity)['requests'] if r['id'] == result['request_id'])
                             return self.manager().prepare_task(identity, result['request_id'], {'branch': preparation.group(1),

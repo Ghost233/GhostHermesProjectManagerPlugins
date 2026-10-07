@@ -19,6 +19,8 @@
     const [humanReviewed, setHumanReviewed] = React.useState({});
     const [humanIntents, setHumanIntents] = React.useState({});
     const [preparationPlans, setPreparationPlans] = React.useState({});
+    const [manualTargets, setManualTargets] = React.useState({});
+    const [manualGrantIntents, setManualGrantIntents] = React.useState({});
     const [roleForm, setRoleForm] = React.useState({ sender: '', target: '', issue: '', anchor: '', channels: '' });
     const [roleReview, setRoleReview] = React.useState(null);
     const [validationForm, setValidationForm] = React.useState({ action: 'plan', details: '' });
@@ -56,6 +58,25 @@
       try { await sdk.fetchJSON(api + '/directory', { method: 'POST', body: JSON.stringify(review) });
         setReview(null); await refresh(); }
       catch (e) { setError(String(e.message || e)); }
+      finally { setSaving(false); }
+    }
+    function manualField(record, key, label) {
+      const selected = manualTargets[record.id] || {};
+      return h('label', { style: { display: 'block' } }, label, h('input', { value: selected[key] || '',
+        onChange: function (e) { setManualTargets(Object.assign({}, manualTargets, { [record.id]: Object.assign({}, selected, { [key]: e.target.value }) })); },
+        style: { margin: '6px', padding: '7px', color: 'inherit', background: 'transparent', border: '1px solid #8886' } }));
+    }
+    async function manualGrantAction(action, record) {
+      const selected = manualTargets[record.id] || {};
+      const previousGrant = (snapshot.control_grants || []).find(function (g) { return g.id === record.control_grant_id; });
+      const savedIntent = previousGrant && previousGrant.status === 'returned' ? null : manualGrantIntents[record.id];
+      const body = action === 'return' ? { action: 'return', request_id: record.id, grant_id: record.control_grant_id } :
+        savedIntent || { action: 'takeover', request_id: record.id, grant_id: window.crypto.randomUUID(),
+          manual_session_id: String(selected.manual_session_id || '').trim(), expected_turn_id: String(selected.turn_id || '').trim() };
+      if (action === 'takeover') setManualGrantIntents(Object.assign({}, manualGrantIntents, { [record.id]: body }));
+      setSaving(true);
+      try { await sdk.fetchJSON(api + '/task', { method: 'POST', body: JSON.stringify(body) }); await refresh(); }
+      catch (e) { await refresh(); setError(String(e.message || e) + ' · 授权 ID：' + body.grant_id); }
       finally { setSaving(false); }
     }
     function roleField(key, label, multiline) {
@@ -268,6 +289,7 @@
           h('details', null, h('summary', null, '原服务与可读取范围'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(source, null, 2)))); })),
         h('ul', null, (snapshot.manual_sessions || []).map(function (session) { return h('li', { key: session.id },
           session.source_kind + ' / ' + session.thread_id + '：' + session.state + ' · 只观察',
+          h('div', null, '手动记录 ID：' + session.id + ' · 当前原 turn：' + (session.current_turn_id || '待本人核对')),
           h('div', null, '最后核实：' + session.last_verified_at + ' · 最后已知：' + (session.last_known_state || '未知')),
           h('div', null, '仓库：' + session.logical_repository + ' · 排队：' + (session.blocks_repository ? '等待手动执行或核实' : '本来源已核实无相关执行')),
           session.reason && h('div', null, session.reason)); })),
@@ -287,6 +309,7 @@
         h('ul', null, (snapshot.requests || []).map(function (r) {
           const source = r.source_anchor;
           const anchor = r.task_start_anchor;
+          const grant = (snapshot.control_grants || []).find(function (g) { return g.id === r.control_grant_id; });
           const controlled = r.session && r.session.control === 'assigned_task' && r.task_delivery !== 'delivered';
           const inputOpen = controlled && !r.repository_released && !['stopping', 'stopped'].includes(r.execution);
           const continueOpen = controlled && r.execution === 'stopped' && r.outer_task_status === 'stopped' &&
@@ -306,6 +329,13 @@
               r.preparation && h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(r.preparation, null, 2))),
             r.handoff_reason && h('div', null, '交付交接受阻：' + r.handoff_reason),
             h('div', null, '交付：' + (r.task_delivery || 'unmet') + ' · PR：' + (r.pr_status || 'none')),
+            grant && h('div', null, '本次手动控制：' + grant.status + ' · 负责人：' + grant.controller_profile_id + ' · 原服务：' + grant.original_executor_id + ' · 授权：' + grant.id),
+            grant && grant.reason && h('div', null, '原控制待核对：' + grant.reason),
+            grant && h('button', { style: button, onClick: function () { manualGrantAction('return', r); }, disabled: saving || snapshot.status !== 'completed' || ['returned', 'completed'].includes(grant.status) }, '归还本次控制（不中断）'),
+            (!r.session || grant && grant.status === 'returned') && h('details', null, h('summary', null, '本人接管此 Issue 的当前手动工作'),
+              h('p', null, '指定本次请求的负责人控制已核实原会话。原服务或能力不支持时保持只观察，其他桌面操作识别仍未知。'),
+              manualField(r, 'manual_session_id', '已观察手动记录 ID'), manualField(r, 'turn_id', '明确当前原 turn ID'),
+              h('button', { style: button, onClick: function () { manualGrantAction('takeover', r); }, disabled: saving || snapshot.status !== 'completed' || !r.task_start_anchor }, '授权本次工作接管')),
             r.session && h('div', null, '原 Codex 会话：' + (r.session.thread_id || '创建待核对') + ' · 轮次：' + (r.session.turn_id || '启动待核对') + ' · 控制：' + r.session.control),
             r.last_execution_verified_at && h('div', null, '执行最后核实：' + r.last_execution_verified_at),
             h('button', { style: button, onClick: function () { taskAction('verify', r.id); }, disabled: saving || snapshot.status !== 'completed' }, '核验执行能力'),
@@ -415,6 +445,22 @@
               query.supplement && h('div', null, '原会话事实补充：' + query.supplement.status + ' · ' + (query.supplement.reason || '执行结果仍需核对')),
               h('details', null, h('summary', null, '公开查询与逐段凭据'), h('pre', { style: { whiteSpace: 'pre-wrap' } }, JSON.stringify(query.outbox || [], null, 2))));
           }))),
+        h('h2', null, '旧档案与数据检查点'),
+        h('p', null, '查询仅按登记迁移和共享范围读取。原入口保持停用；外部服务恢复能力须单独核验。'),
+        h('ul', null, (snapshot.archive_sources || []).map(function (source) {
+          return h('li', { key: source.id }, source.id + ' · ' + source.kind + ' · 迁移 Profile：' + source.new_profile_id,
+            h('details', null, h('summary', null, '授权与原生清理保护'), h('pre', null, JSON.stringify(source, null, 2))));
+        })),
+        h('ul', null, (snapshot.archive_queries || []).map(function (query) {
+          return h('li', { key: query.id }, query.id + ' · ' + query.source_id + ' · ' + query.status,
+            h('div', null, query.reason || ''),
+            h('pre', null, JSON.stringify(query.coverage || {}, null, 2)),
+            h('ul', null, (query.records || []).map(function (row) {
+              return h('li', { key: row.locator }, row.locator + ' · ' + row.timestamp + ' · ' + query.source_version, h('p', null, row.text));
+            })), h('details', null, h('summary', null, '原提问与逐段反馈凭据'), h('pre', null, JSON.stringify(query.outbox || [], null, 2))));
+        })),
+        h('details', null, h('summary', null, '每日副本、长期基线与恢复后查询'),
+          h('pre', null, JSON.stringify({ backups: snapshot.archive_backups || [], restores: snapshot.archive_restores || [] }, null, 2))),
         h('h2', null, '登记或修正'),
         h('p', null, '这里只保存非敏感引用；不创建原生 Profile、机器人、仓库或 worktree。项目身份不能改绑到新项目。'),
         h('form', { onSubmit: preview },
