@@ -37,7 +37,7 @@ for line in sys.stdin:
         with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
             payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
         assert any(r.get('session', {}).get('thread_id') == thread_id for r in payload['requests'].values()), 'thread must be durable before turn/start'
-        value = {'turn': {'id': turn_id, 'status': 'inProgress', 'items': []}}
+        value = {'turn': {'id': turn_id, 'status': 'inProgress', 'items': [], 'itemsView': 'full'}}
         thread['status'] = {'type': 'active', 'activeFlags': []}
         thread['turns'] = [value['turn']]
     elif method == 'thread/read':
@@ -46,6 +46,15 @@ for line in sys.stdin:
         value = {'thread': thread}
     else:
         print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported fixture method'}}), flush=True)
+        continue
+    behavior = json.loads((root / 'behavior.json').read_text()) if (root / 'behavior.json').exists() else {}
+    import time
+    time.sleep(behavior.get('delay', {}).get(method, 0))
+    value.update(behavior.get(method, {}))
+    if behavior.get('oversized') == method:
+        print(json.dumps({'id': request['id'], 'result': {'padding': 'x' * (17 * 1024 * 1024)}}), flush=True)
+        continue
+    if behavior.get('omit_response') == method:
         continue
     response = json.dumps({'id': request['id'], 'result': value})
     # Fragment the envelope: reader must frame by newline, not one read == one response.

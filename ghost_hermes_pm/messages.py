@@ -158,7 +158,7 @@ class FeishuEntry:
             self.manager().publish_request_message(identity, record['id'], 'confirmation',
                 '已受理：项目 ' + record['project_id'] + ' · 负责人 ' + record['profile_id'] + '\n' + scope['url']
                 + '\n范围：' + scope['title'] + '\nIssue 版本：' + scope['updated_at']
-                + '\n等待执行：Codex 执行尚未启用。受理与消息送达分别核对。')
+                + '\n等待执行能力核验与明确启动。受理与消息送达分别核对。')
             self.manager().publish_request_message(identity, record['id'], 'material', '已受理范围：\n' + scope['body'])
             self.require_active(generation)
             await self.deliver(identity, record['id'], transport, generation)
@@ -218,8 +218,26 @@ class FeishuEntry:
                     receipt = {'status': 'unknown'}
                 self.manager().record_clarification_delivery(identity, result['id'], receipt)
         elif result['status'] == 'associated':
-            self.manager().publish_request_message(identity, result['request_id'], 'progress',
-                '已关联输入 ' + envelope['message_id'] + '。已受理范围保持原 Issue 版本；执行仍等待启用。')
+            operations = {'执行': 'start_task', '核对执行': 'refresh_task', '核验执行能力': 'verify_task_execution'}
+            operation = operations.get(text)
+            if operation:
+                def call_if_active():
+                    with self.lifecycle_lock:
+                        self.require_active(generation)
+                        return getattr(self.manager(), operation)(identity, result['request_id'])
+                try:
+                    outcome = await asyncio.to_thread(call_if_active)
+                    self.require_active(generation)
+                    if outcome.get('status') == 'blocked':
+                        self.manager().publish_request_message(identity, result['request_id'], 'progress',
+                            '执行能力受阻：' + outcome['reason'])
+                except ManagementError as exc:
+                    self.require_active(generation)
+                    self.manager().publish_request_message(identity, result['request_id'], 'progress',
+                        '执行操作待核对：' + str(exc))
+            else:
+                self.manager().publish_request_message(identity, result['request_id'], 'progress',
+                    '已关联输入 ' + envelope['message_id'] + '。已受理范围保持原 Issue 版本。')
             await self.deliver(identity, result['request_id'], transport, generation)
         return {'action': 'skip'}
 

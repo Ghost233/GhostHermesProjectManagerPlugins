@@ -98,9 +98,10 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None):
         self.owner_identity_ref = owner_identity_ref
         self.codex_adapter = codex_adapter
+        self.delivery_source = delivery_source
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
         self.state_dir = Path(state_dir).resolve()
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +134,10 @@ class Manager:
         data.setdefault('clarifications', {})
         data.setdefault('intake_failures', {})
         for record in data['requests'].values():
+            session = record.get('session')
+            if session and not record.get('repository_released') and (self.codex_adapter is None or self.codex_adapter.generation != session['generation'] or self.codex_adapter._closed):
+                record['execution'] = 'unverified'
+                record['unexecuted_reason'] = 'Original executor generation unavailable; reconciliation required.'
             for publication in record['outbox']:
                 for segment in publication['segments']:
                     if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
@@ -174,7 +179,8 @@ class Manager:
                     'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
                     'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
                         'compatibility': 'unverified', 'real_connect': 'unverified', 'real_group_acceptance': 'unverified'}),
-                    'execution': 'not_enabled', 'needs_human': ['Execution and channel capabilities are not verified.']}
+                    'execution': 'available' if any(r.get('execution_capability', {}).get('enabled') and self.codex_adapter and r['execution_capability'].get('connection', {}).get('generation') == self.codex_adapter.generation and not self.codex_adapter._closed for r in requests) else 'not_enabled',
+                    'needs_human': ['Capabilities require current service, permission and channel evidence.']}
 
     def accept_request(self, identity, project_id, profile_id, message, issue):
         """Accept an Issue snapshot from a trusted message entry; never start Codex."""
@@ -217,6 +223,18 @@ class Manager:
     def start_task(self, identity, request_id):
         from .execution import start_task
         return start_task(self, identity, request_id)
+
+    def refresh_task(self, identity, request_id):
+        from .execution import refresh_task
+        return refresh_task(self, identity, request_id)
+
+    def record_task_delivery(self, identity, request_id, report):
+        from .delivery import record_task_delivery
+        return record_task_delivery(self, identity, request_id, report)
+
+    def verify_task_execution(self, identity, request_id):
+        from .execution import verify_task_execution
+        return verify_task_execution(self, identity, request_id)
 
     def record_intake_failure(self, identity, project_id, profile_id, message, code):
         reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',

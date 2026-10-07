@@ -55,7 +55,7 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
@@ -68,8 +68,10 @@ class ManagementServer:
                             result = bridge.manager.read_snapshot(identity, payload.get('scope'))
                         elif payload.get('operation') == 'apply_directory_change':
                             result = bridge.manager.apply_directory_change(identity, payload.get('expected_version'), payload.get('change'))
-                        elif payload.get('operation') == 'start_task':
-                            result = bridge.manager.start_task(identity, payload.get('request_id'))
+                        elif payload.get('operation') in {'start_task', 'refresh_task', 'verify_task_execution'}:
+                            result = getattr(bridge.manager, payload['operation'])(identity, payload.get('request_id'))
+                        elif payload.get('operation') == 'record_task_delivery':
+                            result = bridge.manager.record_task_delivery(identity, payload.get('request_id'), payload.get('report'))
                         else:
                             raise ManagementError('unsupported', 'This management operation is not enabled.')
                         response = {'result': result}
@@ -77,7 +79,10 @@ class ManagementServer:
                         response = {'error': {'code': exc.code, 'message': str(exc)}}
                     except (ValueError, TypeError, KeyError):
                         response = {'error': {'code': 'invalid_change', 'message': 'Malformed management input.'}}
-                    self.wfile.write(_frame(response))
+                    try:
+                        self.wfile.write(_frame(response))
+                    except OSError:
+                        pass  # The durable operation remains authoritative after caller disconnect.
 
             class Server(socketserver.ThreadingUnixStreamServer):
                 daemon_threads = False
@@ -124,12 +129,14 @@ class ManagementClient:
     def _call(self, operation, **args):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(3)
+                connection.settimeout(30 if operation in {'start_task', 'refresh_task', 'verify_task_execution', 'record_task_delivery'} else 3)
                 connection.connect(str(self.path))
                 connection.sendall(_frame({'token': self.token, 'operation': operation, **args}))
                 with connection.makefile('rb') as reader:
                     response = _read_frame(reader)
         except (OSError, ValueError) as exc:
+            if operation == 'start_task':
+                raise ManagementError('outcome_unknown', 'Task start response was not confirmed; read the same durable request before retrying. Repository occupancy is retained.') from exc
             raise ManagementError('unavailable', 'The management instance is unavailable; no operation was confirmed.') from exc
         if 'error' in response:
             raise ManagementError(response['error']['code'], response['error']['message'])
@@ -146,3 +153,12 @@ class ManagementClient:
 
     def start_task(self, request_id):
         return self._call('start_task', request_id=request_id)
+
+    def refresh_task(self, request_id):
+        return self._call('refresh_task', request_id=request_id)
+
+    def record_task_delivery(self, request_id, report):
+        return self._call('record_task_delivery', request_id=request_id, report=report)
+
+    def verify_task_execution(self, request_id):
+        return self._call('verify_task_execution', request_id=request_id)

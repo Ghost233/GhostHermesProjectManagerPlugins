@@ -34,6 +34,7 @@ class CodexStdioAdapter:
         self._responses, self._events = {}, []
         self._counter, self._process, self.connection = 0, None, None
         self._closed = False
+        self._failure_reason = None
 
     def connect(self):
         with self._rpc_lock:
@@ -80,10 +81,11 @@ class CodexStdioAdapter:
     def _read(self):
         try:
             while True:
-                line = self._process.stdout.readline(1024 * 1024 + 1)
+                line = self._process.stdout.readline(16 * 1024 * 1024 + 1)
                 if not line:
                     break
-                if len(line) > 1024 * 1024 or not line.endswith(b'\n'):
+                if len(line) > 16 * 1024 * 1024 or not line.endswith(b'\n'):
+                    self._failure_reason = 'Codex JSONL exceeds the 16 MiB frame bound; executor liveness remains unknown.'
                     break
                 envelope = json.loads(line)
                 if not isinstance(envelope, dict):
@@ -117,7 +119,7 @@ class CodexStdioAdapter:
                     remaining = deadline - time.monotonic()
                     if self._closed or remaining <= 0:
                         raise ManagementError('outcome_unknown' if method in {'thread/start', 'turn/start'} else 'unavailable',
-                                              'Codex response was not confirmed; mutating requests are never replayed.')
+                                              self._failure_reason or 'Codex response was not confirmed; mutating requests are never replayed.')
                     self._condition.wait(remaining)
                 response = self._responses.pop(key)
             if 'error' in response:
@@ -170,8 +172,9 @@ class CodexStdioAdapter:
                                            'approvalPolicy': 'untrusted', 'ephemeral': False})
 
     def verify_thread(self, response, repository, proof):
-        thread = response.get('thread', {})
-        if not thread.get('id') or thread.get('cwd') != repository['worktree'] or response.get('cwd') != repository['worktree'] or thread.get('canAcceptDirectInput') is not True or thread.get('cliVersion') != '0.160.1' or response.get('activePermissionProfile', {}).get('id') != proof['permission_profile'] or response.get('runtimeWorkspaceRoots') != proof['runtime_roots']:
+        thread = response.get('thread')
+        profile = response.get('activePermissionProfile')
+        if not isinstance(thread, dict) or not isinstance(profile, dict) or not isinstance(thread.get('id'), str) or not thread.get('id') or thread.get('cwd') != repository['worktree'] or response.get('cwd') != repository['worktree'] or thread.get('canAcceptDirectInput') is not True or thread.get('cliVersion') != '0.160.1' or profile.get('id') != proof['permission_profile'] or response.get('runtimeWorkspaceRoots') != proof['runtime_roots']:
             raise ManagementError('capability_unverified', 'The created thread did not confirm the verified runtime boundary.')
         self._alive()
 
@@ -205,3 +208,29 @@ class CodexStdioAdapter:
                     self._process.wait(timeout=2)
             self._closed = True
             self._process.stdout.close()
+
+
+def configured_adapter(config, state_dir):
+    """Trusted host configuration only. A current-generation report cannot be a Boolean."""
+    if not config:
+        return None
+    allowed = {'command', 'cwd', 'environment', 'service_ref'}
+    if not isinstance(config, dict) or set(config) - allowed or any(k not in config for k in allowed):
+        raise ManagementError('invalid_change', 'Codex stdio configuration requires explicit command, cwd, environment and service reference.')
+    evidence_path = Path(state_dir) / 'codex-validation.json'
+
+    def verifier(connection, repository):
+        try:
+            if evidence_path.stat().st_size > 65536:
+                raise ValueError('Oversized proof.')
+            evidence = json.loads(evidence_path.read_text())
+        except (OSError, ValueError) as exc:
+            raise ManagementError('capability_unverified', 'No current-generation platform/tool/start verification report; actual task start remains disabled.') from exc
+        from .validation import validate_receipts
+        try:
+            return validate_receipts(evidence, connection, repository, config['command'], config['environment'], state_dir)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ManagementError('capability_unverified', 'The current-service capability receipt set is incomplete.') from exc
+
+    return CodexStdioAdapter(config['command'], cwd=config['cwd'], env=config['environment'],
+                             service_ref=config['service_ref'], verifier=verifier)
