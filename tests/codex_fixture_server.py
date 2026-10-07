@@ -40,6 +40,14 @@ for line in sys.stdin:
         value = {'turn': {'id': turn_id, 'status': 'inProgress', 'items': [], 'itemsView': 'full'}}
         thread['status'] = {'type': 'active', 'activeFlags': []}
         thread['turns'] = [value['turn']]
+    elif method == 'turn/steer':
+        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
+            payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
+        assert any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in payload['requests'].values() for c in r.get('controls', []))
+        if params['threadId'] != thread_id or params['expectedTurnId'] != turn_id:
+            print(json.dumps({'id': request['id'], 'error': {'code': -32000, 'message': 'Wrong active turn'}}), flush=True)
+            continue
+        value = {'turnId': turn_id}
     elif method == 'thread/read':
         state = json.loads((root / 'observed.json').read_text()) if (root / 'observed.json').exists() else {}
         thread.update(state)

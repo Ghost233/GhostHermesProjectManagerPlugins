@@ -118,7 +118,7 @@ class CodexStdioAdapter:
                 while key not in self._responses:
                     remaining = deadline - time.monotonic()
                     if self._closed or remaining <= 0:
-                        raise ManagementError('outcome_unknown' if method in {'thread/start', 'turn/start'} else 'unavailable',
+                        raise ManagementError('outcome_unknown' if method in {'thread/start', 'turn/start', 'turn/steer', 'turn/interrupt'} else 'unavailable',
                                               self._failure_reason or 'Codex response was not confirmed; mutating requests are never replayed.')
                     self._condition.wait(remaining)
                 response = self._responses.pop(key)
@@ -180,6 +180,19 @@ class CodexStdioAdapter:
 
     def start_turn(self, thread_id, prompt):
         return self._call('turn/start', {'threadId': thread_id, 'input': [{'type': 'text', 'text': prompt, 'text_elements': []}]})
+
+    def verify_control(self, repository, action):
+        self._alive()
+        if self.verifier is None or self.connection is None:
+            raise ManagementError('capability_unverified', 'Current-service task control receipts are missing.')
+        proof = self.verifier(dict(self.connection), json.loads(json.dumps(repository)))
+        if not isinstance(proof, dict) or proof.get('generation') != self.generation or proof.get('service_id') != self.connection['service_id'] or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']] or not isinstance(proof.get('task_control'), dict) or not proof['task_control'].get(action):
+            raise ManagementError('capability_unverified', 'This task control has not been verified on the original service and boundary.')
+        return proof
+
+    def steer_turn(self, thread_id, turn_id, text, instruction_id):
+        return self._call('turn/steer', {'threadId': thread_id, 'expectedTurnId': turn_id,
+            'input': [{'type': 'text', 'text': text, 'text_elements': []}], 'clientUserMessageId': instruction_id})
 
     def read_thread(self, thread_id):
         self.connect()

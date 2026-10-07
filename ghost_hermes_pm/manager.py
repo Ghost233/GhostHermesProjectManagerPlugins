@@ -241,6 +241,10 @@ class Manager:
         from .execution import refresh_task
         return refresh_task(self, identity, request_id)
 
+    def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
+        from .control import control_task
+        return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
+
     def record_task_delivery(self, identity, request_id, report):
         from .delivery import record_task_delivery
         return record_task_delivery(self, identity, request_id, report)

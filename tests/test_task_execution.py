@@ -15,6 +15,7 @@ def adapter_for(root):
                 'repository_fingerprint': repository_fingerprint(repository), 'permission_profile': 'fixture-boundary',
                 'runtime_roots': [repository['worktree']], 'policy_digest': 'fixture-policy',
                 'platform_enforcement': 'synthetic-peer-only', 'tool_paths': 'synthetic-peer-only',
+                'task_control': {'append': 'synthetic-peer-only', 'stop': 'synthetic-peer-only', 'continue': 'synthetic-peer-only', 'related_execution': 'synthetic-peer-only'},
                 'task_start': 'synthetic-peer-only', 'manual_execution_coverage': 'synthetic-peer-only', 'model': 'fixture-model'}
     return CodexStdioAdapter([sys.executable, str(Path(__file__).with_name('codex_fixture_server.py')), str(root)],
                             cwd=root, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(root / 'codex-home')},
