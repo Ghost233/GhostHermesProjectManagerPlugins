@@ -1,6 +1,6 @@
-# Wiki 来源查询与原任务事实补充（[公开查询 Wiki 并补入任务上下文](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/25)）
+# Wiki 来源查询与原任务事实补充（[公开查询 Wiki 并补入任务上下文](../../../../issues/25)）
 
-这是实际来源 adapter、公共管理入口、注册群消息与原会话输入的实施契约。离线演示使用登记的 local 资料和与实际 ConsoWiki schema 一致的 MCP peer，真实 Lark SDK builder/model、原会话 JSONL peer 与 pristine Hermes SDK 的生产配置启动都有证据。获准原 MCP 的只读预检已核对 initialize/list、wiki_status 和一次 budget=500 context-pack 的结构；公开群／模型／原会话的真实服务验收仍单独记录。
+这是实际来源 adapter、公共管理入口、注册群消息与原会话输入的实施契约。离线演示使用登记的 local 资料和与实际 WikiKnowledge schema 一致的 MCP peer，真实 Lark SDK builder/model、原会话 JSONL peer 与 pristine Hermes SDK 的生产配置启动都有证据。获准原 MCP 的只读预检已核对 initialize/list、wiki_status 和一次 budget=500 context-pack 的结构；公开群／模型／原会话的真实服务验收仍单独记录。
 
 ## 授权与来源
 
@@ -18,19 +18,21 @@ Dashboard `/knowledge` 共用 register/query/supplement 操作，body 不接受 
 
 ## 原 Wiki MCP 连接
 
-现有 ConsoWiki 原连接保持为只读服务，不复制为各 Profile 的记忆库。可信管理 Profile settings 可登记：
+现有 WikiKnowledge 原连接保持为只读服务，不复制为各 Profile 的记忆库。可信管理 Profile settings 可登记：
 
 ```yaml
 knowledge_providers:
-  mcp:conso-knowledge:
-    url: http://127.0.0.1:18641/mcp
-    corpus_scope_id: conso-corpus
+  mcp:example-knowledge:
+    url: http://127.0.0.1:9000/mcp
+    corpus_scope_id: example-corpus
+    expected_server_info: {name: example-knowledge, version: "0.1.0"}
+    expected_tool_description: "Read the synthetic knowledge corpus and return citations."
     credential_ref: native:HERMES_WIKI_TOKEN
 ```
 
-`credential_ref` 是现有 SDK `agent.secret_scope.get_secret` 的名称引用，仅在 Gateway 的管理 Profile/home/secret-scope 校验通过后解析，按 Bearer 使用并留在 RAM；配置和记录不接收秘密原值。明确无需认证的端点可将该引用设为 null。Owner 的 SourceGrant 必须另行授予**原提问者** `conso-corpus`，公开回传还需给具体 channel/binding 登记完整同一范围。它表示该连接的**全部 corpus**，不能拿一个小范围名称冒充可过滤子库。现有工具只接受 `prompt/budget`，没有 requester、scope 或可证明的远端 ACL：适配器仅在实际请求 scope 恰为登记 corpus 时调用，子范围拒绝且不发出网络请求，不以 prompt 伪装访问控制。Owner 登记时冻结 URL/corpus/secret-reference 的非敏感 binding digest；同 reference 改指其他语料须重新登记授权。
+`credential_ref` 是现有 SDK `agent.secret_scope.get_secret` 的名称引用，仅在 Gateway 的管理 Profile/home/secret-scope 校验通过后解析，按 Bearer 使用并留在 RAM；配置和记录不接收秘密原值。明确无需认证的端点可将该引用设为 null。Owner 的 SourceGrant 必须另行授予**原提问者** `example-corpus`，公开回传还需给具体 channel/binding 登记完整同一范围。它表示该连接的**全部 corpus**，不能拿一个小范围名称冒充可过滤子库。现有工具只接受 `prompt/budget`，没有 requester、scope 或可证明的远端 ACL：适配器仅在实际请求 scope 恰为登记 corpus 时调用，子范围拒绝且不发出网络请求，不以 prompt 伪装访问控制。Owner 登记时冻结 URL/corpus/secret-reference 的非敏感 binding digest；同 reference 改指其他语料须重新登记授权。
 
-每次查询只执行 MCP 2025-03-26 initialize、initialized、tools/list 及 `get_context_pack(prompt, budget=500)`，核对 ConsoKnowledge 0.1.0 与获准只读工具的实际 descriptor/schema；支持 JSON 和 POST SSE 响应。不请求原文窗口，不枚举其他工具、不处理 server instructions、不写原库。HTTP 响应上限 1 MiB，整次查询设 20 秒预算与每次连接/读取超时，清理只针对本次 initialize 返回的 owned session，连接/读取各最多 3 秒且不读取清理响应正文。公共 query/resolve bridge 最多等 30 秒；结果未知先从 snapshot 核对同一 durable query ID，不盲重试或另造 query ID。
+每次查询只执行 MCP 2025-03-26 initialize、initialized、tools/list 及 `get_context_pack(prompt, budget=500)`，核对 exampleKnowledge 0.1.0 与获准只读工具的实际 descriptor/schema；支持 JSON 和 POST SSE 响应。不请求原文窗口，不枚举其他工具、不处理 server instructions、不写原库。HTTP 响应上限 1 MiB，整次查询设 20 秒预算与每次连接/读取超时，清理只针对本次 initialize 返回的 owned session，连接/读取各最多 3 秒且不读取清理响应正文。公共 query/resolve bridge 最多等 30 秒；结果未知先从 snapshot 核对同一 durable query ID，不盲重试或另造 query ID。
 
 context-pack 的 primary/secondary 相关 summary/excerpt 随真实 citation source/start/end 返回。引用区间的单位未独立核实，所以 locator 保留源给出的数值，不宣称是行号。材料 `version=result-snapshot-sha256:…` 是返回包快照摘要，`updated_at` 是本次本地观察时间；可取得的 artifact repoRef/commit/observedAt/updatedAt 在文字中明确标为 **reported artifact version，source revision unverified**，不编造原文件版本。freshness 的 contradicted/stale/archived 优先分类为冲突／过时；显式 fact/inference/suggestion 分类保留，未知编译 artifact 类型按 inference 展示，不能自动补充为事实。无引用、无法核实结果、工具或协议变化、源拒绝及已知秘密仅留下固定状态与原获准范围。
 
@@ -46,7 +48,7 @@ context-pack 的 primary/secondary 相关 summary/excerpt 随真实 citation sou
 
 从当前任务发起 query 时，先保存查询意图和逐段 outbox，生成 `资料查询 QUERY_ID` 标记，真实 @ 已登记 Wiki 并回复原任务锚。只有完整 SDK 原始 sender、app/tenant、接收 bot、群、native IDs、已有查询关联及正式 mention 一致时，注册 Wiki 入口才处理该请求。纯文本写 @名字或任意群回复不能假冒 Wiki。
 
-Wiki 以原 requester 权限读取，结果作为固定版本保存；`资料结果 QUERY_ID RESULT_VERSION` 沿实际收到的 query 消息回复、真实 @ 查询发送者。结果回到登记 requester namespace 后再核对原 query parent/root、实际 sender、固定版本和逐段原生发送凭据。query/result 没有恢复开发权或批准权限，[将群内答复送回有效问题与审批](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/21) 原人工请求、正式审批与资料路由独立。
+Wiki 以原 requester 权限读取，结果作为固定版本保存；`资料结果 QUERY_ID RESULT_VERSION` 沿实际收到的 query 消息回复、真实 @ 查询发送者。结果回到登记 requester namespace 后再核对原 query parent/root、实际 sender、固定版本和逐段原生发送凭据。query/result 没有恢复开发权或批准权限，[将群内答复送回有效问题与审批](../../../../issues/21) 原人工请求、正式审批与资料路由独立。
 
 本人直接对独立 Wiki 真实 @ 的命令为 `查询 SOURCE_ID SCOPE1,SCOPE2：问题`。身份、接收 app 与原消息先核验；Wiki 回复实际本人，不要求开发任务、不造 Issue，也不启动 Codex。
 
@@ -58,9 +60,9 @@ outbox 每段先登记 UUID/意图，再发真实 Lark post/@/reply；保存 del
 
 输入明确标为 untrusted source data，并以 JSON 引用实际材料和来源；源指令不变成新授权、执行审批或新的范围。inference/advice/conflict/stale 保留为材料；冲突和过时不自动选边。完整记忆、历史和未经要求的原资料不随输入附带。
 
-发送前再次正式读取原线程。只接受仍 active 且唯一 inProgress 原回合，使用 [在原会话追加、停止和明确继续任务](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/17) `control_task append` 与真实 expectedTurnId；不得借 idle 路径创建新回合。query/result 派生稳定 knowledge instruction ID，持久意图先于 RPC。重复与 unknown 保留原 ID，既不重发，也不换 ID 重试。
+发送前再次正式读取原线程。只接受仍 active 且唯一 inProgress 原回合，使用 [在原会话追加、停止和明确继续任务](../../../../issues/17) `control_task append` 与真实 expectedTurnId；不得借 idle 路径创建新回合。query/result 派生稳定 knowledge instruction ID，持久意图先于 RPC。重复与 unknown 保留原 ID，既不重发，也不换 ID 重试。
 
-任务已结束、stopping/stopped、已交付／释放、仅观察、控制已归还、thread/turn/generation/安排改变、通道未知或资料迟到时，只展示 materials_only／blocked 原因；不 steer/start/resume。明确后续工作沿新的受理或已有普通控制契约处理。[用已知资料答复并回写项目记忆](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/26) 记忆回写不属于本票。
+任务已结束、stopping/stopped、已交付／释放、仅观察、控制已归还、thread/turn/generation/安排改变、通道未知或资料迟到时，只展示 materials_only／blocked 原因；不 steer/start/resume。明确后续工作沿新的受理或已有普通控制契约处理。[用已知资料答复并回写项目记忆](../../../../issues/26) 记忆回写不属于本票。
 
 ## 展示与验证
 
@@ -68,4 +70,4 @@ Dashboard 展示来源授权、实际 requester/scope、原任务关联、fact/i
 
 `tests/test_knowledge.py` 从公共 token/API 与实际原始 Lark text/post 事件驱动 readonly local provider、真实 SDK builder 和 stdio peer，覆盖查询／@回传／原任务 facts 一条链，另有权限拒绝、上级/Wiki 无替代权、重复、scope 撤销、资料字段注入、命名空间伪装、实际拒绝／冲突／秘密、idle/错回合/停止/归还/只观察/失联矩阵。`test_wiki_mcp.py` 在公共 token/Manager/client 与实际 HTTP/SSE peer 处核对完整 corpus、连接换绑、协议/工具/引用拒绝、慢响应、秘密与不重试，并驱动原有真实 SDK @/回传/原 active turn 补充链。`wiki_mcp_smoke_runner.py` 用固定 pristine Hermes SDK 的真实 PluginContext/settings/secret scope/Gateway hook 构建生产 provider，普通加载不连服务，原 Unix bridge 线程可使用 RAM 凭据，关闭仅清理自己的资源。`knowledge_smoke_runner.py` 使用 pristine SDK registry 和独立 participant bridge，拒绝真实 .hermes/.codex 与网络，验证工具拒绝私有上下文替代及稳定原会话补充。
 
-真实验收仍需获准 Source/Wiki 连接、app/tenant/群与真实 @/消息关联、原服务模型预算及 [执行一个 Codex Issue 并核对交付结果](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/16)/[在原会话追加、停止和明确继续任务](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/17)/[按仓库排队并交接下一项 Issue](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/18) 的全部写入／控制／后台边界。生产 gate 保持关闭，不重复已失败权限研究、不降级 full access、实际原 Wiki 仅按当次本人授权做有界只读核验，不自动安装／开机器人／迁移资料。
+真实验收仍需获准 Source/Wiki 连接、app/tenant/群与真实 @/消息关联、原服务模型预算及 [执行一个 Codex Issue 并核对交付结果](../../../../issues/16)/[在原会话追加、停止和明确继续任务](../../../../issues/17)/[按仓库排队并交接下一项 Issue](../../../../issues/18) 的全部写入／控制／后台边界。生产 gate 保持关闭，不重复已失败权限研究、不降级 full access、实际原 Wiki 仅按当次本人授权做有界只读核验，不自动安装／开机器人／迁移资料。

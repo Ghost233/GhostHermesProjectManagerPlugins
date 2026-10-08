@@ -370,18 +370,18 @@ def test_verified_rework_is_immediately_linked_to_actual_public_child_outbox_onc
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
         assert manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})['status'] == 'failed'
-        returned = manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})
+        returned = manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/example-user/fixture/issues/28'})
         assert returned['rework'][0]['route'] == 'child' and returned['rework'][0]['profile_id'] == 'child-lead'
         assert returned['rework'][0]['issue']['url'].endswith('/issues/28')
         handoff = returned['rework'][0]['handoff_id']
         packet = manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': handoff})
         assert packet['mention_open_id'] == 'child-seen-lead' and '/issues/28' in packet['text']
         assert returned['occupancy']['released'] is True
-        assert manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})['rework'] == returned['rework']
+        assert manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/example-user/fixture/issues/28'})['rework'] == returned['rework']
 
         notice = next(e for e in manager.read_snapshot(OWNER)['notifications']['events'] if e['kind'] == 'rework')
         assert notice['role_handoff_id'] == handoff and notice['mention_owner'] is False
-        manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})
+        manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/example-user/fixture/issues/28'})
         assert len([e for e in manager.read_snapshot(OWNER)['notifications']['events'] if e['kind'] == 'rework']) == 1
 
 

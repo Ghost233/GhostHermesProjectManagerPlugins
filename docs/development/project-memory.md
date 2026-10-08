@@ -1,4 +1,4 @@
-# 已知事实答复与所属项目记忆（[用已知资料答复并回写项目记忆](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/26)）
+# 已知事实答复与所属项目记忆（[用已知资料答复并回写项目记忆](../../../../issues/26)）
 
 公开管理入口为 `manage_memory(identity, action, details)`；Dashboard `/memory`、原生 `hermes_pm_memory` 工具和 `ManagementClient.manage_memory` 共用相同身份、来源范围与控制规则。`details` 只接受所选操作的准确字段，不能指定 actor、role、Owner origin、任意资料路径或借用权限。原生工具使用独立 participant 凭据，拒绝 Owner token alias。
 
@@ -24,7 +24,7 @@
 
 ## 当前有效的全局验证结果索引
 
-总负责人可明确选取同一原 mono 请求的 `global_validation_id`，总管可在自己的必要摘要中引用公开可见结果。回写前沿 [验证 mono 交付组合并按 Issue 返工](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/27) 的公开 `global_validation check`（总管沿最新公开 snapshot）核对实际职责、输入与来源，要求当前 `status=complete`、`whole_project_complete=true`、可核实 `completed_at` 与明确边界 scope；`passed`、缺原持续 watch／host、失联、未核实或失效结果都不能成为已验收项目事实。
+总负责人可明确选取同一原 mono 请求的 `global_validation_id`，总管可在自己的必要摘要中引用公开可见结果。回写前沿 [验证 mono 交付组合并按 Issue 返工](../../../../issues/27) 的公开 `global_validation check`（总管沿最新公开 snapshot）核对实际职责、输入与来源，要求当前 `status=complete`、`whole_project_complete=true`、可核实 `completed_at` 与明确边界 scope；`passed`、缺原持续 watch／host、失联、未核实或失效结果都不能成为已验收项目事实。
 
 只保存轮次与原请求定位、mono／相关子提交、完成时间、输入及测试输出 digest 和边界 scope，不复制原内部 inputs、Git 元数据、工作树快照或测试输出。合成 host 的索引明确保留 `synthetic-fixture` 和 `production_acceptance=false`，不能声称生产验收。
 

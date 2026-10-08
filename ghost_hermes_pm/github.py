@@ -1,4 +1,4 @@
-"""Read-only delivery evidence; authenticate Ghost233 before every business read."""
+"""Read-only delivery evidence; verify the configured account before each read."""
 import json
 import re
 import subprocess
@@ -9,8 +9,9 @@ from .manager import ManagementError
 
 
 class GitHubDeliverySource:
-    def __init__(self, state_dir=None, *, error_code="evidence_missing"):
+    def __init__(self, state_dir=None, *, expected_account=None, error_code="evidence_missing"):
         self.error_code = error_code
+        self.expected_account = expected_account
         self.state_dir = Path(state_dir).resolve() if state_dir is not None else None
 
     def read_test_version(self, session, item_id):
@@ -24,8 +25,8 @@ class GitHubDeliverySource:
             if not isinstance(receipt, dict) or receipt.get('thread_id') != session['thread_id']:
                 raise ValueError('Receipt thread mismatch.')
             return receipt
-        except (OSError, ValueError) as exc:
-            raise ManagementError('evidence_missing', 'No trusted runner receipt binds this test to the fixed delivery source.') from exc
+        except (OSError, ValueError):
+            raise ManagementError('evidence_missing', 'No trusted runner receipt binds this test to the fixed delivery source.') from None
 
     def _run(self, *args):
         result = subprocess.run(['gh', *args], capture_output=True, text=True, timeout=30)
@@ -34,13 +35,16 @@ class GitHubDeliverySource:
         return result.stdout
 
     def _business(self, *args):
+        account = self.expected_account
+        if not isinstance(account, str) or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})', account):
+            raise ManagementError('configuration_missing', 'Configure the expected GitHub account before reading development evidence.')
         try:
-            self._run('auth', 'switch', '--hostname', 'github.com', '--user', 'Ghost233')
-            if self._run('api', '--hostname', 'github.com', 'user', '--jq', '.login').strip() != 'Ghost233':
-                raise ManagementError('unauthorized', 'The actual GitHub account must be Ghost233.')
+            self._run('auth', 'switch', '--hostname', 'github.com', '--user', account)
+            if self._run('api', '--hostname', 'github.com', 'user', '--jq', '.login').strip() != account:
+                raise ManagementError('unauthorized', 'The actual GitHub account does not match the configured account.')
             return self._run(*args)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ManagementError(self.error_code, 'GitHub evidence is unavailable; the operation remains pending.') from exc
+        except (OSError, subprocess.TimeoutExpired):
+            raise ManagementError(self.error_code, 'GitHub evidence is unavailable; the operation remains pending.') from None
 
     def read_issue(self, url):
         if not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', url):
@@ -58,7 +62,7 @@ class GitHubDeliverySource:
             return {'url': value['url'], 'head_commit': value['headRefOid'], 'state': state,
                     'review': 'approved' if value.get('reviewDecision') == 'APPROVED' else 'pending',
                     'merge_commit': (value.get('mergeCommit') or {}).get('oid'), 'base_branch': value['baseRefName'],
-                    'merged_at': value.get('mergedAt'), 'source': 'github_Ghost233_read'}
+                    'merged_at': value.get('mergedAt'), 'source': 'github_authenticated_read'}
         except (ValueError, KeyError, TypeError) as exc:
             raise ManagementError('evidence_missing', 'The actual PR result is incomplete.') from exc
 

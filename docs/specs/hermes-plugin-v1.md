@@ -2,7 +2,9 @@
 
 状态：2026-10-07 已确认定稿，可交接实现；本文件描述待实现行为，未安装插件，也未执行真实接口验收。
 
-目标：[Hermes 分层协作与 Codex 监督插件决策地图](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/1)。定稿工单：[锁定首版插件规格、管理入口与验收边界](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/9)。
+本插件仅供本人在自己的 Mac 上使用。交付核对本机完整测试、实际 Hermes／飞书／Codex 闭环、合并后主工作区同步与最终验证；远端 CI 和跨环境复现不作为交付或合并门禁。真实项目、路径、身份、凭据、资料与聊天仅留在仓库外受限配置或状态，公开证据使用脱敏状态或本机引用。以下功能与验收矩阵保持完整。
+
+目标：[Hermes 分层协作与 Codex 监督插件决策地图](../../../../issues/1)。定稿工单：[锁定首版插件规格、管理入口与验收边界](../../../../issues/9)。
 
 ## 1. 首版范围与实现方案
 
@@ -27,17 +29,17 @@
 
 后两层可合并。一个项目的 submodule 数量不决定负责人数量；未指定子负责人的子仓问题仍交本人决定。总负责人只修改自己的仓库内容和子模块引用，不自行 checkout 或修改子仓源码。
 
-责任角色与开发型／非开发型能力分类独立。Wiki 和 Ghost个人助手位于项目树之外，保留通用职责，按需要加入项目群。插件提供调度、资料、监督及管理；Codex 沿用原生环境、仓库规则和 Matt 工作流。
+责任角色与开发型／非开发型能力分类独立。Wiki 和 个人助手位于项目树之外，保留通用职责，按需要加入项目群。插件提供调度、资料、监督及管理；Codex 沿用原生环境、仓库规则和 Matt 工作流。
 
-涉及 GitHub 的操作使用 Ghost233；每次需要认证的 gh 业务操作前切换账号并核验实际登录，不符则停止。远程更新后核对相应本地分支及远端完整 hash，只允许 fast-forward 同步，不自动 stash、移动、删除或覆盖用户未提交／未跟踪内容。
+涉及 GitHub 的操作使用 本机配置的授权 GitHub 账号；每次需要认证的 gh 业务操作前切换账号并核验实际登录，不符则停止。远程更新后核对相应本地分支及远端完整 hash，只允许 fast-forward 同步，不自动 stash、移动、删除或覆盖用户未提交／未跟踪内容。
 
 规范来源：
 
-- [确定责任角色、项目与 Profile 的归属和生命周期](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/4)：角色主决定及后续父子一起封存、子 Profile 逐个恢复的修订。
-- [确定飞书群内公开交接与消息关联协议](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/5#issuecomment-6017769799)。
-- [确定 Codex 会话登记、控制与接管规则](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/6#issuecomment-6019876234)。
-- [确定监督状态、汇报频率与人工介入闭环](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/7#issuecomment-6020454695)。
-- [确定资料查询、上下文传递与记忆回写边界](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/8#issuecomment-6021181667)。
+- [确定责任角色、项目与 Profile 的归属和生命周期](../../../../issues/4)：角色主决定及后续父子一起封存、子 Profile 逐个恢复的修订。
+- [确定飞书群内公开交接与消息关联协议](../../../../issues/5#issuecomment-6017769799)。
+- [确定 Codex 会话登记、控制与接管规则](../../../../issues/6#issuecomment-6019876234)。
+- [确定监督状态、汇报频率与人工介入闭环](../../../../issues/7#issuecomment-6020454695)。
+- [确定资料查询、上下文传递与记忆回写边界](../../../../issues/8#issuecomment-6021181667)。
 
 2026-10-07 的 Grill with Docs 补充审阅确认：封存后的档案由总管按登记授权只读代查；交付版本、工作区交接及运行中 Issue 变化按下述契约处理。
 
@@ -92,7 +94,7 @@ Dashboard 首版提供四类页面：
 
 ## 5. 最少配置
 
-以下是插件自己的配置契约示例，不是可直接安装的 Hermes manifest。所有示例名称及路径是占位值；实际配置必须经登记验证。
+以下是插件自己的配置契约示例，不是可直接安装的 Hermes manifest。所有示例名称及路径是合成占位值；实际绑定只保存在仓库外受限的本机配置或状态中，经登记验证后注入。`github_account_ref` 在原生凭据范围内读取授权账号，不在源码或版本化配置中保存真实值。
 
 ~~~yaml
 schema_version: 1
@@ -100,7 +102,7 @@ manager_profile: ghost-steward
 state_dir: <coordinator-data-dir>
 execution_topology: local_only
 owner_identity_ref: owner-ghost
-github_account: Ghost233
+github_account_ref: native:HERMES_PM_GITHUB_ACCOUNT
 notifications:
   summary_seconds: 900
   stall_check_seconds: 900
@@ -305,8 +307,8 @@ SQLite 位于管理实例专有目录，承担事务、唯一受理及队列／�
 
 ## 15. 一手事实调查指针
 
-- [核实 Hermes 插件与飞书公开协作接口](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/2)：正式扩展接口、Profile-scoped 状态及当前 hook／Dashboard 边界。
-- [核实 Codex 会话监督与人工应答接口](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/3)：协议快照、共享服务、原请求及恢复缺口。
-- [核实助手迁移、历史查询与旧入口归档接口](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/10#issuecomment-6016064950)：选择性迁移、旧档案、自动清理及备份边界。
-- [核实 mono 与子模块的 Codex 写入和测试边界](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/11#issuecomment-6016067881)：Git 元数据、测试产物、稳定输入及工具权限。
-- [核实飞书跨群引用、消息链接与身份关联接口](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/12#issuecomment-6018383626)：跨群锚点、真实身份、投递与幂等。
+- [核实 Hermes 插件与飞书公开协作接口](../../../../issues/2)：正式扩展接口、Profile-scoped 状态及当前 hook／Dashboard 边界。
+- [核实 Codex 会话监督与人工应答接口](../../../../issues/3)：协议快照、共享服务、原请求及恢复缺口。
+- [核实助手迁移、历史查询与旧入口归档接口](../../../../issues/10#issuecomment-6016064950)：选择性迁移、旧档案、自动清理及备份边界。
+- [核实 mono 与子模块的 Codex 写入和测试边界](../../../../issues/11#issuecomment-6016067881)：Git 元数据、测试产物、稳定输入及工具权限。
+- [核实飞书跨群引用、消息链接与身份关联接口](../../../../issues/12#issuecomment-6018383626)：跨群锚点、真实身份、投递与幂等。

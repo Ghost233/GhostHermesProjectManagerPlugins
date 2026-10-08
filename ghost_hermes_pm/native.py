@@ -45,8 +45,12 @@ def register_native(ctx):
             raise ManagementError('unauthorized', 'A distinct native collaboration ingress credential is required.')
         return ManagementClient(state_dir, token)
 
+    def configured_issue_source(url):
+        account = resources[0].delivery_source.expected_account if resources else None
+        return read_github_issue(url, expected_account=account)
+
     intake = FeishuEntry(lambda: resources[0] if resources else None, owner,
-                         ctx.get_config('feishu_intake', {}), read_github_issue,
+                         ctx.get_config('feishu_intake', {}), configured_issue_source,
                          collaboration_identity_ref=ctx.get_config('collaboration_identity_ref'),
                          collaboration_client=collaboration_client if ctx.get_config('collaboration_credential_ref') else None)
     ctx.register_platform_handler(OWNED_PLATFORM, lambda native, adapter: intake.attach_transport(adapter, NativeFeishuTransport(native)))
@@ -122,7 +126,7 @@ def register_native(ctx):
                     intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, value)))
                 return value
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
-                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir), observation_adapters=observation_adapters, control_adapters=control_adapters,
+                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir, expected_account=_credential(ctx.get_config('github_account_ref'))), observation_adapters=observation_adapters, control_adapters=control_adapters,
                               knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {}), credential_resolver=knowledge_credential),
                               archive_providers=configured_archives(ctx.get_config('archive_providers', {}), state_dir=state_dir, credential_resolver=knowledge_credential), recovery_adapters=recovery_adapters,
                               global_validation_host=configured_global_validation_host(ctx.get_config('global_validation_host'), state_dir),

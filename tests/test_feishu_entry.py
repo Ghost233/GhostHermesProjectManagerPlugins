@@ -12,10 +12,10 @@ CONFIG = {'enabled': True, 'verification_ref': 'fixture:controlled-contract', 'b
      'transport_tenant_key': 'tenant-transport', 'verification_ref': 'fixture:identity-map',
      'chat_id': 'oc_project', 'owner_open_id': 'ou_owner',
      'recipient_open_id': 'ou_lead', 'app_id': 'cli_fixture',
-     'project_id': 'mono', 'profile_id': 'mono-lead', 'repository': 'Ghost233/fixture'}]}
+     'project_id': 'mono', 'profile_id': 'mono-lead', 'repository': 'example-user/fixture'}]}
 
 
-def event(text='@_user_1 派发 https://github.com/Ghost233/fixture/issues/15', message_id='om_request'):
+def event(text='@_user_1 派发 https://github.com/example-user/fixture/issues/15', message_id='om_request'):
     raw = NS(header=NS(app_id='cli_fixture', tenant_key='tenant-transport', event_type='im.message.receive_v1'),
              event=NS(sender=NS(sender_type='user', tenant_key='tenant-fixture',
                                sender_id=NS(open_id='ou_owner', user_id='u_owner', union_id='on_owner')),

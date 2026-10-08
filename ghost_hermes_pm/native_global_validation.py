@@ -8,7 +8,7 @@ import sys
 import threading
 import uuid
 
-from .manager import ManagementError
+from .manager import ManagementError, _private_state_directory
 
 
 def _digest(value):
@@ -18,9 +18,8 @@ def _digest(value):
 class NativeGlobalValidationHost:
     def __init__(self, config, state_dir):
         self.config = config
-        self.state_dir = Path(state_dir).resolve()
-        self.work = self.state_dir / 'validation-native'
-        self.work.mkdir(parents=True, exist_ok=True)
+        self.state_dir = _private_state_directory(state_dir)
+        self.work = _private_state_directory(self.state_dir / 'validation-native')
         self.runners, self.watches, self.events, self.watch_bindings = {}, {}, {}, {}
         self.lock = threading.RLock()
         self.configuration_digest = _digest(config)
@@ -58,8 +57,8 @@ class NativeGlobalValidationHost:
             if path != path.resolve() or not path.is_relative_to(self.work) or path.stat().st_size > 1048576:
                 raise ValueError('Invalid native receipt path.')
             return json.loads(path.read_text())
-        except (OSError, ValueError) as exc:
-            raise ManagementError('capability_unverified', 'The original native operation receipt is unavailable.') from exc
+        except (OSError, ValueError):
+            raise ManagementError('capability_unverified', 'The original native operation receipt is unavailable.') from None
 
     def verify_boundary(self, attempt):
         try:
@@ -88,8 +87,8 @@ class NativeGlobalValidationHost:
             if watch.poll() is not None:
                 raise ValueError('Original watch ended while its proof was read.')
             return result
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise ManagementError('capability_unverified', 'No current original runner, input-watch and physical boundary proof is installed; native validation remains blocked.') from exc
+        except (OSError, ValueError, KeyError, TypeError):
+            raise ManagementError('capability_unverified', 'No current original runner, input-watch and physical boundary proof is installed; native validation remains blocked.') from None
 
     def _watch(self, attempt):
         with self.lock:

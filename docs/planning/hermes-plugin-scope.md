@@ -2,7 +2,7 @@
 
 状态：需求与决定已收敛为[已确认首版规格](../specs/hermes-plugin-v1.md)。本文件保留需求来源和边界，不是已实现功能清单。
 
-规范地图为 [Hermes 分层协作与 Codex 监督插件决策地图](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/1)。决定写入各工单解决评论，地图只维护索引；实现契约及通过标准见首版规格。
+规范地图为 [Hermes 分层协作与 Codex 监督插件决策地图](../../../../issues/1)。决定写入各工单解决评论，地图只维护索引；实现契约及通过标准见首版规格。
 
 ## 已确认的需求
 
@@ -17,7 +17,7 @@
 - 责任角色与开发型／非开发型 Profile 分开定义，不用层级强制决定能力。
 - 开发型 Profile 向 Codex 发送提示词、监督会话并汇报，实际开发由 Codex 执行。
 - 非开发型 Profile 可负责调度、资料或个人事务；这一分类本身不额外限制个人助手的通用工具。
-- ConsoWiki、Ghost个人助手是独立助手，不放入项目责任层级。
+- Wiki 助手、个人助手是独立助手，不放入项目责任层级。
 - 总管管理全局组织目录；项目总负责人管理自己的下属，跨总负责人移交由总管处理。同一项目调整上级时保留子 Profile、记忆与历史。
 
 ### 创建、迁移、封存与恢复
@@ -41,7 +41,7 @@
 
 ### Codex 会话、控制与仓库排队
 
-决定来源：[确定 Codex 会话登记、控制与接管规则](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/6#issuecomment-6019876234)。
+决定来源：[确定 Codex 会话登记、控制与接管规则](../../../../issues/6#issuecomment-6019876234)。
 
 - 首版只接入 Codex。
 - 每次明确分派的工作建立独立 Codex 会话；同一工作的追加要求、停止和明确继续关联原会话，长期知识保存在 Profile。
@@ -58,7 +58,7 @@
 
 ### Codex 监督与人工应答
 
-决定来源：[确定监督状态、汇报频率与人工介入闭环](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/7#issuecomment-6020454695)。
+决定来源：[确定监督状态、汇报频率与人工介入闭环](../../../../issues/7#issuecomment-6020454695)。
 
 - 按分配的 GitHub Issue 验收要求核对工作范围、约定测试、提交／PR 和遗留项；未要求合并的 Issue 可以交付，PR 待审查、待合并和已合并分别显示。Issue 明确要求合并时须完成合并。Codex 一轮结束不单独作为交付依据，未运行的测试不报告为通过。
 - 总负责人自身工作及本次相关子 Issue 均满足要求、稳定父子组合上的全局验证通过后，才回传本次项目任务完成。
@@ -77,7 +77,7 @@
 
 ### 资料查询、任务上下文与记忆回写
 
-决定来源：[确定资料查询、上下文传递与记忆回写边界](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/8#issuecomment-6021181667)。
+决定来源：[确定资料查询、上下文传递与记忆回写边界](../../../../issues/8#issuecomment-6021181667)。
 
 - 通过公开真实 @ 请求共享与任务相关的资料、摘要和来源；目录管理及上下级关系不自动开放其他 Profile 的全部原始记忆和历史，额外直接读取须本人明确授权。
 - 资料来源登记其可查询及可公开共享范围，范围内的正常请求无需逐次批准；回复和送入 Codex 前核对当前请求、项目及共享范围，加入群不开放全部私人资料。
@@ -114,17 +114,17 @@
 
 | 名称 | 类型 | 要得到的产物 |
 | --- | --- | --- |
-| [核实 Hermes 插件与飞书公开协作接口](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/2) | AFK Research | 当前正式接口、一手证据、限制与实测缺口 |
-| [核实 Codex 会话监督与人工应答接口](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/3) | AFK Research | 会话、事件、问题和审批的可观测与控制边界 |
-| [确定责任角色、项目与 Profile 的归属和生命周期](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/4) | HITL Grilling | 角色、项目、Profile、记忆和封存的归属规则 |
-| [确定飞书群内公开交接与消息关联协议](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/5) | HITL Grilling | 可见消息样例、关联、去重与交接终止规则 |
-| [确定 Codex 会话登记、控制与接管规则](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/6) | HITL Grilling | 观察与控制授权、占用、并发及重启对账规则 |
-| [确定监督状态、汇报频率与人工介入闭环](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/7) | HITL Grilling | 状态证据、通知与群回复回送行为 |
-| [确定资料查询、上下文传递与记忆回写边界](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/8) | HITL Grilling | Wiki 查询、上下文范围和记忆归属规则 |
-| [核实助手迁移、历史查询与旧入口归档接口](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/10) | AFK Research | 新决定所需的正式接口、版本与技术边界 |
-| [核实 mono 与子模块的 Codex 写入和测试边界](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/11) | AFK Research | 新决定所需的正式接口、版本与技术边界 |
-| [核实飞书跨群引用、消息链接与身份关联接口](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/12) | AFK Research | 跨群引用、链接、成员及身份接口的支持边界 |
-| [锁定首版插件规格、管理入口与验收边界](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/9) | HITL Grilling | 可交接实现的最终规格与验收场景 |
+| [核实 Hermes 插件与飞书公开协作接口](../../../../issues/2) | AFK Research | 当前正式接口、一手证据、限制与实测缺口 |
+| [核实 Codex 会话监督与人工应答接口](../../../../issues/3) | AFK Research | 会话、事件、问题和审批的可观测与控制边界 |
+| [确定责任角色、项目与 Profile 的归属和生命周期](../../../../issues/4) | HITL Grilling | 角色、项目、Profile、记忆和封存的归属规则 |
+| [确定飞书群内公开交接与消息关联协议](../../../../issues/5) | HITL Grilling | 可见消息样例、关联、去重与交接终止规则 |
+| [确定 Codex 会话登记、控制与接管规则](../../../../issues/6) | HITL Grilling | 观察与控制授权、占用、并发及重启对账规则 |
+| [确定监督状态、汇报频率与人工介入闭环](../../../../issues/7) | HITL Grilling | 状态证据、通知与群回复回送行为 |
+| [确定资料查询、上下文传递与记忆回写边界](../../../../issues/8) | HITL Grilling | Wiki 查询、上下文范围和记忆归属规则 |
+| [核实助手迁移、历史查询与旧入口归档接口](../../../../issues/10) | AFK Research | 新决定所需的正式接口、版本与技术边界 |
+| [核实 mono 与子模块的 Codex 写入和测试边界](../../../../issues/11) | AFK Research | 新决定所需的正式接口、版本与技术边界 |
+| [核实飞书跨群引用、消息链接与身份关联接口](../../../../issues/12) | AFK Research | 跨群引用、链接、成员及身份接口的支持边界 |
+| [锁定首版插件规格、管理入口与验收边界](../../../../issues/9) | HITL Grilling | 可交接实现的最终规格与验收场景 |
 
 原生子工单、阻塞与分配状态由 GitHub 维护；本表是问题范围说明，不是状态副本。
 

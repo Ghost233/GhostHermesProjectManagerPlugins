@@ -1,5 +1,9 @@
 """Project memory checks the actual public global-validation round, never old prose."""
 import json
+import time
+import socket
+import struct
+import threading
 import pytest
 
 from ghost_hermes_pm import Manager, ManagementError
@@ -87,3 +91,94 @@ def test_restart_without_original_watch_host_withholds_old_global_memory_and_can
             with pytest.raises(ManagementError):
                 client.load_project_memory(next_id, ['before-restart-global'])
             assert next(r for r in client.read_snapshot()['requests'] if r['id'] == next_id).get('memory_context') is None
+
+
+def test_curating_global_memory_waits_for_the_delayed_original_host_check(tmp_path):
+    class DelayedHost(FixtureHost):
+        delay_next_check = False
+        def read_input_changes(self, context):
+            if self.delay_next_check:
+                self.delay_next_check = False
+                time.sleep(3.5)
+            return super().read_input_changes(context)
+    host = DelayedHost()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, request_id, child_id = combination(manager, tmp_path)
+        with ManagementServer(manager, {'lead': LEAD}):
+            client = ManagementClient(tmp_path / 'state', 'lead')
+            planned = client.global_validation('plan', {'request_id': request_id, 'mono_commit': git(mono, 'rev-parse', 'HEAD'),
+                'children': [{'request_id': child_id, 'path': 'child'}], 'test_ids': ['unit']})
+            client.global_validation('start', {'validation_id': planned['id']})
+            assert client.global_validation('finish', {'validation_id': planned['id']})['status'] == 'passed'
+            accept_mono(tmp_path, manager, client, mono, request_id)
+            client.global_validation('complete', {'validation_id': planned['id']})
+            host.delay_next_check = True
+            try:
+                entry = client.curate_project_memory('mono-lead', 'delayed-global-result', request_id,
+                    {'facts': [], 'decisions': [], 'include_delivery': False, 'global_validation_id': planned['id']})
+            finally:
+                # Wait through the public manager lock before closing a still-running source check.
+                manager.read_snapshot(LEAD)
+            assert entry['global_validation']['validation_id'] == planned['id']
+            assert entry['global_validation']['provenance'] == 'public_global_validation_current_check'
+            assert client.read_project_memory('mono-lead')['entries'][0]['id'] == 'delayed-global-result'
+
+
+def test_lost_curation_reply_preserves_the_same_durable_entry_without_replay(tmp_path):
+    host = FixtureHost()
+    state = tmp_path / 'state'
+    with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+        mono, child, request_id, child_id = combination(manager, tmp_path)
+        with ManagementServer(manager, {'lead': LEAD}):
+            client = ManagementClient(state, 'lead')
+            planned = client.global_validation('plan', {'request_id': request_id, 'mono_commit': git(mono, 'rev-parse', 'HEAD'),
+                'children': [{'request_id': child_id, 'path': 'child'}], 'test_ids': ['unit']})
+            client.global_validation('start', {'validation_id': planned['id']})
+            client.global_validation('finish', {'validation_id': planned['id']})
+            accept_mono(tmp_path, manager, client, mono, request_id)
+            client.global_validation('complete', {'validation_id': planned['id']})
+            relay_home = tmp_path / 'reply-loss'; relay_home.mkdir(mode=0o700)
+            stop, calls, failures = threading.Event(), [], []
+            def packet(connection):
+                with connection.makefile('rb') as reader:
+                    header = reader.read(8)
+                    body = reader.read(struct.unpack('!Q', header)[0])
+                return header + body, json.loads(body)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(relay_home / 'manager.sock'))
+                listener.listen(); listener.settimeout(0.1)
+                def relay():
+                    try:
+                        while not stop.is_set():
+                            try:
+                                incoming, _ = listener.accept()
+                            except socket.timeout:
+                                continue
+                            with incoming, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as original:
+                                incoming.settimeout(30); original.settimeout(30)
+                                request, payload = packet(incoming)
+                                calls.append(payload)
+                                original.connect(str(state / 'manager.sock'))
+                                original.sendall(request)
+                                response, committed = packet(original)
+                                assert committed['result']['id'] == 'lost-global-result'
+                                # Drop the first committed reply; a replay would receive a reply and fail this test.
+                                if len(calls) > 1:
+                                    incoming.sendall(response)
+                    except Exception as exc:
+                        failures.append(exc)
+                thread = threading.Thread(target=relay)
+                thread.start()
+                try:
+                    with pytest.raises(ManagementError) as lost:
+                        ManagementClient(relay_home, 'lead').curate_project_memory('mono-lead', 'lost-global-result', request_id,
+                            {'facts': [], 'decisions': [], 'include_delivery': False, 'global_validation_id': planned['id']})
+                    assert lost.value.code == 'outcome_unknown'
+                    entries = client.read_project_memory('mono-lead')['entries']
+                    assert len(entries) == 1 and entries[0]['id'] == 'lost-global-result'
+                    assert entries[0]['request_id'] == request_id
+                    assert entries[0]['global_validation']['validation_id'] == planned['id']
+                    assert len(calls) == 1 and calls[0]['entry_id'] == 'lost-global-result' and calls[0]['request_id'] == request_id
+                finally:
+                    stop.set(); thread.join(timeout=5)
+                assert not thread.is_alive() and failures == []

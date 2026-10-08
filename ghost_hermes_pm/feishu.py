@@ -106,7 +106,7 @@ class NativeFeishuTransport:
                 **{k: getattr(data, k, None) for k in ('message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id')}}
 
 
-def read_github_issue(url):
+def read_github_issue(url, *, expected_account=None):
     """The intake preserves its unavailable code while sharing authenticated Issue reads."""
     from .github import GitHubDeliverySource
-    return GitHubDeliverySource(error_code='unavailable').read_issue(url)
+    return GitHubDeliverySource(expected_account=expected_account, error_code='unavailable').read_issue(url)

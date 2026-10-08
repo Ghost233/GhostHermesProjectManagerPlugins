@@ -1,4 +1,4 @@
-# mono 稳定组合全局验证（[验证 mono 交付组合并按 Issue 返工](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/27)）
+# mono 稳定组合全局验证（[验证 mono 交付组合并按 Issue 返工](../../../../issues/27)）
 
 `Manager.global_validation(identity, action, details)`、令牌 bridge 的 `ManagementClient.global_validation(action, details)`、Dashboard `POST /global-validation` 与 `hermes_pm_global_validation` 共用一个权威管理实例。身份来自原入口；请求不接受 actor、权限或测试通过声明。原生 participant 工具只允许本人的既定 mono 职责，不能借 Owner credential 或运行 child 物化。
 
@@ -59,7 +59,7 @@ Owner 准备走原宿主的独立 materializer；先保存精确授权和执行�
 
 原观察源关联变化事件，或实际源码、ignored source、父/child commit、Git 元数据、冻结交付/职责、仓库/产物布局或 runner 配置变化使本轮失效。失效一经观察即持久化；恢复旧字节不会复活旧 pass。公共快照和 Dashboard 自动撤销旧完成状态。重启后原持续输入观察宿主不可用时，即使 Git/源码首尾快照相同也降为 unverified、整体完成为 false，历史成功不能冒充当前完整观察。通过、失败、已核实结束后的失效或准备受阻释放本轮验证占用；尚未结束的 mono 原任务继续保持自身占用。未知正在运行的原动作不能被当作结束释放。
 
-`rework` 带原验证 ID、测试证据中的目标及可读的明确 GitHub repair Issue URL。管理实例只通过可信 Ghost233 source 核对已有 Issue，不在此入口创建网络工单。子缺陷生成既有职责群内的真实 mention 工作交接，保存原 Owner 来源、原 mono 目标、失败验证和旧 child 请求关系；独立接收才新建 child 任务。重复返工仍是一项。mono 缺陷回原 mono 任务自行修；未分配模块交 Owner 决定；环境、权限和版本准备问题显示 blocked。
+`rework` 带原验证 ID、测试证据中的目标及可读的明确 GitHub repair Issue URL。管理实例只通过可信 本机配置的授权 GitHub 账号 source 核对已有 Issue，不在此入口创建网络工单。子缺陷生成既有职责群内的真实 mention 工作交接，保存原 Owner 来源、原 mono 目标、失败验证和旧 child 请求关系；独立接收才新建 child 任务。重复返工仍是一项。mono 缺陷回原 mono 任务自行修；未分配模块交 Owner 决定；环境、权限和版本准备问题显示 blocked。
 
 child 修复按原 Issue 交付和工作区交接契约提交新固定版本。总负责人更新 gitlink 并创建新组合验证，旧验证的占用不会阻塞 child 返工。`complete` 要求 mono 原验收与固定交付满足、当前稳定组合全局测试通过、旧明确 child repair Issue 的交付已纳入新清单。Owner 为原未分配模块明确登记负责 Profile 后，匹配原 repair Issue 的新固定 child 交付可闭合该 Owner 决策；环境/权限问题由同一 mono 负责人按明确 repair Issue 交付，并在新组合核对固定版本和原边界证据后闭合。普通 child 结果和 mono 单次交付始终不会自动声称项目整体完成。
 

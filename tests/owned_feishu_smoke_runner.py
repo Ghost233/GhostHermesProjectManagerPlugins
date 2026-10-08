@@ -51,14 +51,15 @@ repo.mkdir()
 subprocess.run(['git', 'init', '-q', str(repo)], check=True)
 runtime_home = get_profile_dir('fixture-runtime')
 runtime_home.mkdir(parents=True)
-(home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=u_owner,on_owner,u_collab\nFEISHU_ALLOW_BOTS=all\n')
+(home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=u_owner,on_owner,u_collab\nFEISHU_ALLOW_BOTS=all\nHERMES_FIXTURE_GITHUB_ACCOUNT=example-user\n')
 (runtime_home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=u_runtime_only\n')
 binding = {'sender_tenant_key': 'tenant-owner', 'recipient_tenant_key': 'tenant-bot', 'transport_tenant_key': 'tenant-app',
            'verification_ref': 'fixture:identity-map', 'app_id': 'cli_fixture', 'recipient_open_id': 'ou_lead',
            'owner_open_id': 'ou_owner', 'owner_native_ids': ['u_owner', 'on_owner'], 'chat_id': 'oc_fixture',
-           'project_id': 'mono', 'profile_id': 'lead', 'repository': 'Ghost233/fixture'}
+           'project_id': 'mono', 'profile_id': 'lead', 'repository': 'example-user/fixture'}
+os.environ['HERMES_FIXTURE_GITHUB_ACCOUNT'] = 'example-user'
 settings = {'manager_profile': 'default', 'state_dir': str(state), 'owner_identity_ref': 'fixture:owner',
-            'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN',
+            'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN', 'github_account_ref': 'native:HERMES_FIXTURE_GITHUB_ACCOUNT',
             'feishu_intake': {'enabled': True, 'verification_ref': 'fixture:controlled-smoke', 'bindings': [binding]}}
 settings['feishu_intake']['registered_bots'] = [{'profile_id': 'collab', 'identity_ref': 'fixture:collab',
     'app_id': 'cli_fixture', 'tenant_key': 'tenant-collab', 'open_id': 'ou_collab', 'native_ids': ['u_collab']}]
@@ -66,7 +67,8 @@ settings['feishu_intake']['registered_bots'] = [{'profile_id': 'collab', 'identi
     'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 import ghost_hermes_pm.feishu as external_issue
-def fixture_issue(url):
+def fixture_issue(url, *, expected_account=None):
+    assert expected_account == 'example-user'
     if url.endswith('/18'): raise RuntimeError('Artificial unavailable Issue source')
     return {'url': url, 'title': 'Scope ' + url.rsplit('/', 1)[-1],
             'body': 'Frozen material for ' + url.rsplit('/', 1)[-1], 'updated_at': '2026-10-07T00:00:00Z'}
@@ -102,7 +104,7 @@ def raw(mid, number=15, text=None):
         'app_id': 'cli_fixture', 'tenant_key': 'tenant-app'}, 'event': {'sender': {'sender_type': 'user',
         'tenant_key': 'tenant-owner', 'sender_id': {'open_id': 'ou_owner', 'user_id': 'u_owner', 'union_id': 'on_owner'}},
         'message': {'message_id': mid, 'chat_id': 'oc_fixture', 'chat_type': 'group', 'message_type': 'text',
-            'content': json.dumps({'text': text or '@_user_1 派发 https://github.com/Ghost233/fixture/issues/' + str(number)}),
+            'content': json.dumps({'text': text or '@_user_1 派发 https://github.com/example-user/fixture/issues/' + str(number)}),
             'mentions': [{'key': '@_user_1', 'mentioned_type': 'bot', 'tenant_key': 'tenant-bot', 'id': {'open_id': 'ou_lead'}}]}}})
 
 async def main():

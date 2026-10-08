@@ -20,6 +20,7 @@ def audit(event, args):
 sys.addaudithook(audit)
 os.environ['HERMES_SKIP_PM_BOOTSTRAP'] = '1'
 os.environ['HERMES_DISABLE_PROJECT_PLUGINS'] = '1'
+os.environ['HERMES_FIXTURE_GITHUB_ACCOUNT'] = 'example-user'
 
 import json
 import subprocess
@@ -28,6 +29,16 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+# Failure IPC must not return a private bound target even for an unexpected key error.
+private_marker = 'synthetic-private-target-marker'
+migration_failure = subprocess.run([sys.executable, str(scratch / 'home' / 'plugins' / 'ghost-hermes-pm' / 'ghost_hermes_pm' / 'native_migration_worker.py')],
+    input=json.dumps({'action': 'inspect', 'host_home': str(scratch / 'missing-host'), 'work_dir': str(scratch / 'missing-work'),
+                     'operation': {'plan': {'target_profile_id': private_marker}, 'bindings': {}}}),
+    text=True, capture_output=True)
+assert migration_failure.returncode == 1
+assert json.loads(migration_failure.stdout)['code'] == 'capability_unverified'
+assert private_marker not in migration_failure.stdout and migration_failure.stderr == ''
+
 home = scratch / 'home'
 state = scratch / 'state'
 repo = scratch / 'repo'
@@ -35,6 +46,7 @@ repo.mkdir()
 subprocess.run(['git', 'init', '-q', str(repo)], check=True)
 subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'fixed native mono'], check=True)
 settings = {'manager_profile': 'default', 'state_dir': str(state), 'owner_identity_ref': 'fixture:owner',
+            'github_account_ref': 'native:HERMES_FIXTURE_GITHUB_ACCOUNT',
             'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN', 'allow_local_dashboard_owner': True,
             'participant_credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN',
             'participant_entries': [{'identity_ref': 'fixture:lead', 'credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN'}]}
@@ -42,7 +54,7 @@ settings['feishu_intake'] = {'enabled': True, 'verification_ref': 'fixture:contr
     {'sender_tenant_key': 'tenant-owner', 'recipient_tenant_key': 'tenant-bot', 'transport_tenant_key': 'tenant-app',
      'verification_ref': 'fixture:identity-map', 'app_id': 'cli_fixture', 'recipient_open_id': 'ou_lead',
      'owner_open_id': 'ou_owner', 'owner_native_ids': ['u_owner', 'on_owner'], 'chat_id': 'oc_fixture', 'project_id': 'mono', 'profile_id': 'lead',
-     'repository': 'Ghost233/fixture'}]}
+     'repository': 'example-user/fixture'}]}
 settings['profile_readiness'] = {'lead': {'native_home': str(home)}}
 settings['global_validation_host'] = {'host_id': 'local:native-sdk-original-host', 'generation': 'controlled-sdk-generation', 'runner': [sys.executable], 'watcher': [sys.executable, '-c', 'import time; time.sleep(60)'], 'tests': {'unit': ['-c', 'assert True']}, 'environment': {'PATH': '/usr/bin:/bin'}}
 settings['archive_providers'] = {'local:original-remote': {'kind': 'feishu_remote', 'binding': {'app_id': 'cli_archive', 'tenant_key': 'tenant-archive', 'bot_open_id': 'ou_archive'}, 'chat_scopes': {'public': ['oc_archive']}, 'credential_ref': 'native:HERMES_FIXTURE_APP_SECRET'}}
@@ -53,13 +65,16 @@ settings['feishu_intake']['channel_acceptance'] = {ready_digest: {'oc_fixture': 
 (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'],
                                                 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 preserved = state / 'user-file'
-state.mkdir()
+state.mkdir(mode=0o700)
 preserved.write_text('keep')
 # Substitute only the external Issue source before the native registrar captures it.
 sys.path.insert(0, str(home / 'plugins' / 'ghost-hermes-pm'))
 import ghost_hermes_pm.feishu as issue_source
-issue_source.read_github_issue = lambda url: {'url': url, 'title': 'Native Issue fixture',
+def fixture_issue(url, *, expected_account=None):
+    assert expected_account == 'example-user'
+    return {'url': url, 'title': 'Native Issue fixture',
     'body': 'Accepted fixture material.\n' + 'A' * 4000, 'updated_at': '2026-10-07T00:00:00Z'}
+issue_source.read_github_issue = fixture_issue
 from native_fixture_boundary import install
 install(home / 'plugins' / 'ghost-hermes-pm', {'feishu': lambda module: setattr(module, 'read_github_issue', issue_source.read_github_issue)}, synthetic_readiness=False)
 from hermes_cli.plugins import get_plugin_manager
@@ -202,7 +217,7 @@ async def exercise_gateway_lifecycle():
         'event': {'sender': {'sender_type': 'user', 'tenant_key': 'tenant-owner',
                             'sender_id': {'open_id': 'ou_owner', 'user_id': 'u_owner', 'union_id': 'on_owner'}},
                   'message': {'message_id': 'om_inbound', 'chat_id': 'oc_fixture', 'chat_type': 'group', 'message_type': 'text',
-                              'content': '{"text":"@_user_1 派发 https://github.com/Ghost233/fixture/issues/15"}',
+                              'content': '{"text":"@_user_1 派发 https://github.com/example-user/fixture/issues/15"}',
                               'mentions': [{'key': '@_user_1', 'mentioned_type': 'bot', 'tenant_key': 'tenant-bot',
                                             'id': {'open_id': 'ou_lead'}}]}}})
     inbound = MessageEvent(text='normalized fixture', source=source, message_id='om_inbound', raw_message=raw)

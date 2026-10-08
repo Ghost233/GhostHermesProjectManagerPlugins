@@ -1,4 +1,4 @@
-# 原 Codex 服务只观察（[只观察手动会话并保护仓库占用](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/19)）
+# 原 Codex 服务只观察（[只观察手动会话并保护仓库占用](../../../../issues/19)）
 
 本切片发现本人明确登记的项目及原执行服务中的手动会话。它读取当前服务、可读取的历史和实际读取范围，不获得控制权。`daemon`、`independent_cli`、`desktop` 分别登记与验证；一个来源通过不代表另两个来源可用。
 
@@ -52,9 +52,9 @@ HTTP、群与原生工具不能指定命令、endpoint、verifier、启用能力
 
 ## 仓库等待与监督
 
-已发现活动、历史/未知未核实执行及来源覆盖缺失阻塞同 Git common directory 的新插件外层任务，符号路径和 linked worktree 不绕过等待。其他逻辑仓库可继续。start、append 和明确 continue 前再次只读核对已登记的相关来源；原服务冲突时停止受影响的新自动执行。观察没有接管入口，不预实现 [接管并归还本次手动工作](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/20)。
+已发现活动、历史/未知未核实执行及来源覆盖缺失阻塞同 Git common directory 的新插件外层任务，符号路径和 linked worktree 不绕过等待。其他逻辑仓库可继续。start、append 和明确 continue 前再次只读核对已登记的相关来源；原服务冲突时停止受影响的新自动执行。观察没有接管入口，不预实现 [接管并归还本次手动工作](../../../../issues/20)。
 
-Gateway 在其受管生命周期内轮询原来源，再尝试 [按仓库排队并交接下一项 Issue](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/18) 已授权队列；卸载或入口失效后停止轮询并关闭插件自己的 proxy transport。群和 Dashboard 共用保存的状态、范围、最后核实、observe_only 及队列原因。[执行一个 Codex Issue 并核对交付结果](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/16) 的启动能力仍独立要求完整实际写入与手动执行覆盖证据；一次观察不能替代跨客户端的排他执行保障。
+Gateway 在其受管生命周期内轮询原来源，再尝试 [按仓库排队并交接下一项 Issue](../../../../issues/18) 已授权队列；卸载或入口失效后停止轮询并关闭插件自己的 proxy transport。群和 Dashboard 共用保存的状态、范围、最后核实、observe_only 及队列原因。[执行一个 Codex Issue 并核对交付结果](../../../../issues/16) 的启动能力仍独立要求完整实际写入与手动执行覆盖证据；一次观察不能替代跨客户端的排他执行保障。
 
 ## 验证与真实缺口
 

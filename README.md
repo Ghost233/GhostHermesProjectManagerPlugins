@@ -1,9 +1,11 @@
-# GhostHermesProjectManagerPlugins
+# Hermes 个人项目管理插件
 
 Hermes 分层协作与 Codex 监督插件。首版规格与决策地图已定稿，目录和请求受理的离线切片已实现；尚未安装插件或完成真实接口验收。
 
+插件仅供本人在自己的 Mac 上使用。交付以本机完整测试、实际 Hermes／飞书／Codex 闭环、合并后主工作区同步和最终验证为准；远端 CI 不作为交付或合并门禁。真实项目和身份绑定由仓库外受限的本机配置注入，版本化内容与公开证据使用合成示例或脱敏引用。
+
 - [首版插件规格](docs/specs/hermes-plugin-v1.md)：已确认的实现契约、管理入口、生命周期与验收矩阵。
-- [Hermes 分层协作与 Codex 监督插件决策地图](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/1)：规划目标、研究与决定索引。
+- [Hermes 分层协作与 Codex 监督插件决策地图](../../issues/1)：规划目标、研究与决定索引。
 - [需求与范围记录](docs/planning/hermes-plugin-scope.md)：形成规格的已确认需求及边界。
 - [架构图](docs/diagrams/hermes-plugin-v1-architecture.svg)与[可编辑 Mermaid 源文件](docs/diagrams/hermes-plugin-v1-architecture.mmd)。
 - [领域术语](GLOSSARY.md)：责任角色、Profile 分类与独立助手。
@@ -33,4 +35,4 @@ Hermes 分层协作与 Codex 监督插件。首版规格与决策地图已定稿
 
 ## 本地验证与阶段交接
 
-本地提交或 CI 前使用 [本地检查与审查阶段门禁](docs/development/local-checks.md)。该入口核对准备条件、原命令退出及最终源码一致性；双轴报告结束后使用显式阶段证据检查。
+本地提交前使用 [本地检查与审查阶段门禁](docs/development/local-checks.md)。该入口核对准备条件、原命令退出及最终源码一致性；双轴报告结束后使用显式阶段证据检查。

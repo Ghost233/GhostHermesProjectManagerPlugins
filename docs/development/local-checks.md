@@ -1,6 +1,6 @@
 # 本地检查与审查阶段门禁
 
-提交前从准备好的 Python ≥3.11 环境运行 `python tools/local_checks.py`。固定 SDK 路径仍由 `HERMES_TEST_SDK_ROOT` 提供；本机独立 SDK Python 可由 `HERMES_TEST_SESSION_PYTHON` 提供。入口先检查 runtime、固定 test 依赖与 Node，再按同一顺序执行 F821、现有 required SDK pytest、Dashboard syntax 和 Git diff。具体参数见 `--help`；CI 调用同一入口。
+提交前从准备好的 Python ≥3.11 环境运行 `python tools/local_checks.py`。固定 SDK 路径仍由 `HERMES_TEST_SDK_ROOT` 提供；本机独立 SDK Python 可由 `HERMES_TEST_SESSION_PYTHON` 提供。入口先检查 runtime、固定 test 依赖与 Node，再按同一顺序执行 F821、现有 required SDK pytest、Dashboard syntax 和 Git diff。具体参数见 `--help`；远端 CI 可调用同一入口作为补充证据，不作为交付或合并硬门禁，也不阻塞可开展的本机工作。验收仍须覆盖本机完整测试、实际 Hermes／飞书／Codex 闭环及合并后主工作区同步与最终验证。
 
 Ruff 仅检查 F821。test extra 固定 [官方 Ruff 0.16.8](https://github.com/astral-sh/ruff/releases/tag/0.16.8)；[官方规则说明](https://docs.astral.sh/ruff/rules/undefined-name/)列明它捕获未定义名称。它不替代原 SDK 行为断言。
 

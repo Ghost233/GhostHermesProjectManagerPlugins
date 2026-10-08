@@ -1,5 +1,7 @@
 from pathlib import Path
 import subprocess
+import stat
+import traceback
 import pytest
 
 from ghost_hermes_pm import Manager, VerifiedIdentity
@@ -22,6 +24,116 @@ def registration(repo: Path, project_id='mono', profile_id='mono-lead'):
 
 
 OWNER = VerifiedIdentity('fixture:owner', 'test-owner-entry')
+
+
+def test_manager_keeps_private_bindings_in_restricted_local_state(tmp_path):
+    state = tmp_path / 'private-state'
+    with Manager(state, owner_identity_ref=OWNER.subject) as manager:
+        manager.apply_directory_change(OWNER, 0, registration(make_repo(tmp_path / 'repo')))
+        assert stat.S_IMODE(state.stat().st_mode) == 0o700
+        assert stat.S_IMODE((state / 'manager.sqlite3').stat().st_mode) == 0o600
+        assert manager.read_snapshot(OWNER)['version'] == 1
+    with Manager(state, owner_identity_ref=OWNER.subject) as restarted:
+        assert restarted.read_snapshot(OWNER)['version'] == 1
+
+
+@pytest.mark.parametrize('kind', ['validation', 'migration'])
+def test_native_host_creation_keeps_state_and_work_directories_private_for_manager(tmp_path, kind):
+    from ghost_hermes_pm.native_global_validation import NativeGlobalValidationHost
+    from ghost_hermes_pm.native_migration import NativeMigrationHost
+    state = tmp_path / 'new-parent' / 'state'
+    if kind == 'validation':
+        host = NativeGlobalValidationHost({'host_id': 'local:fixture-host'}, state)
+        work = host.work
+    else:
+        native = tmp_path / 'synthetic-native'; native.mkdir()
+        host = NativeMigrationHost(native, state / 'migration-native', sdk_root=tmp_path)
+        work = host.work_dir
+    with Manager(state, owner_identity_ref=OWNER.subject) as manager:
+        assert manager.read_snapshot(OWNER)['version'] == 0
+        assert stat.S_IMODE(state.stat().st_mode) == 0o700
+        assert stat.S_IMODE(work.stat().st_mode) == 0o700
+        assert stat.S_IMODE(state.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE((state / 'manager.sqlite3').stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize('kind', ['validation', 'migration'])
+def test_native_host_configuration_preserves_preexisting_unsafe_state(tmp_path, kind):
+    from ghost_hermes_pm import ManagementError
+    from ghost_hermes_pm.native_global_validation import NativeGlobalValidationHost
+    from ghost_hermes_pm.native_migration import configured_migration_host
+    state = tmp_path / 'state'; state.mkdir(); state.chmod(0o755)
+    preserved = state / 'user-file'; preserved.write_text('preserve this original material')
+    native = tmp_path / 'synthetic-native'; native.mkdir()
+    with pytest.raises(ManagementError) as rejected:
+        if kind == 'validation':
+            NativeGlobalValidationHost({'host_id': 'local:fixture-host'}, state)
+        else:
+            configured_migration_host({'host_home': str(native)}, state)
+    assert rejected.value.code == 'unsafe_state'
+    assert stat.S_IMODE(state.stat().st_mode) == 0o755
+    assert preserved.read_text() == 'preserve this original material'
+    assert list(state.iterdir()) == [preserved]
+
+
+@pytest.mark.parametrize('unsafe', ['directory', 'database', 'alias', 'hardlink'])
+def test_manager_preserves_preexisting_unsafe_state_without_restricting_user_files(tmp_path, unsafe):
+    from ghost_hermes_pm import ManagementError
+    state = tmp_path / 'private-state'
+    with Manager(state, owner_identity_ref=OWNER.subject):
+        pass
+    database = state / 'manager.sqlite3'
+    if unsafe == 'directory':
+        state.chmod(0o755)
+    elif unsafe == 'database':
+        database.chmod(0o644)
+    elif unsafe == 'alias':
+        requested = tmp_path / 'state-alias'
+        requested.symlink_to(state, target_is_directory=True)
+    else:
+        import os
+        os.link(database, tmp_path / 'user-preserved-copy')
+    before = database.read_bytes()
+    modes = (stat.S_IMODE(state.stat().st_mode), stat.S_IMODE(database.stat().st_mode))
+    with pytest.raises(ManagementError) as rejected:
+        Manager(requested if unsafe == 'alias' else state, owner_identity_ref=OWNER.subject)
+    assert rejected.value.code == 'unsafe_state'
+    assert database.read_bytes() == before
+    assert modes == (stat.S_IMODE(state.stat().st_mode), stat.S_IMODE(database.stat().st_mode))
+
+
+def test_manager_rejects_runtime_state_inside_git_before_creating_private_files(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    repo = make_repo(tmp_path / 'repo')
+    state = repo / 'runtime-state'
+    with pytest.raises(ManagementError) as rejected:
+        Manager(state, owner_identity_ref=OWNER.subject)
+    assert rejected.value.code == 'unsafe_state'
+    assert not state.exists()
+
+
+def test_project_registration_cannot_include_existing_private_runtime_state(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    repo = tmp_path / 'later-repo'
+    with Manager(repo / 'runtime-state', owner_identity_ref=OWNER.subject) as manager:
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        with pytest.raises(ManagementError) as rejected:
+            manager.apply_directory_change(OWNER, 0, registration(repo))
+        assert rejected.value.code == 'unsafe_state'
+        assert manager.read_snapshot(OWNER)['version'] == 0
+        assert manager.read_snapshot(OWNER)['projects'] == []
+
+
+def test_repository_read_errors_do_not_print_private_paths(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    missing = tmp_path / 'synthetic-private-path-marker'
+    change = registration(missing)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        with pytest.raises(ManagementError) as rejected:
+            manager.apply_directory_change(OWNER, 0, change)
+        assert rejected.value.code == 'invalid_repository'
+        assert missing.name not in ''.join(traceback.format_exception(rejected.value))
+        assert manager.read_snapshot(OWNER)['version'] == 0
 
 
 def test_owner_registers_existing_project_and_profile_and_reads_same_directory(tmp_path):

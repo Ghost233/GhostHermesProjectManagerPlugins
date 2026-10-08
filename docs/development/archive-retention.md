@@ -1,6 +1,6 @@
 # 只读迁移档案、原生保留与恢复
 
-来源工单：[只读查询旧档案并验证永久保护](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/28)，父规格 `docs/specs/hermes-plugin-v1.md` 的旧档案与永久保护约束。首个可审查增量从公共 token API 查询合成 SQLite 原始/压缩历史，查询前后数据库字节一致；后续测试使用固定 pristine SDK 和隔离合成 HOME。实际用户旧资料、群、原 Codex 服务、记忆服务均未迁移或查询，执行阶段 gate 保持原状态。
+来源工单：[只读查询旧档案并验证永久保护](../../../../issues/28)，父规格 `docs/specs/hermes-plugin-v1.md` 的旧档案与永久保护约束。首个可审查增量从公共 token API 查询合成 SQLite 原始/压缩历史，查询前后数据库字节一致；后续测试使用固定 pristine SDK 和隔离合成 HOME。实际用户旧资料、群、原 Codex 服务、记忆服务均未迁移或查询，执行阶段 gate 保持原状态。
 
 ## 来源与身份
 
@@ -19,7 +19,7 @@
 
 - **Hermes 本地**：显式普通文件 SQLite，`mode=ro`、`query_only=ON`、单一读事务。沿压缩祖先/唯一 continuation，排除 native `_is_explicit_fork_child_row(include_reset=True)` 所定义 branch/delegate/reset/tool。逐段 keyset 分页包含 inactive、compacted、summary、工具/模型原字段；保留原生 BLOB display identity 的 hex 编码。不存在的段、分叉歧义、循环、无法读的原字段均不能宣称完整。检索补读相邻上下文；完整请求返回实际原始行及必要 summary，而非只返回摘要。另可登记明确 ID 与批准绝对路径的 UTF-8 封存文件，读前后核对普通文件绑定与 stat；不扫描未登记目录。
 - **飞书远端**：`FeishuArchiveProvider` 接受可信宿主的实际 client、确切 app/tenant/bot 绑定及 chat scope。每次要求当前来源身份证据；真实 `ListMessageRequest` GET 顺序分页，核对 chat/message identity、`has_more`、token 唯一性。无权、已删除内容、重复游标或分页无法结束明确 incomplete。真实端点尚未验收；没有原服务证据时保持 capability_unverified。公开 API 不可注入证明。
-- **Codex 历史**：复用 [只观察手动会话并保护仓库占用](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/19) `ReadOnlyCodexAdapter` 原执行器身份/connection generation。只允许 read RPC，完整读取 turn 与 item 的全部 cursor 分页、核对读前后线程版本。不给同 HOME 的新 app-server 当原执行器，不遍历未经单独授权的 fork/subagent 祖先。`contextCompaction` 的压缩前上下文若仅通过 API 无法证明，返回明确缺口；pagination 尾部出现不代表压缩前原文已恢复。
+- **Codex 历史**：复用 [只观察手动会话并保护仓库占用](../../../../issues/19) `ReadOnlyCodexAdapter` 原执行器身份/connection generation。只允许 read RPC，完整读取 turn 与 item 的全部 cursor 分页、核对读前后线程版本。不给同 HOME 的新 app-server 当原执行器，不遍历未经单独授权的 fork/subagent 祖先。`contextCompaction` 的压缩前上下文若仅通过 API 无法证明，返回明确缺口；pagination 尾部出现不代表压缩前原文已恢复。
 
 正式 native 的 `archive_providers` 支持明确 `kind`：`hermes_local` 保留现有 `path/session_scopes/files`；`feishu_remote` 接受 `binding={app_id,tenant_key,bot_open_id}`、`chat_scopes` 和原生 `credential_ref`，秘密只在 RAM 中构造原 app 的 SDK client，每次原 bot-info 与 tenant/query 均须核对实际来源；`codex_history` 接受 `thread_scopes` 及完整 `adapter` 配置，复用原始只读 observation proxy 的 `executable/cwd/environment/service_ref/source_kind/endpoint/endpoint_ref` 和当前 `codex-observation.json` hashed receipt。原服务不支持完整 turn/item 读取、来源权限或宿主证明缺失时仍 unverified/incomplete。SourceGrant 和固定 provider binding 继续约束公开查询，不自动授予全历史或恢复执行。测试协议替身不等于真实旧服务验收。
 

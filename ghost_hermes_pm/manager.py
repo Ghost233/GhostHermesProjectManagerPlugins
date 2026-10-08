@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import threading
 import re
@@ -22,6 +23,29 @@ class ManagementError(Exception):
     def __init__(self, code, message):
         self.code = code
         super().__init__(message)
+
+
+def _private_state_directory(path):
+    """Admit this plugin's private directory without changing preexisting permissions."""
+    requested = Path(path)
+    try:
+        if requested.is_symlink():
+            raise ManagementError('unsafe_state', 'Private runtime state must use its own local directory.')
+        directory = requested.resolve()
+        if directory.is_relative_to(Path(__file__).resolve().parents[1]) or any((parent / '.git').exists() or (parent / '.git').is_symlink() for parent in (directory, *directory.parents)):
+            raise ManagementError('unsafe_state', 'Private runtime state must remain outside source and Git worktrees.')
+        missing, current = [], directory
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        for created in reversed(missing):
+            created.mkdir(mode=0o700, exist_ok=True)
+        info = directory.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ManagementError('unsafe_state', 'Private runtime state requires an owner-only directory; existing data was preserved.')
+        return directory
+    except (OSError, RuntimeError):
+        raise ManagementError('unsafe_state', 'Private runtime state could not be admitted; existing data was preserved.') from None
 
 
 def _public_text(text, sensitive_values=()):
@@ -92,7 +116,9 @@ def _repository(value):
         return {'worktree': str(path), 'common_dir': str(common), 'git_dir': str(git_dir),
                 'logical_id': str(common), 'nested_repositories': nested,
                 'test_artifact_paths': artifacts}
-    except (OSError, ValueError, TypeError) as exc:
+    except OSError:
+        raise ManagementError('invalid_repository', 'The configured local repository could not be read.') from None
+    except (ValueError, TypeError) as exc:
         raise ManagementError('invalid_repository', str(exc)) from exc
 
 
@@ -116,16 +142,23 @@ class Manager:
         self.control_adapters = dict(control_adapters or {})
         self.recovery_adapters = dict(recovery_adapters or {})
         self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
-        self.state_dir = Path(state_dir).resolve()
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir = _private_state_directory(state_dir)
         bind_maintenance = getattr(self.maintenance_host, 'bind_manager_state', None)
         if callable(bind_maintenance):
             bind_maintenance(self.state_dir)
         self._lock = threading.RLock()
         self._inflight = set()
         from .recovery import verify_directory
-        verify_directory(self.state_dir / 'manager.sqlite3')
-        self._db = sqlite3.connect(self.state_dir / 'manager.sqlite3', check_same_thread=False)
+        database = self.state_dir / 'manager.sqlite3'
+        if database.exists() or database.is_symlink():
+            database_info = database.lstat()
+            if not stat.S_ISREG(database_info.st_mode) or database_info.st_uid != os.getuid() or database_info.st_nlink != 1 or stat.S_IMODE(database_info.st_mode) & 0o077:
+                raise ManagementError('unsafe_state', 'Private runtime database must be an owner-only regular file; existing data was preserved.')
+            verify_directory(database)
+        else:
+            descriptor = os.open(database, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+        self._db = sqlite3.connect(database, check_same_thread=False)
         self._db.execute('CREATE TABLE IF NOT EXISTS directory (id INTEGER PRIMARY KEY CHECK(id=1), schema_version INTEGER NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL)')
         self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 1, 0, ?)',
                          (json.dumps({'projects': {}, 'profiles': {}, 'last_verified_at': None}),))
@@ -899,6 +932,8 @@ class Manager:
                 value = change['project']
                 self._validate_project(value)
                 candidate = {'id': value['id'], 'name': value['name'], 'repo': _repository(value)}
+                if any(self.state_dir.is_relative_to(Path(candidate['repo'][key])) for key in ('worktree', 'git_dir', 'common_dir')):
+                    raise ManagementError('unsafe_state', 'Managed repositories cannot contain private runtime state.')
                 existing = data['projects'].get(value['id'], {})
                 candidate.update({k: existing[k] for k in ('lifecycle', 'archive_intent') if k in existing})
                 self._authorize_change(principal, 'project', candidate, data)

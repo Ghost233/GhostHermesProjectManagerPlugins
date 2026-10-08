@@ -1,4 +1,4 @@
-# 维护原生运行边界（[维护升级、主动停用并从检查点回退](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/31)）
+# 维护原生运行边界（[维护升级、主动停用并从检查点回退](../../../../issues/31)）
 
 统一管理入口的 `maintenance(action, details)` 接收 `enter`、`deactivate`、`check`、`checkpoint`、`switch`、`rollback`、`reenable`。Owner 在 `enter/deactivate` 审定当前目录 revision、完整 Profile ID 列表、原版本及目标源码；`switch/rollback/reenable` 再审定当前目录 revision 与同一完整范围。已有 operation ID 的意图、原版本和目标不可改写。群与 Dashboard 共用此入口，机器人/model 的只读 token 不构成 Owner 决定。页面与群的操作方式另见维护入口文档。
 

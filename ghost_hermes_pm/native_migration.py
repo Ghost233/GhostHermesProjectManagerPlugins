@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from .manager import ManagementError
+from .manager import ManagementError, _private_state_directory
 
 
 class NativeMigrationHost:
@@ -16,7 +16,7 @@ class NativeMigrationHost:
         self.work_dir = Path(work_dir)
         if not self.host_home.is_absolute() or self.host_home != self.host_home.resolve() or not self.host_home.is_dir() or not self.work_dir.is_absolute() or self.work_dir != self.work_dir.resolve():
             raise ManagementError('capability_unverified', 'Migration requires one explicit canonical native host and isolated work directory.')
-        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.work_dir = _private_state_directory(self.work_dir)
         if sdk_root is None:
             spec = importlib.util.find_spec('hermes_cli')
             if spec is None:
@@ -38,8 +38,8 @@ class NativeMigrationHost:
             if completed.returncode or 'error' in answer:
                 raise ManagementError(answer.get('code', 'capability_unverified'), answer.get('error', 'Native migration action failed.'))
             return answer
-        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired) as exc:
-            raise ManagementError('outcome_unknown', 'Native migration receipt is unavailable; reconcile the same plan before retrying.') from exc
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            raise ManagementError('outcome_unknown', 'Native migration receipt is unavailable; reconcile the same plan before retrying.') from None
 
     def preview(self, source):
         return self._run('preview', source=source)
@@ -111,6 +111,7 @@ def configured_migration_host(config, state_dir, intake=None):
         return None
     if not isinstance(config, dict) or set(config) - {'host_home', 'memory_write_approval'} or 'host_home' not in config or type(config.get('memory_write_approval', False)) is not bool:
         raise ManagementError('invalid_change', 'Native migration configuration names one host and its native memory approval policy.')
-    return NativeMigrationHost(config['host_home'], Path(state_dir).resolve() / 'migration-native',
+    private_state = _private_state_directory(state_dir)
+    return NativeMigrationHost(config['host_home'], private_state / 'migration-native',
         memory_write_approval=config.get('memory_write_approval', False),
         verifier=(lambda operation: verify_new_bot(intake, operation)) if intake else None)

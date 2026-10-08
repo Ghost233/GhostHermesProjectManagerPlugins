@@ -1,6 +1,7 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from ghost_hermes_pm import Manager
 from readiness_support import ReadyManager as Manager
@@ -55,8 +56,11 @@ def accepted(manager, repo, scope=ISSUE):
 
 def test_public_bridge_starts_one_issue_and_registers_thread_durably_before_turn(tmp_path):
     adapter = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
-        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+    account = 'example-user'
+    scope = {**ISSUE, 'url': 'https://github.com/example-org/fixture/issues/15'}
+    source = SimpleNamespace(expected_account=account, read_issue=lambda url: scope)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter, delivery_source=source) as manager:
+        request_id = accepted(manager, make_repo(tmp_path / 'repo'), scope)
         with ManagementServer(manager, {'fixture-entry': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
             started = client.start_task(request_id)
@@ -75,6 +79,11 @@ def test_public_bridge_starts_one_issue_and_registers_thread_durably_before_turn
         prompt = next(r for r in wire if r['method'] == 'turn/start')['params']['input'][0]['text']
         assert ISSUE['body'] in prompt and ISSUE['updated_at'] in prompt
         assert 'Matt' in prompt and str(tmp_path / 'repo') in prompt
+        assert 'expected account from the protected local execution configuration' in prompt
+        assert 'If that account is unavailable, do not perform authenticated GitHub operations.' in prompt
+        assert 'Expected GitHub account (private runtime binding): ' + account in prompt
+        assert account not in json.dumps(started)
+        assert account not in json.dumps(task['outbox'][-1])
         assert task['outbox'][-1]['kind'] == 'progress'
 
 
@@ -282,7 +291,7 @@ def test_issue_requiring_merge_keeps_delivery_unmet_but_records_actual_pr_state(
                 'command': 'python -m pytest tests/test_fixture.py -q', 'cwd': str(repo), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed'}]}]}))
         report = {'issue_updated_at': scope['updated_at'], 'criteria': [{'text': 'Run fixture tests', 'test_item_ids': ['pytest-1']},
             {'text': 'Merge PR into main', 'pr_evidence': True}], 'source_commit': head,
-            'pr_url': 'https://github.com/Ghost233/fixture/pull/16', 'sync_branches': ['main']}
+            'pr_url': 'https://github.com/example-user/fixture/pull/16', 'sync_branches': ['main']}
         with pytest.raises(ManagementError):
             manager.record_task_delivery(OWNER, request_id, report)
         task = manager.read_snapshot(OWNER)['requests'][0]
@@ -428,9 +437,8 @@ def test_executor_cannot_write_authoritative_manager_receipts_inside_repository(
     from ghost_hermes_pm import ManagementError
     repo = make_repo(tmp_path / 'repo')
     adapter = adapter_for(tmp_path)
-    with Manager(repo / 'manager-state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
-        request_id = accepted(manager, repo)
-        with pytest.raises(ManagementError) as overlap:
-            manager.start_task(OWNER, request_id)
-        assert overlap.value.code == 'capability_unverified'
-        assert adapter.connection is None
+    with pytest.raises(ManagementError) as overlap:
+        Manager(repo / 'manager-state', owner_identity_ref=OWNER.subject, codex_adapter=adapter)
+    assert overlap.value.code == 'unsafe_state'
+    assert not (repo / 'manager-state').exists()
+    assert adapter.connection is None

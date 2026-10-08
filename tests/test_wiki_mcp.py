@@ -14,6 +14,10 @@ from test_directory import OWNER
 from test_knowledge import WIKI, source_grant
 
 
+EXPECTED_SERVER_INFO = {'name': 'synthetic-knowledge', 'version': '0.1.0'}
+EXPECTED_TOOL_DESCRIPTION = 'Synthetic compiled knowledge with cited source windows.'
+
+
 SCHEMA = {'type': 'object', 'properties': {'prompt': {'type': 'string'},
     'budget': {'type': 'integer', 'minimum': 500, 'maximum': 6000}},
     'required': ['prompt'], 'additionalProperties': False}
@@ -47,14 +51,17 @@ def mcp_peer(pack=None, *, mode='json', delay=0, fault=None, owned_session=True)
                 self.send_response(401); self.end_headers(); return
             if body['method'] == 'initialize':
                 result = {'protocolVersion': '2025-03-26', 'capabilities': {'tools': {}},
-                          'serverInfo': {'name': 'conso-knowledge', 'version': '0.1.0'}}
+                          'serverInfo': dict(EXPECTED_SERVER_INFO)}
                 if fault == 'protocol': result['protocolVersion'] = 'unsupported'
+                if fault == 'server-name': result['serverInfo']['name'] = 'unexpected-source'
+                if fault == 'server-version': result['serverInfo']['version'] = 'unexpected-version'
             elif body['method'] == 'notifications/initialized':
                 self.send_response(202); self.end_headers(); return
             elif body['method'] == 'tools/list':
                 result = {'tools': [{'name': 'get_context_pack', 'inputSchema': SCHEMA,
-                    'description': 'Read compact compiled Conso knowledge and its citations. Raw sources are read separately only when needed.'}]}
+                    'description': EXPECTED_TOOL_DESCRIPTION}]}
                 if fault == 'schema': result['tools'][0]['inputSchema'] = {'type': 'object'}
+                if fault == 'description': result['tools'][0]['description'] = 'Unexpected compiled reader.'
             elif body['method'] == 'tools/call':
                 time.sleep(delay)
                 if fault == 'http-error':
@@ -85,12 +92,54 @@ def mcp_peer(pack=None, *, mode='json', delay=0, fault=None, owned_session=True)
 
 def provider_config(peer, corpus='corpus'):
     return {'mcp:fixture-wiki': {'url': peer['url'], 'corpus_scope_id': corpus,
-        'credential_ref': 'native:FIXTURE_WIKI_TOKEN'}}
+        'credential_ref': 'native:FIXTURE_WIKI_TOKEN',
+        'expected_server_info': dict(EXPECTED_SERVER_INFO),
+        'expected_tool_description': EXPECTED_TOOL_DESCRIPTION}}
 
 
 def mcp_grant(scope='corpus'):
     return {**source_grant(), 'provider_ref': 'mcp:fixture-wiki',
             'query_subjects': {OWNER.subject: [scope]}}
+
+
+@pytest.mark.parametrize('field,value', [('expected_server_info', None), ('expected_tool_description', None),
+    ('expected_server_info', {}), ('expected_tool_description', '')])
+def test_unreviewed_descriptors_never_resolve_credentials_or_contact_the_source(field, value):
+    from ghost_hermes_pm import ManagementError
+    with mcp_peer() as peer:
+        config = provider_config(peer)
+        if value is None:
+            config['mcp:fixture-wiki'].pop(field)
+        else:
+            config['mcp:fixture-wiki'][field] = value
+        credentials = []
+        with pytest.raises(ManagementError) as missing:
+            configured_providers(config, credential_resolver=lambda ref: credentials.append(ref))
+        assert missing.value.code == 'invalid_change'
+        assert credentials == [] and peer['calls'] == peer['deletions'] == []
+
+
+@pytest.mark.parametrize('field', ['expected_server_info', 'expected_tool_description'])
+def test_original_corpus_grant_cannot_follow_changed_reviewed_descriptors(tmp_path, field):
+    from ghost_hermes_pm import ManagementError
+    with mcp_peer() as peer:
+        config = provider_config(peer)
+        resolver = lambda ref: 'synthetic-wiki-token'
+        with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                knowledge_providers=configured_providers(config, credential_resolver=resolver)) as manager:
+            manager.apply_directory_change(OWNER, 0, {'profile': WIKI})
+            with ManagementServer(manager, {'owner': OWNER}):
+                client = ManagementClient(tmp_path / 'state', 'owner')
+                client.register_knowledge_source(1, mcp_grant())
+                if field == 'expected_server_info':
+                    config['mcp:fixture-wiki'][field]['name'] = 'replacement-synthetic-source'
+                else:
+                    config['mcp:fixture-wiki'][field] = 'Replacement synthetic compiled reader.'
+                manager.knowledge_providers.update(configured_providers(config, credential_resolver=resolver))
+                with pytest.raises(ManagementError) as changed:
+                    client.query_knowledge('fixture-wiki', 'changed-descriptor', 'retry delivery', ['corpus'])
+                assert changed.value.code == 'source_denied'
+                assert peer['calls'] == peer['deletions'] == []
 
 
 def test_registered_query_uses_original_mcp_corpus_and_returns_actual_citations(tmp_path):
@@ -191,7 +240,9 @@ def test_sse_preserves_compiled_material_classification_and_owned_session_only(t
 
 
 @pytest.mark.parametrize('fault,methods', [('protocol', ['initialize']),
+    ('server-name', ['initialize']), ('server-version', ['initialize']),
     ('mismatched-id', ['initialize']), ('schema', ['initialize', 'notifications/initialized', 'tools/list']),
+    ('description', ['initialize', 'notifications/initialized', 'tools/list']),
     ('http-error', ['initialize', 'notifications/initialized', 'tools/list', 'tools/call']),
     ('rpc-error', ['initialize', 'notifications/initialized', 'tools/list', 'tools/call'])])
 def test_mcp_failure_is_sanitized_without_blind_retry(tmp_path, fault, methods):

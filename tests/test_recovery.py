@@ -132,9 +132,10 @@ def test_reconnect_old_human_request_points_to_original_interface_and_never_reus
 def test_corrupt_durable_directory_blocks_restart_without_starting_any_service(tmp_path):
     import pytest
     state = tmp_path / 'state'
-    state.mkdir()
+    state.mkdir(mode=0o700)
     database = state / 'manager.sqlite3'
     database.write_bytes(b'broken original directory; preserve for recovery')
+    database.chmod(0o600)
     before = database.read_bytes()
     with pytest.raises(ManagementError) as failure:
         Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path))
@@ -198,7 +199,7 @@ def test_abrupt_manager_process_restart_reclaims_only_its_proven_orphan_socket(t
     import subprocess
     import pytest
     state = tmp_path / 'state'
-    state.mkdir()
+    state.mkdir(mode=0o700)
     preserved = state / 'keep-user-file'
     preserved.write_text('preserved')
     process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('recovery_process_runner.py')), str(state)],

@@ -1,4 +1,4 @@
-"""Narrow readonly adapter for the existing Conso knowledge context-pack tool."""
+"""Narrow readonly adapter for one configured knowledge context-pack tool."""
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -13,14 +13,16 @@ PROTOCOL = '2025-03-26'
 SCHEMA = {'type': 'object', 'properties': {'prompt': {'type': 'string'},
     'budget': {'type': 'integer', 'minimum': 500, 'maximum': 6000}},
     'required': ['prompt'], 'additionalProperties': False}
-DESCRIPTION = 'Read compact compiled Conso knowledge and its citations. Raw sources are read separately only when needed.'
 
 
-class ConsoWikiMCPProvider:
+class WikiKnowledgeProvider:
     """An explicitly granted entire corpus; the remote tool has no requester ACL."""
     def __init__(self, config, credential_resolver):
-        if not isinstance(config, dict) or set(config) != {'url', 'corpus_scope_id', 'credential_ref'}:
-            raise ManagementError('invalid_change', 'An original MCP endpoint, entire corpus scope and native credential reference are required.')
+        if not isinstance(config, dict) or set(config) != {'url', 'corpus_scope_id', 'credential_ref', 'expected_server_info', 'expected_tool_description'}:
+            raise ManagementError('invalid_change', 'An original MCP endpoint, corpus scope, native credential reference and reviewed descriptors are required.')
+        server, description = config['expected_server_info'], config['expected_tool_description']
+        if not isinstance(server, dict) or set(server) != {'name', 'version'} or any(not isinstance(server[key], str) or not server[key].strip() or len(server[key]) > 256 for key in ('name', 'version')) or not isinstance(description, str) or not description.strip() or len(description) > 4096:
+            raise ManagementError('invalid_change', 'Reviewed exact MCP server and readonly tool descriptors are required before querying.')
         url, corpus, reference = (config[k] for k in ('url', 'corpus_scope_id', 'credential_ref'))
         if not isinstance(url, str) or not isinstance(corpus, str) or not corpus or len(corpus) > 256:
             raise ManagementError('invalid_change', 'Explicit bounded MCP endpoint and corpus scope are required.')
@@ -33,6 +35,8 @@ class ConsoWikiMCPProvider:
         if reference is not None and (not isinstance(self._token, str) or not self._token or '\r' in self._token or '\n' in self._token):
             raise ManagementError('source_unavailable', 'The native MCP credential is unavailable in the verified Profile scope.')
         self.url, self.corpus_scope_id = url, corpus
+        self.expected_server_info = dict(server)
+        self.expected_tool_description = description
         self.binding_digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
 
     def query(self, *, requester, source_id, question, scope_ids):
@@ -93,13 +97,13 @@ class ConsoWikiMCPProvider:
         try:
             initial = rpc('initialize', {'protocolVersion': PROTOCOL, 'capabilities': {},
                 'clientInfo': {'name': 'ghost-hermes-pm-readonly', 'version': '0.1.0'}}, 1)
-            if initial.get('protocolVersion') != PROTOCOL or initial.get('serverInfo') != {'name': 'conso-knowledge', 'version': '0.1.0'}:
+            if initial.get('protocolVersion') != PROTOCOL or initial.get('serverInfo') != self.expected_server_info:
                 raise ManagementError('source_denied', 'The registered original Wiki protocol or server changed.')
             headers['MCP-Protocol-Version'] = PROTOCOL
             rpc('notifications/initialized')
             tools = rpc('tools/list', {}, 2).get('tools')
             reader = [t for t in tools if isinstance(t, dict) and t.get('name') == 'get_context_pack'] if isinstance(tools, list) else []
-            if len(reader) != 1 or reader[0].get('inputSchema') != SCHEMA or reader[0].get('description') != DESCRIPTION:
+            if len(reader) != 1 or reader[0].get('inputSchema') != SCHEMA or reader[0].get('description') != self.expected_tool_description:
                 raise ManagementError('source_denied', 'The registered readonly context-pack contract changed.')
             result = rpc('tools/call', {'name': 'get_context_pack', 'arguments': {'prompt': question, 'budget': 500}}, 3)
             content = result.get('content')

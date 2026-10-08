@@ -82,8 +82,8 @@ def _boundary(manager, attempt):
             raise ManagementError('capability_unverified', 'Original-host enforcement receipt is absent or changed.')
         try:
             receipt = json.loads(path.read_text())
-        except (OSError, ValueError) as exc:
-            raise ManagementError('capability_unverified', 'Original boundary receipt is unreadable.') from exc
+        except (OSError, ValueError):
+            raise ManagementError('capability_unverified', 'Original boundary receipt is unreadable.') from None
         expected.update({k: proof[k] for k in ('host_id', 'generation', 'runner_configuration_digest', 'input_watch')})
         required = {'source_write_denied', 'child_source_write_denied', 'parent_git_write_denied', 'child_git_write_denied', 'artifact_write_allowed', 'artifact_escape_denied', 'preexisting_hardlink_write_denied', 'tool_paths_confined', 'process_paths_confined', 'input_change_observation_complete'}
         if any(receipt.get(k) != v for k, v in expected.items()) or set(receipt.get('checks', {})) != required or any(v != 'PASS' for v in receipt['checks'].values()):
@@ -388,7 +388,7 @@ def _rework(manager, identity, details, version, data, attempt):
     reader = getattr(manager.delivery_source, 'read_issue', None)
     issue = reader(details['issue_url']) if callable(reader) else None
     if not isinstance(issue, dict) or issue.get('url') != details['issue_url'] or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
-        raise ManagementError('evidence_missing', 'Repair Issue scope and current locator require the trusted Ghost233 source.')
+        raise ManagementError('evidence_missing', 'Repair Issue scope and current locator require the authenticated configured source.')
     _public_text(issue['title'] + '\n' + issue['body'], manager._sensitive_values())
     repair = {'target': target, 'issue': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')}, 'defects': defects,
               'validation_id': attempt['id'], 'status': 'awaiting_repair', 'created_at': _now()}

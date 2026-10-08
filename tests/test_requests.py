@@ -7,7 +7,7 @@ MESSAGE = {'tenant_key': 'tenant-fixture', 'recipient_open_id': 'ou_lead',
            'app_id': 'cli_fixture', 'transport_tenant_key': 'tenant-transport', 'recipient_tenant_key': 'tenant-bot',
            'chat_id': 'oc_project', 'message_id': 'om_request', 'sender_open_id': 'ou_owner',
            'parent_id': None, 'root_id': None, 'thread_id': None}
-ISSUE = {'url': 'https://github.com/Ghost233/fixture/issues/15', 'title': 'Fix fixture behavior',
+ISSUE = {'url': 'https://github.com/example-user/fixture/issues/15', 'title': 'Fix fixture behavior',
          'body': 'Acceptance: preserve the original request.', 'updated_at': '2026-10-07T00:00:00Z'}
 
 

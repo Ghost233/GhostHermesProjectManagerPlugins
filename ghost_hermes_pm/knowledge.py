@@ -520,8 +520,8 @@ def configured_providers(config, credential_resolver=None):
     providers = {}
     for reference, value in config.items():
         if isinstance(reference, str) and reference.startswith('mcp:'):
-            from .wiki_mcp import ConsoWikiMCPProvider
-            providers[reference] = ConsoWikiMCPProvider(value, credential_resolver)
+            from .wiki_mcp import WikiKnowledgeProvider
+            providers[reference] = WikiKnowledgeProvider(value, credential_resolver)
         elif isinstance(reference, str) and reference.startswith('local:') and isinstance(value, dict) and set(value) == {'root', 'documents'}:
             providers[reference] = LocalKnowledgeProvider(value['root'], value['documents'])
         else:

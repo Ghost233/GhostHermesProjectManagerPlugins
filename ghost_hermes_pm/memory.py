@@ -29,7 +29,7 @@ def _factual_question(question):
         return False
     spec = question['questions'][0]
     text = spec['question'].strip()
-    if spec.get('options') or re.search(r'(?i)should|shall|would|choose|prefer|decid|trade.?off|implement|add |change |can (?:you|we|i)|owner|human|yourself|ghost233|本人|亲自|选择|取舍|偏好|决定|需求|新增|修改|批准|授权|允许|是否(?:可以|应该)|要不要|应该', text):
+    if spec.get('options') or re.search(r'(?i)should|shall|would|choose|prefer|decid|trade.?off|implement|add |change |can (?:you|we|i)|owner|human|yourself|本人|亲自|选择|取舍|偏好|决定|需求|新增|修改|批准|授权|允许|是否(?:可以|应该)|要不要|应该', text):
         return False
     return bool(re.match(r'(?i)^(?:what (?:is|are|was|were)|when (?:is|was|did)|where (?:is|are)|how many|which (?:version|commit)|什么|何时|哪里|多少|哪个(?:版本|提交)|已确认的.+是什么)', text))
 

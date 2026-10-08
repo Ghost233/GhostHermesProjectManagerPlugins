@@ -38,7 +38,7 @@ def channel(profile, group='project'):
         'recipient_open_id': 'ou_' + profile, 'recipient_tenant_key': 'bot-' + profile,
         'transport_tenant_key': 'app-' + profile, 'chat_id': 'oc_' + group,
         'owner_open_id': 'owner-' + profile, 'owner_tenant_key': 'owner-tenant',
-        'repository': 'Ghost233/fixture', 'verification_ref': 'fixture:registered-map',
+        'repository': 'example-user/fixture', 'verification_ref': 'fixture:registered-map',
         'bot_sources': [{'profile_id': 'steward', 'open_id': 'steward-seen-' + profile,
                          'tenant_key': 'steward-tenant', 'native_ids': ['steward-user-' + profile]}]}
 
@@ -89,7 +89,7 @@ def test_repositoryless_entry_does_not_allow_an_issue_from_another_project_repos
         sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
         manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving]})
         with pytest.raises(ManagementError) as conflict:
-            manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': 'https://github.com/Ghost233/another-project/issues/1'})
+            manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': 'https://github.com/example-user/another-project/issues/1'})
         assert conflict.value.code == 'binding_conflict'
         snapshot = manager.read_snapshot(OWNER)
         assert snapshot['collaboration']['handoffs'] == [] and snapshot['requests'] == []
@@ -97,7 +97,7 @@ def test_repositoryless_entry_does_not_allow_an_issue_from_another_project_repos
 
 def test_one_repositoryless_steward_channel_dispatches_distinct_projects_in_the_same_group(tmp_path):
     from ghost_hermes_pm import ManagementError
-    other_issue = {**ISSUE, 'url': 'https://github.com/Ghost233/other/issues/16', 'title': 'Fix the other project'}
+    other_issue = {**ISSUE, 'url': 'https://github.com/example-user/other/issues/16', 'title': 'Fix the other project'}
     class ProjectIssues:
         def read_issue(self, url):
             return dict({ISSUE['url']: ISSUE, other_issue['url']: other_issue}[url])
@@ -109,7 +109,7 @@ def test_one_repositoryless_steward_channel_dispatches_distinct_projects_in_the_
         entry, sending, lead, other_lead = channel('steward', 'entry'), channel('steward'), channel('mono-lead'), channel('other-lead')
         entry['repository'] = None
         sending.update(project_id=None, repository=None)
-        other_lead.update(project_id='other', repository='Ghost233/other')
+        other_lead.update(project_id='other', repository='example-user/other')
         sending['bot_sources'].extend([
             {'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']},
             {'profile_id': 'other-lead', 'open_id': 'other-seen-steward', 'tenant_key': 'other-tenant', 'native_ids': ['other-user-steward']}])

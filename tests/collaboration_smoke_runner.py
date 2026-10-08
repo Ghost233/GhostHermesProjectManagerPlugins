@@ -62,8 +62,9 @@ bindings = [{**{k: c[k] for k in ('app_id', 'recipient_open_id', 'recipient_tena
     'owner_open_id': c['owner_open_id'], 'sender_tenant_key': c['owner_tenant_key'], 'owner_native_ids': ['owner-native']} for c in channels]
 bots = [{'profile_id': b['profile_id'], 'identity_ref': 'fixture:' + ('lead' if b['profile_id'] == 'mono-lead' else b['profile_id']),
     'app_id': c['app_id'], 'tenant_key': b['tenant_key'], 'open_id': b['open_id'], 'native_ids': b['native_ids']} for c in channels for b in c['bot_sources']]
+os.environ['HERMES_FIXTURE_GITHUB_ACCOUNT'] = 'example-user'
 settings = {'manager_profile': 'default', 'state_dir': str(state), 'owner_identity_ref': OWNER.subject,
-    'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN', 'participant_credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN',
+    'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN', 'github_account_ref': 'native:HERMES_FIXTURE_GITHUB_ACCOUNT', 'participant_credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN',
     'participant_entries': [{'identity_ref': 'fixture:lead', 'credential_ref': 'native:HERMES_FIXTURE_PARTICIPANT_TOKEN'}, {'identity_ref': 'fixture:child', 'credential_ref': 'native:HERMES_FIXTURE_CHILD_TOKEN'}], 'collaboration_identity_ref': STEWARD.subject,
     'feishu_intake': {'enabled': True, 'verification_ref': 'fixture:owned-role-source', 'bindings': bindings, 'registered_bots': bots}}
 os.environ['HERMES_FIXTURE_CHILD_TOKEN'] = 'synthetic-child-credential'
@@ -144,15 +145,15 @@ async def main():
     child_repo = scratch / 'child-repo'; child_repo.mkdir(); subprocess.run(['git', 'init', '-q', str(child_repo)], check=True)
     owner.apply_directory_change(2, {'enable_profile': 'child', 'project': {'id': 'child-project', 'name': 'Explicit SDK child', 'repo_path': str(child_repo)}, 'profile': {'id': 'child', 'native_profile': 'child', 'identity_ref': 'fixture:child', 'role': 'subproject_lead', 'capability': 'development', 'project_id': 'child-project', 'parent_profile_id': 'mono-lead', 'connection_refs': {'codex': 'local:fixture-stdio'}}})
     owner.collaborate('register_channels', {'channels': channels})
-    incoming = raw(channels[0], '项目 mono https://github.com/Ghost233/fixture/issues/15', 'om_sdk_owner_goal')
+    incoming = raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_owner_goal')
     runners[0].authorized = False
     await adapters[0]._handle_message_event_data(incoming)
     assert not owner.read_snapshot()['collaboration']['handoffs'] and not created
     runners[0].authorized = True; runners[0].budget = False
-    await adapters[0]._handle_message_event_data(raw(channels[0], '项目 mono https://github.com/Ghost233/fixture/issues/15', 'om_sdk_budget_denied'))
+    await adapters[0]._handle_message_event_data(raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_budget_denied'))
     assert not owner.read_snapshot()['collaboration']['handoffs'] and not created
     runners[0].budget = True
-    await adapters[0]._handle_message_event_data(raw(channels[0], '项目 mono https://github.com/Ghost233/fixture/issues/15', 'om_sdk_owner_goal_valid'))
+    await adapters[0]._handle_message_event_data(raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_owner_goal_valid'))
     h = owner.read_snapshot()['collaboration']['handoffs'][0]
     assert len(created) == 1 and h['acceptance'] == 'awaiting_receiver' and owner.read_snapshot()['requests'] == []
     request = created[0][1]

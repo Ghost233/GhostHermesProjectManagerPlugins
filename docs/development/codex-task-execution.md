@@ -1,6 +1,6 @@
-# 单 Issue Codex 执行切片（[执行一个 Codex Issue 并核对交付结果](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/16)）
+# 单 Issue Codex 执行切片（[执行一个 Codex Issue 并核对交付结果](../../../../issues/16)）
 
-原任务的追加、停止和明确继续见 [在原会话追加、停止和明确继续任务](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/17)。
+原任务的追加、停止和明确继续见 [在原会话追加、停止和明确继续任务](../../../../issues/17)。
 
 本切片实现真实自有 stdio app-server adapter 与统一任务入口；协议替身测试不等于获准真实服务验收。当前真实启动能力保持未启用：尚无符合全部写入、工具、连接与真实执行要求的完整验证收据。没有连接原 daemon、读取已有会话、修改真实配置或使用 full access。
 
@@ -16,7 +16,7 @@
 2. initialize/initialized 确认实际自有进程、连接 generation 和来源；验证权限 profile 可选、完整 loaded/list 与当前执行能力证据。
 3. 先提交 SQLite `thread_start_intent`，然后 `thread/start`；响应中的 thread ID 即使权限核对失败也先登记。
 4. 核对实际 cwd、`canAcceptDirectInput`、固定 CLI、activePermissionProfile 与 runtime roots；提交 thread 绑定及 `turn_start_intent` 后才发 `turn/start`。
-5. 当前目标、冻结 Issue 版本及验收、仓库/子仓/产物边界、Matt 工作流、Ghost233 与本地同步约束进入该独立任务会话。
+5. 当前目标、冻结 Issue 版本及验收、仓库/子仓/产物边界、Matt 工作流、本机配置的授权 GitHub 账号 与本地同步约束进入该独立任务会话。
 
 超时、EOF、异常响应、落盘失败或权限不符保留意图/原 thread 和仓库占用。重复 start 不新建线程。更换自有进程会取得新的 generation；相同 CODEX_HOME 或历史不能接替原执行器控制。刷新按已登记 session 的原仓库快照只使用 `thread/read`，目录纠正不改写原仓库占用，也不 resume。完整 JSONL 帧上限 16 MiB；超过上限使监测失联、执行待核实，不能据此宣称停止。bridge 执行操作预算 30 秒；启动应答不明需读取原 durable request，不能盲目重发。
 
@@ -26,7 +26,7 @@
 
 交付输入只提供冻结验收项及证据引用，不接受 `passed` / `delivered` 布尔值。每项原 Markdown checklist 按原顺序逐字对应；没有 checklist 时使用原 body。测试引用正式 `commandExecution` item，必须原任务仓库内 completed、exit 0；agentMessage 中的“测试通过”没有证据效力。保存命令、cwd、exit、原 service/generation/thread/turn/item、观察时间和输出 digest，不保存全部输出或秘密。未引用的命令不自动当测试。只直接识别正常 pytest/unittest 执行；echo、collect/help/version、复杂shell或其他自定义runner需可信测试runner收据，不能经 test_item_ids 标签伪造测试。固定文件证据读取允许的普通文件并核对 SHA-256。源码变化后的测试还须有独立可信测试 runner 写入 state_dir/test-evidence 的版本收据，绑定实际 command/output digest、thread/turn/item、相同 before/after 源码 digest、源码/Git只读和授权产物目录；仅在测试后读到某个 HEAD 不证明该版本接受了测试。缺少收据不交付，任务会话自身不能写入管理实例的证据目录；state_dir 位于任务仓库或其Git写集内时在连接前拒绝启动。
 
-源码变化需要当前固定提交与工作区交接核对，逐一核对变化文件在该 commit 中的 blob，保留原有用户内容。相同 porcelain 状态不能把既有 dirty 文件的新改动变成已提交源码。纯测试或无源码变化不要求新增提交/PR。实际 PR 读取独立显示 awaiting_review、awaiting_merge、merged；冻结验收明确以“Merge…”或“合并…PR”等列出合并要求时，未合并不交付，还须核验实际 base 分支本地与远端完整 hash。其他合并措辞由本人明确冻结为验收条目，不能从普通文本猜测任务要求。GitHub 只读 source 在每个认证业务命令前 switch Ghost233 并核验实际 login；不符停止。交付模块自身不 push、merge、stash、reset 或清理用户内容。
+源码变化需要当前固定提交与工作区交接核对，逐一核对变化文件在该 commit 中的 blob，保留原有用户内容。相同 porcelain 状态不能把既有 dirty 文件的新改动变成已提交源码。纯测试或无源码变化不要求新增提交/PR。实际 PR 读取独立显示 awaiting_review、awaiting_merge、merged；冻结验收明确以“Merge…”或“合并…PR”等列出合并要求时，未合并不交付，还须核验实际 base 分支本地与远端完整 hash。其他合并措辞由本人明确冻结为验收条目，不能从普通文本猜测任务要求。GitHub 只读 source 在每个认证业务命令前 switch 本机配置的授权 GitHub 账号 并核验实际 login；不符停止。交付模块自身不 push、merge、stash、reset 或清理用户内容。
 
 ## 原生配置与验证收据
 
@@ -43,10 +43,10 @@
 
 ## 已知真实验收门槛
 
-三条调查路线尚不能满足生产写入边界，不能据此启用控制：
+本机写入边界仍须实际验证；以下保留本机缺口与既有研究记录，不能据此启用控制：
 
 1. Mac nested sandbox 的运行探针未验证；已有无推理握手 smoke 只证明 framing/初始化/只读方法。
-2. 固定 Linux broad mono write + child read 允许保护祖先 rename；文件级窄写集无法支持正常 Git，目录级窄写集无法正常修改 root 源码/index。不能以只读小范围代替本产品开发需求。
+2. 既有 Linux 研究曾发现 broad mono write + child read 允许保护祖先 rename；该跨平台结果仅为历史研究，不是本机交付门禁。文件级窄写集无法支持正常 Git，目录级窄写集无法正常修改 root 源码/index。不能以只读小范围代替本产品开发需求。
 3. Mac 整体自有进程外层 Seatbelt 的有界矩阵多数成功，但预存 mono hardlink alias 可以写穿 child 源码并改变保护 hash，结果 BOUNDARY_FAILED。部分操作拒绝不等于整体边界成立。
 
 后续必须在明确获准的测试仓库/服务、模型/预算与工具集合上证明完整可用开发边界、测试阶段写集、真实 thread/turn 启动、事件/等待/结束/结果，以及原群发送/受理。当前不会降级到 full access，也不会把协议替身、收据形状验证或静态 schema 作为实际验收。

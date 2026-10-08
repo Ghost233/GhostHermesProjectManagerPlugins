@@ -8,7 +8,7 @@
 
 ## 独立停止条件
 
-操作记录 `lifecycle_operations` 的 `checks` 分别展示原任务执行、只观察的手动执行、每个 Profile 的 `profile_service`、`bot`、`scheduled_entry` 与 `manual_execution` 覆盖。原任务使用 [接管并归还本次手动工作](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/20) 的每条原执行器/current grant 和 [在原会话追加、停止和明确继续任务](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/17) 的 durable stop：interrupt 受理不释放占用，完整原 turn、相关 thread/item/background 和宿主进程覆盖核实停止后才释放。原执行或未知启动无法核实时保持处理中/受阻，不创建新执行器，也不改变 PR、Issue、改动或资料。
+操作记录 `lifecycle_operations` 的 `checks` 分别展示原任务执行、只观察的手动执行、每个 Profile 的 `profile_service`、`bot`、`scheduled_entry` 与 `manual_execution` 覆盖。原任务使用 [接管并归还本次手动工作](../../../../issues/20) 的每条原执行器/current grant 和 [在原会话追加、停止和明确继续任务](../../../../issues/17) 的 durable stop：interrupt 受理不释放占用，完整原 turn、相关 thread/item/background 和宿主进程覆盖核实停止后才释放。原执行或未知启动无法核实时保持处理中/受阻，不创建新执行器，也不改变 PR、Issue、改动或资料。
 
 已观察的手动活动始终只读；封存不创建控制授权、不发送其 interrupt。本人在原界面明确处理后，通过 `check` 的 `handled_manual_session_ids` 登记对应记录，并再次取得当前终止证据。消失、断连、历史 idle 或本人一句已处理均不能替代终止证明。
 
@@ -28,9 +28,9 @@ native 组件动作前必须取得当前、同 operation/Profile/component 的 s
 
 `restore` 只处理指定 archived Profile；父负责人先恢复，子负责人逐个恢复且要求父已 active。外部动作前保存 `restoring` intent，并用 SQLite backup 建立、校验及哈希管理目录一致性检查点。该 checkpoint 仅覆盖管理目录，明确不覆盖 native Profile/bot/cron/source archives 和 notification-health；当前健康/授权不会从旧副本回放。长期项目绑定、资料索引和原记录保留，旧 Codex 停止决定仍抑制自动续跑；新工作需新受理/能力核实。
 
-档案代查复用 [只读查询旧档案并验证永久保护](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/28) 的原 requester、迁移来源授权、SourceGrant revision 和公开 namespace，不因总管职责开放原始来源。本人公开 @ 已登记总管，授权共享 channel 对应总管回传相关结论和原 locator；不恢复旧 Profile/bot/Codex。超范围拒绝，原库不写。封存不提升 `verified_native_cleanup_copy` 或 `permanent_protection=unverified` 的既有保护证据。
+档案代查复用 [只读查询旧档案并验证永久保护](../../../../issues/28) 的原 requester、迁移来源授权、SourceGrant revision 和公开 namespace，不因总管职责开放原始来源。本人公开 @ 已登记总管，授权共享 channel 对应总管回传相关结论和原 locator；不恢复旧 Profile/bot/Codex。超范围拒绝，原库不写。封存不提升 `verified_native_cleanup_copy` 或 `permanent_protection=unverified` 的既有保护证据。
 
-全部检查满足才生成一个 durable `lifecycle_events` 事实：`id=lifecycle:<operation_id>:completed`，`kind=archive_completed|profile_restored`，另含 operation/profile/profile_ids/project_ids/verified_at。处理中、受阻、静态标志及发送成功都不产生完成事件。[定期汇总并提醒待处理请求](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/23) 只消费该事实并由通知 ledger 去重；重启不会制造新 Owner 授权。
+全部检查满足才生成一个 durable `lifecycle_events` 事实：`id=lifecycle:<operation_id>:completed`，`kind=archive_completed|profile_restored`，另含 operation/profile/profile_ids/project_ids/verified_at。处理中、受阻、静态标志及发送成功都不产生完成事件。[定期汇总并提醒待处理请求](../../../../issues/23) 只消费该事实并由通知 ledger 去重；重启不会制造新 Owner 授权。
 
 群命令使用真实 @：`封存项目 <ProfileID>`、`恢复负责人 <ProfileID>`、`核对生命周期 <operationID> [已处理 <manualID,...>]`。项目入口限自己的职责范围，总管入口可管理已登记项目；处理反馈关联原消息，未知投递不重放。Dashboard 展示同一 scoped checks、核实时间、档案状态及本人需处理事项，并预览明确操作后提交。
 

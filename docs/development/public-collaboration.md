@@ -1,6 +1,6 @@
 # 公开分层协作
 
-[按责任角色跨群派发并逐级回传](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/24) 使用同一权威 Manager 的目录、请求、队列和原执行证据。Owner 在入口群明确指定项目目标，总管在项目群真实 @ 总负责人；只有已独立受理该目标的总负责人，才能把明确 GitHub 子 Issue 派给 Owner 已登记的自己的 child。角色与 development/non_development 能力分别登记。合并两层时由 project_lead 直接承接项目工作，不自动创建 submodule 助手。Wiki 与个人助手保持 independent、无 project/parent 绑定。
+[按责任角色跨群派发并逐级回传](../../../../issues/24) 使用同一权威 Manager 的目录、请求、队列和原执行证据。Owner 在入口群明确指定项目目标，总管在项目群真实 @ 总负责人；只有已独立受理该目标的总负责人，才能把明确 GitHub 子 Issue 派给 Owner 已登记的自己的 child。角色与 development/non_development 能力分别登记。合并两层时由 project_lead 直接承接项目工作，不自动创建 submodule 助手。Wiki 与个人助手保持 independent、无 project/parent 绑定。
 
 ## 公共入口
 
@@ -32,7 +32,7 @@
 5. `report_result` 对委派工作使用 `{handoff_id}`，对直接 Owner child 工作使用 `{request_id}`。必须原 task_delivery=delivered，且原负责人绑定未变。固定 Issue、源码/测试/原命令/后台进程/工作区证据仍由原 delivery 接缝验证。不能以自然语言 done 或 bot 送达回执代替。
 6. child result 在 parent 原 native 入口独立收到后登记 received_results 与 awaiting_integration。`report_summary` 由该项目 lead 汇总原 task 状态和独立已收到的子交付证据，公开送回原 steward；`report_progress` 只传递当前原 Issue 状态。steward 独立收到后，在入口原 Owner 目标锚返回汇总。
 
-所有 summary/result 都保留 whole_project_complete=false。[验证 mono 交付组合并按 Issue 返工](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/27) 的稳定组合与全局验证完成条件另行核对；子交付不能宣称项目整体完成。新的汇总内容建立新的记录，同样内容重复发布保留已有记录。普通 ack/thanks/进度文本不创建开发 task；只有严格原 role-work marker 进入派发。
+所有 summary/result 都保留 whole_project_complete=false。[验证 mono 交付组合并按 Issue 返工](../../../../issues/27) 的稳定组合与全局验证完成条件另行核对；子交付不能宣称项目整体完成。新的汇总内容建立新的记录，同样内容重复发布保留已有记录。普通 ack/thanks/进度文本不创建开发 task；只有严格原 role-work marker 进入派发。
 
 ## 投递、重复与恢复
 
@@ -54,4 +54,4 @@ HERMES_TEST_SDK_ROOT=/private/tmp/hermes-implementation/sdk-isolated HERMES_REQU
   /private/tmp/hermes-plugin-dev-venv/bin/python -m pytest --basetemp=/private/tmp/hc24-final -q
 ```
 
-SDK fixture 缺失在 mandatory 模式直接失败；普通 SDK skip 不构成验收。Dashboard 另需真实 React runtime 对新增关系与 Owner 表单操作验证；原来其他控件的点击记录不覆盖 [按责任角色跨群派发并逐级回传](https://github.com/Ghost233/GhostHermesProjectManagerPlugins/issues/24) 新控件。发布前仍需独立 merger、双轴审查和 Retro，以及授权测试 Profile/群/服务的具体验收。真实 bots、开通、生产配置、资料迁移、未知执行权限或未验证能力保持 unverified/off。
+SDK fixture 缺失在 mandatory 模式直接失败；普通 SDK skip 不构成验收。Dashboard 另需真实 React runtime 对新增关系与 Owner 表单操作验证；原来其他控件的点击记录不覆盖 [按责任角色跨群派发并逐级回传](../../../../issues/24) 新控件。发布前仍需独立 merger、双轴审查和 Retro，以及授权测试 Profile/群/服务的具体验收。真实 bots、开通、生产配置、资料迁移、未知执行权限或未验证能力保持 unverified/off。

@@ -246,14 +246,14 @@ def test_failed_child_has_an_explicit_verified_issue_and_a_public_rework_handoff
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
         assert manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})['status'] == 'failed'
-        returned = manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})
+        returned = manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/example-user/fixture/issues/28'})
         assert returned['rework'][0]['route'] == 'child' and returned['rework'][0]['profile_id'] == 'child-lead'
         assert returned['rework'][0]['issue']['url'].endswith('/issues/28')
         handoff = returned['rework'][0]['handoff_id']
         packet = manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': handoff})
         assert packet['mention_open_id'] == 'child-seen-lead' and '/issues/28' in packet['text']
         assert returned['occupancy']['released'] is True
-        assert manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})['rework'] == returned['rework']
+        assert manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'child', 'issue_url': 'https://github.com/example-user/fixture/issues/28'})['rework'] == returned['rework']
 
 
 def test_final_completion_requires_original_mono_acceptance_and_fresh_stable_validation(tmp_path):
@@ -324,7 +324,7 @@ def test_unassigned_materialized_module_is_checked_without_creating_an_owner(tmp
         run['defects'] = [{'target': 'unassigned', 'description': 'Unassigned child contract', 'test_ids': ['unit']}]
         failed = manager.global_validation(LEAD, 'finish', {'validation_id': plan['id']})
         assert failed['status'] == 'failed'
-        returned = manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'unassigned', 'issue_url': 'https://github.com/Ghost233/fixture/issues/29'})
+        returned = manager.global_validation(LEAD, 'rework', {'validation_id': plan['id'], 'target': 'unassigned', 'issue_url': 'https://github.com/example-user/fixture/issues/29'})
         assert returned['rework'][0]['route'] == 'owner_decision' and returned['rework'][0]['status'] == 'needs_owner'
         assert len(manager.read_snapshot(OWNER)['profiles']) == 2
         assert returned['occupancy']['released'] is True
@@ -425,7 +425,7 @@ async def test_approved_repository_delivery_failure_issue_repair_revalidation_an
         first = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         manager.global_validation(LEAD, 'start', {'validation_id': first['id']})
         assert manager.global_validation(LEAD, 'finish', {'validation_id': first['id']})['status'] == 'failed'
-        returned = manager.global_validation(LEAD, 'rework', {'validation_id': first['id'], 'target': 'child', 'issue_url': 'https://github.com/Ghost233/fixture/issues/28'})
+        returned = manager.global_validation(LEAD, 'rework', {'validation_id': first['id'], 'target': 'child', 'issue_url': 'https://github.com/example-user/fixture/issues/28'})
         handoff_id = returned['rework'][0]['handoff_id']
         child_ingress = VerifiedIdentity('fixture:child', 'native-collaboration-ingress')
         await deliver(LEAD, handoff_id, (child_ingress, channels[3]))

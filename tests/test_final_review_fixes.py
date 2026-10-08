@@ -250,7 +250,7 @@ def test_native_codex_archive_configuration_uses_original_proxy_and_public_grant
     fixture = Path(__file__).with_name('archive_fixture_server.py')
     binary.write_text('#!' + sys.executable + '\nimport os,runpy,sys\nsys.argv=[' + repr(str(fixture)) + ',os.environ["OWNED_ARCHIVE_ROOT"]]\nrunpy.run_path(sys.argv[0],run_name="__main__")\n')
     binary.chmod(0o700)
-    state = tmp_path / 'state'; state.mkdir()
+    state = tmp_path / 'state'; state.mkdir(mode=0o700)
     config = {'executable': str(binary), 'cwd': str(tmp_path), 'environment': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(tmp_path / 'synthetic-home'), 'OWNED_ARCHIVE_ROOT': str(tmp_path)}, 'service_ref': 'local:original-proxy', 'source_kind': 'daemon', 'endpoint': str(tmp_path / 'original.sock'), 'endpoint_ref': 'local:original-socket'}
     providers = configured_providers({'local:old-hermes': {'kind': 'codex_history', 'adapter': config, 'thread_scopes': {'public': ['original-thread']}}}, state_dir=state)
     provider = providers['local:old-hermes']; adapter = provider.adapter

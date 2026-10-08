@@ -1,6 +1,7 @@
 """Single accepted Issue execution, persisted before every external mutation."""
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 from .manager import ManagementError, _repository
 from .codex import repository_fingerprint
@@ -101,6 +102,10 @@ def start_task(manager, identity, request_id):
             record['session']['start_phase'] = 'turn_start_intent'
             with manager._db:
                 manager._save(version + 2, data)
+            account = getattr(manager.delivery_source, 'expected_account', None)
+            private_github_context = ('\nExpected GitHub account (private runtime binding): ' + account
+                if isinstance(account, str) and re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})', account)
+                else '\nExpected GitHub account is unavailable; authenticated GitHub operations are disabled.')
             prompt = ('Complete this accepted Issue using the repository rules and Matt workflow.\n'
                       'Accepted scope is frozen; source changes require an explicit addition.\n'
                       'Goal and acceptance:\n' + record['accepted_scope']['title'] + '\n' + record['accepted_scope']['body'] +
@@ -111,10 +116,12 @@ def start_task(manager, identity, request_id):
                       '\nDo not modify preserved user paths; report any conflict before proceeding. ' +
                       '\nOnly modify this repository own source and Git metadata; nested repositories remain read-only. '
                       'Tests may write only registered artifacts. Do not expand permissions or use full access. '
-                      'GitHub authentication must switch to Ghost233 and verify the actual login before every authenticated business command. '
+                      'GitHub authentication must switch to the expected account from the protected local execution configuration and verify the actual login before every authenticated business command. '
+                      'If that account is unavailable, do not perform authenticated GitHub operations. '
+                      'Suppress raw authentication and login command output; never put private binding values in ordinary diagnostics or public artifacts. '
                       'After remote writes sync affected local branches only by fast-forward. Protect user changes. '
                       'Report executed tests and fixed delivery evidence; do not call a turn end delivery or require a PR for test-only work.')
-            prompt += memory_text
+            prompt += private_github_context + memory_text
             result = adapter.start_turn(thread['id'], prompt)
             turn = result.get('turn') if isinstance(result.get('turn'), dict) else {}
             if not isinstance(turn.get('id'), str) or not turn['id']:
