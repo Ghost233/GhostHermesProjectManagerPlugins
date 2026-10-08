@@ -53,7 +53,7 @@
 
 ## 离线验证
 
-从公共令牌 bridge 与核验飞书入口驱动真实 Python 子进程 JSONL peer。peer 在 turn/start 时读取 authoritative SQLite，证明 durable 顺序；覆盖分片/通知穿插、null profile、未知启动不重放、同仓库竞争、原 generation、更长启动链、过大帧失联、等待/轮次结束、正式测试证据、纯测试交付、PR/合并/同步独立状态、静态能力声明拒绝及原群引用/@。这些明确是 synthetic fixtures。
+从公共令牌 bridge 与核验飞书入口驱动真实 Python 子进程 JSONL peer。peer 在 turn/start 时读取同一已提交公共业务快照，并记录原服务事件，证明 durable 顺序；覆盖分片/通知穿插、null profile、未知启动不重放、同仓库竞争、原 generation、更长启动链、过大帧失联、等待/轮次结束、正式测试证据、纯测试交付、PR/合并/同步独立状态、静态能力声明拒绝及原群引用/@。这些明确是 synthetic fixtures。
 
 使用项目 test extra 和指定 pristine SDK fixture：
 
@@ -67,3 +67,7 @@ node --check dashboard/dist/index.js
 ## 合并验收解释
 
 受理时从原 Issue 冻结明确的合并义务。`must/必须` 的合并操作、状态展示、可选及禁止合并分别核对；仅出现 `merged/合并` 不添加义务。历史关键词版本的义务按原已冻结 body 纠正解释，原验收文本不自动替换为后来 Issue 内容。必要 merge 仍要求真实 merged PR 与 local/remote 同步；明确禁止的实际 merged 结果不能交付。条件、冲突或不能唯一解释的条目清楚返回 `needs_clarification` 并保持未交付。本人可在原任务通过 `append`，或在原群唯一关联的任务回复中明确解释原条件，例如“本任务测试即可交付，PR 无需合并”。该输入仍经原 `control_task` 的身份、权限、服务、代次与预期回合核对，实际 RPC 受理后单独保存解释及任务、原验收、授权和消息来源；不改原 Issue、冻结 scope 或验收文字。多个不明确条目须引用原条目逐字说明，不能猜测其目标。交付时只使用当前授权仍有效的最新明确解释，批准合并仍要求真实 merged 与同步证据；普通状态展示、建议、其他身份、其他任务和过期输入不能解除门禁。解释只决定原条件验收，不能取得执行审批或扩大仓库边界；消息收到、送回原会话与最终交付分别核对。 只识别原任务当前明确的决定句，如“本任务批准合并 PR”“本任务不批准合并 PR”“本任务 PR 不是必须合并／无需合并”。尚未批准、报告、讨论和引用材料保持待澄清，不从提到“批准”推导决定；同条输入中的原条件逐字引用只用于唯一目标关联，其他引用不能拼成新的决定。明确决定与附带的状态展示分别处理。 Markdown 反引号或波浪号围栏的完整正文均为材料；关闭围栏须同种字符且长度足够，未关闭的块保留至输入末尾。材料块以独立占位保留边界，块内决定文字不会提升为本人答复；块外明确决定仍经原入口核对，原条件逐字引用只用于关联。
+
+## 已提交业务快照
+
+`ManagementClient.read_snapshot(committed=True)` 与 `Manager.read_snapshot(..., committed=True)` 使用独立只读连接返回已提交的项目、Profile 和任务视图；`SnapshotReader` 为相同可信入口的独立只读读者。身份、角色、项目可见性与默认快照共用规则，敏感值按已有公开材料规则过滤。结果明确标记 `committed_snapshot`、观测时间及 `execution=unverified`，不能当作当前执行、停止或授权验证。该读取不对账、写库、发 RPC 或启动服务；默认快照行为保持。原服务 fixture 在输入 RPC 到达时用此视图保留 thread/control/stop intent-before-send 断言，不访问物理表或私有 payload。

@@ -56,8 +56,10 @@ class ManagementServer:
                     self.request.settimeout(3)
                     try:
                         payload = _read_frame(self.rfile, limit=1024 * 1024)
-                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'details', 'profile_id', 'entry_id', 'selection', 'supersedes', 'include_superseded', 'entry_ids', 'statement', 'manual_session_id', 'grant_id', 'complete', 'backup_id', 'restore_id', 'protection_id', 'kind'}:
+                        if not isinstance(payload, dict) or set(payload) - {'token', 'operation', 'expected_version', 'change', 'scope', 'request_id', 'report', 'action', 'instruction_id', 'text', 'expected_turn_id', 'human_request_id', 'reply_id', 'response', 'plan', 'source', 'source_id', 'query_id', 'question', 'scope_ids', 'channel_id', 'auto_supplement', 'material_ids', 'registration', 'details', 'profile_id', 'entry_id', 'selection', 'supersedes', 'include_superseded', 'entry_ids', 'statement', 'manual_session_id', 'grant_id', 'complete', 'backup_id', 'restore_id', 'protection_id', 'kind', 'committed'}:
                             raise ManagementError('invalid_change', 'Unknown bridge fields; caller identity is not a body field.')
+                        if 'committed' in payload and (payload.get('operation') not in {'read_snapshot', 'read_participant_snapshot'} or not isinstance(payload['committed'], bool)):
+                            raise ManagementError('invalid_change', 'Committed is an explicit read-only snapshot option.')
                         token = payload.get('token', '')
                         identity = next((identity for secret, identity in bridge.credentials.items()
                                          if isinstance(token, str) and hmac.compare_digest(secret.encode(), token.encode())), None)
@@ -66,7 +68,7 @@ class ManagementServer:
                         if payload.get('operation') in {'read_snapshot', 'read_participant_snapshot'}:
                             if payload['operation'] == 'read_participant_snapshot' and identity.subject == bridge.manager.owner_identity_ref:
                                 raise ManagementError('forbidden', 'The participant entry cannot borrow owner authority.')
-                            result = bridge.manager.read_snapshot(identity, payload.get('scope'))
+                            result = bridge.manager.read_snapshot(identity, payload.get('scope'), committed=payload.get('committed', False))
                         elif payload.get('operation') == 'manage_notifications':
                             result = bridge.manager.manage_notifications(identity, payload.get('action'), payload.get('details'))
                         elif payload.get('operation') == 'run_notifications':
@@ -222,8 +224,8 @@ class ManagementClient:
     def run_notifications(self):
         return self._call('run_notifications')
 
-    def read_snapshot(self, scope=None):
-        return self._call('read_snapshot', scope=scope)
+    def read_snapshot(self, scope=None, *, committed=False):
+        return self._call('read_snapshot', scope=scope, **({'committed': True} if committed else {}))
 
     def read_participant_snapshot(self):
         return self._call('read_participant_snapshot')

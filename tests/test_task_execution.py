@@ -21,8 +21,9 @@ def adapter_for(root, control_proof=None):
                 'task_start': 'synthetic-peer-only', 'manual_execution_coverage': 'synthetic-peer-only', 'model': 'fixture-model'}
         proof.update(control_proof or {})
         return proof
+    import ghost_hermes_pm
     return CodexStdioAdapter([sys.executable, str(Path(__file__).with_name('codex_fixture_server.py')), str(root)],
-                            cwd=root, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(root / 'codex-home')},
+                            cwd=root, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(root / 'codex-home'), 'HERMES_FIXTURE_PLUGIN_ROOT': str(Path(ghost_hermes_pm.__file__).resolve().parent.parent)},
                             service_ref='local:fixture-stdio', verifier=verifier, timeout=2)
 
 
