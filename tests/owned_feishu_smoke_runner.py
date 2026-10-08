@@ -27,6 +27,8 @@ def audit(event, args):
         raise RuntimeError('Owned smoke refused launch/model imports.')
 sys.addaudithook(audit)
 
+# Privacy bootstrap precedes native/SDK imports.
+import hermes_bootstrap  # noqa: F401
 import asyncio
 import json
 import subprocess
@@ -43,6 +45,14 @@ from hermes_cli.profiles import get_profile_dir
 from hermes_constants import get_hermes_home
 from hermes_cli.plugins import get_plugin_manager
 from gateway.platform_registry import platform_registry
+
+
+def passed(protection=None):
+    # Protected gateway console descriptors remain closed, including on success.
+    result = {'native_smoke': 'passed'}
+    if protection:
+        result['protection'] = protection
+    (scratch / 'native-smoke-result.json').write_text(json.dumps(result))
 
 home = scratch / 'home'
 state = scratch / 'state'
@@ -122,6 +132,30 @@ async def main():
     platform = Platform('hermes_feishu_pm')
     config = PlatformConfig(enabled=True, extra={'app_id': 'cli_fixture', 'app_secret': 'synthetic-unused-secret',
         'require_mention': False, 'default_group_policy': 'open', 'allow_bots': 'none'})
+    protection_case = os.environ.get('HERMES_TEST_OWNED_PROTECTION_CASE')
+    if protection_case == 'missing_helper':
+        (scratch / 'sdk' / 'hermes_native_log_privacy.py').unlink()
+    elif protection_case == 'factory_changed':
+        import logging
+        logging.setLogRecordFactory(logging.LogRecord)
+    elif protection_case == 'signal_changed':
+        import signal
+        signal.signal(signal.SIGUSR2, signal.SIG_IGN)
+    elif protection_case == 'console_changed':
+        fd = os.open(scratch / 'synthetic-console.log', os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.dup2(fd, 1)
+        finally:
+            os.close(fd)
+    if protection_case and protection_case != 'connect_factory_changed':
+        assert runner._create_adapter(platform, config) is None
+        assert not (state / 'manager.sqlite3').exists()
+        assert not runner.budget_sources
+        assert plugins.unload('ghost-hermes-pm')
+        if protection_case == 'console_changed':
+            assert (scratch / 'synthetic-console.log').read_bytes() == b''
+        passed('refused')
+        return
     if os.environ.get('HERMES_TEST_OWNED_ARTIFACT_MISMATCH') == '1':
         # Only this disposable SDK copy is changed; runtime code has no test flag.
         artifact = scratch / 'sdk' / 'gateway' / 'profile_routing.py'
@@ -130,10 +164,21 @@ async def main():
         assert not (state / 'manager.sqlite3').exists()
         assert not runner.budget_sources
         plugins.unload('ghost-hermes-pm')
-        print('native load, Dashboard bridge, restart, teardown: OK')
+        passed()
         return
     adapter = runner._create_adapter(platform, config)
     assert adapter is not None and adapter.platform is platform
+    if protection_case == 'connect_factory_changed':
+        import logging
+        logging.setLogRecordFactory(logging.LogRecord)
+        assert await adapter.connect(is_reconnect=True) is False
+        assert adapter.fatal_error_code == 'native_log_privacy_unavailable'
+        assert adapter._ws_client is None and adapter._running is False
+        assert not (state / 'manager.sqlite3').exists()
+        assert not runner.budget_sources
+        assert plugins.unload('ghost-hermes-pm')
+        passed('refused')
+        return
     runner.adapters[platform] = adapter
     runner._wire_adapter_handlers(adapter)
     async def chat_info(chat_id): return {'name': 'Synthetic chat', 'type': 'group'}
@@ -176,7 +221,7 @@ async def main():
         from ghost_hermes_pm import Manager, VerifiedIdentity
         with Manager(state, owner_identity_ref='fixture:owner') as stopped:
             assert stopped.read_snapshot(VerifiedIdentity('fixture:owner', 'fixture-audit'))['requests'] == []
-        print('native load, Dashboard bridge, restart, teardown: OK')
+        passed()
         return
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'issue_queue':
         from concurrent.futures import ThreadPoolExecutor
@@ -212,7 +257,7 @@ async def main():
         release.set()
         await asyncio.wait_for(pending, timeout=6)
         assert calls == [] and not sent and not (state / 'manager.sock').exists()
-        print('native load, Dashboard bridge, restart, teardown: OK')
+        passed()
         return
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'issue':
         started, release = asyncio.Event(), asyncio.Event()
@@ -231,7 +276,7 @@ async def main():
         from ghost_hermes_pm import Manager, VerifiedIdentity
         with Manager(state, owner_identity_ref='fixture:owner') as stopped:
             assert stopped.read_snapshot(VerifiedIdentity('fixture:owner', 'fixture-audit'))['requests'] == []
-        print('native load, Dashboard bridge, restart, teardown: OK')
+        passed()
         return
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') in {'failure_replay', 'failure_optional'}:
         await adapter._handle_message_event_data(raw('om_seed', 15))
@@ -254,7 +299,7 @@ async def main():
         failure = client.read_snapshot()['intake_failures']
         assert len(failure) == 1 and failure[0]['source_anchor']['thread_id'] is None
         assert plugins.unload('ghost-hermes-pm')
-        print('native load, Dashboard bridge, restart, teardown: OK')
+        passed()
         return
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'send':
         transport = next(t for a, t in adapter.intake.transports if a is adapter)
@@ -277,7 +322,7 @@ async def main():
         with Manager(state, owner_identity_ref='fixture:owner') as stopped:
             record = stopped.read_snapshot(VerifiedIdentity('fixture:owner', 'fixture-audit'))['requests'][0]
             assert record['delivery'] == 'unknown' and record['task_start_anchor'] is None
-        print('native load, Dashboard bridge, restart, teardown: OK')
+        passed()
         return
     await adapter._handle_message_event_data(raw('om_one', 15))
     await adapter._handle_message_event_data(raw('om_two', 16))
@@ -431,7 +476,7 @@ async def main():
             assert not adapter._running and adapter._ws_supervisor is None and adapter._app_lock_identity is None
             assert sockets[0][1].closed and sockets[0][0]._auto_reconnect is False
             assert not (state / 'manager.sock').exists()
-        print('native load, Dashboard bridge, restart, teardown: OK')
+        passed()
         return
     with patch.object(SdkHTTP, 'execute', side_effect=sdk_http), patch.object(SdkWebSocket, 'start', return_value=None):
         assert await adapter.connect() is True
@@ -451,6 +496,6 @@ async def main():
     assert not platform_registry.is_registered('hermes_feishu_pm')
     assert await adapter.connect(is_reconnect=True) is False
     assert adapter.fatal_error_code == 'intake_closed'
-    print('native load, Dashboard bridge, restart, teardown: OK')
+    passed()
 
 asyncio.run(main())

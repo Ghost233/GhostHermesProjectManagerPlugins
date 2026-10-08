@@ -27,6 +27,7 @@ def audit(event, args):
         raise RuntimeError('Owned smoke refused launch/model imports.')
 sys.addaudithook(audit)
 
+import hermes_bootstrap  # noqa: F401
 import asyncio
 import json
 import subprocess
@@ -227,6 +228,6 @@ async def main():
     await asyncio.sleep(0.05)
     assert sent_count == len(created) + len(replies)
     for runner in runners: runner.stopped.set()
-    print('native load, Dashboard bridge, restart, teardown: OK')
+    (scratch / 'native-smoke-result.json').write_text(json.dumps({'native_smoke': 'passed'}))
 
 asyncio.run(main())

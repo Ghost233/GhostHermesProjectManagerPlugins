@@ -260,7 +260,12 @@ def register_native(ctx):
 
     def owned_factory(config):
         from .owned_feishu import OwnedFeishuAdapter
-        adapter = OwnedFeishuAdapter(config, intake, start_for_gateway, registered_home)
+        try:
+            adapter = OwnedFeishuAdapter(config, intake, start_for_gateway, registered_home)
+        except ManagementError:
+            # Native registry logs factory exceptions with full source paths.
+            # A known admission refusal must stay a generic unavailable result.
+            return None
         adapter.bind_lifecycle(ctx)
         ctx.on_unload(intake.deactivate)
         return adapter

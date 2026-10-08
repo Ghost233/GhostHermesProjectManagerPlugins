@@ -22,6 +22,8 @@ os.environ['HERMES_SKIP_PM_BOOTSTRAP'] = '1'
 os.environ['HERMES_DISABLE_PROJECT_PLUGINS'] = '1'
 os.environ['HERMES_FIXTURE_GITHUB_ACCOUNT'] = 'example-user'
 
+# Consume the gateway host marker before launching any protocol child.
+import hermes_bootstrap  # noqa: F401
 import json
 import subprocess
 import types
@@ -298,4 +300,4 @@ async def exercise_gateway_lifecycle():
     assert preserved.read_text() == 'keep'
 
 asyncio.run(exercise_gateway_lifecycle())
-print('native load, Dashboard bridge, restart, teardown: OK')
+(scratch / 'native-smoke-result.json').write_text(json.dumps({'native_smoke': 'passed'}))

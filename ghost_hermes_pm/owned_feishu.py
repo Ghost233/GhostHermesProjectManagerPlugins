@@ -3,7 +3,6 @@ from dataclasses import replace
 from pathlib import Path
 import logging
 from collections import OrderedDict
-import hashlib
 import inspect
 from importlib.metadata import version
 import asyncio
@@ -16,23 +15,21 @@ from plugins.platforms.feishu.adapter import FeishuAdapter
 
 from .manager import ManagementError, VerifiedIdentity
 from .messages import OWNED_PLATFORM
+from .sdk_contract import SDK_REVISION, SDK_BASE_FILES, SDK_PRIVACY_FILES, source_files_match
 
 logger = logging.getLogger(__name__)
-SDK_REVISION = 'bd0affe5e5f723579df8902852f5d0c47795f355'
-_PINNED_FILES = {
-    'plugins/platforms/feishu/adapter.py': '2dcbaa98e9801c2ac0e10b4cf7436e778f6d38fe98d5a585e995700f80147afc',
-    'gateway/platforms/base.py': '8657cab37e6e481a7f7893d975c623a24500a216ccf82a1bdf35e473b04a357b',
-    'gateway/authz_mixin.py': '2f5b9507cd7fc3d5d559c005ec32317ec6f4aec5479cf89108c7c9d4ca5cd884',
-    'gateway/session_identity.py': '9ad91ff2ae1bbce835b6a44c0926d0bbf56c15c91a81c5d595c16f561a0d4d7c',
-    'gateway/run.py': 'd0ea287688b45a6e0b67e0bbb0487cd44dff2f434aab628b7e087c951bbb9a54',
-    'gateway/profile_routing.py': 'e399603aa627b2794a5723fcafbf1eac5531617dacd0ab8aa0a2e5fdf70c75f4',
-    'gateway/run_adapters.py': 'dfb882f4e90e82b3543b1c994671245ba27ab6fbff585bb8b965fef696ac2514',
-    'gateway/platform_registry.py': '40c0e47d43462bf174e058189cbb305d88b42e1cd2ca4c3f16fd42656ac76c9e',
-    'gateway/config.py': '93fecbfbfc6f09b710aadbd266668f99281ffa567680bf7f9dedbc124e9fb45e',
-    'gateway/session.py': 'd274960c58869d456d0063358a8143562ccdbe9471d996e99841275789c4e998',
-    'agent/secret_scope.py': '5f2584dc93be49ef7e4de23f9f92a4abd05aa42aab8fc2fac40f54f9f8b9c664',
-    'hermes_cli/plugins.py': '31c99f61f61732557bb84429d014e943d2d51a753b2541ab5de3b196a893bf9a',
-}
+
+def _native_protection_verified(manager_home):
+    try:
+        sdk_root = Path(inspect.getfile(FeishuAdapter)).resolve().parents[3]
+        if version('lark-oapi') != '1.6.8' or not source_files_match(sdk_root, {**SDK_BASE_FILES, **SDK_PRIVACY_FILES}):
+            return False
+        import hermes_native_log_privacy
+        if Path(inspect.getfile(hermes_native_log_privacy)).resolve() != sdk_root / 'hermes_native_log_privacy.py':
+            return False
+        return hermes_native_log_privacy.protected_profile_logging_active(manager_home) is True
+    except Exception:
+        return False
 
 
 class OwnedFeishuAdapter(FeishuAdapter):
@@ -40,9 +37,8 @@ class OwnedFeishuAdapter(FeishuAdapter):
         self.intake, self.ensure_manager, self.manager_home = intake, ensure_manager, manager_home
         if intake.settings.get('enabled') is not True or not intake.settings.get('verification_ref') or manager_home is None:
             raise ManagementError('unavailable', 'Owned Feishu intake is not enabled by trusted management configuration.')
-        sdk_root = Path(inspect.getfile(FeishuAdapter)).resolve().parents[3]
-        if version('lark-oapi') != '1.6.8' or any(hashlib.sha256((sdk_root / path).read_bytes()).hexdigest() != digest for path, digest in _PINNED_FILES.items()):
-            raise ManagementError('unavailable', 'Owned Feishu private compatibility differs from the pinned SDK; intake stays disabled.')
+        if not _native_protection_verified(manager_home):
+            raise ManagementError('unavailable', 'Owned intake requires the fixed native SDK and active log protection; intake stays disabled.') from None
         extra = dict(config.extra or {})
         if not extra.get('app_id') or not extra.get('app_secret'):
             raise ManagementError('invalid_change', 'Configure this new platform with explicit native app credentials.')
@@ -87,6 +83,9 @@ class OwnedFeishuAdapter(FeishuAdapter):
     async def connect(self, *, is_reconnect=False):
         if self.intake.closed or self._close_requested:
             self._set_fatal_error('intake_closed', 'The plugin owner is unloaded; reconnect was not attempted.', retryable=False)
+            return False
+        if not _native_protection_verified(self.manager_home):
+            self._set_fatal_error('native_log_privacy_unavailable', 'Native log protection could not be verified; connection was not attempted.', retryable=False)
             return False
         runner = self.gateway_runner
         adapters = list(getattr(runner, 'adapters', {}).values())
