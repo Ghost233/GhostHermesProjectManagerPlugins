@@ -1,11 +1,27 @@
 """Synthetic 0.160.1 JSONL peer, never a real service acceptance result."""
 import json
 import os
-import sqlite3
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+sys.path.insert(0, os.environ.get('HERMES_FIXTURE_PLUGIN_ROOT', str(Path(__file__).resolve().parents[1])))
+from ghost_hermes_pm import VerifiedIdentity
+from ghost_hermes_pm.snapshots import SnapshotReader
+reader = SnapshotReader(root / 'state', owner_identity_ref='fixture:owner')
+identity = VerifiedIdentity('fixture:owner', 'owned-original-service-public-observer')
+
+def committed_requests(method):
+    snapshot = reader.read_snapshot(identity)
+    with (root / 'public-snapshots.jsonl').open('a') as log:
+        log.write(json.dumps({'method': method, 'snapshot': snapshot}) + '\n')
+    return snapshot['requests']
+
+def require(condition, requirement, method):
+    with (root / 'oracle-events.jsonl').open('a') as log:
+        log.write(json.dumps({'method': method, 'requirement': requirement, 'satisfied': bool(condition)}) + '\n')
+    assert condition, requirement
+
 thread_id = '00000000-0000-7000-8000-000000000016'
 turn_id = '00000000-0000-7000-8000-000000000017'
 thread = None
@@ -39,11 +55,10 @@ for line in sys.stdin:
                  'activePermissionProfile': {'id': params['permissions'], 'extends': ':read-only'},
                  'runtimeWorkspaceRoots': params['runtimeWorkspaceRoots']}
     elif method == 'turn/start':
-        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
-            payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
-        assert any(r.get('session', {}).get('thread_id') == thread_id for r in payload['requests'].values()), 'thread must be durable before turn/start'
+        records = committed_requests(method)
+        require(any(r.get('session', {}).get('thread_id') == thread_id for r in records), 'thread must be durable before turn/start', method)
         if params.get('clientUserMessageId'):
-            assert any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in payload['requests'].values() for c in r.get('controls', []))
+            require(any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in records for c in r.get('controls', [])), 'control intent must be durable before original input RPC', method)
             turn_sequence += 1
             turn_id = '00000000-0000-7000-8000-' + str(turn_sequence).zfill(12)
         value = {'turn': {'id': turn_id, 'status': 'inProgress', 'items': [], 'itemsView': 'full'}}
@@ -53,9 +68,8 @@ for line in sys.stdin:
         if behavior.get('steer_active_turn'):
             turn_id = behavior['steer_active_turn']
             thread['turns'] = [{'id': turn_id, 'status': 'inProgress', 'itemsView': 'full', 'items': []}]
-        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
-            payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
-        assert any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in payload['requests'].values() for c in r.get('controls', []))
+        records = committed_requests(method)
+        require(any(c.get('phase') == 'rpc_intent' and c.get('id') == params['clientUserMessageId'] for r in records for c in r.get('controls', [])), 'control intent must be durable before original input RPC', method)
         if params['threadId'] != thread_id or params['expectedTurnId'] != turn_id:
             print(json.dumps({'id': request['id'], 'error': {'code': -32000, 'message': 'Wrong active turn'}}), flush=True)
             continue
@@ -63,9 +77,8 @@ for line in sys.stdin:
             applied.write(json.dumps({'thread_id': thread_id, 'turn_id': turn_id, 'instruction_id': params['clientUserMessageId']}) + '\n')
         value = {'turnId': turn_id}
     elif method == 'turn/interrupt':
-        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
-            payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
-        assert any(r.get('stop', {}).get('status') == 'processing' for r in payload['requests'].values())
+        records = committed_requests(method)
+        require(any(r.get('stop', {}).get('status') == 'processing' for r in records), 'stop intent must be durable before interrupt', method)
         value = {}
     elif method == 'thread/backgroundTerminals/list':
         pages = json.loads((root / 'background.json').read_text()) if (root / 'background.json').exists() else {'': {'data': [], 'nextCursor': None}}

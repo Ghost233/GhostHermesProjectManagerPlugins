@@ -238,31 +238,17 @@ class Manager:
         return version, data
 
     def _principal(self, identity, data):
-        if not isinstance(identity, VerifiedIdentity) or not identity.source:
-            raise ManagementError('unauthorized', 'A verified entry identity is required.')
-        if identity.subject == self.owner_identity_ref:
-            return None
-        profile = next((p for p in data['profiles'].values() if p['identity_ref'] == identity.subject), None)
-        if profile is None:
-            raise ManagementError('unauthorized', 'Identity is not registered.')
-        return profile
+        from .snapshots import principal
+        return principal(identity, data, self.owner_identity_ref)
 
-    def read_snapshot(self, identity, scope=None):
+    def read_snapshot(self, identity, scope=None, *, committed=False):
+        if committed:
+            from .snapshots import SnapshotReader
+            return SnapshotReader(self.state_dir, owner_identity_ref=self.owner_identity_ref, sensitive_values=self._sensitive_values).read_snapshot(identity, scope)
         with self._lock:
             version, data = self._load()
-            principal = self._principal(identity, data)
-            projects = list(data['projects'].values())
-            profiles = list(data['profiles'].values())
-            if principal and principal['role'] != 'steward':
-                visible = self._visible_profile_ids(principal, data)
-                profiles = [p for p in profiles if p['id'] in visible]
-                project_ids = {p['project_id'] for p in profiles if p['project_id'] is not None}
-                projects = [p for p in projects if p['id'] in project_ids]
-            if scope is not None:
-                projects = [p for p in projects if p['id'] == scope]
-                profiles = [p for p in profiles if p['project_id'] == scope]
-            visible_ids = {p['id'] for p in profiles}
-            requests = [r for r in data['requests'].values() if r['profile_id'] in visible_ids]
+            from .snapshots import directory_view
+            principal, projects, profiles, requests, visible_ids = directory_view(identity, self.owner_identity_ref, data, scope)
             for request in requests:
                 capability = request.get('execution_capability', {})
                 if capability.get('enabled'):
@@ -826,14 +812,8 @@ class Manager:
             return {'status': 'completed', 'request': record}
 
     def _visible_profile_ids(self, principal, data):
-        visible = {principal['id']}
-        if principal['role'] == 'project_lead':
-            while True:
-                expanded = visible | {p['id'] for p in data['profiles'].values() if p.get('parent_profile_id') in visible}
-                if expanded == visible:
-                    break
-                visible = expanded
-        return visible
+        from .snapshots import visible_profile_ids
+        return visible_profile_ids(principal, data)
 
     def _authorize_change(self, principal, kind, candidate, data):
         if principal is None:
