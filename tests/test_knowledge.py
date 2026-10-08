@@ -375,17 +375,33 @@ import pytest
 
 @pytest.mark.parametrize('state', ['idle', 'wrong_turn', 'stopping', 'returned', 'observe_only', 'disconnected'])
 def test_late_ended_returned_or_uncontrolled_material_never_starts_or_steers(tmp_path, state):
-    import sqlite3
     from test_directory import make_repo
     from test_task_execution import accepted, adapter_for
     from test_task_control import TURN, wire
     provider = local_provider(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), knowledge_providers={'local:fixture-wiki': provider}) as manager:
-        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
-        manager.start_task(OWNER, request_id)
+    repo = make_repo(tmp_path / 'repo')
+    original = {}
+    if state in {'returned', 'observe_only'}:
+        from test_manual_control import adapters, original_state, ORIGINAL_TURN
+        from test_manual_observation import source
+        peer = tmp_path / 'original'
+        original_state(peer, repo)
+        read, control = adapters(peer)
+        original = {'observation_adapters': {'local:manual-daemon': read}, 'control_adapters': {'manual-daemon': control}}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), knowledge_providers={'local:fixture-wiki': provider}, **original) as manager:
+        request_id = accepted(manager, repo)
+        if original:
+            manager.register_observation_source(OWNER, source())
+            observed = manager.refresh_manual_sessions(OWNER)['manual_sessions'][0]
+        else:
+            manager.start_task(OWNER, request_id)
         manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
         with ManagementServer(manager, {'owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'owner')
+            if original:
+                assert client.take_over_session(request_id, observed['id'], 'materials-current-work', ORIGINAL_TURN)['status'] == 'active'
+                if state == 'observe_only':
+                    assert client.return_session_control(request_id, 'materials-current-work')['status'] == 'returned'
             query_id = prepared_result(manager, client, tmp_path, request_id)
             if state == 'idle':
                 (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': []}]}))
@@ -395,17 +411,20 @@ def test_late_ended_returned_or_uncontrolled_material_never_starts_or_steers(tmp
                 client.control_task(request_id, 'stop', 'stop-before-material', expected_turn_id=TURN)
             elif state == 'disconnected':
                 manager.codex_adapter.close()
-            else:
-                # External persisted binding fixture represents #20's future control-return/import boundary.
-                # The behavior is exercised only via public supplement, never a private control helper.
-                with sqlite3.connect(tmp_path / 'state' / 'manager.sqlite3') as db:
-                    payload = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])
-                    payload['requests'][request_id]['session']['control'] = state
-                    db.execute('UPDATE directory SET payload=?', (json.dumps(payload),))
+            elif state == 'returned':
+                assert client.return_session_control(request_id, 'materials-current-work')['status'] == 'returned'
             result = client.supplement_knowledge(query_id)
             assert result['status'] == 'materials_only'
-            methods = [r['method'] for r in wire(tmp_path)]
-            assert methods.count('turn/start') == 1
+            if original:
+                snapshot = client.read_snapshot()
+                assert snapshot['requests'][0]['session']['control'] == 'observe_only'
+                assert snapshot['requests'][0]['repository_released'] is False
+                methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
+                assert methods.count('turn/start') == 0
+                assert not (tmp_path / 'wire.jsonl').exists()
+            else:
+                methods = [r['method'] for r in wire(tmp_path)]
+                assert methods.count('turn/start') == 1
             assert 'turn/steer' not in methods
             assert client.read_snapshot()['knowledge_queries'][0]['materials']
 
