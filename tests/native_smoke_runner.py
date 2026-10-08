@@ -5,6 +5,8 @@ import sys
 
 scratch = Path(sys.argv[1]).resolve()
 real_hermes = Path.home() / '.hermes'
+(scratch / 'os-home').mkdir()
+os.environ['HOME'] = str(scratch / 'os-home')
 
 
 def audit(event, args):
@@ -22,7 +24,7 @@ os.environ['HERMES_SKIP_PM_BOOTSTRAP'] = '1'
 os.environ['HERMES_DISABLE_PROJECT_PLUGINS'] = '1'
 os.environ['HERMES_FIXTURE_GITHUB_ACCOUNT'] = 'example-user'
 
-# Consume the gateway host marker before launching any protocol child.
+# Load the original SDK before launching any protocol child.
 import hermes_bootstrap  # noqa: F401
 import json
 import subprocess
@@ -175,12 +177,12 @@ async def exercise_gateway_lifecycle():
     assert all(capability['status'] == 'unknown' for capability in observation['manual_capabilities']), observation
     task_rejection = json.loads(registry.dispatch('hermes_pm_task', {'action': 'verify', 'request_id': 'unknown'}, scope=str(home)))
     assert task_rejection['status'] == 'rejected' and task_rejection['code'] == 'invalid_change'
-    from lark_oapi import Client
+    from feishu_service_support import service_client, connect_service, receive
     from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse, GetChatResponse, GetMessageResponse
     from gateway.session import SessionSource
     from gateway.config import Platform
     from gateway.platforms.event import MessageEvent
-    native = Client.builder().app_id('cli_fixture').app_secret('synthetic-unused-secret').build()
+    native = service_client('cli_fixture')
     sent = []
     native.request = lambda request: types.SimpleNamespace(code=0, raw=types.SimpleNamespace(
         content=b'{"code":0,"bot":{"open_id":"ou_lead","activate_status":2}}'))
@@ -198,9 +200,7 @@ async def exercise_gateway_lifecycle():
     gateway._wire_adapter_handlers(gateway.adapter)
     async def chat_info(chat_id): return {'name': 'Synthetic chat', 'type': 'group'}
     gateway.adapter.get_chat_info = chat_info
-    factories = manager.get_platform_handler_factories('hermes_feishu_pm')
-    assert len(factories) == 1
-    factories[0][0](native, gateway.adapter)
+    await connect_service(gateway.adapter, native)
     native.im.v1.chat.get = lambda request: GetChatResponse({'code': 0, 'data': {'tenant_key': 'tenant-bot'}})
     def channel_message(request):
         delivery = request.message_id == 'om_channel_delivery'
@@ -224,7 +224,7 @@ async def exercise_gateway_lifecycle():
                                             'id': {'open_id': 'ou_lead'}}]}}})
     inbound = MessageEvent(text='normalized fixture', source=source, message_id='om_inbound', raw_message=raw)
     assert await ainvoke_hook('pre_gateway_dispatch', event=inbound, gateway=gateway) == []
-    await gateway.adapter._handle_message_event_data(raw)
+    await receive(gateway.adapter, raw)
     assert gateway.authorized_source._transport_adapter_ref() is gateway.adapter
     assert gateway.authorized_source.message_id == source.message_id
     accepted = browser.get(base + '/snapshot', headers=headers).json()
@@ -233,7 +233,7 @@ async def exercise_gateway_lifecycle():
     assert sent[0].message_id == 'om_inbound' and sent[1].message_id == 'om_native_1'
     assert json.loads(sent[0].request_body.content)['zh_cn']['content'][0][0] == {'tag': 'at', 'user_id': 'ou_owner'}
     assert await ainvoke_hook('pre_gateway_dispatch', event=inbound, gateway=gateway) == []
-    await gateway.adapter._handle_message_event_data(raw)
+    await receive(gateway.adapter, raw)
     assert len(sent) == 4, 'Duplicate receive must not resend acknowledged segments.'
     from ghost_hermes_pm.transport import ManagementClient
     owner_client = ManagementClient(state, 'synthetic-owner-credential')
@@ -248,23 +248,23 @@ async def exercise_gateway_lifecycle():
         assert error.code == 'capability_unverified', error
     else:
         raise AssertionError('Actual native host must retain missing physical boundary proof gate.')
-    from lark_oapi.core.http.transport import Transport as SDKHttp
-    from lark_oapi.core.model import RawResponse
+    import requests
+    from urllib.parse import urlparse
     archive_calls = []
-    def archive_http(conf, request, option=None):
-        archive_calls.append(request.uri)
-        if '/auth/' in request.uri:
+    def archive_http(method, url, **kwargs):
+        uri = urlparse(url).path
+        archive_calls.append(uri)
+        if '/auth/' in uri:
             body = {'code': 0, 'tenant_access_token': 'synthetic-token', 'expire': 3600}
-        elif '/bot/' in request.uri:
+        elif '/bot/' in uri:
             body = {'code': 0, 'bot': {'open_id': 'ou_archive', 'activate_status': 2}}
-        elif '/tenant/' in request.uri:
+        elif '/tenant/' in uri:
             body = {'code': 0, 'data': {'tenant': {'tenant_key': 'tenant-archive'}}}
         else:
-            assert request.uri == '/open-apis/im/v1/messages', request.uri
+            assert uri == '/open-apis/im/v1/messages', uri
             body = {'code': 0, 'data': {'has_more': False, 'items': [{'message_id': 'om_original', 'chat_id': 'oc_archive', 'deleted': False, 'body': {'content': '{"text":"Original remote requirement"}'}}]}}
-        response = RawResponse(); response.status_code = 200; response.headers = {'Content-Type': 'application/json'}; response.content = json.dumps(body).encode()
-        return response
-    SDKHttp.execute = archive_http
+        return types.SimpleNamespace(status_code=200, headers={'Content-Type': 'application/json'}, content=json.dumps(body).encode())
+    requests.request = archive_http
     owner_client.apply_directory_change(owner_client.read_snapshot()['version'], {'profile': {'id': 'wiki', 'native_profile': 'wiki', 'identity_ref': 'fixture:wiki', 'role': 'independent', 'capability': 'non_development'}})
     owner_client.register_knowledge_source(owner_client.read_snapshot()['version'], {'id': 'original-archive-grant', 'name': 'Explicit original remote source', 'provider_ref': 'local:original-remote', 'wiki_profile_id': 'wiki', 'query_subjects': {'fixture:lead': ['public']}, 'public_channels': [], 'task_profiles': [], 'wiki_bindings': []})
     owner_client.register_archive_source({'id': 'original-remote', 'kind': 'feishu_remote', 'provider_ref': 'local:original-remote', 'grant_source_id': 'original-archive-grant', 'new_profile_id': 'lead', 'scope_ids': ['public'], 'authorization_ref': 'owner:explicit-original-archive'})

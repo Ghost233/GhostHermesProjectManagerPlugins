@@ -33,7 +33,7 @@ import json
 import subprocess
 import types
 import yaml
-from lark_oapi import Client
+from feishu_service_support import service_client, connect_service, receive
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse, CreateMessageResponse
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
@@ -129,7 +129,7 @@ async def main():
         runner._wire_adapter_handlers(adapter)
         async def chat_info(chat_id): return {'name': 'Synthetic role chat', 'type': 'group'}
         adapter.get_chat_info = chat_info
-        native = Client.builder().app_id(own[0]['app_id']).app_secret('synthetic-unused-secret').build()
+        native = service_client(own[0]['app_id'])
         native.request = lambda request, c=own[0]: types.SimpleNamespace(code=0, raw=types.SimpleNamespace(content=json.dumps({'code': 0, 'bot': {'open_id': c['recipient_open_id'], 'activate_status': 2}}).encode()))
         def create(request, profile=profile):
             created.append((profile, request))
@@ -143,7 +143,7 @@ async def main():
             delivered_chats[message_id] = chat_id
             return ReplyMessageResponse({'code': 0, 'data': {'message_id': message_id, 'chat_id': chat_id, 'parent_id': request.message_id}})
         native.im.v1.message.create, native.im.v1.message.reply = create, reply
-        plugins.get_platform_handler_factories('hermes_feishu_pm')[0][0](native, adapter)
+        await connect_service(adapter, native)
         runners.append(runner); adapters.append(adapter); clients.append(native)
     await plugins.ainvoke_hook('pre_gateway_dispatch', event=object(), gateway=runners[0])
     owner = ManagementClient(state, 'synthetic-owner-credential')
@@ -155,20 +155,20 @@ async def main():
     owner.collaborate('register_channels', {'channels': channels})
     incoming = raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_owner_goal')
     runners[0].authorized = False
-    await adapters[0]._handle_message_event_data(incoming)
+    await receive(adapters[0], incoming)
     assert not owner.read_snapshot()['collaboration']['handoffs'] and not created
     runners[0].authorized = True; runners[0].budget = False
-    await adapters[0]._handle_message_event_data(raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_budget_denied'))
+    await receive(adapters[0], raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_budget_denied'))
     assert not owner.read_snapshot()['collaboration']['handoffs'] and not created
     runners[0].budget = True
-    await adapters[0]._handle_message_event_data(raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_owner_goal_valid'))
+    await receive(adapters[0], raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_owner_goal_valid'))
     h = owner.read_snapshot()['collaboration']['handoffs'][0]
     assert len(created) == 1 and h['acceptance'] == 'awaiting_receiver' and owner.read_snapshot()['requests'] == []
     request = created[0][1]
     post = json.loads(request.request_body.content)['zh_cn']['content'][0]
     assert post[0] == {'tag': 'at', 'user_id': 'lead-seen-steward'}
     original_bot = raw(channels[2], h['segments'][0]['text'], 'om_cross_1', bot=True)
-    await adapters[1]._handle_message_event_data(original_bot)
+    await receive(adapters[1], original_bot)
     snapshot = owner.read_snapshot()
     assert snapshot['collaboration']['handoffs'][0]['acceptance'] == 'accepted', snapshot
     assert snapshot['requests'][0]['task_start_anchor']['message_id'] == 'om_ack_1'
@@ -176,7 +176,7 @@ async def main():
     assert any(s.is_bot is True for s in runners[1].auth_sources) and any(s.is_bot is True for s in runners[1].budget_sources)
     before = len(runners[1].budget_sources)
     adapters[1]._committed.clear()
-    await adapters[1]._handle_message_event_data(original_bot)
+    await receive(adapters[1], original_bot)
     assert len(runners[1].budget_sources) == before and len(owner.read_snapshot()['requests']) == 1
     task = owner.read_snapshot()['requests'][0]
     current = workspace(owner.read_snapshot()['projects'][0]['repo'])
@@ -210,10 +210,10 @@ async def main():
     assert alert['target_channel']['chat_id'] == 'oc_entry' and actual.message_id != task['task_start_anchor']['message_id']
     incoming = raw(channels[0], '回答 ' + alert['human_request_id'] + '：Blue', 'om_owner_answer')
     runners[0].budget = False
-    await adapters[0]._handle_message_event_data(incoming)
+    await receive(adapters[0], incoming)
     assert owner.read_snapshot()['requests'][0]['human_requests'][0]['reply'] is None
     runners[0].budget = True
-    await adapters[0]._handle_message_event_data(raw(channels[0], '回答 ' + alert['human_request_id'] + '：Blue', 'om_owner_answer_valid'))
+    await receive(adapters[0], raw(channels[0], '回答 ' + alert['human_request_id'] + '：Blue', 'om_owner_answer_valid'))
     resolved = await wait_for(lambda s: s['requests'][0]['human_requests'][0]['resolution'] == 'resolved')
     assert resolved['requests'][0]['human_requests'][0]['reply']['source_anchor']['chat_id'] == 'oc_entry'
     clock[0] += 3600

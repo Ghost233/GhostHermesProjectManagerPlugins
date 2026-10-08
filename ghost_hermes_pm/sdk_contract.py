@@ -1,4 +1,4 @@
-"""Immutable reviewed native source contract; no runtime SDK patching."""
+"""Reviewed unmodified SDK source metadata for compatibility and test evidence."""
 import hashlib
 from pathlib import Path
 from types import MappingProxyType
@@ -27,19 +27,6 @@ SDK_BASE_FILES = MappingProxyType({
     'hermes_startup_watchdog.py': 'e06cb9b7cc1f847766d7aa495f78f97ed190103235b88c7c9bdc643e44469daa',
     'agent/agent_runtime_helpers.py': '5a1d8f87f8904fa84f2df724767da055c03567d96c753d304b1e985fbdbd2755',
     'hermes_cli/gateway_launchd.py': '84783849b0a9497a43c0e5e70db79cd530c479508d71e8ca0acf6e152ceb8358',
-})
-SDK_PRIVACY_PATCH_SHA256 = 'ae80f01ce8c72bfa829a37ec4073b07389965308045dd974ae40bc3a35aaca4b'
-SDK_PRIVACY_FILES = MappingProxyType({
-    'hermes_bootstrap.py': '4b1bd1330ed64b8906d41fbe971db44217cc91cf5edef89fc96aee97a8bd9a16',
-    'hermes_logging.py': '49112587f4c0428c2f553f9eba789c5992db19c313f92343e444340e69c867f2',
-    'gateway/run.py': '3ea5e65027768d19c2d54ba235df2444ea577efe7bd5e138e5d81d04857b65d7',
-    'gateway/run_startup.py': '8620ef0fe04bdb1b9aebf99658879538e16518345219cd4c93aa5d496406154a',
-    'gateway/shutdown_forensics.py': '4fa5796993b9578a65cb1ec74b5fa1c0a44dd9b9234d83e8e031df35e840093e',
-    'gateway/shutdown_watchdog.py': '7722f5f3dabfc430eadc46f3288baba455208149254277709e5e41b485916571',
-    'hermes_startup_watchdog.py': 'c858175a62a7961b227f23d97434b6a9cad14f4aea42b8b261461b7c0c6515ec',
-    'agent/agent_runtime_helpers.py': '9e0e4c17e444fc2c81d53afd8c69414c3c7bdda894b96266d05ed15b1362319e',
-    'hermes_cli/gateway_launchd.py': 'f63d6cd83947ffad37fca73c8e587a7be36a928019042de82e0496fe097ab0cc',
-    'hermes_native_log_privacy.py': '4064ba396c3a4ffd45dd712252cf709d82547cf3584bfcbd05093aa14762de11',
 })
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from .manager import Manager, ManagementError, VerifiedIdentity
 from .transport import ManagementClient, ManagementServer
 from .messages import FeishuEntry, OWNED_PLATFORM
-from .feishu import NativeFeishuTransport, read_github_issue
+from .feishu import read_github_issue
 
 PLUGIN_ID = 'ghost-hermes-pm'
 
@@ -53,7 +53,6 @@ def register_native(ctx):
                          ctx.get_config('feishu_intake', {}), configured_issue_source,
                          collaboration_identity_ref=ctx.get_config('collaboration_identity_ref'),
                          collaboration_client=collaboration_client if ctx.get_config('collaboration_credential_ref') else None)
-    ctx.register_platform_handler(OWNED_PLATFORM, lambda native, adapter: intake.attach_transport(adapter, NativeFeishuTransport(native)))
     if state_dir and (ctx.get_config('participant_credential_ref') or (manager_profile and owner)):
         runtime = 'manager_unavailable'
     from hermes_constants import get_hermes_home

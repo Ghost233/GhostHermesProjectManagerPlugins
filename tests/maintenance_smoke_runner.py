@@ -28,10 +28,13 @@ plugin = home / 'plugins' / 'ghost-hermes-pm'
 settings = {'manager_profile': 'default', 'state_dir': str(state), 'owner_identity_ref': 'fixture:owner',
             'dashboard_credential_ref': 'native:HERMES_FIXTURE_OWNER_TOKEN'}
 (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
-sdk = scratch / 'sdk'
-# Package the already verified fixed source into this disposable runtime using
-# the SDK's public build-stamp writer, never a production install/version claim.
-subprocess.run([sys.executable, str(sdk / 'scripts' / 'write_install_stamp.py'), '--output', str(sdk / 'install-stamp.json'),
+sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])
+# The original SDK's public sealed-install path carries only this synthetic
+# provenance stamp; the executing source tree remains unchanged.
+install_metadata = scratch / 'install-metadata'
+install_metadata.mkdir()
+os.environ['HERMES_INSTALL_ROOT'] = str(install_metadata)
+subprocess.run([sys.executable, str(sdk / 'scripts' / 'write_install_stamp.py'), '--output', str(install_metadata / 'install-stamp.json'),
                 '--commit', os.environ['HERMES_TEST_SDK_COMMIT'], '--base-version', '0.21.5', '--distance', '0',
                 '--source', 'local', '--update-mechanism', 'external'], check=True, capture_output=True, env=os.environ)
 sys.path.insert(0, str(plugin))

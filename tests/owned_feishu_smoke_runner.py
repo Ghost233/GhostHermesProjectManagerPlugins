@@ -1,4 +1,4 @@
-"""Actual fixed Gateway/adapter/Lark pipeline in the staged artificial runtime."""
+"""Unmodified Gateway SDK with plugin-owned Feishu intake and external service fixtures."""
 import os
 import sys
 from pathlib import Path
@@ -27,14 +27,14 @@ def audit(event, args):
         raise RuntimeError('Owned smoke refused launch/model imports.')
 sys.addaudithook(audit)
 
-# Privacy bootstrap precedes native/SDK imports.
+# Load the original SDK without any preparation or host logging changes.
 import hermes_bootstrap  # noqa: F401
 import asyncio
 import json
 import subprocess
 import types
 import yaml
-from lark_oapi import Client
+from feishu_service_support import service_client, connect_service, receive
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse
 from gateway.config import Platform, PlatformConfig, GatewayConfig
 from gateway.run import GatewayRunner
@@ -48,7 +48,7 @@ from gateway.platform_registry import platform_registry
 
 
 def passed(protection=None):
-    # Protected gateway console descriptors remain closed, including on success.
+    # Report only a synthetic result through the private test artifact.
     result = {'native_smoke': 'passed'}
     if protection:
         result['protection'] = protection
@@ -131,59 +131,14 @@ async def main():
     runner.stopped = asyncio.Event()
     platform = Platform('hermes_feishu_pm')
     config = PlatformConfig(enabled=True, extra={'app_id': 'cli_fixture', 'app_secret': 'synthetic-unused-secret',
-        'require_mention': False, 'default_group_policy': 'open', 'allow_bots': 'none'})
-    protection_case = os.environ.get('HERMES_TEST_OWNED_PROTECTION_CASE')
-    if protection_case == 'missing_helper':
-        (scratch / 'sdk' / 'hermes_native_log_privacy.py').unlink()
-    elif protection_case == 'factory_changed':
-        import logging
-        logging.setLogRecordFactory(logging.LogRecord)
-    elif protection_case == 'signal_changed':
-        import signal
-        signal.signal(signal.SIGUSR2, signal.SIG_IGN)
-    elif protection_case == 'console_changed':
-        fd = os.open(scratch / 'synthetic-console.log', os.O_CREAT | os.O_WRONLY, 0o600)
-        try:
-            os.dup2(fd, 1)
-        finally:
-            os.close(fd)
-    if protection_case and protection_case != 'connect_factory_changed':
-        assert runner._create_adapter(platform, config) is None
-        assert not (state / 'manager.sqlite3').exists()
-        assert not runner.budget_sources
-        assert plugins.unload('ghost-hermes-pm')
-        if protection_case == 'console_changed':
-            assert (scratch / 'synthetic-console.log').read_bytes() == b''
-        passed('refused')
-        return
-    if os.environ.get('HERMES_TEST_OWNED_ARTIFACT_MISMATCH') == '1':
-        # Only this disposable SDK copy is changed; runtime code has no test flag.
-        artifact = scratch / 'sdk' / 'gateway' / 'profile_routing.py'
-        artifact.write_text(artifact.read_text() + '\n# artificial unsupported artifact revision\n')
-        assert runner._create_adapter(platform, config) is None
-        assert not (state / 'manager.sqlite3').exists()
-        assert not runner.budget_sources
-        plugins.unload('ghost-hermes-pm')
-        passed()
-        return
+        'require_mention': True, 'default_group_policy': 'open', 'allow_bots': 'none'})
     adapter = runner._create_adapter(platform, config)
     assert adapter is not None and adapter.platform is platform
-    if protection_case == 'connect_factory_changed':
-        import logging
-        logging.setLogRecordFactory(logging.LogRecord)
-        assert await adapter.connect(is_reconnect=True) is False
-        assert adapter.fatal_error_code == 'native_log_privacy_unavailable'
-        assert adapter._ws_client is None and adapter._running is False
-        assert not (state / 'manager.sqlite3').exists()
-        assert not runner.budget_sources
-        assert plugins.unload('ghost-hermes-pm')
-        passed('refused')
-        return
     runner.adapters[platform] = adapter
     runner._wire_adapter_handlers(adapter)
     async def chat_info(chat_id): return {'name': 'Synthetic chat', 'type': 'group'}
     adapter.get_chat_info = chat_info
-    native = Client.builder().app_id('cli_fixture').app_secret('synthetic-unused-secret').build()
+    native = service_client('cli_fixture')
     sent = []
     native.request = lambda request: types.SimpleNamespace(code=0, raw=types.SimpleNamespace(
         content=b'{"code":0,"bot":{"open_id":"ou_lead","activate_status":2}}'))
@@ -192,15 +147,40 @@ async def main():
         return ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_sent_' + str(len(sent)),
             'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     native.im.v1.message.reply = reply
-    factories = plugins.get_platform_handler_factories('hermes_feishu_pm')
-    assert len(factories) == 1
-    factories[0][0](native, adapter)
+    await connect_service(adapter, native)
     await plugins.ainvoke_hook('pre_gateway_dispatch', event=object(), gateway=runner)
     from ghost_hermes_pm.transport import ManagementClient
     client = ManagementClient(state, 'synthetic-owner-credential')
     client.apply_directory_change(0, {'enable_profile': 'lead', 'project': {'id': 'mono', 'name': 'Fixture', 'repo_path': str(repo)},
         'profile': {'id': 'lead', 'native_profile': 'fixture-runtime', 'identity_ref': 'fixture:lead',
             'role': 'project_lead', 'capability': 'development', 'project_id': 'mono'}})
+    if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'ordinary':
+        started, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        dispatched = []
+        async def ordinary_handler(event):
+            dispatched.append(event.message_id)
+            started.set()
+            try:
+                await release.wait()
+            finally:
+                cancelled.set()
+        runner._wire_adapter_handlers(adapter, message_handler=ordinary_handler,
+            busy_text_mode='queue', busy_text_timing=(0.2, 0.2))
+        adapter.set_busy_session_handler(None)
+        await receive(adapter, raw('om_ordinary_running', text='@_user_1 普通消息'))
+        await asyncio.wait_for(started.wait(), timeout=3)
+        await receive(adapter, raw('om_ordinary_debounced', text='@_user_1 普通后续'))
+        assert dispatched == ['om_ordinary_running']
+        assert plugins.unload('ghost-hermes-pm')
+        plugins.discover_and_load(force=True)
+        await asyncio.wait_for(cancelled.wait(), timeout=3)
+        release.set()
+        await asyncio.sleep(0.3)
+        assert dispatched == ['om_ordinary_running'], ('Old message dispatched after reload.', dispatched)
+        assert not sent and not adapter.is_connected
+        assert plugins.unload('ghost-hermes-pm')
+        passed()
+        return
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'verify':
         transport = next(t for a, t in adapter.intake.transports if a is adapter)
         verify = transport.verify_identity
@@ -210,7 +190,7 @@ async def main():
             await release.wait()
             return await verify(binding)
         transport.verify_identity = pending_verify
-        pending = asyncio.create_task(adapter._handle_message_event_data(raw('om_unload_pending', 15)))
+        pending = asyncio.create_task(receive(adapter, raw('om_unload_pending', 15)))
         await asyncio.wait_for(started.wait(), timeout=3)
         assert plugins.unload('ghost-hermes-pm')
         assert not (state / 'manager.sock').exists() and adapter.intake.closed
@@ -250,7 +230,7 @@ async def main():
                 return super().submit(function, *args, **kwargs)
         pool = SourceQueue(max_workers=1)
         loop.set_default_executor(pool)
-        pending = asyncio.create_task(adapter._handle_message_event_data(raw('om_queued_issue', 15)))
+        pending = asyncio.create_task(receive(adapter, raw('om_queued_issue', 15)))
         await asyncio.wait_for(queued.wait(), timeout=4)
         assert calls == [] and len(runner.budget_sources) == 1
         assert plugins.unload('ghost-hermes-pm')
@@ -267,7 +247,7 @@ async def main():
             await release.wait()
             return reader(url)
         adapter.intake.issue_reader = pending_issue
-        pending = asyncio.create_task(adapter._handle_message_event_data(raw('om_unload_issue', 15)))
+        pending = asyncio.create_task(receive(adapter, raw('om_unload_issue', 15)))
         await asyncio.wait_for(started.wait(), timeout=3)
         assert plugins.unload('ghost-hermes-pm')
         release.set()
@@ -279,21 +259,21 @@ async def main():
         passed()
         return
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') in {'failure_replay', 'failure_optional'}:
-        await adapter._handle_message_event_data(raw('om_seed', 15))
+        await receive(adapter, raw('om_seed', 15))
         def unknown_notice(request):
             sent.append(request)
             return ReplyMessageResponse({'code': 0, 'data': {}})
         native.im.v1.message.reply = unknown_notice
-        await adapter._handle_message_event_data(raw('om_fail', 18))
+        await receive(adapter, raw('om_fail', 18))
         before = len(sent)
         assert client.read_snapshot()['intake_failures'][0]['notification']['status'] == 'unknown'
         for number in range(33):
-            await adapter._handle_message_event_data(raw('om_thanks_' + str(number), text='谢谢'))
+            await receive(adapter, raw('om_thanks_' + str(number), text='谢谢'))
         budget_before_replay = len(runner.budget_sources)
         replay = raw('om_fail', 18)
         if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'failure_optional':
             replay.event.message.thread_id = ''
-        await adapter._handle_message_event_data(replay)
+        await receive(adapter, replay)
         assert len(sent) == before, 'An evicted original must not resend its unknown durable failure notice.'
         assert len(runner.budget_sources) == budget_before_replay
         failure = client.read_snapshot()['intake_failures']
@@ -312,7 +292,7 @@ async def main():
             await release.wait()
             return await send(segment)
         transport.send = pending_send
-        pending = asyncio.create_task(adapter._handle_message_event_data(raw('om_unload_send', 15)))
+        pending = asyncio.create_task(receive(adapter, raw('om_unload_send', 15)))
         await asyncio.wait_for(started.wait(), timeout=3)
         assert plugins.unload('ghost-hermes-pm')
         release.set()
@@ -324,12 +304,12 @@ async def main():
             assert record['delivery'] == 'unknown' and record['task_start_anchor'] is None
         passed()
         return
-    await adapter._handle_message_event_data(raw('om_one', 15))
-    await adapter._handle_message_event_data(raw('om_two', 16))
+    await receive(adapter, raw('om_one', 15))
+    await receive(adapter, raw('om_two', 16))
     snapshot = client.read_snapshot()
     assert [r['source_anchor']['message_id'] for r in snapshot['requests']] == ['om_one', 'om_two']
     assert [r['accepted_scope']['title'] for r in snapshot['requests']] == ['Scope 15', 'Scope 16']
-    assert len(sent) == 4 and not adapter._pending_text_batches and not runner.cold
+    assert len(sent) == 4 and not runner.cold
     source = runner.budget_sources[-1]
     identity = identity_of(source)
     assert source.platform is platform and source.profile == 'fixture-runtime'
@@ -337,46 +317,129 @@ async def main():
     assert identity.authorization_home == home and identity.runtime_home == runtime_home
     assert source._transport_adapter_ref() is adapter and runner.auth_sources[-1] is source
     assert Path(get_hermes_home()) == home
-    await adapter._handle_message_event_data(raw('om_two', 16))
+    await receive(adapter, raw('om_two', 16))
     assert len(sent) == 4 and len(runner.budget_sources) == 2
-    busy_key = adapter._event_session_key(types.SimpleNamespace(source=source, metadata={}))
-    owner_task = asyncio.create_task(asyncio.Event().wait())
-    adapter._active_sessions[busy_key] = asyncio.Event()
-    adapter._session_tasks[busy_key] = owner_task
-    await adapter._handle_message_event_data(raw('om_busy', 17))
-    assert len(client.read_snapshot()['requests']) == 3 and not runner.busy and len(sent) == 6
-    await adapter._handle_message_event_data(raw('om_fail', 18))
+    native_started, release_native = asyncio.Event(), asyncio.Event()
+    native_events, native_task = [], None
+    async def pending_native(event):
+        native_events.append(event)
+        native_started.set()
+        await release_native.wait()
+    adapter.set_message_handler(pending_native)
+    try:
+        from gateway.platforms.event import MessageEvent
+        native_source = adapter.build_source(chat_id='oc_fixture', chat_type='group',
+            user_id='u_owner', user_id_alt='on_owner', message_id='om_native_running', is_bot=False)
+        native_event = MessageEvent(text='Ordinary pending native conversation', source=native_source, message_id='om_native_running')
+        await adapter.handle_message(native_event)
+        await asyncio.wait_for(native_started.wait(), timeout=3)
+        assert len(native_events) == 1 and native_events[0].message_id == 'om_native_running'
+        assert len(adapter._active_sessions) == 1
+        native_key = next(iter(adapter._active_sessions))
+        native_task = adapter._session_tasks[native_key]
+        assert not native_task.done() and not adapter._active_sessions[native_key].is_set()
+        budget_before_issue = len(runner.budget_sources)
+        busy_raw = raw('om_busy', 17)
+        await receive(adapter, busy_raw)
+        accepted = client.read_snapshot()['requests']
+        assert len(accepted) == 3 and not runner.busy and not runner.cold and len(sent) == 6
+        assert accepted[-1]['source_anchor']['message_id'] == 'om_busy'
+        assert accepted[-1]['source_anchor']['chat_id'] == 'oc_fixture'
+        assert accepted[-1]['source_anchor']['tenant_key'] == 'tenant-owner'
+        assert accepted[-1]['source_anchor']['transport_tenant_key'] == 'tenant-app'
+        assert accepted[-1]['source_anchor']['recipient_tenant_key'] == 'tenant-bot'
+        assert accepted[-1]['accepted_scope']['title'] == 'Scope 17'
+        assert accepted[-1]['accepted_scope']['body'] == 'Frozen material for 17'
+        assert len(runner.budget_sources) == budget_before_issue + 1
+        busy_source = runner.budget_sources[-1]
+        assert busy_source.message_id == 'om_busy' and busy_source._transport_adapter_ref() is adapter
+        assert runner.auth_sources[-1] is busy_source
+        assert identity_of(busy_source).runtime_profile == 'fixture-runtime'
+        assert identity_of(busy_source).authorization_home == home
+        await receive(adapter, busy_raw)
+        assert len(runner.budget_sources) == budget_before_issue + 1
+        assert len(client.read_snapshot()['requests']) == 3 and len(sent) == 6
+        assert len(native_events) == 1
+        from gateway.session import build_session_key
+        assert build_session_key(busy_source, profile='fixture-runtime') == native_key
+        assert adapter._session_tasks[native_key] is native_task and not native_task.done()
+        assert native_key not in adapter._pending_messages and native_key not in adapter._text_debounce
+    finally:
+        release_native.set()
+        if native_task is not None:
+            await asyncio.wait_for(asyncio.shield(native_task), timeout=3)
+        runner._wire_adapter_handlers(adapter)
+    await receive(adapter, raw('om_fail', 18))
     failed = client.read_snapshot()
     assert len(failed['requests']) == 3
     assert failed['intake_failures'][0]['acceptance'] == 'unaccepted'
     assert failed['intake_failures'][0]['reason'] == 'Issue source could not be verified; no new work was accepted.'
     budget_count = len(runner.budget_sources)
-    await adapter._handle_message_event_data(raw('om_fail', 18))
+    await receive(adapter, raw('om_fail', 18))
     assert len(runner.budget_sources) == budget_count and not runner.busy and not runner.cold
     for mode in (False, None, 'raises'):
         runner.auth_mode = mode
-        await adapter._handle_message_event_data(raw('om_auth_' + str(mode), 19))
+        await receive(adapter, raw('om_auth_' + str(mode), 19))
         await asyncio.sleep(0.06)
         assert len(client.read_snapshot()['requests']) == 3
         assert len(runner.budget_sources) == budget_count
     runner.auth_mode = 'native'
     other_namespace = raw('om_wrong_namespace', 20)
     other_namespace.header.app_id = 'cli_foreign'
-    await adapter._handle_message_event_data(other_namespace)
+    await receive(adapter, other_namespace)
     await asyncio.sleep(0.06)
     assert len(client.read_snapshot()['requests']) == 3
+    wrong_tenant = raw('om_wrong_tenant', 20)
+    wrong_tenant.event.sender.tenant_key = 'tenant-untrusted'
+    wrong_sender = raw('om_wrong_sender', 20)
+    wrong_sender.event.sender.sender_id.open_id = 'ou_untrusted'
+    wrong_sender.event.sender.sender_id.user_id = 'u_untrusted'
+    wrong_sender.event.sender.sender_id.union_id = 'on_untrusted'
+    missing_mention = raw('om_missing_mention', 20)
+    missing_mention.event.message.mentions = []
+    for rejected in (wrong_tenant, wrong_sender, missing_mention):
+        await receive(adapter, rejected)
+        assert len(client.read_snapshot()['requests']) == 3 and len(runner.budget_sources) == budget_count, (
+            rejected.event.message.message_id, len(client.read_snapshot()['requests']), len(runner.budget_sources), budget_count)
+    native_identity = native.request
+    native.request = lambda request: types.SimpleNamespace(code=0, raw=types.SimpleNamespace(
+        content=b'{"code":0,"bot":{"open_id":"ou_untrusted","activate_status":2}}'))
+    await receive(adapter, raw('om_wrong_recipient', 20))
+    assert len(client.read_snapshot()['requests']) == 3 and len(runner.budget_sources) == budget_count
+    native.request = native_identity
+    ordinary = runner._create_adapter(platform, PlatformConfig(enabled=True,
+        extra={**config.extra, 'require_mention': False}))
+    runner._wire_adapter_handlers(ordinary)
+    await adapter.disconnect()
+    runner.adapters[platform] = ordinary
+    await connect_service(ordinary, native)
+    unmentioned = raw('om_owner_ordinary_without_mention', text='普通消息无需提及')
+    unmentioned.event.message.mentions = []
+    before_fallback = len(runner.budget_sources)
+    await receive(ordinary, unmentioned)
+    await asyncio.sleep(0.06)
+    assert any(source.message_id == 'om_owner_ordinary_without_mention' for source in runner.budget_sources[before_fallback:])
+    assert len(client.read_snapshot()['requests']) == 3, 'An allowed ordinary fallback cannot create a managed Issue request.'
+    await ordinary.disconnect()
+    runner.adapters[platform] = adapter
+    budget_count = len(runner.budget_sources)
     disabled = runner._create_adapter(platform, PlatformConfig(enabled=True, extra={**config.extra,
         'group_rules': {'oc_fixture': {'policy': 'disabled'}}}))
     runner._wire_adapter_handlers(disabled)
     disabled.get_chat_info = chat_info
-    factories[0][0](native, disabled)
-    await disabled._handle_message_event_data(raw('om_native_group_denied', 21))
-    assert len(client.read_snapshot()['requests']) == 3 and len(runner.budget_sources) == budget_count
+    await adapter.disconnect()
+    runner.adapters[platform] = disabled
+    await connect_service(disabled, native)
+    await receive(disabled, raw('om_native_group_denied', 21))
+    assert len(client.read_snapshot()['requests']) == 3 and len(runner.budget_sources) == budget_count, (
+        len(client.read_snapshot()['requests']), len(runner.budget_sources), budget_count)
     bot_echo = raw('om_owner_id_is_bot', 22)
     bot_echo.event.sender.sender_type = 'bot'
-    await adapter._handle_message_event_data(bot_echo)
+    await receive(adapter, bot_echo)
     assert len(client.read_snapshot()['requests']) == 3 and len(runner.budget_sources) == budget_count
-    replacement = Client.builder().app_id('cli_fixture').app_secret('synthetic-reconnected-secret').build()
+    await disabled.disconnect()
+    runner.adapters[platform] = adapter
+    replacement = service_client('cli_fixture', 'synthetic-reconnected-secret')
     replacement_sent = []
     replacement.request = native.request
     def replacement_reply(request):
@@ -384,23 +447,21 @@ async def main():
         return ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_new_client_' + str(len(replacement_sent)),
             'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     replacement.im.v1.message.reply = replacement_reply
-    factories[0][0](replacement, adapter)
+    await connect_service(adapter, replacement)
     old_sent_count = len(sent)
-    await adapter._handle_message_event_data(raw('om_reconnected', 23))
+    await receive(adapter, raw('om_reconnected', 23))
     assert len(replacement_sent) == 2 and len(sent) == old_sent_count
     assert len(client.read_snapshot()['requests']) == 4
-    owner_task.cancel()
-    await asyncio.gather(owner_task, return_exceptions=True)
-    adapter._active_sessions.clear(); adapter._session_tasks.clear()
     client.apply_directory_change(client.read_snapshot()['version'], {'enable_profile': 'collab', 'profile': {'id': 'collab', 'native_profile': 'fixture-collab',
         'identity_ref': 'fixture:collab', 'role': 'subproject_lead', 'capability': 'development', 'project_id': 'mono', 'parent_profile_id': 'lead'}})
     bot_adapter = runner._create_adapter(platform, PlatformConfig(enabled=True, extra={**config.extra, 'allow_bots': 'all'}))
     runner.adapters[platform] = bot_adapter
     runner._wire_adapter_handlers(bot_adapter)
     bot_adapter.get_chat_info = chat_info
-    factories[0][0](replacement, bot_adapter)
+    await adapter.disconnect()
+    await connect_service(bot_adapter, replacement)
     def bot_raw(mid, user_id='u_collab'):
-        incoming = raw(mid, text='/fixture-native-bot')
+        incoming = raw(mid, text='@_user_1 /fixture-native-bot')
         incoming.event.sender.sender_type = 'bot'
         incoming.event.sender.tenant_key = 'tenant-collab'
         incoming.event.sender.sender_id.user_id = user_id
@@ -408,22 +469,22 @@ async def main():
         incoming.event.sender.sender_id.union_id = None
         return incoming
     previous_budget = len(runner.budget_sources)
-    await adapter._handle_message_event_data(bot_raw('om_native_bots_disabled'))
+    await receive(adapter, bot_raw('om_native_bots_disabled'))
     assert len(runner.budget_sources) == previous_budget
     for mid in ('om_bot_one', 'om_bot_two', 'om_bot_over_budget'):
-        await bot_adapter._handle_message_event_data(bot_raw(mid))
+        await receive(bot_adapter, bot_raw(mid))
         await asyncio.sleep(0.04)
     assert len(runner.native_bots) == 2, {'bots': len(runner.native_bots), 'cold': [(e.message_id, e.source.user_id, e.source.is_bot) for e in runner.cold], 'budget': [(s.user_id, s.is_bot) for s in runner.budget_sources]}
     assert all(e.source.is_bot is True for e in runner.native_bots)
     assert len(client.read_snapshot()['requests']) == 4
     previous_budget = len(runner.budget_sources)
-    await bot_adapter._handle_message_event_data(bot_raw('om_unknown_bot', 'u_unknown_bot'))
+    await receive(bot_adapter, bot_raw('om_unknown_bot', 'u_unknown_bot'))
     assert len(runner.budget_sources) == previous_budget
     await bot_adapter.disconnect()
     runner.adapters[platform] = adapter
     conditions = client.read_snapshot()['intake_conditions']
     assert conditions['runtime_route'] == 'owned_prebatch'
-    assert conditions['compatibility'] == 'pinned_seams_matched'
+    assert conditions['compatibility'] == 'native_platform_registration'
     assert conditions['allowed_users_policy'] == 'explicit_owner_and_registered_bot_ids'
     assert conditions['real_group_acceptance'] == 'unverified' and conditions['enabled'] is False
     from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -432,62 +493,21 @@ async def main():
     assert await adapter.connect() is False
     assert adapter.fatal_error_code == 'feishu_app_conflict'
     del runner.adapters[Platform.FEISHU]
-    # Drive the actual public connect/reconnect/disconnect lifecycle. Only the
-    # external SDK HTTP and websocket service boundary is inert, never the host.
-    from unittest.mock import patch
-    from lark_oapi.core.http import Transport as SdkHTTP
-    from lark_oapi.core.model import RawResponse
-    from lark_oapi.ws import Client as SdkWebSocket
-    http_requests = []
-    def sdk_http(conf, request, option=None):
-        http_requests.append(request.uri)
-        if 'tenant_access_token' in request.uri:
-            payload = {'code': 0, 'tenant_access_token': 'synthetic-sdk-token', 'expire': 7200}
-        elif '/bot/v3/info' in request.uri:
-            payload = {'code': 0, 'bot': {'open_id': 'ou_lead', 'activate_status': 2, 'app_name': 'Fixture only'}}
-        elif request.uri.endswith('/reply'):
-            payload = {'code': 0, 'data': {'message_id': 'om_connected_' + str(len(http_requests)), 'chat_id': 'oc_fixture', 'parent_id': request.message_id}}
-        else:
-            payload = {'code': 0, 'data': {}}
-        response = RawResponse()
-        response.status_code, response.headers, response.content = 200, {'Content-Type': 'application/json'}, json.dumps(payload).encode()
-        return response
     if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') == 'connected':
-        ready = asyncio.Event()
-        main_loop = asyncio.get_running_loop()
-        sockets = []
-        class SocketBoundary:
-            closed = False
-            async def close(self): self.closed = True
-        def active_start(ws):
-            ws._conn = SocketBoundary()
-            sockets.append((ws, ws._conn))
-            main_loop.call_soon_threadsafe(ready.set)
-            asyncio.get_event_loop().run_forever()
-        with patch.object(SdkHTTP, 'execute', side_effect=sdk_http), patch.object(SdkWebSocket, 'start', active_start):
-            assert await adapter.connect() is True
-            await asyncio.wait_for(ready.wait(), timeout=3)
-            assert adapter._running and adapter._ws_supervisor is not None and adapter._app_lock_identity
-            assert plugins.unload('ghost-hermes-pm')
-            for _ in range(100):
-                if not adapter._running and adapter._ws_supervisor is None and adapter._app_lock_identity is None and sockets[0][1].closed:
-                    break
-                await asyncio.sleep(0.02)
-            assert not adapter._running and adapter._ws_supervisor is None and adapter._app_lock_identity is None
-            assert sockets[0][1].closed and sockets[0][0]._auto_reconnect is False
-            assert not (state / 'manager.sock').exists()
+        transport = await connect_service(adapter, replacement)
+        assert adapter.is_connected
+        assert plugins.unload('ghost-hermes-pm')
+        await asyncio.sleep(0)
+        assert not adapter.is_connected and transport.closed and not (state / 'manager.sock').exists()
         passed()
         return
-    with patch.object(SdkHTTP, 'execute', side_effect=sdk_http), patch.object(SdkWebSocket, 'start', return_value=None):
-        assert await adapter.connect() is True
-        await adapter._handle_message_event_data(raw('om_connected', 26))
-        assert len(client.read_snapshot()['requests']) == 5
-        await adapter.disconnect()
-        assert await adapter.connect(is_reconnect=True) is True
-        await adapter._handle_message_event_data(raw('om_after_reconnect', 27))
-        assert len(client.read_snapshot()['requests']) == 6
-        await adapter.disconnect()
-    assert '/open-apis/bot/v3/info' in http_requests
+    await connect_service(adapter, replacement)
+    await receive(adapter, raw('om_connected', 26))
+    assert len(client.read_snapshot()['requests']) == 5
+    await adapter.disconnect()
+    await connect_service(adapter, replacement)
+    await receive(adapter, raw('om_after_reconnect', 27))
+    assert len(client.read_snapshot()['requests']) == 6
     await adapter.disconnect()
     runner.stopped.set()
     await asyncio.sleep(0)
