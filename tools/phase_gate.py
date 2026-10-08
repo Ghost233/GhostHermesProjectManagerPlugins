@@ -46,8 +46,14 @@ def main():
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--artifacts', type=Path)
     args = parser.parse_args()
+    root = args.root.resolve()
+    if args.artifacts:
+        args.artifacts = args.artifacts.resolve()
+        if args.artifacts.is_relative_to(root):
+            print(json.dumps({'status': 'failed', 'reason': 'Phase artifacts must be outside the frozen repository.'}))
+            return 1
     try:
-        result = validate(args.root.resolve(), json.loads(args.manifest.read_text()))
+        result = validate(root, json.loads(args.manifest.read_text()))
         code = 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
         result, code = {'status': 'failed', 'reason': str(exc)}, 1

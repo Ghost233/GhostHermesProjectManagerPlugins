@@ -57,3 +57,33 @@ def test_missing_incomplete_or_stale_phase_evidence_fails(tmp_path, mode):
     result = subprocess.run([sys.executable, str(GATE), '--root', str(root), '--manifest', str(manifest)], capture_output=True, text=True)
     assert result.returncode != 0
     assert 'failed' in result.stdout
+
+
+@pytest.mark.parametrize('location', ['inside', 'inside_symlink', 'outside'])
+def test_phase_outputs_preflight_preserves_frozen_source(tmp_path, location):
+    root, manifest = evidence(tmp_path, 'complete')
+    before = fingerprint(root)
+    if location == 'inside_symlink':
+        alias = tmp_path / 'root-alias'
+        alias.symlink_to(root, target_is_directory=True)
+        output = alias / 'review-output'
+    else:
+        output = (root if location == 'inside' else tmp_path) / 'review-output'
+    traces = tmp_path / 'outer-checks'
+    checks = GATE.with_name('local_checks.py')
+    command = [sys.executable, str(GATE), '--root', str(root), '--manifest', str(manifest), '--artifacts', str(output)]
+    result = subprocess.run([sys.executable, str(checks), '--root', str(root), '--artifacts', str(traces), '--', *command], capture_output=True, text=True)
+    record = json.loads((traces / 'result.json').read_text())
+    after = fingerprint(root)
+    write(tmp_path / ('retro-phase-output-' + location + '.json'), {'phase_command': command,
+        'phase_actual_exit': record['command_exit_code'], 'outer_actual_exit': result.returncode,
+        'outer_validation_exit': record['validation_exit_code'], 'source_before': before, 'source_after': after,
+        'source_unchanged': before == after, 'phase_log': Path(record['commands'][0]['log']).read_text()})
+    if location == 'outside':
+        assert result.returncode == record['command_exit_code'] == record['validation_exit_code'] == 0
+        assert (output / 'phase-gate.json').is_file()
+    else:
+        assert result.returncode != 0 and record['validation_exit_code'] != 0
+        assert record['command_exit_code'] != 0, 'The phase CLI itself must reject before writing inside frozen source.'
+        assert not output.exists()
+    assert before == after and record['source_unchanged'] is True
