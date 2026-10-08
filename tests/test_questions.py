@@ -21,7 +21,7 @@ def question_adapter(root):
         result['task_control']['human_response'] = 'synthetic-peer-only'
         return result
     return CodexStdioAdapter([sys.executable, str(Path(__file__).with_name('questions_fixture_server.py')), str(root)],
-        cwd=root, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(root / 'codex-home')},
+        cwd=root, env=adapter.env,
         service_ref='local:fixture-stdio', verifier=proof, timeout=2)
 
 
@@ -159,11 +159,28 @@ def test_invalid_or_racing_request_never_receives_a_new_answer(tmp_path, case):
     if case == 'missing_receipt':
         adapter = adapter_for(tmp_path)
         adapter.command[1] = str(Path(__file__).with_name('questions_fixture_server.py'))
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
-        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
-        manager.start_task(OWNER, task_id)
-        event = user_question(**({'turnId': 'foreign-turn'} if case == 'foreign_turn' else {'threadId': 'foreign-thread'} if case == 'foreign_thread' else {}))
-        emit(tmp_path, event)
+    repo = make_repo(tmp_path / 'repo')
+    original = {}
+    if case == 'returned':
+        from test_manual_control import adapters, original_state, ORIGINAL_THREAD, ORIGINAL_TURN
+        from test_manual_observation import source
+        peer = tmp_path / 'original'
+        original_state(peer, repo)
+        read, control = adapters(peer)
+        original = {'observation_adapters': {'local:manual-daemon': read}, 'control_adapters': {'manual-daemon': control}}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter, **original) as manager:
+        task_id = accepted(manager, repo)
+        if case == 'returned':
+            manager.register_observation_source(OWNER, source())
+            observed = manager.refresh_manual_sessions(OWNER)['manual_sessions'][0]
+            assert manager.take_over_session(OWNER, task_id, observed['id'], 'answer-current-work', ORIGINAL_TURN)['status'] == 'active'
+            state = json.loads((peer / 'original-state.json').read_text())
+            state['server_requests'] = [user_question(threadId=ORIGINAL_THREAD, turnId=ORIGINAL_TURN)]
+            (peer / 'original-state.json').write_text(json.dumps(state))
+        else:
+            manager.start_task(OWNER, task_id)
+            event = user_question(**({'turnId': 'foreign-turn'} if case == 'foreign_turn' else {'threadId': 'foreign-thread'} if case == 'foreign_thread' else {}))
+            emit(tmp_path, event)
         task = manager.refresh_task(OWNER, task_id)
         if case == 'foreign_thread':
             assert task['human_requests'] == []
@@ -176,15 +193,10 @@ def test_invalid_or_racing_request_never_receives_a_new_answer(tmp_path, case):
             terminal_state(tmp_path)
             assert manager.refresh_task(OWNER, task_id)['outer_task_status'] == 'stopped'
         if case == 'returned':
-            with manager._lock, manager._db:
-                version, data = manager._load()
-                record = data['requests'][task_id]
-                if case == 'returned':
-                    record['session']['control'] = 'observe'
-                else:
-                    record['outer_task_status'] = 'stopped'
-                    record['repository_released'] = True
-                manager._save(version, data)
+            assert manager.return_session_control(OWNER, task_id, 'answer-current-work')['status'] == 'returned'
+            snapshot = manager.read_snapshot(OWNER)
+            assert snapshot['requests'][0]['session']['control'] == 'observe_only'
+            assert snapshot['requests'][0]['repository_released'] is False
         if case == 'expired':
             (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full', 'items': []}]}))
         if case in {'resolved', 'race'}:
@@ -193,7 +205,13 @@ def test_invalid_or_racing_request_never_receives_a_new_answer(tmp_path, case):
                 assert manager.refresh_task(OWNER, task_id)['human_requests'][0]['resolution'] == 'resolved'
         with pytest.raises(ManagementError):
             manager.answer_human_request(actor, task_id, q['id'], 'denied', {'answers': {'colour': ['Blue']}})
-        assert replies(tmp_path) == []
+        if case == 'returned':
+            original_wire = [json.loads(line) for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
+            assert [reply for reply in original_wire if 'method' not in reply] == []
+            assert not {'thread/start', 'turn/start', 'turn/steer', 'turn/interrupt'} & {message.get('method') for message in original_wire}
+            assert not (tmp_path / 'wire.jsonl').exists()
+        else:
+            assert replies(tmp_path) == []
 
 
 def test_disconnect_and_unknown_reply_are_reconciled_without_replay(tmp_path):

@@ -1,10 +1,23 @@
 """Multi-thread synthetic JSONL service; durable bridge state governs every start."""
 import json
-import sqlite3
+import os
 import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+sys.path.insert(0, os.environ.get('HERMES_FIXTURE_PLUGIN_ROOT', str(Path(__file__).resolve().parents[1])))
+from ghost_hermes_pm import VerifiedIdentity
+from ghost_hermes_pm.snapshots import SnapshotReader
+reader = SnapshotReader(root / 'state', owner_identity_ref='fixture:owner')
+identity = VerifiedIdentity('fixture:owner', 'owned-original-service-public-observer')
+
+
+def committed_requests(method):
+    snapshot = reader.read_snapshot(identity)
+    with (root / 'public-snapshots.jsonl').open('a') as log:
+        log.write(json.dumps({'method': method, 'snapshot': snapshot}) + '\n')
+    return snapshot['requests']
+
 external = root / 'queue-external.json'
 threads = json.loads(external.read_text()) if external.exists() else {}
 sequence = 0
@@ -35,8 +48,7 @@ for line in sys.stdin:
         threads[thread_id] = thread
         result = {'thread': thread, 'model': 'fixture-model', 'cwd': params['cwd'], 'activePermissionProfile': {'id': params['permissions']}, 'runtimeWorkspaceRoots': params['runtimeWorkspaceRoots']}
     elif method == 'turn/start':
-        with sqlite3.connect(root / 'state' / 'manager.sqlite3') as db:
-            records = json.loads(db.execute('SELECT payload FROM directory').fetchone()[0])['requests'].values()
+        records = committed_requests(method)
         assert any(r.get('session', {}).get('thread_id') == params['threadId'] and not r.get('repository_released') for r in records)
         sequence += 1
         turn = {'id': 'queue-turn-' + str(sequence), 'status': 'inProgress', 'itemsView': 'full', 'items': []}
