@@ -27,6 +27,11 @@ def _channel(data, channel_id):
     return channel
 
 
+def _owner_goal_channel(channel):
+    return channel['profile_binding']['role'] == 'steward' and (channel['group_kind'] == 'entry' or
+        channel['group_kind'] == 'project' and channel['project_id'] is None and channel['repository'] is None)
+
+
 
 def _freeze_channels(sending, receiving):
     return json.loads(json.dumps({sending['id']: sending, receiving['id']: receiving}))
@@ -99,9 +104,9 @@ def _new_handoff(manager, data, sender, target, issue_url, owner_origin, source_
 
 def _result_handoff(manager, data, sender, target, original, text, kind='result'):
     state = _state(data)
-    targets = [c for c in state['channels'].values() if c['profile_id'] == target['id'] and c['group_kind'] == 'project']
+    targets = [c for c in state['channels'].values() if c['profile_id'] == target['id'] and c['group_kind'] == 'project' and c['chat_id'] == original['received_anchor']['chat_id']]
     if len(targets) != 1:
-        raise ManagementError('binding_conflict', 'The result receiver project channel must be unique.')
+        raise ManagementError('binding_conflict', 'The result receiver must have a unique channel in the original project group.')
     receiving = targets[0]
     senders = [c for c in state['channels'].values() if c['profile_id'] == sender['id'] and c['chat_id'] == receiving['chat_id'] and c['group_kind'] == 'project']
     if len(senders) != 1:
@@ -170,10 +175,11 @@ def perform(manager, identity, action, details):
                 allowed = {'id', 'profile_id', 'group_kind', 'project_id', 'app_id', 'recipient_open_id', 'recipient_tenant_key', 'transport_tenant_key', 'chat_id', 'owner_open_id', 'owner_tenant_key', 'repository', 'verification_ref', 'bot_sources'}
                 if not isinstance(supplied, dict) or set(supplied) != allowed or any(not isinstance(v, str) or not v for k, v in supplied.items() if k not in {'project_id', 'bot_sources', 'repository'}):
                     raise ManagementError('invalid_change', 'Role channels require exact registered scalar identities and source observations.')
-                if not (supplied['group_kind'] == 'entry' and supplied['repository'] is None) and (not isinstance(supplied['repository'], str) or not supplied['repository']):
-                    raise ManagementError('invalid_change', 'Project channels require a repository; only entry channels may omit it.')
                 profile = data['profiles'].get(supplied['profile_id'])
-                if not profile or supplied['group_kind'] not in {'entry', 'project'} or supplied['group_kind'] == 'entry' and (profile['role'] != 'steward' or supplied['project_id'] is not None) or supplied['group_kind'] == 'project' and supplied['project_id'] not in data['projects']:
+                coordinator = profile is not None and profile['role'] == 'steward' and supplied['group_kind'] == 'project' and supplied['project_id'] is None and supplied['repository'] is None
+                if not ((supplied['group_kind'] == 'entry' or coordinator) and supplied['repository'] is None) and (not isinstance(supplied['repository'], str) or not supplied['repository']):
+                    raise ManagementError('invalid_change', 'Project roles require a repository; steward entry and shared coordinator channels may omit it.')
+                if not profile or supplied['group_kind'] not in {'entry', 'project'} or supplied['group_kind'] == 'entry' and (profile['role'] != 'steward' or supplied['project_id'] is not None) or supplied['group_kind'] == 'project' and not coordinator and supplied['project_id'] not in data['projects']:
                     raise ManagementError('invalid_change', 'The channel does not match an existing role and project group.')
                 if profile['role'] in {'project_lead', 'subproject_lead'}:
                     group_project = data['profiles'][profile['parent_profile_id']]['project_id'] if profile['role'] == 'subproject_lead' else profile['project_id']
@@ -194,7 +200,7 @@ def perform(manager, identity, action, details):
                 raise ManagementError('forbidden', 'A project goal explicitly names its steward and registered project lead.')
             message = details['source_anchor']
             required = _message_anchor(message)
-            entry = [c for c in state['channels'].values() if c['profile_id'] == sender['id'] and c['group_kind'] == 'entry' and all(c.get(k) == message.get(k) for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')) and c['owner_open_id'] == message['sender_open_id'] and c['owner_tenant_key'] == message['tenant_key']]
+            entry = [c for c in state['channels'].values() if c['profile_id'] == sender['id'] and _owner_goal_channel(c) and all(c.get(k) == message.get(k) for k in ('app_id', 'transport_tenant_key', 'recipient_tenant_key', 'recipient_open_id', 'chat_id')) and c['owner_open_id'] == message['sender_open_id'] and c['owner_tenant_key'] == message['tenant_key']]
             targets = [c for c in state['channels'].values() if c['profile_id'] == target['id'] and c['group_kind'] == 'project']
             if len(entry) != 1 or len(targets) != 1:
                 raise ManagementError('binding_conflict', 'The source entry and destination role channel must be unique.')
@@ -261,7 +267,7 @@ def perform(manager, identity, action, details):
                 raise ManagementError('forbidden', 'Only the steward returns an independently received project update to its original Owner goal.')
             _handoff_channels(data, original)
             anchor = original['owner_origin']['source_anchor']
-            entries = [c for c in state['channels'].values() if c['profile_id'] == principal['id'] and c['group_kind'] == 'entry' and all(c.get(k) == anchor.get(k) for k in ('app_id', 'chat_id', 'recipient_open_id', 'transport_tenant_key', 'recipient_tenant_key')) and c['owner_open_id'] == anchor['sender_open_id'] and c['owner_tenant_key'] == anchor['tenant_key']]
+            entries = [c for c in state['channels'].values() if c['profile_id'] == principal['id'] and _owner_goal_channel(c) and all(c.get(k) == anchor.get(k) for k in ('app_id', 'chat_id', 'recipient_open_id', 'transport_tenant_key', 'recipient_tenant_key')) and c['owner_open_id'] == anchor['sender_open_id'] and c['owner_tenant_key'] == anchor['tenant_key']]
             if len(entries) != 1:
                 raise ManagementError('binding_conflict', 'The original Owner entry anchor must match the registered steward entry namespace.')
             entry = _channel(data, entries[0]['id'])

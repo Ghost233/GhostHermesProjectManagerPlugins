@@ -4,6 +4,7 @@ import json
 import re
 
 from .manager import ManagementError, VerifiedIdentity
+from .collaboration import _owner_goal_channel
 
 
 @dataclass(frozen=True)
@@ -67,7 +68,7 @@ class CollaborationEntry:
             if sender.sender_type == 'user' and source.is_bot is False:
                 text = text.strip()
                 goal = re.fullmatch(r'项目\s+(\S+)\s+(https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*)', text)
-                if not goal or channel['group_kind'] != 'entry' or channel['owner_open_id'] != sender.sender_id.open_id or channel['owner_tenant_key'] != sender.tenant_key:
+                if not goal or not _owner_goal_channel(channel) or channel['owner_open_id'] != sender.sender_id.open_id or channel['owner_tenant_key'] != sender.tenant_key:
                     return None
                 targets = [p for p in routes['profiles'] if p['role'] == 'project_lead' and p['project_id'] == goal.group(1)]
                 if len(targets) != 1:

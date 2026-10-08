@@ -95,6 +95,51 @@ def test_repositoryless_entry_does_not_allow_an_issue_from_another_project_repos
         assert snapshot['collaboration']['handoffs'] == [] and snapshot['requests'] == []
 
 
+def test_one_repositoryless_steward_channel_dispatches_distinct_projects_in_the_same_group(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    other_issue = {**ISSUE, 'url': 'https://github.com/Ghost233/other/issues/16', 'title': 'Fix the other project'}
+    class ProjectIssues:
+        def read_issue(self, url):
+            return dict({ISSUE['url']: ISSUE, other_issue['url']: other_issue}[url])
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=ProjectIssues()) as manager:
+        register_roles(manager, tmp_path)
+        other = registration(make_repo(tmp_path / 'other'), 'other', 'other-lead')
+        other['profile']['identity_ref'] = 'fixture:other'
+        manager.apply_directory_change(OWNER, 2, other)
+        entry, sending, lead, other_lead = channel('steward', 'entry'), channel('steward'), channel('mono-lead'), channel('other-lead')
+        entry['repository'] = None
+        sending.update(project_id=None, repository=None)
+        other_lead.update(project_id='other', repository='Ghost233/other')
+        sending['bot_sources'].extend([
+            {'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']},
+            {'profile_id': 'other-lead', 'open_id': 'other-seen-steward', 'tenant_key': 'other-tenant', 'native_ids': ['other-user-steward']}])
+        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, lead, other_lead]})
+        for receiving, issue, identity_ref in [(lead, ISSUE, LEAD.subject), (other_lead, other_issue, 'fixture:other')]:
+            handoff = manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': receiving['profile_id'],
+                'source_anchor': source(entry, message_id='om_goal_' + receiving['profile_id']), 'issue_url': issue['url']})
+            packet = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': handoff['id']})
+            assert packet['chat_id'] == 'oc_project' and handoff['sender_channel_id'] == sending['id']
+            message_id = 'om_scope_' + receiving['profile_id']
+            manager.collaborate(STEWARD, 'record_delivery', {'handoff_id': handoff['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': message_id, 'chat_id': 'oc_project'}})
+            accepted = manager.collaborate(VerifiedIdentity(identity_ref, 'native-collaboration-ingress'), 'ingest', {
+                'channel_id': receiving['id'], 'source_anchor': source(receiving, 'bot', message_id), 'text': packet['text']})
+            task = next(r for r in manager.read_snapshot(OWNER)['requests'] if r['id'] == accepted['task_request_id'])
+            assert task['profile_id'] == receiving['profile_id'] and task['project_id'] == receiving['project_id']
+            assert task['accepted_scope']['url'] == issue['url'] and task['actor_provenance']['actor']['subject'] == identity_ref
+        with pytest.raises(ManagementError) as conflict:
+            manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'other-lead',
+                'source_anchor': source(entry, message_id='om_wrong_project'), 'issue_url': ISSUE['url']})
+        assert conflict.value.code == 'binding_conflict'
+        for invalid_origin in [source(lead, message_id='om_lead_owner_goal'), {**source(sending, message_id='om_foreign_owner'), 'sender_open_id': 'foreign-owner'}]:
+            with pytest.raises(ManagementError) as conflict:
+                manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead',
+                    'source_anchor': invalid_origin, 'issue_url': ISSUE['url']})
+            assert conflict.value.code == 'binding_conflict'
+        snapshot = manager.read_snapshot(OWNER)
+        assert len(snapshot['requests']) == 2 and len(snapshot['collaboration']['handoffs']) == 2
+        assert len([c for c in snapshot['collaboration']['channels'] if c['profile_id'] == 'steward' and c['chat_id'] == 'oc_project']) == 1
+
+
 @pytest.mark.asyncio
 async def test_owner_goal_is_publicly_sent_by_steward_and_independently_accepted_by_lead(tmp_path):
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
@@ -181,21 +226,25 @@ def test_unknown_cross_group_send_is_never_replayed_after_restart(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('authorized,budget', [(True, True), (False, True), (True, False)])
-async def test_real_sdk_owner_goal_entry_preserves_original_source_auth_and_budget(tmp_path, authorized, budget):
+@pytest.mark.parametrize('owner_group', ['entry', 'project'])
+async def test_real_sdk_owner_goal_entry_preserves_original_source_auth_and_budget(tmp_path, authorized, budget, owner_group):
     from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
     from ghost_hermes_pm.messages import FeishuEntry
     entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
     entry['repository'] = None
+    sending.update(project_id=None, repository=None)
     sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+    if owner_group == 'project':
+        entry = sending
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
         register_roles(manager, tmp_path)
-        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving]})
+        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, receiving] if owner_group == 'project' else [entry, sending, receiving]})
         raw = P2ImMessageReceiveV1({'schema': '2.0', 'header': {'event_type': 'im.message.receive_v1', 'app_id': entry['app_id'], 'tenant_key': entry['transport_tenant_key']},
             'event': {'sender': {'sender_type': 'user', 'tenant_key': entry['owner_tenant_key'], 'sender_id': {'open_id': entry['owner_open_id'], 'user_id': 'owner-native'}},
                 'message': {'message_id': 'om_native_owner_goal', 'chat_id': entry['chat_id'], 'chat_type': 'group', 'message_type': 'text',
                     'content': json.dumps({'text': '@_user_1 项目 mono ' + ISSUE['url']}),
                     'mentions': [{'key': '@_user_1', 'mentioned_type': 'bot', 'tenant_key': entry['recipient_tenant_key'], 'id': {'open_id': entry['recipient_open_id']}}]}}})
-        original = NS(platform='feishu', user_id='owner-native', user_id_alt=None, chat_id='oc_entry', is_bot=False, message_id='om_native_owner_goal')
+        original = NS(platform='feishu', user_id='owner-native', user_id_alt=None, chat_id=entry['chat_id'], is_bot=False, message_id='om_native_owner_goal')
         event = NS(source=original, raw_message=raw, message_id=original.message_id)
         native = Client.builder().app_id('cli_steward').app_secret('synthetic-unused-secret').build()
         native.request = lambda request: NS(code=0, raw=NS(content=b'{"code":0,"bot":{"open_id":"ou_steward","activate_status":2}}'))
@@ -225,6 +274,19 @@ async def test_real_sdk_owner_goal_entry_preserves_original_source_auth_and_budg
             assert handoffs[0]['owner_origin']['subject'] == OWNER.subject
             assert handoffs[0]['owner_origin']['source'] == 'verified-native-collaboration-owner'
             assert handoffs[0]['source_anchor']['message_id'] == original.message_id
+            accepted = manager.collaborate(INGRESS, 'ingest', {'channel_id': receiving['id'], 'source_anchor': source(receiving, 'bot', 'om_created_1'), 'text': handoffs[0]['segments'][0]['text']})
+            assert accepted['acceptance'] == 'accepted'
+            progress = manager.collaborate(LEAD, 'report_progress', {'handoff_id': accepted['id']})
+            packet = manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': progress['id']})
+            manager.collaborate(LEAD, 'record_delivery', {'handoff_id': progress['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_native_progress', 'chat_id': 'oc_project'}})
+            observed = source(sending, 'bot', 'om_native_progress')
+            observed.update(tenant_key='lead-tenant', sender_open_id='lead-seen-steward')
+            received = manager.collaborate(VerifiedIdentity(STEWARD.subject, 'native-collaboration-ingress'), 'ingest', {'channel_id': sending['id'], 'source_anchor': observed, 'text': packet['text']})
+            summary = manager.collaborate(STEWARD, 'publish_owner_summary', {'handoff_id': received['id']})
+            owner_packet = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': summary['id']})
+            assert owner_packet['path'] == 'reply' and owner_packet['chat_id'] == original.chat_id
+            assert owner_packet['reply_to'] == original.message_id
+            assert len(manager.read_snapshot(OWNER)['requests']) == 1
 
 
 CHILD = VerifiedIdentity('fixture:child', 'participant')
@@ -247,6 +309,45 @@ def accepted_parent(manager, root, lead_capability='development'):
     manager.collaborate(STEWARD, 'record_delivery', {'handoff_id': h['id'], 'uuid': p['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_parent_scope', 'chat_id': 'oc_project'}})
     manager.collaborate(INGRESS, 'ingest', {'channel_id': receiving['id'], 'source_anchor': source(receiving, 'bot', 'om_parent_scope'), 'text': p['text']})
     return h['id'], child
+
+
+def test_project_progress_returns_to_the_original_group_when_steward_coordinates_other_groups(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        parent_id, _ = accepted_parent(manager, tmp_path)
+        other_group = channel('steward')
+        other_group.update(id='steward-other-group', chat_id='oc_other_group', project_id=None, repository=None)
+        manager.collaborate(OWNER, 'register_channels', {'channels': [other_group]})
+        progress = manager.collaborate(LEAD, 'report_progress', {'handoff_id': parent_id})
+        packet = manager.collaborate(LEAD, 'claim_delivery', {'handoff_id': progress['id']})
+        assert progress['target_channel_id'] == 'steward-project' and packet['chat_id'] == 'oc_project'
+        assert packet['mention_open_id'] == 'steward-seen-mono-lead'
+        manager.collaborate(LEAD, 'record_delivery', {'handoff_id': progress['id'], 'uuid': packet['uuid'], 'receipt': {'status': 'delivered', 'message_id': 'om_project_progress', 'chat_id': 'oc_project'}})
+        steward_ingress = VerifiedIdentity(STEWARD.subject, 'native-collaboration-ingress')
+        with pytest.raises(ManagementError):
+            manager.collaborate(steward_ingress, 'ingest', {'channel_id': other_group['id'], 'source_anchor': source(other_group, 'bot', 'om_project_progress'), 'text': packet['text']})
+        receiving = next(c for c in manager.read_snapshot(OWNER)['collaboration']['channels'] if c['id'] == progress['target_channel_id'])
+        observed = source(receiving, 'bot', 'om_project_progress')
+        observed.update(tenant_key='lead-tenant', sender_open_id='lead-seen-steward')
+        received = manager.collaborate(steward_ingress, 'ingest', {'channel_id': receiving['id'], 'source_anchor': observed, 'text': packet['text']})
+        owner_summary = manager.collaborate(STEWARD, 'publish_owner_summary', {'handoff_id': received['id']})
+        owner_packet = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': owner_summary['id']})
+        assert owner_packet['chat_id'] == 'oc_entry' and owner_packet['reply_to'] == 'om_owner_goal'
+        assert len(manager.read_snapshot(OWNER)['requests']) == 1
+
+
+@pytest.mark.parametrize('profile_id', ['mono-lead', 'child'])
+def test_project_responsible_roles_cannot_replace_their_binding_with_a_shared_coordinator_channel(tmp_path, profile_id):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        accepted_parent(manager, tmp_path)
+        before = manager.read_snapshot(OWNER)['collaboration']['channels']
+        replacement = {k: v for k, v in next(c for c in before if c['profile_id'] == profile_id).items() if k != 'profile_binding'}
+        replacement.update(project_id=None, repository=None)
+        with pytest.raises(ManagementError) as invalid:
+            manager.collaborate(OWNER, 'register_channels', {'channels': [replacement]})
+        assert invalid.value.code == 'invalid_change'
+        assert manager.read_snapshot(OWNER)['collaboration']['channels'] == before
 
 
 def test_project_lead_delegates_a_clear_issue_only_to_explicit_own_child(tmp_path):
