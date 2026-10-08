@@ -168,8 +168,10 @@ def perform(manager, identity, action, details):
                 raise ManagementError('forbidden', 'Only the Owner registers existing verified role/group namespaces.')
             for supplied in details['channels']:
                 allowed = {'id', 'profile_id', 'group_kind', 'project_id', 'app_id', 'recipient_open_id', 'recipient_tenant_key', 'transport_tenant_key', 'chat_id', 'owner_open_id', 'owner_tenant_key', 'repository', 'verification_ref', 'bot_sources'}
-                if not isinstance(supplied, dict) or set(supplied) != allowed or any(not isinstance(v, str) or not v for k, v in supplied.items() if k not in {'project_id', 'bot_sources'}):
+                if not isinstance(supplied, dict) or set(supplied) != allowed or any(not isinstance(v, str) or not v for k, v in supplied.items() if k not in {'project_id', 'bot_sources', 'repository'}):
                     raise ManagementError('invalid_change', 'Role channels require exact registered scalar identities and source observations.')
+                if not (supplied['group_kind'] == 'entry' and supplied['repository'] is None) and (not isinstance(supplied['repository'], str) or not supplied['repository']):
+                    raise ManagementError('invalid_change', 'Project channels require a repository; only entry channels may omit it.')
                 profile = data['profiles'].get(supplied['profile_id'])
                 if not profile or supplied['group_kind'] not in {'entry', 'project'} or supplied['group_kind'] == 'entry' and (profile['role'] != 'steward' or supplied['project_id'] is not None) or supplied['group_kind'] == 'project' and supplied['project_id'] not in data['projects']:
                     raise ManagementError('invalid_change', 'The channel does not match an existing role and project group.')

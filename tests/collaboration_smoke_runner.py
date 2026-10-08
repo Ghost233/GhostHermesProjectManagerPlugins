@@ -52,6 +52,7 @@ from test_task_control import TURN
 from ghost_hermes_pm.queue import workspace
 from tools.registry import registry
 channels = [channel('steward', 'entry'), channel('steward'), channel('mono-lead'), channel('child')]
+channels[0]['repository'] = None
 channels[2]['bot_sources'].append({'profile_id': 'child', 'open_id': 'child-seen-lead', 'tenant_key': 'child-tenant', 'native_ids': ['child-user-lead']})
 channels[3]['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-child', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-child']})
 channels[1]['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})

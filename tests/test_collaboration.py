@@ -51,6 +51,50 @@ def source(c, sender='owner', message_id='om_owner_goal'):
         'chat_id': c['chat_id'], 'message_id': message_id, 'parent_id': None, 'root_id': None, 'thread_id': None}
 
 
+def test_repositoryless_steward_entry_routes_an_owner_goal_to_the_bound_project(tmp_path):
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        register_roles(manager, tmp_path)
+        entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+        entry['repository'] = None
+        sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving]})
+        handoff = manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': ISSUE['url']})
+        packet = manager.collaborate(STEWARD, 'claim_delivery', {'handoff_id': handoff['id']})
+        assert packet['chat_id'] == 'oc_project' and packet['mention_open_id'] == 'lead-seen-steward'
+        snapshot = manager.read_snapshot(OWNER)
+        assert next(c for c in snapshot['collaboration']['channels'] if c['id'] == entry['id'])['repository'] is None
+        assert handoff['issue']['url'] == ISSUE['url'] and handoff['acceptance'] == 'awaiting_receiver'
+        assert snapshot['requests'] == []
+
+
+@pytest.mark.parametrize('repository', [None, ''])
+def test_project_channel_without_a_repository_is_not_registered(tmp_path, repository):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
+        register_roles(manager, tmp_path)
+        receiving = channel('mono-lead')
+        receiving['repository'] = repository
+        with pytest.raises(ManagementError) as invalid:
+            manager.collaborate(OWNER, 'register_channels', {'channels': [receiving]})
+        assert invalid.value.code == 'invalid_change'
+        assert manager.read_snapshot(OWNER)['collaboration']['channels'] == []
+
+
+def test_repositoryless_entry_does_not_allow_an_issue_from_another_project_repository(tmp_path):
+    from ghost_hermes_pm import ManagementError
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
+        register_roles(manager, tmp_path)
+        entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+        entry['repository'] = None
+        sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
+        manager.collaborate(OWNER, 'register_channels', {'channels': [entry, sending, receiving]})
+        with pytest.raises(ManagementError) as conflict:
+            manager.collaborate(OWNER, 'project_goal', {'sender_profile_id': 'steward', 'target_profile_id': 'mono-lead', 'source_anchor': source(entry), 'issue_url': 'https://github.com/Ghost233/another-project/issues/1'})
+        assert conflict.value.code == 'binding_conflict'
+        snapshot = manager.read_snapshot(OWNER)
+        assert snapshot['collaboration']['handoffs'] == [] and snapshot['requests'] == []
+
+
 @pytest.mark.asyncio
 async def test_owner_goal_is_publicly_sent_by_steward_and_independently_accepted_by_lead(tmp_path):
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
@@ -141,6 +185,7 @@ async def test_real_sdk_owner_goal_entry_preserves_original_source_auth_and_budg
     from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
     from ghost_hermes_pm.messages import FeishuEntry
     entry, sending, receiving = channel('steward', 'entry'), channel('steward'), channel('mono-lead')
+    entry['repository'] = None
     sending['bot_sources'].append({'profile_id': 'mono-lead', 'open_id': 'lead-seen-steward', 'tenant_key': 'lead-tenant', 'native_ids': ['lead-user-steward']})
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource()) as manager:
         register_roles(manager, tmp_path)

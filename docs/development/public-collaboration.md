@@ -15,6 +15,8 @@
 
 总管可同时登记 entry/project 群；project_lead 留本项目群，subproject_lead 留其上级的大项目群。真实 CreateMessage builder 在目标群建立该群独立锚并构造 at；跨群不复用另一群的 native reply。入口回 Owner 则使用原 Owner 消息的真实 ReplyMessage builder 与 Owner mention。
 
+总管不必持有仓库：entry channel 的 repository 可为 null，已有非空字符串登记继续有效。project channel 仍必须登记非空 repository；派发的 Issue 必须匹配目标负责人 project channel 的仓库，入口登记不改变该范围检查。
+
 每条新交接冻结两侧完整 channel/profile 身份快照。Profile 上级、原 app/group/recipient 或来源映射变化后，旧交接发送、受理或汇总返回 binding_conflict。已有旧版未带冻结 channel 身份的交接须重新对账，不能补猜为可信。跨上级移交只由总管执行，保持项目、native Profile、identity 与连接绑定；directory_audit 保留操作入口 actor、版本及 before/after 责任绑定，并按目录权限过滤查询。资料与项目记忆仍按原 Profile 所属模块保管。
 
 ## 工作与结果账本
