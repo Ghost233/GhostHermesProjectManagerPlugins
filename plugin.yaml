@@ -21,3 +21,4 @@ provides_hooks:
 python_dependencies:
   - fastapi
   - requests
+  - websockets>=15,<16

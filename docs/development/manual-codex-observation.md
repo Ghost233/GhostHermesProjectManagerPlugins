@@ -19,7 +19,7 @@ HTTP、群与原生工具不能指定命令、endpoint、verifier、启用能力
 
 ## 原 endpoint 与只读传输
 
-原生配置必须显式提供 `executable`、`cwd`、`environment`、`service_ref`、`source_kind`、`endpoint`、`endpoint_ref`。执行器只构造：
+原生配置必须显式提供 `executable`、`cwd`、`environment`、`service_ref`、`source_kind`、`endpoint`、`endpoint_ref`。省略 `transport` 或指定 `original_proxy_stdio` 时，保留原有配置行为，只构造：
 
 ```text
 <fixed executable> app-server proxy --sock <explicit registered original endpoint>
@@ -27,7 +27,13 @@ HTTP、群与原生工具不能指定命令、endpoint、verifier、启用能力
 
 它不开新 app-server，不查默认 socket，不操作 daemon start/stop/restart。继承的 JSONL codec 只用于插件自己创建的 proxy transport 子进程；其 PID 不是原执行器身份，关闭 proxy 也不代表手动执行结束。
 
+支持 Unix-WebSocket 的已登记原服务须显式选择 `transport: original_unix_websocket`。该选项只启动宿主 Python 运行插件自有 `codex_unix_read_proxy.py` 客户端，连接配置中的原 Unix socket，并完成 WebSocket HTTP Upgrade。依据官方 [App-server Protocol](https://learn.chatgpt.com/docs/app-server)，该协议的请求不包含 `jsonrpc` 字段；Unix socket 不能当作裸 JSONL socket 使用。`executable` 仍表示被核验的原 Codex 二进制，作为宿主能力收据绑定的一部分；它不是桥接客户端的原执行器身份证明。
+
+两种传输都使用原有 `cwd`、明确 `environment`、`CODEX_HOME` 核对与当前代宿主收据门槛。新选项不会根据 socket 存在、相同历史或一次初始化自动启用观察。配置哈希与收据内的 `transport` 必须匹配，旧 stdio 收据不能直接用于新的 WebSocket 连接。
+
 `ReadOnlyCodexAdapter` 的出站白名单只允许 initialize/initialized、thread/read、thread/list、thread/loaded/list、thread/backgroundTerminals/list 及 thread/turns/list、thread/items/list。thread/start/resume/fork、turn/start/steer/interrupt、审批或 server request 的 JSON-RPC result 都在写入前拒绝。收到手动审批请求不答复、不把它登记为插件可批准请求。
+
+WebSocket 桥接进程还独立检查同一白名单，拒绝出站 `result`、`error`、额外协议字段和不合法参数，不向原服务转发它们；`thread/list` 必须明确 `useStateDbOnly=true`，避免默认扫描与修复。两端使用同一 16 MiB 完整 JSONL 帧边界。stdin EOF、原连接关闭或插件卸载只释放桥接客户端的任务、管道和连接；原 daemon 保持由原宿主管理。桥接 stdout 仅承载 JSONL 协议，错误诊断不会输出 endpoint、帧内容或凭据；它只禁用自己创建的连接 logger，不改宿主 logger 或信号处理。
 
 ## 当前能力证据
 
@@ -58,6 +64,6 @@ Gateway 在其受管生命周期内轮询原来源，再尝试 [按仓库排队�
 
 ## 验证与真实缺口
 
-公共令牌桥、HTTP/群及原生 SDK registry 使用合成的原服务 JSONL/proxy-shaped peer 验证全出站帧只读、跨仓库与别名、重启/相同历史不能替换原执行器、unsupported/分页/历史缺口、相关子执行与后台、当前 hashed receipt 门槛。它们都是 synthetic fixtures。
+公共令牌桥、HTTP/群及原生 SDK registry 使用合成的原服务 JSONL/proxy-shaped peer 验证全出站帧只读、跨仓库与别名、重启/相同历史不能替换原执行器、unsupported/分页/历史缺口、相关子执行与后台、当前 hashed receipt 门槛。新增的本机 Unix-WebSocket fixture 验证真实 HTTP Upgrade、公共配置和 adapter 的 initialize/loaded-list/read/list 往返、绕过 adapter 伪造控制帧仍被拒绝、原 server request 不答复、帧边界及连接清理。这些都是 synthetic fixtures。
 
-当前没有本人获准的测试 daemon、独立 CLI 或桌面 endpoint，也没有它们的真实读取、原请求路由、宿主 runtime coverage 或群验收收据。三个真实来源的能力分别未知；不读取真实 .hermes/.codex、原会话、默认 socket 或秘密，不运行真实 daemon/模型服务探针，不宣称真实只观察已验收。
+真实原服务的最小读取探针与身份范围证据保存在仓库外受限状态中，独立于上述 fixture。一次原 daemon 的 initialize/loaded-list 往返不等于完整来源身份、PID、原请求路由、宿主 runtime coverage、跨来源或群验收。未满足当前完整收据门槛的来源仍保持 unknown，不写入临时 PASS 收据或另启服务来强行验收；本切片不启用控制。

@@ -5,10 +5,10 @@ import json
 from pathlib import Path
 
 from .codex import CodexStdioAdapter, repository_fingerprint
+from .codex_unix_read_proxy import READ_METHODS
 from .manager import ManagementError
 from .queue import logical_repository
 
-READ_METHODS = frozenset({'initialize', 'initialized', 'thread/read', 'thread/list', 'thread/loaded/list', 'thread/backgroundTerminals/list', 'thread/turns/list', 'thread/items/list'})
 SOURCE_KINDS = {'daemon', 'independent_cli', 'desktop'}
 
 
@@ -17,12 +17,14 @@ def _now():
 
 
 class ReadOnlyCodexAdapter(CodexStdioAdapter):
-    def __init__(self, command, *, cwd, env, service_ref, source_kind, endpoint_ref, verifier=None, timeout=10):
+    def __init__(self, command, *, cwd, env, service_ref, source_kind, endpoint_ref, verifier=None, timeout=10, transport='original_proxy_stdio'):
         super().__init__(command, cwd=cwd, env=env, service_ref=service_ref, timeout=timeout)
         if source_kind not in SOURCE_KINDS or not isinstance(endpoint_ref, str) or not endpoint_ref.startswith('local:'):
             raise ManagementError('invalid_change', 'An explicit original local endpoint and individual source kind are required.')
         self.source_kind, self.endpoint_ref, self.observation_verifier = source_kind, endpoint_ref, verifier
-        self.transport = 'original_proxy_stdio'
+        if transport not in {'original_proxy_stdio', 'original_unix_websocket'}:
+            raise ManagementError('invalid_change', 'Select an explicit registered observation transport.')
+        self.transport = transport
 
     def proof(self):
         binding = {'generation': self.generation, 'service_ref': self.service_ref, 'source_kind': self.source_kind,
@@ -261,7 +263,7 @@ def configured_observation_adapters(configs, state_dir):
     adapters = {}
     allowed = {'executable', 'cwd', 'environment', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref'}
     for config in configs:
-        if not isinstance(config, dict) or set(config) != allowed or any(not isinstance(config.get(k), str) or not config[k] for k in ('executable', 'cwd', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref')) or not Path(config['executable']).is_absolute() or not Path(config['endpoint']).is_absolute() or config['service_ref'] in adapters:
+        if not isinstance(config, dict) or set(config) - (allowed | {'transport'}) or not allowed.issubset(config) or config.get('transport', 'original_proxy_stdio') not in {'original_proxy_stdio', 'original_unix_websocket'} or any(not isinstance(config.get(k), str) or not config[k] for k in ('executable', 'cwd', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref')) or not Path(config['executable']).is_absolute() or not Path(config['endpoint']).is_absolute() or config['service_ref'] in adapters:
             raise ManagementError('invalid_change', 'Specify the fixed executable, original endpoint, source kind and explicit environment; no default socket or owned server is accepted.')
         frozen = dict(config)
         def verifier(binding, frozen=frozen):
@@ -289,6 +291,10 @@ def configured_observation_adapters(configs, state_dir):
                 return {**receipt, 'evidence_ref': str(receipt_path)}
             except (OSError, ValueError, TypeError, KeyError) as exc:
                 raise ManagementError('capability_unverified', 'No current hashed host evidence verifies this approved original endpoint and read capabilities; observation remains unavailable.') from exc
-        adapters[config['service_ref']] = ReadOnlyCodexAdapter([config['executable'], 'app-server', 'proxy', '--sock', config['endpoint']],
-            cwd=config['cwd'], env=config['environment'], service_ref=config['service_ref'], source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'], verifier=verifier)
+        transport = config.get('transport', 'original_proxy_stdio')
+        command = [config['executable'], 'app-server', 'proxy', '--sock', config['endpoint']]
+        if transport == 'original_unix_websocket':
+            command = [sys.executable, str(Path(__file__).with_name('codex_unix_read_proxy.py')), '--sock', config['endpoint']]
+        adapters[config['service_ref']] = ReadOnlyCodexAdapter(command,
+            cwd=config['cwd'], env=config['environment'], service_ref=config['service_ref'], source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'], verifier=verifier, transport=transport)
     return adapters
