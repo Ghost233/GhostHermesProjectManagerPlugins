@@ -7,7 +7,7 @@ import yaml
 
 scratch = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(scratch / 'readiness-fixtures'))
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / '.hermes', Path.home() / '.dsh', Path.home() / '.codex']
 
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
@@ -42,7 +42,7 @@ repo, head = commit_repo(scratch / 'repo')
 class Source:
     def read_issue(self, url):
         return {**ISSUE, 'url': url, 'body': ISSUE['body'] + '\nNew source context.', 'updated_at': '2026-10-07T04:00:00Z'}
-with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(scratch), delivery_source=Source()) as authority:
+with Manager(state, owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(scratch), delivery_source=Source()) as authority:
     request_id = accepted(authority, repo)
     second = acknowledge(authority)
     with ManagementServer(authority, {os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN']: participant}):

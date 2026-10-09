@@ -4,34 +4,35 @@ import hashlib
 import json
 from pathlib import Path
 
-from .codex import CodexStdioAdapter, repository_fingerprint
+from .dsh import DshRemoteAdapter, repository_fingerprint
 from .manager import ManagementError, _repository
 from .observation import READ_METHODS, SOURCE_KINDS
 
-CONTROL_METHODS = frozenset({'turn/steer', 'turn/start', 'turn/interrupt'})
+CONTROL_METHODS = frozenset({'session/prompt', 'session/cancel', '$events/result', 'userQuestions/answer'})
 
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-class OriginalControlAdapter(CodexStdioAdapter):
+class OriginalControlAdapter(DshRemoteAdapter):
     """Independent original proxy. The readonly adapter is never promoted."""
-    def __init__(self, command, *, cwd, env, service_ref, source_kind, endpoint_ref, verifier=None, timeout=10):
-        super().__init__(command, cwd=cwd, env=env, service_ref=service_ref, timeout=timeout)
+    def __init__(self, base_url, *, cookie='', service_ref, source_kind, endpoint_ref, verifier=None, timeout=10, expected_home=None):
+        super().__init__(base_url, cookie=cookie, service_ref=service_ref, timeout=timeout, expected_home=expected_home)
         if source_kind not in SOURCE_KINDS or not isinstance(endpoint_ref, str) or not endpoint_ref.startswith('local:'):
             raise ManagementError('invalid_change', 'An explicit original endpoint and individual supported source kind are required.')
         self.source_kind, self.endpoint_ref, self.control_verifier = source_kind, endpoint_ref, verifier
-        self.origin_proof, self.authority = None, None
+        self.origin_proof, self.authority, self.control_repository = None, None, None
 
     def _proof(self, repository, context):
         binding = {'generation': self.generation, 'service_ref': self.service_ref, 'service_id': context['original_executor_id'],
-                   'endpoint_ref': self.endpoint_ref, 'source_kind': self.source_kind, 'transport': 'original_proxy_stdio'}
+                   'endpoint_ref': self.endpoint_ref, 'source_kind': self.source_kind, 'transport': 'desktop_http_mux', 'engine': 'dsh'}
         if self.connection is not None:
             binding['platform'] = self.connection['platform']
+            binding['client_id'] = self.connection['client_id']
         proof = self.control_verifier(binding, repository, context) if callable(self.control_verifier) else None
         required = ('permission_profile', 'policy_digest', 'platform_enforcement', 'tool_paths', 'manual_execution_coverage', 'takeover', 'control_access')
-        if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in binding.items()) or proof.get('grant_binding') != context or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']] or any(not isinstance(proof.get(k), str) or not proof[k] for k in required) or proof.get('control_access') != 'verified-original-input-path':
+        if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in binding.items()) or proof.get('grant_binding') != context or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']] or any(not isinstance(proof.get(k), str) or not proof[k] for k in required) or proof.get('control_access') != 'verified-original-input-path' or not proof['permission_profile'].startswith('host:') or not isinstance(proof.get('backend_instance_ref'), str) or not proof['backend_instance_ref']:
             raise ManagementError('capability_unverified', 'Current original-service control, task scope and complete write/tool boundary evidence are unavailable; takeover is not enabled.')
         actions = {'append', 'stop', 'continue', 'idle_input', 'related_execution', 'human_response'}
         if not isinstance(proof.get('task_control'), dict) or any(not isinstance(proof['task_control'].get(action), str) or not proof['task_control'][action] for action in actions):
@@ -39,11 +40,14 @@ class OriginalControlAdapter(CodexStdioAdapter):
         return proof
 
     def verify_takeover(self, repository, context):
+        self.control_repository = repository
+        self.bind_repository(context['thread_id'], repository)
         proof = self._proof(repository, context)
         self.origin_proof = proof
         self.connect()
         proof = self._proof(repository, context)
         self.origin_proof = proof
+        self._control_proof = proof
         return proof
 
     def connect(self):
@@ -52,26 +56,26 @@ class OriginalControlAdapter(CodexStdioAdapter):
         if self.connection and self.connection.get('service_id') != self.origin_proof['service_id']:
             raise ManagementError('binding_conflict', 'The control connection belongs to another original executor.')
         connection = super().connect()
-        self.connection.update(service_id=self.origin_proof['service_id'], endpoint_ref=self.endpoint_ref, source_kind=self.source_kind,
-                               transport='original_proxy_stdio', control='manual_work_grant')
+        if connection['service_id'] != self.origin_proof['service_id']:
+            raise ManagementError('binding_conflict', 'The current DSH backend differs from the original granted executor.')
+        self.connection.update(endpoint_ref=self.endpoint_ref, source_kind=self.source_kind,
+                               transport='desktop_http_mux', control='manual_work_grant')
         return dict(self.connection)
 
-    def _write(self, envelope):
-        method = envelope.get('method')
+    def _guard_request(self, method, params):
         if method in READ_METHODS:
-            return super()._write(envelope)
-        if method is not None and method not in CONTROL_METHODS:
-            raise ManagementError('forbidden', 'Manual takeover cannot create/resume/fork a thread or control the daemon.')
+            return super()._guard_request(method, params)
+        if method not in CONTROL_METHODS:
+            raise ManagementError('forbidden', 'Manual takeover cannot create a session or replace the DSH backend.')
         authority = self.authority() if callable(self.authority) else None
-        if not authority or authority['status'] != 'active' or authority['id'] != self.origin_proof['grant_binding']['grant_id']:
+        if not authority or authority['status'] != 'active' or authority['id'] != (self.origin_proof or {}).get('grant_binding', {}).get('grant_id'):
             raise ManagementError('forbidden', 'No active current-work grant authorizes this original input.')
-        params = envelope.get('params', {})
-        if method is None:
-            incoming = self._server_requests.get((type(envelope.get('id')), envelope.get('id')))
-            params = incoming['envelope'].get('params', {}) if incoming else {}
-        if params.get('threadId') != authority['thread_id'] or method in {'turn/steer', 'turn/interrupt'} and params.get('expectedTurnId', params.get('turnId')) != authority['turn_id'] or method is None and params.get('turnId') != authority['turn_id']:
+        target = params.get('_authority', {})
+        if target.get('thread_id') != authority['thread_id'] or target.get('turn_id') != authority['turn_id']:
             raise ManagementError('binding_conflict', 'The input is outside the original granted thread/current turn.')
-        return super()._write(envelope)
+        action = 'stop' if method == 'session/cancel' else 'human_response' if method in {'$events/result', 'userQuestions/answer'} else 'append'
+        self.verify_control(self.control_repository, action, self.origin_proof)
+        return super()._guard_request(method, params)
 
     def verify_control(self, repository, action, expected_capability):
         authority = self.authority() if callable(self.authority) else None
@@ -83,6 +87,7 @@ class OriginalControlAdapter(CodexStdioAdapter):
         if not isinstance(proof.get('task_control'), dict) or not isinstance(proof['task_control'].get(action), str) or not proof['task_control'][action] or any(proof.get(k) != expected_capability.get(k) for k in ('permission_profile', 'policy_digest', 'runtime_roots')):
             raise ManagementError('capability_unverified', 'The current original control capability differs from the granted immutable boundary.')
         self.origin_proof = proof
+        self._control_proof = proof
         return proof
 
     def verify_start(self, repository):
@@ -101,13 +106,25 @@ def executor_for(manager, record):
     session = record.get('session', {})
     if session.get('recovery_ref'):
         return manager.recovery_adapters.get(session['recovery_ref'])
-    return manager.control_adapters.get(session.get('manual_source_id')) if session.get('origin') == 'manual_takeover' else manager.codex_adapter
+    if session.get('origin') == 'manual_takeover':
+        return manager.control_adapters.get(session.get('manual_source_id'))
+    accepted_ref, session_ref = record.get('accepted_dsh_ref'), session.get('service_ref')
+    if accepted_ref and session_ref and accepted_ref != session_ref:
+        return None
+    reference = accepted_ref or session_ref
+    adapter = manager.dsh_adapters.get(reference)
+    if adapter is not None:
+        return adapter
+    legacy = manager.dsh_adapter
+    return legacy if legacy is not None and reference == legacy.service_ref else None
 
 
 def _assignment(record, data):
+    if record.get('executor_engine') != 'dsh':
+        raise ManagementError('binding_conflict', 'The accepted work belongs to another executor and requires explicit migration.')
     profile = data['profiles'].get(record['profile_id'], {})
     accepted = record.get('accepted_responsibility', {})
-    if not accepted or any(profile.get(k) != v for k, v in accepted.items()) or profile.get('connection_refs', {}).get('codex') != record.get('accepted_codex_ref') or record['accepted_repository_fingerprint'] != repository_fingerprint(data['projects'][record['project_id']]['repo']):
+    if not accepted or any(profile.get(k) != v for k, v in accepted.items()) or profile.get('connection_refs', {}).get('dsh') != record.get('accepted_dsh_ref') or record['accepted_repository_fingerprint'] != repository_fingerprint(data['projects'][record['project_id']]['repo']):
         raise ManagementError('forbidden', 'The accepted responsibility and repository must remain current for this work grant.')
 
 
@@ -230,6 +247,9 @@ def return_session_control(manager, identity, request_id, grant_id):
 
 def bind_executor(manager, record):
     adapter = executor_for(manager, record)
+    if adapter is not None:
+        adapter.waterfall_authority = lambda thread_id, turn_id: _waterfall_authority(manager, adapter, thread_id, turn_id)
+        adapter.waterfall_question_supported = lambda envelope: _waterfall_question_supported(manager, envelope)
     if adapter is not None and record.get('session', {}).get('recovery_ref'):
         from .recovery import bind_recovery
         return bind_recovery(manager, record, adapter)
@@ -237,6 +257,53 @@ def bind_executor(manager, record):
         grant_id = record.get('control_grant_id')
         adapter.authority = lambda: _authority(manager, grant_id)
     return adapter
+
+
+def _waterfall_authority(manager, adapter, thread_id, turn_id):
+    """A pending interaction must still belong to one durably assigned work item."""
+    if not manager._lock.acquire(blocking=False):
+        return False  # Passing through must not wait behind an execution operation.
+    try:
+        if adapter._closed or not adapter.connection:
+            return False
+        schema, _, payload = manager._db.execute('SELECT schema_version, version, payload FROM directory WHERE id=1').fetchone()
+        data = json.loads(payload)
+        if schema != 2 or data.get('executor_engine') != 'dsh':
+            return False
+        for candidate in data.get('requests', {}).values():
+            session = candidate.get('session', {})
+            if (executor_for(manager, candidate) is not adapter or session.get('thread_id') != thread_id
+                    or session.get('turn_id') != turn_id or session.get('generation') != adapter.generation
+                    or session.get('service_id') != adapter.connection['service_id']
+                    or session.get('control') != 'assigned_task' or candidate.get('repository_released')
+                    or candidate.get('task_delivery') == 'delivered' or candidate.get('archive_stop_intent')
+                    or candidate.get('outer_task_status') == 'stopped'
+                    or candidate.get('stop', {}).get('status') == 'processing'):
+                continue
+            _assignment(candidate, data)
+            from .lifecycle import require_active
+            require_active(data, candidate['profile_id'], candidate['project_id'])
+            if (session.get('origin') == 'manual_takeover'
+                    and data.get('control_grants', {}).get(candidate.get('control_grant_id'), {}).get('status') != 'active'):
+                return False
+            return True
+        return False
+    except Exception:
+        return False
+    finally:
+        manager._lock.release()
+
+
+def _waterfall_question_supported(manager, envelope):
+    if not manager._lock.acquire(blocking=False):
+        return False
+    try:
+        from .questions import _describe
+        return _describe(manager, envelope).get('answerable') is True
+    except Exception:
+        return False
+    finally:
+        manager._lock.release()
 
 
 def _expire_grant(data, grant, status, reason=None):
@@ -300,22 +367,21 @@ def complete_grant(manager, record, data):
 
 
 def configured_control_adapters(configs, state_dir):
-    """Only trusted native original-proxy settings and hashed current-grant evidence."""
+    """Independent clients of the existing DSH backend, never promoted observers."""
+    from .observation import resolved_configuration
     if not configs:
         return {}
-    allowed = {'source_id', 'executable', 'cwd', 'environment', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref'}
     adapters = {}
     if not isinstance(configs, list):
         raise ManagementError('invalid_change', 'Manual control requires an explicit native configuration list.')
     for config in configs:
-        if not isinstance(config, dict) or set(config) != allowed or any(not isinstance(config.get(k), str) or not config[k] for k in ('source_id', 'executable', 'cwd', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref')) or not Path(config['executable']).is_absolute() or not Path(config['endpoint']).is_absolute() or config['source_id'] in adapters:
-            raise ManagementError('invalid_change', 'Specify the original source, fixed executable and registered endpoint; no default daemon or new server is accepted.')
-        command = [config['executable'], 'app-server', 'proxy', '--sock', config['endpoint']]
-        frozen = dict(config)
-        def verifier(binding, repository, context, frozen=frozen, command=command):
+        frozen, runtime = resolved_configuration(config, extra=('source_id',))
+        if config['source_id'] in adapters:
+            raise ManagementError('invalid_change', 'A manual source cannot have multiple control connections.')
+        def verifier(binding, repository, context, frozen=frozen):
             try:
                 base = Path(state_dir).resolve()
-                manifest_path = base / 'manual-control.json'
+                manifest_path = base / 'dsh-manual-control.json'
                 if manifest_path != manifest_path.resolve() or manifest_path.stat().st_size > 65536:
                     raise ValueError('Invalid control manifest.')
                 reference = json.loads(manifest_path.read_text())[context['grant_id']]
@@ -326,15 +392,17 @@ def configured_control_adapters(configs, state_dir):
                 if hashlib.sha256(raw).hexdigest() != reference['sha256']:
                     raise ValueError('Control receipt digest mismatch.')
                 report = json.loads(raw)
-                if not isinstance(report, dict) or report.get('grant_binding') != context or report.get('source_id') != frozen['source_id'] or report.get('endpoint_ref') != frozen['endpoint_ref'] or report.get('endpoint_sha256') != hashlib.sha256(frozen['endpoint'].encode()).hexdigest() or report.get('source_kind') != frozen['source_kind']:
-                    raise ValueError('The current work/source scope differs.')
-                connection = {'generation': binding['generation'], 'service_id': binding['service_id'], 'platform': binding.get('platform', report.get('platform'))}
+                if not isinstance(report, dict) or report.get('grant_binding') != context or report.get('source_id') != frozen['source_id'] or report.get('endpoint_ref') != frozen['endpoint_ref'] or report.get('endpoint_sha256') != hashlib.sha256(frozen['base_url'].encode()).hexdigest() or report.get('source_kind') != frozen['source_kind'] or not isinstance(report.get('backend_instance_ref'), str) or not report['backend_instance_ref']:
+                    raise ValueError('The current work/backend scope differs.')
+                connection = {**binding, 'platform': binding.get('platform', report.get('platform'))}
                 from .validation import validate_receipts
-                proof = validate_receipts(report, connection, repository, command, frozen['environment'], state_dir, startup_kind='manual_takeover')
+                proof = validate_receipts(report, connection, repository, frozen, state_dir, startup_kind='manual_takeover')
                 return {**proof, **binding, 'grant_binding': context, 'takeover': proof['manual_takeover'],
+                        'backend_instance_ref': report['backend_instance_ref'],
                         'control_access': 'verified-original-input-path', 'external_actor_coverage': 'unknown'}
             except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise ManagementError('capability_unverified', 'Current hashed original takeover/write/tool/control evidence is missing; original control remains disabled.') from exc
-        adapters[config['source_id']] = OriginalControlAdapter(command, cwd=config['cwd'], env=config['environment'], service_ref=config['service_ref'],
-            source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'], verifier=verifier)
+                raise ManagementError('capability_unverified', 'Current hashed DSH takeover/write/tool/control evidence is missing; original control remains disabled.') from exc
+        adapters[config['source_id']] = OriginalControlAdapter(runtime['base_url'], cookie=runtime['cookie'],
+            service_ref=config['service_ref'], source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'],
+            verifier=verifier, expected_home=config.get('expected_home'))
     return adapters

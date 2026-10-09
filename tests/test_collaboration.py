@@ -379,11 +379,11 @@ def test_project_lead_delegates_a_clear_issue_only_to_explicit_own_child(tmp_pat
 def test_child_result_uses_original_issue_delivery_and_parent_only_reports_pending_integration(tmp_path):
     from test_task_execution import adapter_for, prepare_fixture
     from test_task_control import THREAD, TURN
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource(), codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource(), dsh_adapter=adapter_for(tmp_path)) as manager:
         parent_id, child_channel = accepted_parent(manager, tmp_path)
         version = manager.read_snapshot(OWNER)['version']
         profile = next(p for p in manager.read_snapshot(OWNER)['profiles'] if p['id'] == 'child')
-        manager.apply_directory_change(OWNER, version, {'profile': {k: profile[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id')} | {'connection_refs': {'codex': 'local:fixture-stdio'}}})
+        manager.apply_directory_change(OWNER, version, {'profile': {k: profile[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id')} | {'connection_refs': {'dsh': 'local:fixture-stdio'}}})
         channels = [dict(c) for c in manager.read_snapshot(OWNER)['collaboration']['channels']]
         for c in channels:
             c.pop('profile_binding')
@@ -588,11 +588,11 @@ async def test_multipart_native_work_preserves_full_text_first_source_and_create
 def test_direct_child_delivery_answers_original_owner_and_synchronizes_result_to_parent(tmp_path):
     from test_task_execution import adapter_for, prepare_fixture
     from test_task_control import TURN
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource(), codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource(), dsh_adapter=adapter_for(tmp_path)) as manager:
         parent_id, child = accepted_parent(manager, tmp_path)
         current = next(p for p in manager.read_snapshot(OWNER)['profiles'] if p['id'] == 'child')
         profile = {k: current[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id')}
-        profile['connection_refs'] = {'codex': 'local:fixture-stdio'}
+        profile['connection_refs'] = {'dsh': 'local:fixture-stdio'}
         manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': profile})
         task = manager.accept_request(OWNER, 'child-project', 'child', source(child, message_id='om_direct_delivery'), ISSUE)['request']
         manager.publish_request_message(OWNER, task['id'], 'confirmation', '已受理本人直接 Issue')

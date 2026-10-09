@@ -47,7 +47,9 @@ def snapshot(manager, data, project_ids):
 
 def human_text(question):
     text = '人工请求：' + question['id'] + '\n分类：' + question['category']
-    if question['category'] in {'question', 'nonblocking'}:
+    if question.get('notification_only') is True and question.get('resolution') == 'unverified':
+        text += '\n原审批审计状态待核实，无法唯一关联；不会代作决定。'
+    if question['category'] in {'question', 'nonblocking'} and question.get('answerable') is True and question.get('control_enabled') is True:
         text += '\n' + '\n'.join(q['question'] for q in question.get('questions', []))
         text += '\n本人可回复：回答 ' + question['id'] + '：答案'
     elif question['category'] == 'approval' and question['answerable']:
@@ -58,6 +60,27 @@ def human_text(question):
         text += '\n请在原服务的安全原界面处理。服务：' + question['original_interface']['service_ref']
         text += '\n原会话：' + question['thread_id'] + '；安全链接尚不可用。不要在群里发送秘密答案。'
     return text
+
+
+def live_human_request(manager, task, question):
+    """A notice can use a live original RPC without granting permission to answer."""
+    if question['resolution'] not in {'pending', 'unverified'} or question.get('reply') or task.get('repository_released') or task.get('task_delivery') == 'delivered' or task.get('session', {}).get('control') != 'assigned_task':
+        return False
+    from .takeover import executor_for
+    adapter = executor_for(manager, task)
+    if adapter is None or adapter._closed or adapter.generation != question.get('generation') or not adapter.connection or adapter.connection.get('service_id') != question.get('service_id'):
+        return False
+    if question['method'] == 'natural_language':
+        return question['resolution'] == 'pending'
+    try:
+        requests = adapter.server_requests(question['thread_id'])
+    except ManagementError:
+        return False
+    return any((incoming['state'] == 'pending' or question.get('notification_only') is True
+                and incoming['state'] == 'notice' and incoming['envelope'].get('params', {}).get('notice_current') is True)
+        and type(incoming['envelope']['id']) is type(question.get('rpc_id')) and incoming['envelope']['id'] == question.get('rpc_id')
+        and incoming['envelope']['method'] == question['method'] and incoming['envelope'].get('params', {}).get('threadId') == question['thread_id']
+        and (question['resolution'] == 'unverified' or incoming['envelope']['params'].get('turnId') == question.get('turn_id')) for incoming in requests)
 
 
 def emit(saved, kind, project_id, tasks, text, now, *, human_request_id=None, mention_owner=False, key=None):
@@ -95,7 +118,7 @@ def stall_coverage(manager, task):
         if thread.get('id') != session['thread_id'] or thread.get('cwd') != session['repository']['worktree']:
             return 'unverified'
         related, evidence = terminal_evidence(adapter, session, thread, session['turn_id'])
-        if any(r['kind'] in {'background_terminal', 'unfinished_item'} or r['thread_id'] != session['thread_id'] for r in related):
+        if any(r['kind'] in {'background_job', 'unfinished_item'} or r['thread_id'] != session['thread_id'] for r in related):
             return 'explained_related_execution'
         if not any(e.get('process_coverage') for e in evidence):
             return 'unverified'
@@ -237,7 +260,7 @@ def run(manager, identity):
                     elif coverage == 'explained_related_execution':
                         tracker.update(progress_at=now, stall_sent=False)
             for question in task.get('human_requests', []):
-                if task['execution'] in {'unverified', 'stopping', 'stopped'} or task['id'] in refresh_failures or question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled') or not (question.get('blocking') is True or question['category'] == 'approval'):
+                if task['execution'] in {'unverified', 'stopping', 'stopped'} or task['id'] in refresh_failures or not live_human_request(manager, task, question) or not (question.get('blocking') is True or question['category'] == 'approval'):
                     continue
                 previous = saved['human_requests'].get(question['id'])
                 if previous is not None and now - previous < 1800:
@@ -257,7 +280,8 @@ def run(manager, identity):
             text = '项目汇总：' + project_id + '\n' + '\n'.join(
                 '负责人：' + t['profile_id'] + '；状态：' + t['execution'] + '\n进展：' + ('本周期已核实变化' if schedule['task_progress'].get(t['id']) != current_progress[t['id']] else '无新进展') + '；交付：' + t.get('task_delivery', 'unmet') +
                 '；PR：' + t.get('pr_status', 'none') + '\n阻塞：' + (t.get('unexecuted_reason') or '无已核实阻塞') +
-                '\n待处理：' + '\n'.join(human_text(q) for q in t.get('human_requests', []) if q['resolution'] == 'pending' and not q.get('reply')) +
+                '\n待处理：' + '\n'.join(human_text(q) for q in t.get('human_requests', [])
+                    if (q['resolution'] == 'pending' or q.get('notification_only') is True and q['resolution'] == 'unverified') and not q.get('reply')) +
                 '\n下一步：核对原服务与当前有效请求\nIssue：' + t['accepted_scope']['url'] for t in tasks)
             emit(saved, 'summary', project_id, tasks, text, now)
             schedule['summary_at'] = now
@@ -321,7 +345,7 @@ def manage(manager, identity, action, details):
                     return None
             if event.get('human_request_id'):
                 question = next((q for task_id in event['request_ids'] for q in data['requests'][task_id].get('human_requests', []) if q['id'] == event['human_request_id']), None)
-                if not question or question['resolution'] != 'pending' or question.get('reply') or not question.get('control_enabled') or any(data['requests'][task_id]['execution'] in {'unverified', 'stopping', 'stopped'} for task_id in event['request_ids']):
+                if not question or any(data['requests'][task_id]['execution'] in {'unverified', 'stopping', 'stopped'} or not live_human_request(manager, data['requests'][task_id], question) for task_id in event['request_ids']):
                     event['delivery'] = 'expired'
                     manager._save(version, data)
                     return None

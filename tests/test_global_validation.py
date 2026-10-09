@@ -32,10 +32,10 @@ def combination(manager, root, *, unassigned=False, public_goal=False):
         subprocess.run(['git', '-C', str(mono), 'update-index', '--add', '--cacheinfo', '160000,' + leaf_head + ',unassigned'], check=True)
         subprocess.run(['git', '-C', str(mono), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'unassigned module'], check=True)
     value = registration(mono)
-    value['profile']['connection_refs']['codex'] = 'local:fixture-stdio'
+    value['profile']['connection_refs']['dsh'] = 'local:fixture-stdio'
     manager.apply_directory_change(OWNER, 0, value)
     value = registration(child, 'child-project', 'child-lead')
-    value['profile'].update(identity_ref='fixture:child', role='subproject_lead', parent_profile_id='mono-lead', connection_refs={'codex': 'local:fixture-stdio'})
+    value['profile'].update(identity_ref='fixture:child', role='subproject_lead', parent_profile_id='mono-lead', connection_refs={'dsh': 'local:fixture-stdio'})
     manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], value)
     if public_goal:
         from test_collaboration import channel, source, STEWARD
@@ -72,7 +72,7 @@ def combination(manager, root, *, unassigned=False, public_goal=False):
 
 
 def test_fixed_combination_holds_related_repositories_and_only_releases_validation_occupancy(tmp_path):
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path)) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
             client = ManagementClient(tmp_path / 'state', 'lead')
@@ -125,7 +125,7 @@ class FixtureHost:
 
 def test_real_synthetic_test_run_blocks_new_child_work_and_releases_only_its_own_holds(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
             client = ManagementClient(tmp_path / 'state', 'lead')
@@ -151,7 +151,7 @@ def test_real_synthetic_test_run_blocks_new_child_work_and_releases_only_its_own
 @pytest.mark.parametrize('change', ['source', 'metadata', 'commit', 'ignored_source'])
 def test_input_change_invalidates_passed_tests_and_releases_validation_hold(tmp_path, change):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
@@ -184,7 +184,7 @@ class PreparationHost(FixtureHost):
 
 def test_only_independent_owner_preparation_materializes_fixed_child_before_testing(tmp_path):
     host = PreparationHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         fixed = git(child, 'rev-parse', 'HEAD')
         subprocess.run(['git', '-C', str(child), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'different materialization'], check=True)
@@ -203,7 +203,7 @@ def test_only_independent_owner_preparation_materializes_fixed_child_before_test
 
 def test_preparation_preserves_user_changes_and_never_calls_materializer_when_dirty(tmp_path):
     host = PreparationHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         (child / 'source.py').write_text('owner uncommitted work\n')
@@ -235,7 +235,7 @@ class FailedHost(FixtureHost):
 
 def test_failed_child_has_an_explicit_verified_issue_and_a_public_rework_handoff(tmp_path):
     from test_collaboration import channel
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=FailedHost(), delivery_source=IssueReadSource()) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=FailedHost(), delivery_source=IssueReadSource()) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         lead_channel, kid_channel = channel('mono-lead'), channel('child-lead')
         lead_channel['bot_sources'] = []
@@ -258,7 +258,7 @@ def test_failed_child_has_an_explicit_verified_issue_and_a_public_rework_handoff
 
 def test_final_completion_requires_original_mono_acceptance_and_fresh_stable_validation(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
@@ -284,7 +284,7 @@ async def test_dashboard_and_native_group_share_versions_evidence_and_round_hold
     from test_feishu_entry import CONFIG, Gateway, Transport, event
     from ghost_hermes_pm.messages import FeishuEntry
     from ghost_hermes_pm.dashboard import create_router
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=FixtureHost()) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=FixtureHost()) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         with ManagementServer(manager, {'owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'owner')
@@ -315,7 +315,7 @@ async def test_dashboard_and_native_group_share_versions_evidence_and_round_hold
 
 def test_unassigned_materialized_module_is_checked_without_creating_an_owner(tmp_path):
     host = FailedHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host, delivery_source=IssueReadSource()) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host, delivery_source=IssueReadSource()) as manager:
         mono, child, parent, kid = combination(manager, tmp_path, unassigned=True)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         assert plan['unassigned'][0]['path'] == 'unassigned' and plan['unassigned'][0]['commit'] == git(mono / 'unassigned', 'rev-parse', 'HEAD')
@@ -333,10 +333,10 @@ def test_unassigned_materialized_module_is_checked_without_creating_an_owner(tmp
 def test_current_manual_activity_blocks_global_validation_without_any_control(tmp_path):
     from test_manual_observation import observer, manual_state, READ_ONLY
     peer = tmp_path / 'manual-peer'
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=FixtureHost(), observation_adapters={'local:manual-daemon': observer(peer)}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=FixtureHost(), observation_adapters={'local:manual-desktop': observer(peer)}) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         manual_state(peer, child, 'idle')
-        manager.register_observation_source(OWNER, {'id': 'manual-child', 'kind': 'daemon', 'project_ids': ['child-project'], 'adapter_ref': 'local:manual-daemon'})
+        manager.register_observation_source(OWNER, {'id': 'manual-child', 'kind': 'desktop', 'project_ids': ['child-project'], 'adapter_ref': 'local:manual-desktop'})
         manager.refresh_manual_sessions(OWNER, 'child-project')
         manual_state(peer, child, 'active')
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
@@ -389,7 +389,7 @@ async def test_approved_repository_delivery_failure_issue_repair_revalidation_an
     from types import SimpleNamespace as NS
     from ghost_hermes_pm.feishu import NativeFeishuTransport
     issue_source, host = RunnerIssueSource(), FailedHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host, delivery_source=issue_source) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host, delivery_source=issue_source) as manager:
         mono, child, parent, kid = combination(manager, tmp_path, public_goal=True)
         channels = [channel('steward', 'entry'), channel('steward'), channel('mono-lead'), channel('child-lead')]
         manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': {'id': 'steward', 'native_profile': 'steward', 'identity_ref': STEWARD.subject,
@@ -483,7 +483,7 @@ class UnknownStartHost(FixtureHost):
 
 def test_unknown_test_start_is_not_replayed_and_reconciles_the_original_run_after_restart(tmp_path):
     host = UnknownStartHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         with pytest.raises(ManagementError) as unknown:
@@ -501,7 +501,7 @@ def test_unknown_test_start_is_not_replayed_and_reconciles_the_original_run_afte
 
 
 def test_duplicate_plan_is_one_round_and_explicit_retry_is_a_new_related_round(tmp_path):
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path)) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         details = {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']}
         first = manager.global_validation(LEAD, 'plan', details)
@@ -515,7 +515,7 @@ def test_duplicate_plan_is_one_round_and_explicit_retry_is_a_new_related_round(t
 
 def test_detected_invalidation_is_durable_and_restoring_bytes_cannot_revive_old_pass(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         (child / '.git' / 'info' / 'exclude').write_text('hidden.py\n')
         (child / 'hidden.py').write_text('original ignored input\n')
@@ -532,7 +532,7 @@ def test_detected_invalidation_is_durable_and_restoring_bytes_cannot_revive_old_
 
 def test_runner_configuration_change_withdraws_a_previously_passed_combination(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
@@ -543,7 +543,7 @@ def test_runner_configuration_change_withdraws_a_previously_passed_combination(t
 
 def test_responsibility_correction_invalidates_existing_global_evidence(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})
@@ -567,7 +567,7 @@ class UnknownPreparationHost(PreparationHost):
 
 def test_unknown_authorized_preparation_queries_original_action_without_another_checkout(tmp_path):
     host = UnknownPreparationHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         fixed = git(child, 'rev-parse', 'HEAD')
         subprocess.run(['git', '-C', str(child), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'other materialization'], check=True)
@@ -587,7 +587,7 @@ def test_unknown_authorized_preparation_queries_original_action_without_another_
 
 def test_original_input_change_event_invalidates_even_when_ignored_bytes_are_restored(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         (child / '.git' / 'info' / 'exclude').write_text('hidden.py\n')
         (child / 'hidden.py').write_text('original ignored input\n')
@@ -603,7 +603,7 @@ def test_original_input_change_event_invalidates_even_when_ignored_bytes_are_res
 
 def test_restart_without_original_input_watch_withdraws_current_completion(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
         manager.global_validation(LEAD, 'start', {'validation_id': plan['id']})

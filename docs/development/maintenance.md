@@ -1,5 +1,7 @@
 # 维护、停用与恢复
 
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
 统一管理入口 `maintenance(action, details)` 提供 `enter`、`check`、`checkpoint`、`switch`、`rollback`、`deactivate`、`reenable`。Dashboard 和已核实飞书本人入口调用同一权威实例，普通 Profile、模型凭据和消息正文中的身份自称不提供本人维护权限。
 
 ## Dashboard 用户路径
@@ -34,4 +36,4 @@
 
 ## 当前验收范围
 
-离线公共测试使用真实管理入口、HTTP 路由和飞书原事件语义，外部原生维护、Codex、飞书及 React／Dashboard SDK 边界使用受控夹具。完整获准的真实版本、控制、消息、资料边界、备份与恢复验收须分别取得证据。Dashboard 的 `release_verified` 保持由权威实际核实结果决定，离线测试或静态版本显示不开放发布能力；正式安装、开通现有机器人和真实资料迁移需要具体安排。
+离线公共测试使用真实管理入口、HTTP 路由和飞书原事件语义，外部原生维护、DSH、飞书及 React／Dashboard SDK 边界使用受控夹具。完整获准的真实版本、控制、消息、资料边界、备份与恢复验收须分别取得证据。Dashboard 的 `release_verified` 保持由权威实际核实结果决定，离线测试或静态版本显示不开放发布能力；正式安装、开通现有机器人和真实资料迁移需要具体安排。

@@ -7,7 +7,7 @@ import yaml
 
 scratch = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(scratch / 'readiness-fixtures'))
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / '.hermes', Path.home() / '.dsh', Path.home() / '.codex']
 
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
@@ -42,7 +42,7 @@ repo = make_repo(scratch / 'repo')
 peer = scratch / 'original'
 original_state(peer, repo)
 read, control = adapters(peer)
-with Manager(state, owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as authority:
+with Manager(state, owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as authority:
     request_id, observed = setup(authority, repo)
     authority.take_over_session(OWNER, request_id, observed['id'], 'sdk-current-work', ORIGINAL_TURN)
     with ManagementServer(authority, {os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN']: participant}):
@@ -57,5 +57,5 @@ with Manager(state, owner_identity_ref=OWNER.subject, observation_adapters={'loc
         assert task({'action': 'takeover', 'grant_id': 'bot-takeover', 'manual_session_id': observed['id'], 'expected_turn_id': ORIGINAL_TURN})['code'] == 'forbidden'
         assert plugin_manager.unload('ghost-hermes-pm')
 methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
-assert methods.count('turn/steer') == 1 and not {'thread/start', 'thread/resume', 'thread/fork', 'turn/interrupt'} & set(methods)
+assert methods.count('fixture/append') == 1 and not {'fixture/create', 'thread/resume', 'thread/fork', 'fixture/stop'} & set(methods)
 print('native load, Dashboard bridge, restart, teardown: OK')

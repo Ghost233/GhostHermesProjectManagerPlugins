@@ -102,7 +102,7 @@ def prepare_task(manager, identity, request_id, plan):
     import re
     from .execution import _responsible
     from .manager import _git, _repository
-    from .codex import repository_fingerprint
+    from .dsh import repository_fingerprint
     if not isinstance(plan, dict) or set(plan) - {'branch', 'commit', 'dependencies', 'issue_updated_at', 'workspace_digest'} or not isinstance(plan.get('branch'), str) or not re.fullmatch(r'[A-Za-z0-9_./-]+', plan['branch']) or (plan.get('commit') is not None and not re.fullmatch(r'[a-f0-9]{40}', str(plan['commit']))) or not isinstance(plan.get('dependencies'), list) or any(not isinstance(d, str) for d in plan['dependencies']) or len(set(plan['dependencies'])) != len(plan['dependencies']):
         raise ManagementError('invalid_change', 'Preparation needs an explicit local branch, full commit, dependency request IDs and accepted Issue version.')
     with manager._lock:

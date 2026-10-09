@@ -1,5 +1,7 @@
 # Wiki 来源查询与原任务事实补充（[公开查询 Wiki 并补入任务上下文](../../../../issues/25)）
 
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
 这是实际来源 adapter、公共管理入口、注册群消息与原会话输入的实施契约。离线演示使用登记的 local 资料和与实际 WikiKnowledge schema 一致的 MCP peer，真实 Lark SDK builder/model、原会话 JSONL peer 与 pristine Hermes SDK 的生产配置启动都有证据。获准原 MCP 的只读预检已核对 initialize/list、wiki_status 和一次 budget=500 context-pack 的结构；公开群／模型／原会话的真实服务验收仍单独记录。
 
 ## 授权与来源
@@ -50,7 +52,7 @@ context-pack 的 primary/secondary 相关 summary/excerpt 随真实 citation sou
 
 Wiki 以原 requester 权限读取，结果作为固定版本保存；`资料结果 QUERY_ID RESULT_VERSION` 沿实际收到的 query 消息回复、真实 @ 查询发送者。结果回到登记 requester namespace 后再核对原 query parent/root、实际 sender、固定版本和逐段原生发送凭据。query/result 没有恢复开发权或批准权限，[将群内答复送回有效问题与审批](../../../../issues/21) 原人工请求、正式审批与资料路由独立。
 
-本人直接对独立 Wiki 真实 @ 的命令为 `查询 SOURCE_ID SCOPE1,SCOPE2：问题`。身份、接收 app 与原消息先核验；Wiki 回复实际本人，不要求开发任务、不造 Issue，也不启动 Codex。
+本人直接对独立 Wiki 真实 @ 的命令为 `查询 SOURCE_ID SCOPE1,SCOPE2：问题`。身份、接收 app 与原消息先核验；Wiki 回复实际本人，不要求开发任务、不造 Issue，也不启动 DSH。
 
 outbox 每段先登记 UUID/意图，再发真实 Lark post/@/reply；保存 delivered/failed/unknown 及实际 message/chat/parent/root/thread 字段。配对错误的 transport 在 claim 前拒绝。发送结果未知或重启留下 sending 时保留 unknown，不换 UUID 重放。重复 query ID 固定 requester、问题、scope、任务和意图；相同请求返回原版本结果，变更内容拒绝。
 
@@ -70,4 +72,4 @@ Dashboard 展示来源授权、实际 requester/scope、原任务关联、fact/i
 
 `tests/test_knowledge.py` 从公共 token/API 与实际原始 Lark text/post 事件驱动 readonly local provider、真实 SDK builder 和 stdio peer，覆盖查询／@回传／原任务 facts 一条链，另有权限拒绝、上级/Wiki 无替代权、重复、scope 撤销、资料字段注入、命名空间伪装、实际拒绝／冲突／秘密、idle/错回合/停止/归还/只观察/失联矩阵。`test_wiki_mcp.py` 在公共 token/Manager/client 与实际 HTTP/SSE peer 处核对完整 corpus、连接换绑、协议/工具/引用拒绝、慢响应、秘密与不重试，并驱动原有真实 SDK @/回传/原 active turn 补充链。`wiki_mcp_smoke_runner.py` 用固定 pristine Hermes SDK 的真实 PluginContext/settings/secret scope/Gateway hook 构建生产 provider，普通加载不连服务，原 Unix bridge 线程可使用 RAM 凭据，关闭仅清理自己的资源。`knowledge_smoke_runner.py` 使用 pristine SDK registry 和独立 participant bridge，拒绝真实 .hermes/.codex 与网络，验证工具拒绝私有上下文替代及稳定原会话补充。
 
-真实验收仍需获准 Source/Wiki 连接、app/tenant/群与真实 @/消息关联、原服务模型预算及 [执行一个 Codex Issue 并核对交付结果](../../../../issues/16)/[在原会话追加、停止和明确继续任务](../../../../issues/17)/[按仓库排队并交接下一项 Issue](../../../../issues/18) 的全部写入／控制／后台边界。生产 gate 保持关闭，不重复已失败权限研究、不降级 full access、实际原 Wiki 仅按当次本人授权做有界只读核验，不自动安装／开机器人／迁移资料。
+真实验收仍需获准 Source/Wiki 连接、app/tenant/群与真实 @/消息关联、原服务模型预算及 [执行一个 Issue 并核对交付结果](../../../../issues/16)/[在原会话追加、停止和明确继续任务](../../../../issues/17)/[按仓库排队并交接下一项 Issue](../../../../issues/18) 的全部写入／控制／后台边界。生产 gate 保持关闭，不重复已失败权限研究、不降级 full access、实际原 Wiki 仅按当次本人授权做有界只读核验，不自动安装／开机器人／迁移资料。

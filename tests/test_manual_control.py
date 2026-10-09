@@ -7,7 +7,7 @@ import pytest
 
 from ghost_hermes_pm import Manager, ManagementError, VerifiedIdentity
 from readiness_support import ReadyManager as Manager
-from ghost_hermes_pm.codex import repository_fingerprint
+from ghost_hermes_pm.dsh import repository_fingerprint
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo
 from test_task_execution import accepted, adapter_for
@@ -20,13 +20,13 @@ CONTROLLER = VerifiedIdentity('fixture:lead', 'verified-controller-entry')
 
 def original_state(peer, repo):
     peer.mkdir(exist_ok=True)
-    thread = {'id': ORIGINAL_THREAD, 'cwd': str(repo), 'cliVersion': '0.160.1', 'source': 'cli', 'canAcceptDirectInput': True,
+    thread = {'id': ORIGINAL_THREAD, 'cwd': str(repo), 'cliVersion': 'fixture-v1', 'source': 'desktop', 'canAcceptDirectInput': True,
               'status': {'type': 'active', 'activeFlags': []}, 'turns': [{'id': ORIGINAL_TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}
     (peer / 'original-state.json').write_text(json.dumps({'thread': thread}))
 
 
 def adapters(peer, host_capability=True):
-    from ghost_hermes_pm.takeover import OriginalControlAdapter
+    from normalized_executor_fixture import SyntheticControlAdapter as OriginalControlAdapter
     read = observer(peer)
     read.command[1] = str(Path(__file__).with_name('takeover_fixture_server.py'))
     def verifier(binding, repository, context):
@@ -39,9 +39,9 @@ def adapters(peer, host_capability=True):
             'task_control': {action: 'synthetic-original-only' for action in ('append', 'stop', 'continue', 'idle_input', 'related_execution', 'human_response')},
             'process_coverage': {'kind': 'no_unregistered_process_paths', 'evidence': 'synthetic-original-only'},
             'external_actor_coverage': 'unknown', 'control_access': 'verified-original-input-path'}
-    control = OriginalControlAdapter([sys.executable, str(Path(__file__).with_name('takeover_fixture_server.py')), str(peer), 'app-server', 'proxy', '--sock', str(peer / 'registered-synthetic.sock')],
-        cwd=peer, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(peer / 'synthetic-home')}, service_ref='local:manual-daemon-control',
-        source_kind='daemon', endpoint_ref='local:registered-daemon', verifier=verifier, timeout=1)
+    control = OriginalControlAdapter([sys.executable, str(Path(__file__).with_name('takeover_fixture_server.py')), str(peer)],
+        cwd=peer, env={'PATH': '/usr/bin:/bin', 'FIXTURE_HOME': str(peer / 'synthetic-home')}, service_ref='local:manual-desktop-control',
+        source_kind='desktop', endpoint_ref='local:registered-desktop', verifier=verifier, timeout=1)
     return read, control
 
 
@@ -57,8 +57,8 @@ def test_owner_takeover_controls_original_turn_and_return_keeps_it_running_witho
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         with ManagementServer(manager, {'manual-owner': OWNER, 'manual-controller': CONTROLLER}):
             owner = ManagementClient(tmp_path / 'state', 'manual-owner')
@@ -79,8 +79,8 @@ def test_owner_takeover_controls_original_turn_and_return_keeps_it_running_witho
                 controller.control_task(request_id, 'append', 'after-return', text='Do new work.', expected_turn_id=ORIGINAL_TURN)
             assert expired.value.code == 'forbidden'
         methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
-        assert methods.count('turn/steer') == 1
-        assert not {'thread/start', 'thread/resume', 'thread/fork', 'turn/interrupt'} & set(methods)
+        assert methods.count('fixture/append') == 1
+        assert not {'fixture/create', 'thread/resume', 'thread/fork', 'fixture/stop'} & set(methods)
 
 
 def test_external_current_turn_change_suspends_grant_without_claiming_all_desktop_actor_detection(tmp_path):
@@ -88,8 +88,8 @@ def test_external_current_turn_change_suspends_grant_without_claiming_all_deskto
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         with ManagementServer(manager, {'manual-owner': OWNER, 'manual-controller': CONTROLLER}):
             owner = ManagementClient(tmp_path / 'state', 'manual-owner')
@@ -105,7 +105,7 @@ def test_external_current_turn_change_suspends_grant_without_claiming_all_deskto
             assert snapshot['control_grants'][0]['external_actor_coverage'] == 'unknown'
             assert snapshot['requests'][0]['session']['control'] == 'observe_only'
             assert snapshot['requests'][0]['repository_released'] is False
-    assert not any(json.loads(line).get('method') == 'turn/steer' for line in (peer / 'original-wire.jsonl').read_text().splitlines())
+    assert not any(json.loads(line).get('method') == 'fixture/append' for line in (peer / 'original-wire.jsonl').read_text().splitlines())
 
 
 def test_completed_issue_delivery_ends_manual_grant_only_after_original_background_verification(tmp_path):
@@ -114,8 +114,8 @@ def test_completed_issue_delivery_ends_manual_grant_only_after_original_backgrou
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         with ManagementServer(manager, {'manual-owner': OWNER}):
             owner = ManagementClient(tmp_path / 'state', 'manual-owner')
@@ -137,7 +137,7 @@ def test_completed_issue_delivery_ends_manual_grant_only_after_original_backgrou
             assert snapshot['control_grants'][0]['status'] == 'completed'
             assert snapshot['requests'][0]['session']['control'] == 'observe_only'
             with pytest.raises(ManagementError): owner.control_task(request_id, 'append', 'future-work', text='Do future work.', expected_turn_id=ORIGINAL_TURN)
-    assert not any(json.loads(line).get('method') == 'turn/interrupt' for line in (peer / 'original-wire.jsonl').read_text().splitlines())
+    assert not any(json.loads(line).get('method') == 'fixture/stop' for line in (peer / 'original-wire.jsonl').read_text().splitlines())
 
 
 def test_owner_only_grant_and_concurrent_session_claim_have_one_current_controller(tmp_path):
@@ -147,8 +147,8 @@ def test_owner_only_grant_and_concurrent_session_claim_have_one_current_controll
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         second = acknowledge(manager, suffix='other-work')
         with ManagementServer(manager, {'manual-owner': OWNER, 'manual-controller': CONTROLLER}):
@@ -168,7 +168,7 @@ def test_owner_only_grant_and_concurrent_session_claim_have_one_current_controll
             with pytest.raises(ManagementError) as rebound:
                 owner.take_over_session(second if active[0]['request_id'] == request_id else request_id, observed['id'], active[0]['id'], ORIGINAL_TURN)
             assert rebound.value.code == 'binding_conflict'
-    assert not any(json.loads(line).get('method') in {'thread/start', 'turn/start', 'thread/resume'} for line in (peer / 'original-wire.jsonl').read_text().splitlines())
+    assert not any(json.loads(line).get('method') in {'fixture/create', 'fixture/start', 'thread/resume'} for line in (peer / 'original-wire.jsonl').read_text().splitlines())
 
 
 def test_missing_original_control_capability_keeps_observation_without_starting_control_proxy(tmp_path):
@@ -176,10 +176,10 @@ def test_missing_original_control_capability_keeps_observation_without_starting_
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer, host_capability=False)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
-        before = (peer / 'original-wire.jsonl').read_text().count('initialize')
+        before = (peer / 'original-wire.jsonl').read_text().count('fixture/connect')
         with ManagementServer(manager, {'manual-owner': OWNER}):
             owner = ManagementClient(tmp_path / 'state', 'manual-owner')
             with pytest.raises(ManagementError) as disabled:
@@ -189,7 +189,7 @@ def test_missing_original_control_capability_keeps_observation_without_starting_
             assert snapshot['control_grants'][0]['status'] == 'blocked'
             assert snapshot['manual_sessions'][0]['control'] == 'observe_only'
             assert snapshot['requests'][0].get('session') is None
-        assert (peer / 'original-wire.jsonl').read_text().count('initialize') == before
+        assert (peer / 'original-wire.jsonl').read_text().count('fixture/connect') == before
 
 
 def test_restarted_control_connection_cannot_inherit_a_previous_current_work_grant(tmp_path):
@@ -197,20 +197,20 @@ def test_restarted_control_connection_cannot_inherit_a_previous_current_work_gra
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         manager.take_over_session(OWNER, request_id, observed['id'], 'grant-current-work', ORIGINAL_TURN)
     replacement_read, replacement_control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': replacement_read}, control_adapters={'manual-daemon': replacement_control}) as restarted:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': replacement_read}, control_adapters={'manual-desktop': replacement_control}) as restarted:
         with ManagementServer(restarted, {'manual-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'manual-owner')
             snapshot = client.read_snapshot()
             assert snapshot['control_grants'][0]['status'] == 'suspended'
             assert snapshot['requests'][0]['repository_released'] is False
             with pytest.raises(ManagementError): client.control_task(request_id, 'append', 'old-grant-retry', text='Continue old work.', expected_turn_id=ORIGINAL_TURN)
-    assert not any(json.loads(line).get('method') == 'turn/steer' for line in (peer / 'original-wire.jsonl').read_text().splitlines())
+    assert not any(json.loads(line).get('method') == 'fixture/append' for line in (peer / 'original-wire.jsonl').read_text().splitlines())
 
 
 def test_original_human_response_requires_owner_and_return_expires_pending_request_without_replay(tmp_path):
@@ -218,27 +218,28 @@ def test_original_human_response_requires_owner_and_return_expires_pending_reque
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         with ManagementServer(manager, {'manual-owner': OWNER, 'manual-controller': CONTROLLER}):
             owner = ManagementClient(tmp_path / 'state', 'manual-owner')
             controller = ManagementClient(tmp_path / 'state', 'manual-controller')
             owner.take_over_session(request_id, observed['id'], 'grant-current-work', ORIGINAL_TURN)
             state = json.loads((peer / 'original-state.json').read_text())
-            state['server_requests'] = [{'id': 'original-approval', 'method': 'item/commandExecution/requestApproval', 'params': {
-                'threadId': ORIGINAL_THREAD, 'turnId': ORIGINAL_TURN, 'itemId': 'original-cmd', 'command': 'python -m pytest -q', 'cwd': str(repo)}}]
+            state['server_requests'] = [{'id': 'original-question', 'method': 'user-questions/request', 'params': {
+                'threadId': ORIGINAL_THREAD, 'turnId': ORIGINAL_TURN, 'itemId': 'original-choice', 'isBlocking': True,
+                'native_response_available': True, 'questions': [{'id': 'choice', 'question': 'Choose a value?', 'options': [{'label': 'One'}]}]}}]
             (peer / 'original-state.json').write_text(json.dumps(state))
             task = owner.refresh_task(request_id)
             question = task['human_requests'][0]
-            response = {'decision': 'accept', 'operation_id': question['operation_id'], 'scope': 'turn'}
+            response = {'answers': {'choice': ['One']}}
             with pytest.raises(ManagementError) as denied:
-                controller.answer_human_request(request_id, question['id'], 'bot-approval', response)
+                controller.answer_human_request(request_id, question['id'], 'bot-answer', response)
             assert denied.value.code == 'forbidden'
-            answered = owner.answer_human_request(request_id, question['id'], 'owner-approval', response)
+            answered = owner.answer_human_request(request_id, question['id'], 'owner-answer', response)
             assert answered['reply']['sent'] == 'sent'
             state = json.loads((peer / 'original-state.json').read_text())
-            state['server_requests'].append({'id': 777, 'method': 'item/tool/requestUserInput', 'params': {'threadId': ORIGINAL_THREAD,
+            state['server_requests'].append({'id': 777, 'method': 'user-questions/request', 'params': {'threadId': ORIGINAL_THREAD,
                 'turnId': ORIGINAL_TURN, 'itemId': 'pending-input', 'isBlocking': True, 'questions': [{'id': 'choice', 'header': 'Choice', 'question': 'Choose a value?', 'isSecret': False, 'isOther': True, 'options': None}]}})
             (peer / 'original-state.json').write_text(json.dumps(state))
             task = owner.refresh_task(request_id)
@@ -247,7 +248,32 @@ def test_original_human_response_requires_owner_and_return_expires_pending_reque
             with pytest.raises(ManagementError): owner.answer_human_request(request_id, pending['id'], 'late-answer', {'answers': {'choice': ['one']}})
             assert next(q for q in owner.read_snapshot()['requests'][0]['human_requests'] if q['rpc_id'] == 777)['resolution'] == 'expired'
     responses = [json.loads(line) for line in (peer / 'original-wire.jsonl').read_text().splitlines() if 'method' not in json.loads(line)]
-    assert responses == [{'id': 'original-approval', 'result': {'decision': 'accept'}}]
+    assert responses == [{'id': 'original-question', 'result': {'answers': [{'id': 'choice', 'selected': ['One']}]}}]
+
+
+def test_manual_grant_keeps_unverified_native_approval_on_original_interface(tmp_path):
+    repo = make_repo(tmp_path / 'repo')
+    peer = tmp_path / 'original'
+    original_state(peer, repo)
+    read, control = adapters(peer)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
+        request_id, observed = setup(manager, repo)
+        manager.take_over_session(OWNER, request_id, observed['id'], 'grant-current-work', ORIGINAL_TURN)
+        state = json.loads((peer / 'original-state.json').read_text())
+        state['server_requests'] = [{'id': 'native-approval', 'method': 'approval/request', 'params': {
+            'threadId': ORIGINAL_THREAD, 'turnId': ORIGINAL_TURN, 'itemId': 'original-operation',
+            'command': 'synthetic test operation', 'native_response_available': False}}]
+        (peer / 'original-state.json').write_text(json.dumps(state))
+        question = manager.refresh_task(OWNER, request_id)['human_requests'][0]
+        assert question['category'] == 'approval'
+        assert question['answerable'] is False
+        assert question['control_enabled'] is False
+        response = {'decision': 'accept', 'operation_id': question['operation_id'], 'scope': 'turn'}
+        with pytest.raises(ManagementError):
+            manager.answer_human_request(OWNER, request_id, question['id'], 'unverified-approval', response)
+        assert manager.read_snapshot(OWNER)['requests'][0]['human_requests'][0]['reply'] is None
+    assert not any('result' in json.loads(line) for line in (peer / 'original-wire.jsonl').read_text().splitlines())
 
 
 def test_granted_manual_stop_and_explicit_continue_use_same_original_thread_and_preserve_stop(tmp_path):
@@ -255,8 +281,8 @@ def test_granted_manual_stop_and_explicit_continue_use_same_original_thread_and_
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         with ManagementServer(manager, {'manual-owner': OWNER, 'manual-controller': CONTROLLER}):
             owner = ManagementClient(tmp_path / 'state', 'manual-owner')
@@ -275,8 +301,8 @@ def test_granted_manual_stop_and_explicit_continue_use_same_original_thread_and_
             assert task['session']['turn_id'] == 'continued-original-turn'
             assert task['stop_records'][0]['status'] == 'confirmed'
     methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
-    assert methods.count('turn/interrupt') == 1 and methods.count('turn/start') == 1
-    assert not {'thread/start', 'thread/resume', 'thread/fork'} & set(methods)
+    assert methods.count('fixture/stop') == 1 and methods.count('fixture/start') == 1
+    assert not {'fixture/create', 'thread/resume', 'thread/fork'} & set(methods)
 
 
 def test_new_explicit_grant_for_same_current_work_does_not_reactivate_old_pending_approval(tmp_path):
@@ -284,15 +310,15 @@ def test_new_explicit_grant_for_same_current_work_does_not_reactivate_old_pendin
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         with ManagementServer(manager, {'manual-owner': OWNER, 'manual-controller': CONTROLLER}):
             owner = ManagementClient(tmp_path / 'state', 'manual-owner')
             controller = ManagementClient(tmp_path / 'state', 'manual-controller')
             owner.take_over_session(request_id, observed['id'], 'first-grant', ORIGINAL_TURN)
             state = json.loads((peer / 'original-state.json').read_text())
-            state['server_requests'] = [{'id': 'old-pending', 'method': 'item/commandExecution/requestApproval', 'params': {
+            state['server_requests'] = [{'id': 'old-pending', 'method': 'approval/request', 'params': {
                 'threadId': ORIGINAL_THREAD, 'turnId': ORIGINAL_TURN, 'itemId': 'old-command', 'command': 'python -m pytest -q', 'cwd': str(repo)}}]
             (peer / 'original-state.json').write_text(json.dumps(state))
             old = owner.refresh_task(request_id)['human_requests'][0]
@@ -312,21 +338,61 @@ def test_native_control_config_does_not_connect_without_complete_hashed_current_
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, _ = adapters(peer)
-    config = {'source_id': 'manual-daemon', 'executable': sys.executable, 'cwd': str(peer),
-        'environment': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(peer / 'synthetic-home')}, 'service_ref': 'local:manual-daemon-control',
-        'source_kind': 'daemon', 'endpoint': str(peer / 'explicit-approved.sock'), 'endpoint_ref': 'local:registered-daemon'}
+    from test_dsh_engine_transition import dsh_config
+    config = {**dsh_config('http://127.0.0.1:9', source_id='manual-desktop'),
+        'service_ref': 'local:manual-desktop-control'}
     controls = configured_control_adapters([config], tmp_path / 'state')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters=controls) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters=controls) as manager:
         request_id, observed = setup(manager, repo)
-        before = (peer / 'original-wire.jsonl').read_text().count('initialize')
+        before = (peer / 'original-wire.jsonl').read_text().count('fixture/connect')
         with ManagementServer(manager, {'manual-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'manual-owner')
             with pytest.raises(ManagementError): client.take_over_session(request_id, observed['id'], 'host-grant', ORIGINAL_TURN)
-            (tmp_path / 'state' / 'manual-control.json').write_text(json.dumps({'enabled': True, 'permission_profile': 'full-access', 'takeover': 'PASS'}))
+            (tmp_path / 'state' / 'dsh-manual-control.json').write_text(json.dumps({'enabled': True, 'permission_profile': 'full-access', 'takeover': 'PASS'}))
             with pytest.raises(ManagementError): client.take_over_session(request_id, observed['id'], 'new-host-grant', ORIGINAL_TURN)
             assert all(g['status'] == 'blocked' for g in client.read_snapshot()['control_grants'])
-        assert (peer / 'original-wire.jsonl').read_text().count('initialize') == before
+        assert (peer / 'original-wire.jsonl').read_text().count('fixture/connect') == before
+
+
+def test_native_dsh_manual_controller_requires_current_grant_and_exact_exclusive_target():
+    import hashlib
+    from dsh_fixture_server import remote_peer
+    from ghost_hermes_pm.takeover import OriginalControlAdapter
+    repository = {'worktree': '/synthetic/project', 'logical_id': 'synthetic-logical', 'test_artifact_paths': []}
+    with remote_peer() as (url, peer):
+        service_id = 'dsh:' + hashlib.sha256(url.encode()).hexdigest() + ':' + hashlib.sha256(b'/synthetic/home').hexdigest()
+        context = {'original_executor_id': service_id, 'grant_id': 'synthetic-current-grant',
+            'thread_id': 'session-fixture', 'current_turn_id': 'dsh-turn:1'}
+        authority = {'id': context['grant_id'], 'status': 'active', 'thread_id': context['thread_id'], 'turn_id': context['current_turn_id']}
+        def verifier(binding, actual, scope):
+            return {**binding, 'grant_binding': scope, 'permission_profile': 'host:synthetic-policy', 'policy_digest': 'synthetic-policy',
+                'repository_fingerprint': repository_fingerprint(actual), 'runtime_roots': [actual['worktree']],
+                'platform_enforcement': 'synthetic-proof', 'tool_paths': 'synthetic-proof', 'manual_execution_coverage': 'synthetic-proof',
+                'takeover': 'synthetic-proof', 'backend_instance_ref': 'fixture:synthetic-http-peer',
+                'control_access': 'verified-original-input-path',
+                'task_control': {action: 'synthetic-proof' for action in ('append', 'stop', 'continue', 'idle_input', 'related_execution', 'human_response')},
+                'exclusive_input': {'kind': 'exclusive_original_input', 'evidence': 'fixture:synthetic-input-lease',
+                    'generation': binding['generation'], 'service_id': service_id, 'repository_fingerprint': repository_fingerprint(actual),
+                    'thread_id': context['thread_id'], 'turn_id': context['current_turn_id']}}
+        adapter = OriginalControlAdapter(url, cookie='synthetic-auth=value', service_ref='local:manual-control',
+            source_kind='desktop', endpoint_ref='local:synthetic-endpoint', verifier=verifier, timeout=1)
+        try:
+            adapter.verify_takeover(repository, context)
+            adapter.authority = lambda: dict(authority)
+            with pytest.raises(ManagementError):
+                adapter.interrupt_turn('other-session', 'dsh-turn:1')
+            assert peer['calls'] == []
+            assert adapter.interrupt_turn('session-fixture', 'dsh-turn:1') == {'accepted': True}
+            assert peer['calls'][-1]['method'] == 'session/cancel'
+            assert peer['calls'][-1]['payload']['args'] == {'request': {'sessionId': 'session-fixture'}}
+            authority['status'] = 'observe_only'
+            with pytest.raises(ManagementError) as returned:
+                adapter.interrupt_turn('session-fixture', 'dsh-turn:1')
+            assert returned.value.code == 'forbidden'
+            assert len(peer['calls']) == 1
+        finally:
+            adapter.close()
 
 
 def test_foreign_original_service_evidence_and_unsupported_desktop_do_not_enable_control(tmp_path):
@@ -336,18 +402,18 @@ def test_foreign_original_service_evidence_and_unsupported_desktop_do_not_enable
     read, control = adapters(peer)
     provider = control.control_verifier
     control.control_verifier = lambda binding, repository, context: {**provider(binding, repository, context), 'service_id': 'another-executor-with-same-history'}
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         with ManagementServer(manager, {'manual-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'manual-owner')
             with pytest.raises(ManagementError) as wrong: client.take_over_session(request_id, observed['id'], 'wrong-service', ORIGINAL_TURN)
             assert wrong.value.code == 'capability_unverified'
-            control.source_kind = 'desktop'
+            control.source_kind = 'unregistered-independent-source'
             with pytest.raises(ManagementError): client.take_over_session(request_id, observed['id'], 'unsupported-desktop', ORIGINAL_TURN)
             assert client.read_snapshot()['manual_sessions'][0]['control'] == 'observe_only'
     methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
-    assert not {'turn/start', 'turn/steer', 'turn/interrupt', 'thread/start', 'thread/resume'} & set(methods)
+    assert not {'fixture/start', 'fixture/append', 'fixture/stop', 'fixture/create', 'thread/resume'} & set(methods)
 
 
 @pytest.mark.asyncio
@@ -364,8 +430,8 @@ async def test_group_dashboard_show_same_owner_grant_and_non_interrupting_return
     original_state(peer, repo)
     read, control = adapters(peer)
     surface, transport = object(), Transport()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         manager.apply_directory_change(OWNER, 0, execution_registration(repo))
         manager.register_observation_source(OWNER, source())
         intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda _: ISSUE)
@@ -396,7 +462,7 @@ async def test_group_dashboard_show_same_owner_grant_and_non_interrupting_return
             feedback = [s for s in transport.sent if '本次工作接管' in s['text'] or '控制已归还' in s['text']]
             assert len(feedback) == 2 and all(s['reply_to'] == task['task_start_anchor']['message_id'] and s['mention_open_id'] is None for s in feedback)
     methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
-    assert methods.count('turn/steer') == 1 and 'turn/interrupt' not in methods
+    assert methods.count('fixture/append') == 1 and 'fixture/stop' not in methods
 
 
 @pytest.mark.parametrize('authorization', ['active', 'returned', 'new_grant_after_query'])
@@ -407,8 +473,8 @@ def test_scoped_wiki_facts_use_original_manual_executor_and_cannot_cross_grant_e
     original_state(peer, repo)
     read, control = adapters(peer)
     provider = local_provider(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control},
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control},
                  knowledge_providers={'local:fixture-wiki': provider}) as manager:
         request_id, observed = setup(manager, repo)
         manager.take_over_session(OWNER, request_id, observed['id'], 'grant-current-work', ORIGINAL_TURN)
@@ -424,7 +490,7 @@ def test_scoped_wiki_facts_use_original_manual_executor_and_cannot_cross_grant_e
             assert snapshot['knowledge_queries'][0]['requester'] == OWNER.subject
             assert snapshot['knowledge_queries'][0]['scope_ids'] == ['public']
             assert snapshot['knowledge_queries'][0]['materials']
-    steering = [json.loads(line) for line in (peer / 'original-wire.jsonl').read_text().splitlines() if json.loads(line).get('method') == 'turn/steer']
+    steering = [json.loads(line) for line in (peer / 'original-wire.jsonl').read_text().splitlines() if json.loads(line).get('method') == 'fixture/append']
     assert len(steering) == (1 if authorization == 'active' else 0)
     if steering:
         assert steering[0]['params']['threadId'] == ORIGINAL_THREAD and steering[0]['params']['expectedTurnId'] == ORIGINAL_TURN

@@ -6,6 +6,7 @@ from test_directory import OWNER, make_repo
 from test_task_execution import adapter_for, execution_registration, prepare_fixture
 from test_requests import MESSAGE, ISSUE
 from test_collaboration import channel
+import pytest
 
 
 class Clock:
@@ -38,7 +39,7 @@ def register_entry(manager):
 
 def test_active_projects_are_summarized_every_fifteen_minutes_even_without_progress_and_idle_is_quiet(tmp_path):
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         with ManagementServer(manager, {'owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'owner')
             client.run_notifications()
@@ -63,7 +64,7 @@ def test_active_projects_are_summarized_every_fifteen_minutes_even_without_progr
 def test_owner_blocking_request_is_immediate_reminded_at_thirty_minutes_and_stops_after_resolution(tmp_path):
     from test_questions import question_adapter, emit, user_question
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         with ManagementServer(manager, {'owner': OWNER}):
@@ -95,7 +96,7 @@ def test_real_lark_entry_builder_mentions_only_urgent_owner_and_keeps_actual_loc
     from ghost_hermes_pm.feishu import NativeFeishuTransport
     from test_questions import question_adapter, emit, user_question
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -132,23 +133,23 @@ def test_stall_threshold_checks_original_service_again_and_never_interrupts_or_s
     import json
     from test_task_control import TURN, wire
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
         manager.run_notifications(OWNER)
         clock.advance(899)
         assert not any(e['kind'] == 'suspected_stall' for e in manager.run_notifications(OWNER)['notifications'])
-        reads_before = len([r for r in wire(tmp_path) if r['method'] == 'thread/read'])
+        reads_before = len([r for r in wire(tmp_path) if r['method'] == 'fixture/read'])
         clock.advance(1)
         events = manager.run_notifications(OWNER)['notifications']
-        assert len([r for r in wire(tmp_path) if r['method'] == 'thread/read']) > reads_before
+        assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/read']) > reads_before
         stalls = [e for e in events if e['kind'] == 'suspected_stall']
         assert len(stalls) == 1 and '核查' in stalls[0]['text'] and stalls[0]['mention_owner'] is False
         clock.advance(900)
         assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'suspected_stall']) == 1
-        assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
-        assert not any(r['method'] == 'turn/interrupt' for r in wire(tmp_path))
+        assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/start']) == 1
+        assert not any(r['method'] == 'fixture/stop' for r in wire(tmp_path))
         (tmp_path / 'observed.json').write_text(json.dumps({'turns': [{'id': TURN, 'status': 'inProgress', 'itemsView': 'full', 'items': [{'id': 'fresh', 'type': 'agentMessage', 'text': 'new verified progress'}]}]}))
         manager.run_notifications(OWNER)
         clock.advance(899)
@@ -159,7 +160,7 @@ def test_waits_explained_long_commands_and_unverified_history_do_not_raise_stall
     import json
     from test_task_control import TURN
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -178,12 +179,12 @@ def test_waits_explained_long_commands_and_unverified_history_do_not_raise_stall
 def test_continuous_original_channel_loss_warns_once_after_two_minutes_and_once_on_recovery(tmp_path):
     import json
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
         manager.run_notifications(OWNER)
-        (tmp_path / 'behavior.json').write_text(json.dumps({'rpc_error': 'thread/read'}))
+        (tmp_path / 'behavior.json').write_text(json.dumps({'rpc_error': 'fixture/read'}))
         manager.run_notifications(OWNER)
         clock.advance(119)
         assert not any(e['kind'] == 'channel_lost' for e in manager.run_notifications(OWNER)['notifications'])
@@ -205,7 +206,7 @@ def test_continuous_original_channel_loss_warns_once_after_two_minutes_and_once_
 def test_active_background_and_unknown_process_coverage_explain_or_block_stall_judgment(tmp_path):
     import json
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -219,7 +220,7 @@ def test_restart_does_not_catch_up_ticks_or_replay_unknown_delivery_and_offline_
     from test_recovery import original_state, recovery_adapter
     clock = Clock()
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, repo)
         register_entry(manager)
         service_id = manager.start_task(OWNER, task_id)['session']['service_id']
@@ -247,7 +248,7 @@ def test_restart_does_not_catch_up_ticks_or_replay_unknown_delivery_and_offline_
 def test_nonblocking_questions_wait_for_summary_and_pending_alerts_expire_before_send(tmp_path):
     from test_questions import question_adapter, emit, user_question
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -270,7 +271,7 @@ def test_confirmed_stop_updates_once_and_processing_intent_does_not_claim_comple
     import json
     from test_task_control import TURN
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -289,7 +290,7 @@ def test_project_completion_is_once_only_after_fresh_stable_global_validation_an
     from test_repository_queue import queue_adapter
     clock = Clock()
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host, notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host, notification_clock=clock) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         register_entry(manager)
         plan = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
@@ -316,11 +317,11 @@ def test_child_delivery_immediately_queues_original_public_parent_return_once(tm
     from test_collaboration import accepted_parent, IssueSource, LEAD, CHILD, CHILD_INGRESS, source
     from test_task_execution import adapter_for, prepare_fixture
     from test_task_control import THREAD, TURN
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource(), codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, delivery_source=IssueSource(), dsh_adapter=adapter_for(tmp_path)) as manager:
         parent_id, child_channel = accepted_parent(manager, tmp_path)
         version = manager.read_snapshot(OWNER)['version']
         profile = next(p for p in manager.read_snapshot(OWNER)['profiles'] if p['id'] == 'child')
-        manager.apply_directory_change(OWNER, version, {'profile': {k: profile[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id')} | {'connection_refs': {'codex': 'local:fixture-stdio'}}})
+        manager.apply_directory_change(OWNER, version, {'profile': {k: profile[k] for k in ('id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id')} | {'connection_refs': {'dsh': 'local:fixture-stdio'}}})
         channels = [dict(c) for c in manager.read_snapshot(OWNER)['collaboration']['channels']]
         for c in channels:
             c.pop('profile_binding')
@@ -359,7 +360,7 @@ def test_verified_rework_is_immediately_linked_to_actual_public_child_outbox_onc
     from test_collaboration import channel
     from test_global_validation import combination, FailedHost, IssueReadSource, git, LEAD
     from test_repository_queue import queue_adapter
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=FailedHost(), delivery_source=IssueReadSource()) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=FailedHost(), delivery_source=IssueReadSource()) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         lead_channel, kid_channel = channel('mono-lead'), channel('child-lead')
         lead_channel['bot_sources'] = []
@@ -389,7 +390,7 @@ def test_summary_distinguishes_actual_new_progress_from_an_unchanged_period(tmp_
     import json
     from test_task_control import TURN
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -438,7 +439,7 @@ def test_owner_short_answer_quotes_actual_entry_notification_and_returns_to_orig
     from test_feishu_entry import Transport, Gateway
     from test_questions import question_adapter, emit, user_question, replies
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -464,12 +465,12 @@ def test_owner_short_answer_quotes_actual_entry_notification_and_returns_to_orig
         assert asyncio.run(intake.receive(event, Gateway(adapter))) == {'action': 'skip'}
         resolved = manager.refresh_task(OWNER, task_id)['human_requests'][0]
         assert resolved['resolution'] == 'resolved' and resolved['reply']['source_anchor']['parent_id'] == actual_id
-        assert replies(tmp_path) == [{'id': 8, 'result': {'answers': {'colour': {'answers': ['Blue']}}}}]
+        assert replies(tmp_path) == [{'id': 8, 'result': {'answers': [{'id': 'colour', 'selected': [], 'custom': 'Blue'}]}}]
 
 
 def test_stale_supervision_is_visible_without_claiming_current_delivery_or_current_source_coverage(tmp_path):
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -486,7 +487,7 @@ def test_stale_supervision_is_visible_without_claiming_current_delivery_or_curre
 def test_revoked_host_process_coverage_blocks_stall_and_keeps_unknown_coverage_visible(tmp_path):
     clock = Clock()
     host_receipt = {}
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path, host_receipt), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path, host_receipt), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -502,14 +503,18 @@ def test_approval_and_sensitive_requests_remain_immediate_and_stop_after_the_ori
     from test_questions import question_adapter, emit, approval, user_question
     from test_task_control import TURN
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
         emit(tmp_path, approval(rpc_id='operation'), user_question(rpc_id='secret', questions=[{'id': 'secret', 'header': 'Private', 'question': 'synthetic-sensitive-placeholder', 'isSecret': True, 'isOther': False, 'options': None}]))
         events = [e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request']
         assert len(events) == 2 and all(e['mention_owner'] for e in events)
-        assert any('具体操作' in e['text'] and '范围：turn' in e['text'] for e in events)
+        approval_question = next(q for q in manager.read_snapshot(OWNER)['requests'][0]['human_requests'] if q['category'] == 'approval')
+        approval_notice = next(e for e in events if e['human_request_id'] == approval_question['id'])
+        assert approval_question['answerable'] is False and approval_question['control_enabled'] is False
+        assert '原界面' in approval_notice['text'] and '本人须明确批准' not in approval_notice['text']
+        assert manager.manage_notifications(OWNER, 'claim', {'event_id': approval_notice['id']})['mention_open_id'] == channel('steward', 'entry')['owner_open_id']
         sensitive = next(q for q in manager.read_snapshot(OWNER)['requests'][0]['human_requests'] if q['category'] == 'sensitive')
         secret_notice = next(e for e in events if e['human_request_id'] == sensitive['id'])
         assert '原界面' in secret_notice['text'] and 'synthetic-sensitive-placeholder' not in json.dumps(manager.read_snapshot(OWNER))
@@ -521,12 +526,113 @@ def test_approval_and_sensitive_requests_remain_immediate_and_stop_after_the_ori
         assert len([e for e in manager.run_notifications(OWNER)['notifications'] if e['kind'] == 'human_request']) == 4
 
 
+def test_live_unknown_turn_approval_notifies_original_interface_without_enabling_a_reply(tmp_path):
+    from test_questions import question_adapter, emit, approval, replies
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, approval(rpc_id='live-unbound-turn', turnId=None))
+        snapshot = manager.run_notifications(OWNER)
+        question = manager.read_snapshot(OWNER)['requests'][0]['human_requests'][0]
+        assert question['resolution'] == 'unverified'
+        assert question['answerable'] is False and question['control_enabled'] is False
+        events = [event for event in snapshot['notifications'] if event['kind'] == 'human_request']
+        assert len(events) == 1 and events[0]['mention_owner']
+        assert '原界面' in events[0]['text']
+        packet = manager.manage_notifications(OWNER, 'claim', {'event_id': events[0]['id']})
+        assert packet['mention_open_id'] == channel('steward', 'entry')['owner_open_id']
+        assert replies(tmp_path) == []
+        emit(tmp_path, {'method': 'serverRequest/resolved', 'params': {'requestId': 'live-unbound-turn', 'threadId': question['thread_id']}})
+        manager.run_notifications(OWNER)
+        clock.advance(1800)
+        assert len([event for event in manager.run_notifications(OWNER)['notifications'] if event['kind'] == 'human_request']) == 1
+
+
+@pytest.mark.parametrize('available', [False, True])
+def test_current_question_notice_only_offers_group_reply_when_original_response_is_available(tmp_path, available):
+    from test_questions import question_adapter, emit, user_question
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=Clock()) as manager:
+        task_id = accepted(manager, make_repo(tmp_path / 'repo'))
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, user_question(native_response_available=available))
+        event = next(event for event in manager.run_notifications(OWNER)['notifications'] if event['kind'] == 'human_request')
+        assert ('本人可回复' in event['text']) is available
+        assert ('原界面' in event['text']) is not available
+
+
+@pytest.mark.parametrize('case', ['no_frame', 'cancelled', 'closed_source', 'stale_generation', 'stopped', 'finished'])
+def test_unknown_turn_approval_cannot_notify_from_stale_source_or_ended_work(tmp_path, monkeypatch, case):
+    import json
+    from test_questions import question_adapter, emit, approval, replies
+    from test_task_control import TURN
+    clock = Clock()
+    adapter = question_adapter(tmp_path)
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter, notification_clock=clock) as manager:
+        repo = make_repo(tmp_path / 'repo')
+        task_id = accepted(manager, repo)
+        register_entry(manager)
+        manager.start_task(OWNER, task_id)
+        emit(tmp_path, approval(rpc_id='pending-unknown-turn', turnId=None))
+        question = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        assert question['resolution'] == 'unverified'
+        if case == 'no_frame':
+            monkeypatch.setattr(adapter, 'server_requests', lambda _: [])
+        elif case == 'cancelled':
+            emit(tmp_path, {'method': 'serverRequest/resolved', 'params': {'requestId': 'pending-unknown-turn', 'threadId': question['thread_id']}})
+        elif case == 'closed_source':
+            adapter.close()
+        elif case == 'stale_generation':
+            adapter.close()
+            manager.dsh_adapter = question_adapter(tmp_path)
+        elif case == 'stopped':
+            manager.control_task(OWNER, task_id, 'stop', 'owner-stop', expected_turn_id=TURN)
+        else:
+            (tmp_path / 'observed.json').write_text(json.dumps({'status': {'type': 'idle'}, 'turns': [{'id': TURN, 'status': 'completed', 'itemsView': 'full',
+                'items': [{'type': 'commandExecution', 'id': 'pytest-finished', 'command': 'python -m pytest -q', 'cwd': str(repo), 'status': 'completed', 'exitCode': 0, 'aggregatedOutput': '1 passed'}]}]}))
+            manager.record_task_delivery(OWNER, task_id, {'issue_updated_at': ISSUE['updated_at'],
+                'criteria': [{'text': ISSUE['body'], 'test_item_ids': ['pytest-finished']}], 'source_commit': None, 'pr_url': None, 'sync_branches': []})
+        assert not any(event['kind'] == 'human_request' for event in manager.run_notifications(OWNER)['notifications'])
+        clock.advance(1800)
+        assert not any(event['kind'] == 'human_request' for event in manager.run_notifications(OWNER)['notifications'])
+        assert replies(tmp_path) == []
+
+
+def test_returned_manual_work_does_not_notify_a_cached_unknown_turn_approval(tmp_path):
+    import json
+    from test_manual_control import adapters, original_state, setup, ORIGINAL_THREAD, ORIGINAL_TURN
+    from test_questions import approval
+    repo = make_repo(tmp_path / 'repo')
+    peer = tmp_path / 'manual'
+    original_state(peer, repo)
+    read, control = adapters(peer)
+    clock = Clock()
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-desktop': read},
+                 control_adapters={'manual-desktop': control}, notification_clock=clock) as manager:
+        task_id, observed = setup(manager, repo)
+        register_entry(manager)
+        manager.take_over_session(OWNER, task_id, observed['id'], 'current-work', ORIGINAL_TURN)
+        state_path = peer / 'original-state.json'
+        state = json.loads(state_path.read_text())
+        state['server_requests'] = [approval(rpc_id='unknown-manual-turn', threadId=ORIGINAL_THREAD, turnId=None)]
+        state_path.write_text(json.dumps(state))
+        question = manager.refresh_task(OWNER, task_id)['human_requests'][0]
+        assert question['resolution'] == 'unverified'
+        manager.return_session_control(OWNER, task_id, 'current-work')
+        assert not any(event['kind'] == 'human_request' for event in manager.run_notifications(OWNER)['notifications'])
+        clock.advance(1800)
+        assert not any(event['kind'] == 'human_request' for event in manager.run_notifications(OWNER)['notifications'])
+        assert json.loads(state_path.read_text()).get('responses', []) == []
+
+
 def test_repeated_handoff_block_does_not_create_new_alerts_or_new_execution(tmp_path):
     import pytest
     from ghost_hermes_pm import ManagementError
     from test_task_control import wire
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -536,12 +642,12 @@ def test_repeated_handoff_block_does_not_create_new_alerts_or_new_execution(tmp_
             manager.run_notifications(OWNER)
         blocked = [e for e in manager.read_snapshot(OWNER)['notifications']['events'] if e['kind'] == 'blocked']
         assert len(blocked) == 1 and blocked[0]['mention_owner'] is False
-        assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+        assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/start']) == 1
 
 
 def test_changed_responsibility_keeps_actual_execution_unknown_and_supervision_block_visible(tmp_path):
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -562,7 +668,7 @@ def test_changed_responsibility_keeps_actual_execution_unknown_and_supervision_b
 
 def test_idle_and_unchanged_active_sampling_do_not_expire_owner_scope_versions(tmp_path):
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), notification_clock=clock) as manager:
         initial = manager.read_snapshot(OWNER)['version']
         manager.run_notifications(OWNER)
         clock.advance(5)
@@ -618,7 +724,7 @@ def test_explicit_stop_intent_disables_pending_owner_reminders_before_actual_sto
     from test_questions import question_adapter, emit, user_question
     from test_task_control import TURN
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)
@@ -635,7 +741,7 @@ def test_explicit_stop_intent_disables_pending_owner_reminders_before_actual_sto
 def test_partial_unknown_notification_delivery_is_durable_and_never_replayed_after_request_expires(tmp_path):
     from test_questions import question_adapter, emit, user_question
     clock = Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path), notification_clock=clock) as manager:
         task_id = accepted(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
         manager.start_task(OWNER, task_id)

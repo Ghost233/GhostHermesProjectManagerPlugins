@@ -1,4 +1,4 @@
-"""Pristine native SDK registry drives original-session controls against a JSONL peer."""
+"""Pristine SDK registration with an explicitly normalized business fixture peer."""
 from pathlib import Path
 import json
 import os
@@ -7,7 +7,7 @@ import yaml
 
 scratch = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(scratch / 'readiness-fixtures'))
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / name for name in ('.hermes', '.dsh', '.codex')]
 
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
@@ -41,7 +41,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 participant = VerifiedIdentity('fixture:lead', 'fixture-native-participant')
-with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(scratch)) as authority:
+with Manager(state, owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(scratch)) as authority:
     request_id = accepted(authority, make_repo(scratch / 'repo'))
     with ManagementServer(authority, {os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN']: participant,
                                      os.environ['HERMES_FIXTURE_OWNER_TOKEN']: OWNER}):
@@ -64,6 +64,6 @@ with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=question_ada
         assert answered.status_code == 200 and answered.json()['reply']['sent'] == 'sent', answered.text
         assert task({'action': 'refresh'})['human_requests'][0]['resolution'] == 'resolved'
         wire = list(map(json.loads, (scratch / 'wire.jsonl').read_text().splitlines()))
-        assert [r for r in wire if 'method' not in r] == [{'id': 8, 'result': {'answers': {'colour': {'answers': ['Blue']}}}}]
+        assert [r for r in wire if 'method' not in r] == [{'id': 8, 'result': {'answers': [{'id': 'colour', 'selected': [], 'custom': 'Blue'}]}}]
         assert plugin_manager.unload('ghost-hermes-pm')
 print('native load, Dashboard bridge, restart, teardown: OK')

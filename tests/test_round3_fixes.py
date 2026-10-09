@@ -23,7 +23,7 @@ def original_task(root, criterion):
     subprocess.run(['git', '-C', str(repo), 'add', 'test_original_scope.py'], check=True)
     subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Owned Scope', '-c', 'user.email=owned@example.invalid', 'commit', '-qm', 'Owned scope assertions'], check=True)
     scope = {**ISSUE, 'body': '- [ ] ' + criterion}
-    with ReadyManager(root / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(root)) as manager:
+    with ReadyManager(root / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(root)) as manager:
         request_id = accepted(manager, repo, scope)
         lead = VerifiedIdentity('fixture:lead', 'owned-participant')
         with ManagementServer(manager, {'owner': OWNER, 'lead': lead}):

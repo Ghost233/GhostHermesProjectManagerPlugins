@@ -124,12 +124,20 @@ def _repository(value):
 
 class Manager:
     """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
-    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), codex_adapter=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, profile_readiness_host=None, lifecycle_host=None, migration_host=None, maintenance_host=None, notification_clock=None):
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), dsh_adapter=None, dsh_adapters=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, profile_readiness_host=None, lifecycle_host=None, migration_host=None, maintenance_host=None, notification_clock=None):
         import time
         self.notification_clock = notification_clock or time.time
         self._notification_generation = str(uuid.uuid4())
         self.owner_identity_ref = owner_identity_ref
-        self.codex_adapter = codex_adapter
+        self.dsh_adapter = dsh_adapter
+        if dsh_adapters is not None and not isinstance(dsh_adapters, dict):
+            raise ManagementError('invalid_change', 'DSH executors require a protected reference-to-adapter mapping.')
+        self.dsh_adapters = dict(dsh_adapters or {})
+        if any(not isinstance(ref, str) or not ref.startswith('local:') or getattr(adapter, 'service_ref', None) != ref
+               for ref, adapter in self.dsh_adapters.items()):
+            raise ManagementError('invalid_change', 'Each DSH executor reference must exactly match its native adapter binding.')
+        if dsh_adapter is not None and dsh_adapter.service_ref in self.dsh_adapters and self.dsh_adapters[dsh_adapter.service_ref] is not dsh_adapter:
+            raise ManagementError('invalid_change', 'A singular and mapped DSH executor cannot share a reference with different instances.')
         self.delivery_source = delivery_source
         self.global_validation_host = global_validation_host
         self.profile_readiness_host = profile_readiness_host
@@ -160,8 +168,8 @@ class Manager:
             os.close(descriptor)
         self._db = sqlite3.connect(database, check_same_thread=False)
         self._db.execute('CREATE TABLE IF NOT EXISTS directory (id INTEGER PRIMARY KEY CHECK(id=1), schema_version INTEGER NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL)')
-        self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 1, 0, ?)',
-                         (json.dumps({'projects': {}, 'profiles': {}, 'last_verified_at': None}),))
+        self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 2, 0, ?)',
+                         (json.dumps({'executor_engine': 'dsh', 'projects': {}, 'profiles': {}, 'last_verified_at': None}),))
         self._db.commit()
         version, data = self._load()
         from .queue import ensure_queues
@@ -173,13 +181,14 @@ class Manager:
         from .notifications import shutdown
         shutdown(self)
         with self._lock:
-            if self.codex_adapter is not None:
-                self.codex_adapter.close()
-            for adapter in (*self.observation_adapters.values(), *self.control_adapters.values(), *self.recovery_adapters.values()):
-                adapter.close()
-            from .archive_sources import CodexArchiveProvider
+            closed = set()
+            for adapter in (self.dsh_adapter, *self.dsh_adapters.values(), *self.observation_adapters.values(), *self.control_adapters.values(), *self.recovery_adapters.values()):
+                if adapter is not None and id(adapter) not in closed:
+                    adapter.close()
+                    closed.add(id(adapter))
+            from .archive_sources import DshArchiveProvider
             for provider in self.archive_providers.values():
-                if isinstance(provider, CodexArchiveProvider):
+                if isinstance(provider, DshArchiveProvider):
                     provider.close()
             close_global_host = getattr(self.global_validation_host, 'close', None)
             if callable(close_global_host):
@@ -194,9 +203,11 @@ class Manager:
 
     def _load(self):
         schema, version, payload = self._db.execute('SELECT schema_version, version, payload FROM directory WHERE id=1').fetchone()
-        if schema != 1:
-            raise ManagementError('unknown_version', 'Directory schema requires a verified upgrade.')
+        if schema != 2:
+            raise ManagementError('unknown_version', 'Existing executor state requires an explicit verified migration; it was preserved.')
         data = json.loads(payload)
+        if data.get('executor_engine') != 'dsh':
+            raise ManagementError('unknown_version', 'The executor state is not registered for DSH; no execution or migration is permitted.')
         from .notifications import reconcile as reconcile_notifications
         reconcile_notifications(self, data)
         data.setdefault('requests', {})
@@ -298,11 +309,16 @@ class Manager:
                         capability.update(enabled=False, status='blocked', reason=str(exc))
             from .takeover import executor_for
             original_interface_requests = []
-            if principal is None and self.codex_adapter and self.codex_adapter.connection:
-                original_interface_requests = [{'rpc_id': r['envelope']['id'], 'method': r['envelope']['method'],
-                    'service_id': self.codex_adapter.connection['service_id'], 'generation': self.codex_adapter.generation,
-                    'thread_id': None, 'url': None, 'answerable': False, 'resolution': r['state'],
-                    'availability': 'original_client_required'} for r in self.codex_adapter.server_requests(None)]
+            if principal is None:
+                seen = set()
+                for adapter in (self.dsh_adapter, *self.dsh_adapters.values()):
+                    if adapter is None or id(adapter) in seen or not adapter.connection:
+                        continue
+                    seen.add(id(adapter))
+                    original_interface_requests.extend({'rpc_id': r['envelope']['id'], 'method': r['envelope']['method'],
+                        'service_id': adapter.connection['service_id'], 'generation': adapter.generation,
+                        'thread_id': None, 'url': None, 'answerable': False, 'resolution': r['state'],
+                        'availability': 'original_client_required'} for r in adapter.server_requests(None))
             from .collaboration import snapshot as collaboration_snapshot
             role_snapshot = collaboration_snapshot(data, principal, visible_ids)
             from .knowledge import snapshot_knowledge
@@ -315,7 +331,7 @@ class Manager:
                     'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
                     'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
                     'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
-                    'manual_capabilities': [{'kind': kind, 'status': 'verified' if any(s['kind'] == kind and s['status'] == 'verified' and set(s['project_ids']) & {p['id'] for p in projects} for s in data.get('manual_sources', {}).values()) else 'unknown'} for kind in ('daemon', 'independent_cli', 'desktop')],
+                    'manual_capabilities': [{'kind': kind, 'status': 'verified' if any(s['kind'] == kind and s['status'] == 'verified' and set(s['project_ids']) & {p['id'] for p in projects} for s in data.get('manual_sources', {}).values()) else 'unknown'} for kind in ('desktop', 'web')],
                     'original_interface_requests': original_interface_requests,
                     'control_grants': [g for g in data.get('control_grants', {}).values() if g['request_id'] in {r['id'] for r in requests}],
                     'collaboration': role_snapshot,
@@ -339,7 +355,7 @@ class Manager:
         return run(self, identity)
 
     def accept_request(self, identity, project_id, profile_id, message, issue, *, delegation_id=None):
-        """Accept an Issue snapshot from a trusted message entry; never start Codex."""
+        """Accept an Issue snapshot from a trusted message entry; never start DSH."""
         with self._lock, self._db:
             self._db.execute('BEGIN IMMEDIATE')
             version, data = self._load()
@@ -369,11 +385,11 @@ class Manager:
                       'accepted_scope': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')},
                       'source_anchor': dict(message), 'task_start_anchor': None,
                       'accepted_responsibility': {k: profile.get(k) for k in ('id', 'identity_ref', 'project_id', 'capability', 'role', 'parent_profile_id')},
-                      'accepted_codex_ref': profile.get('connection_refs', {}).get('codex'),
+                      'executor_engine': 'dsh', 'accepted_dsh_ref': profile.get('connection_refs', {}).get('dsh'),
                       'accepted_repository_fingerprint': hashlib.sha256(json.dumps(data['projects'][project_id]['repo'], sort_keys=True).encode()).hexdigest(),
                       'accepted_actor': {'subject': identity.subject, 'source': identity.source},
                       'acceptance': 'accepted', 'accepted_at': datetime.now(timezone.utc).isoformat(),
-                      'execution': 'waiting', 'unexecuted_reason': 'Codex execution is not enabled.',
+                      'execution': 'waiting', 'unexecuted_reason': 'DSH execution is not enabled.',
                       'delivery': 'pending', 'messages': [], 'outbox': []}
             if actor_provenance is not None:
                 record['actor_provenance'] = actor_provenance
@@ -909,13 +925,13 @@ class Manager:
         if value['identity_ref'] == self.owner_identity_ref:
             raise ManagementError('invalid_change', 'A bot identity cannot reuse the owner identity.')
         refs = value.get('connection_refs', {})
-        if not isinstance(refs, dict) or set(refs) - {'bot', 'credential', 'codex'}:
+        if not isinstance(refs, dict) or set(refs) - {'bot', 'credential', 'dsh'}:
             raise ManagementError('invalid_change', 'Use non-sensitive bot, native credential and local service references.')
         if any(not isinstance(ref, str) or not re.fullmatch(r'(native|local|identity):[A-Za-z0-9_.:/-]+', ref) for ref in refs.values()):
             raise ManagementError('invalid_change', 'Only native/local/identity references are accepted, never secret values.')
         if 'credential' in refs and not refs['credential'].startswith('native:'):
             raise ManagementError('invalid_change', 'Credential must reference native secret management.')
-        if 'codex' in refs and not refs['codex'].startswith('local:'):
+        if 'dsh' in refs and not refs['dsh'].startswith('local:'):
             raise ManagementError('invalid_change', 'Only local execution service references are supported.')
 
     def apply_directory_change(self, identity, expected_version, change):

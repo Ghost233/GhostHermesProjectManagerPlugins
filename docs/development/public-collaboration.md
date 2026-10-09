@@ -1,5 +1,7 @@
 # 公开分层协作
 
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
 [按责任角色跨群派发并逐级回传](../../../../issues/24) 使用同一权威 Manager 的目录、请求、队列和原执行证据。Owner 在入口群明确指定项目目标，总管在项目群真实 @ 总负责人；只有已独立受理该目标的总负责人，才能把明确 GitHub 子 Issue 派给 Owner 已登记的自己的 child。角色与 development/non_development 能力分别登记。合并两层时由 project_lead 直接承接项目工作，不自动创建 submodule 助手。Wiki 与个人助手保持 independent、无 project/parent 绑定。
 
 ## 公共入口
@@ -50,8 +52,9 @@
 必跑命令：
 
 ```sh
-HERMES_TEST_SDK_ROOT=/private/tmp/hermes-implementation/sdk-isolated HERMES_REQUIRE_SDK_SMOKE=1 \
-  /private/tmp/hermes-plugin-dev-venv/bin/python -m pytest --basetemp=/private/tmp/hc24-final -q
+HERMES_TEST_SDK_ROOT='<original-hermes-sdk-dir>' \
+DSH_TEST_SDK_ROOT='<original-dsh-packages-dir>' \
+  python tools/local_checks.py --artifacts '<private-check-artifacts-dir>'
 ```
 
 SDK fixture 缺失在 mandatory 模式直接失败；普通 SDK skip 不构成验收。Dashboard 另需真实 React runtime 对新增关系与 Owner 表单操作验证；原来其他控件的点击记录不覆盖 [按责任角色跨群派发并逐级回传](../../../../issues/24) 新控件。发布前仍需独立 merger、双轴审查和 Retro，以及授权测试 Profile/群/服务的具体验收。真实 bots、开通、生产配置、资料迁移、未知执行权限或未验证能力保持 unverified/off。

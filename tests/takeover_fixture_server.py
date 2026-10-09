@@ -16,19 +16,19 @@ for line in sys.stdin:
         (root / 'original-state.json').write_text(json.dumps(state))
         continue
     method, params = request['method'], request.get('params', {})
-    if method == 'initialized':
+    if method == 'fixture/ready':
         continue
-    if method == 'initialize':
-        result = {'userAgent': 'codex-cli/0.160.1', 'codexHome': str(root / 'synthetic-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
-    elif method == 'thread/loaded/list':
+    if method == 'fixture/connect':
+        result = {'userAgent': 'fixture-cli/fixture-v1', 'fixtureHome': str(root / 'synthetic-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
+    elif method == 'fixture/loaded':
         result = {'data': state.get('loaded', [thread['id']]), 'nextCursor': None}
-    elif method == 'thread/list':
+    elif method == 'fixture/list':
         result = {'data': [thread], 'nextCursor': None, 'backwardsCursor': None}
-    elif method == 'thread/read':
+    elif method == 'fixture/read':
         result = {'thread': thread}
-    elif method == 'thread/backgroundTerminals/list':
+    elif method == 'fixture/background':
         result = {'data': state.get('backgrounds', []), 'nextCursor': None}
-    elif method == 'turn/steer':
+    elif method == 'fixture/append':
         active = [t['id'] for t in thread['turns'] if t['status'] == 'inProgress']
         if params['threadId'] != thread['id'] or active != [params['expectedTurnId']]:
             print(json.dumps({'id': request['id'], 'error': {'code': -32000, 'message': 'Wrong original turn'}}), flush=True)
@@ -36,9 +36,9 @@ for line in sys.stdin:
         state.setdefault('inputs', []).append(params)
         (root / 'original-state.json').write_text(json.dumps(state))
         result = {'turnId': params['expectedTurnId']}
-    elif method == 'turn/interrupt':
+    elif method == 'fixture/stop':
         result = {}
-    elif method == 'turn/start':
+    elif method == 'fixture/start':
         turn = {'id': 'continued-original-turn', 'status': 'inProgress', 'itemsView': 'full', 'items': []}
         thread['turns'].append(turn)
         thread['status'] = {'type': 'active', 'activeFlags': []}

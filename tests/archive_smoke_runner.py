@@ -1,4 +1,4 @@
-"""Pristine SDK native automatic cleanup and public migration/restore demonstration."""
+"""Pristine Hermes archive cleanup/restore; no live DSH capability is asserted."""
 from pathlib import Path
 import hashlib
 import json
@@ -7,11 +7,15 @@ import sys
 import yaml
 
 scratch=Path(sys.argv[1]).resolve()
-protected=[Path.home()/'.hermes',Path.home()/'.codex']
+protected=[Path.home()/'.hermes',Path.home()/'.dsh',Path.home()/'.codex']
+sdk_root=Path(os.environ['HERMES_TEST_SDK_ROOT']).resolve()
 def audit(event,args):
     if event=='open' and isinstance(args[0],(str,bytes)):
         path=Path(os.fsdecode(args[0])).resolve()
-        if any(path.is_relative_to(p) for p in protected) or (path.name=='.env' and not path.is_relative_to(scratch)):
+        # This test loads the original SDK in place, while forbidding its user data.
+        flags=args[2] if len(args)>2 and isinstance(args[2],int) else 0
+        sdk_code_read=path.is_relative_to(sdk_root) and path.suffix in {'.py','.pyc'} and not flags & (os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREAT|os.O_TRUNC)
+        if any(path.is_relative_to(p) for p in protected) and not sdk_code_read or (path.name=='.env' and not path.is_relative_to(scratch)):
             raise RuntimeError('Archive smoke refused real home, histories or credentials.')
     if event=='socket.connect' and isinstance(args[1],tuple):
         raise RuntimeError('Archive smoke refused external network access.')
@@ -36,10 +40,10 @@ from tools.registry import registry
 original=scratch/'native-original';original.mkdir()
 path=original/'state.db'
 native=SessionDB(path)
-native.create_session('old-root','cli')
+native.create_session('old-root','desktop')
 first=native.append_message('old-root','user','Original retry requirement',timestamp=1)
 native.append_message('old-root','assistant','Unknown outcomes remain unknown',timestamp=2)
-native.publish_compression_child(parent_session_id='old-root',child_session_id='old-tip',source='cli',
+native.publish_compression_child(parent_session_id='old-root',child_session_id='old-tip',source='desktop',
     messages=[{'role':'system','content':'Earlier compacted summary','_compressed_summary':True,'timestamp':3}],require_compression_lease=False)
 native.append_message('old-tip','assistant','Actual delivery receipts',timestamp=4)
 native.end_session('old-tip','user_close')
@@ -78,7 +82,7 @@ with Manager(state,owner_identity_ref=OWNER.subject,archive_providers={'local:ol
         # Actual source auto-cleanup, with on-disk transcripts: pin, not archived, is the protection.
         (sessions_dir/'unprotected-archived.jsonl').write_text('Synthetic unprotected control transcript')
         native=SessionDB(path)
-        native.create_session('unprotected-archived','cli')
+        native.create_session('unprotected-archived','desktop')
         native.end_session('unprotected-archived','user_close')
         native._write_sql('UPDATE sessions SET ended_at=1,started_at=1,archived=1 WHERE id=?',('unprotected-archived',))
         frozen=provider.query(viewer.subject,['public'],'all',True)
@@ -104,7 +108,7 @@ with Manager(state,owner_identity_ref=OWNER.subject,archive_providers={'local:ol
         current=owner.read_snapshot()['archive_sources'][0]['protection']
         assert current['current_native_pins']=='unverified' and current['permanent_protection']=='unverified',current
         assert current['status']=='verified_native_cleanup_copy',current
-        print(json.dumps({'source':'pristine SDK / isolated synthetic original data', 'cleanup_copy':protection,
+        print(json.dumps({'source':'pristine SDK / isolated synthetic original data', 'dsh_live_acceptance':'not_tested', 'cleanup_copy':protection,
             'synthetic_original_auto_cleanup':cleanup,'protected_transcripts':'preserved','archived_unpinned_control_transcript':'deleted',
             'baseline':{'status':baseline['status'],'source_version':baseline['source_version'],'consistency':baseline['consistency']},
             'restore':{'status':restored['status'],'source_version':restored['query']['source_version'],'actual_original_rows':restored['query']['coverage']['original_rows']},

@@ -544,7 +544,7 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
                 if not failure['notification_claimed']:
                     return
                 receipt = await prepared.transport.send({'uuid': failure['notification']['uuid'],
-                    'text': '受理需核对：' + failure['reason'] + '\n请查看 Dashboard；当前不会启动 Codex。',
+                    'text': '受理需核对：' + failure['reason'] + '\n请查看 Dashboard；当前不会启动 DSH。',
                     'chat_id': prepared.envelope['chat_id'], 'reply_to': prepared.envelope['message_id'],
                     'thread_id': prepared.envelope.get('thread_id'), 'mention_open_id': prepared.envelope['sender_open_id']})
                 self.intake.require_active(generation)

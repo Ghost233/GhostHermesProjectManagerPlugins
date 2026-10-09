@@ -57,9 +57,11 @@ class SnapshotReader:
         path = self.state_dir / 'manager.sqlite3'
         with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as database:
             schema, version, payload = database.execute('SELECT schema_version, version, payload FROM directory WHERE id=1').fetchone()
-        if schema != 1:
+        if schema != 2:
             raise ManagementError('unknown_version', 'Directory schema requires a verified upgrade.')
         data = json.loads(payload)
+        if data.get('executor_engine') != 'dsh':
+            raise ManagementError('unknown_version', 'The committed directory is not registered for DSH; existing material was preserved.')
         _, projects, profiles, requests, _ = directory_view(identity, self.owner_identity_ref, data, scope)
         for request in requests:
             if request.get('execution_capability'):

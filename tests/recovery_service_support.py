@@ -4,9 +4,10 @@ import os
 from pathlib import Path
 import sys
 
-from ghost_hermes_pm.codex import CodexStdioAdapter, repository_fingerprint
+from normalized_executor_fixture import SyntheticExecutorAdapter
+from ghost_hermes_pm.dsh import repository_fingerprint
 from ghost_hermes_pm.manager import ManagementError
-from ghost_hermes_pm.recovery import OriginalRecoveryAdapter
+from normalized_executor_fixture import SyntheticRecoveryAdapter as OriginalRecoveryAdapter
 
 
 def fixture_adapter(root, original_service_id, *, recover=False):
@@ -26,12 +27,12 @@ def fixture_adapter(root, original_service_id, *, recover=False):
             result['recovery_binding'] = context
         return result
     command = [sys.executable, str(Path(__file__).with_name('recovery_service_fixture.py')), 'proxy', str(root)]
-    settings = {'cwd': root, 'env': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(root / 'isolated-home')}, 'service_ref': 'local:fixture-stdio', 'timeout': 1}
+    settings = {'cwd': root, 'env': {'PATH': '/usr/bin:/bin', 'FIXTURE_HOME': str(root / 'isolated-home')}, 'service_ref': 'local:fixture-stdio', 'timeout': 1}
     if recover:
-        return OriginalRecoveryAdapter(command, **settings, source_kind='daemon', endpoint_ref='local:owned-original', verifier=proof)
-    class InitialProxy(CodexStdioAdapter):
+        return OriginalRecoveryAdapter(command, **settings, source_kind='desktop', endpoint_ref='local:owned-original', verifier=proof)
+    class InitialProxy(SyntheticExecutorAdapter):
         def connect(self):
             super().connect()
-            self.connection.update(service_id=original_service_id, endpoint_ref='local:owned-original', transport='original_proxy_stdio')
+            self.connection.update(service_id=original_service_id, endpoint_ref='local:owned-original', transport='synthetic_domain_pipe')
             return dict(self.connection)
     return InitialProxy(command, **settings, verifier=proof)

@@ -20,7 +20,7 @@ def install(directory):
     def audit(event, args):
         if event == 'open' and isinstance(args[0], (str, bytes)):
             path = Path(os.fsdecode(args[0])).resolve()
-            if path.name == '.env' or any(path.is_relative_to(protected_home / p) for p in ('.hermes', '.codex', '.config', '.local/state/hermes')):
+            if path.name == '.env' or any(path.is_relative_to(protected_home / p) for p in ('.hermes', '.dsh', '.codex', '.config', '.local/state/hermes')):
                 raise RuntimeError('Owned test child refused user data.')
         if event == 'socket.connect' and isinstance(args[1], tuple):
             raise RuntimeError('Owned test child refused external network.')

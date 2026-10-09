@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .codex import repository_fingerprint
+from .dsh import repository_fingerprint
 from .execution import _responsible, _current_assignment
 from .manager import ManagementError, _public_text, _repository
 
@@ -13,6 +13,8 @@ def _now():
 
 def _authorize(manager, identity, request_id, data):
     record = _responsible(manager, identity, request_id, data)
+    if record.get('executor_engine') != 'dsh':
+        raise ManagementError('binding_conflict', 'The accepted work belongs to another executor and requires explicit migration.')
     session = record.get('session')
     if session and session.get('origin') == 'manual_takeover' and data.get('control_grants', {}).get(record.get('control_grant_id'), {}).get('status') != 'active':
         raise ManagementError('forbidden', 'This current-work manual grant is inactive; the original session is observe-only.')
@@ -21,7 +23,7 @@ def _authorize(manager, identity, request_id, data):
     if manager._principal(identity, data) is not None:
         profile = data['profiles'].get(record['profile_id'], {})
         accepted = record.get('accepted_responsibility')
-        if not isinstance(accepted, dict) or any(profile.get(k) != v for k, v in accepted.items()) or profile.get('connection_refs', {}).get('codex') != record.get('accepted_codex_ref') or record.get('accepted_repository_fingerprint') != repository_fingerprint(data['projects'][record['project_id']]['repo']):
+        if not isinstance(accepted, dict) or any(profile.get(k) != v for k, v in accepted.items()) or profile.get('connection_refs', {}).get('dsh') != record.get('accepted_dsh_ref') or record.get('accepted_repository_fingerprint') != repository_fingerprint(data['projects'][record['project_id']]['repo']):
             raise ManagementError('forbidden', 'The original task control responsibility is no longer current.')
     return record, session
 
@@ -108,17 +110,17 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
         active = [t for t in thread.get('turns', []) if t.get('status') == 'inProgress']
         if expected_turn_id != session['turn_id']:
             raise ManagementError('binding_conflict', 'The expected original turn does not match; nothing was sent.')
-        method = 'turn/steer' if thread['status'].get('type') == 'active' else 'turn/start'
-        if action == 'continue' and method != 'turn/start':
+        mode = 'steer' if thread['status'].get('type') == 'active' else 'queue'
+        if action == 'continue' and mode != 'queue':
             raise ManagementError('binding_conflict', 'Explicit continuation requires verified idle new-turn semantics.')
-        if method == 'turn/steer' and (len(active) != 1 or active[0].get('id') != session['turn_id']):
+        if mode == 'steer' and (len(active) != 1 or active[0].get('id') != session['turn_id']):
             raise ManagementError('binding_conflict', 'The expected original active turn does not match; nothing was sent.')
         known_turn_ids = session.setdefault('known_turn_ids', [session['turn_id']])
-        if method == 'turn/start':
+        if mode == 'queue':
             adapter.verify_control(session['repository'], 'idle_input', session['capability'])
             adapter.verify_idle(thread, session['turn_id'], known_turn_ids)
         instruction = {'id': instruction_id, **request, 'thread_id': session['thread_id'], 'turn_id': session['turn_id'],
-                       'generation': session['generation'], 'method': method, 'previous_turn_id': session['turn_id'],
+                       'generation': session['generation'], 'method': 'session/prompt', 'mode': mode, 'previous_turn_id': session['turn_id'],
                        'phase': 'rpc_intent', 'accepted_at': _now()}
         record.setdefault('controls', []).append(instruction)
         arrangement = None
@@ -131,7 +133,7 @@ def control_task(manager, identity, request_id, action, instruction_id, text=Non
         with manager._db:
             manager._save(version, data)
         try:
-            if method == 'turn/steer':
+            if mode == 'steer':
                 result = adapter.steer_turn(session['thread_id'], session['turn_id'], text, instruction_id)
                 if result.get('turnId') != session['turn_id']:
                     raise ManagementError('outcome_unknown', 'The service did not confirm the expected original turn.')
@@ -186,7 +188,7 @@ def _stop(manager, identity, request_id, version, data, record, session, instruc
             if len(active) != 1 or active[0].get('id') != session['turn_id']:
                 raise ManagementError('binding_conflict', 'The original active turn changed; stop needs reconciliation.')
             result = adapter.interrupt_turn(session['thread_id'], session['turn_id'])
-            if result != {}:
+            if result != {'accepted': True}:
                 raise ManagementError('outcome_unknown', 'Interrupt returned an unrecognized acknowledgement.')
             stop['rpc_status'] = 'accepted'
         else:
@@ -254,6 +256,14 @@ def refresh_stop(manager, identity, request_id, *, sampling=False):
         return record
 
 
+def background_activity(adapter, thread_id):
+    """Native DSH jobs do not identify OS processes or the turn that created them."""
+    jobs = adapter.background_terminals(thread_id)
+    if not isinstance(jobs, list) or any(not isinstance(job, dict) or not isinstance(job.get('id'), str) or not job['id'] or not isinstance(job.get('kind'), str) or not job['kind'] or job.get('status') not in {'running', 'stopping', 'completed', 'killed', 'failed'} or job.get('owner') not in (None, thread_id) for job in jobs) or len({job['id'] for job in jobs}) != len(jobs):
+        raise ManagementError('capability_unverified', 'The original DSH job roster has missing, duplicate or foreign scope identities.')
+    return [job for job in jobs if job['status'] in {'running', 'stopping'}], len(jobs)
+
+
 def terminal_evidence(adapter, session, thread, turn_id):
     pending = [(thread, thread['turns'])]
     seen, related, evidence = set(), [], []
@@ -295,12 +305,11 @@ def terminal_evidence(adapter, session, thread, turn_id):
                         if child_thread.get('id') != child:
                             raise ManagementError('capability_unverified', 'Related child thread identity does not match.')
                         pending.append((child_thread, child_thread.get('turns', [])))
-        backgrounds = adapter.background_terminals(thread_id)
-        for terminal in backgrounds:
-            if not isinstance(terminal, dict) or not isinstance(terminal.get('itemId'), str) or not isinstance(terminal.get('processId'), str):
-                raise ManagementError('capability_unverified', 'Background execution evidence is malformed.')
-            related.append({'thread_id': thread_id, 'item_id': terminal['itemId'], 'process_id': terminal['processId'], 'kind': 'background_terminal'})
-        evidence.append({'thread_id': thread_id, 'background_coverage': 'complete', 'background_count': len(backgrounds),
+        backgrounds, job_count = background_activity(adapter, thread_id)
+        for job in backgrounds:
+            related.append({'thread_id': thread_id, 'job_id': job['id'], 'job_kind': job['kind'], 'job_status': job['status'],
+                'owner_scope': 'unowned' if job.get('owner') is None else 'session', 'kind': 'background_job'})
+        evidence.append({'thread_id': thread_id, 'background_coverage': 'registered_jobs_only', 'background_count': len(backgrounds), 'job_count': job_count,
                          'generation': session['generation'], 'observed_at': _now()})
     process_coverage = adapter.verify_process_coverage(session, {'turn_id': turn_id})
     evidence.append({'process_coverage': process_coverage, 'observed_at': _now()})

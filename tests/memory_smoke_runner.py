@@ -6,7 +6,7 @@ import sys
 import yaml
 
 scratch = Path(sys.argv[1]).resolve()
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / '.hermes', Path.home() / '.dsh', Path.home() / '.codex']
 
 
 def audit(event, args):
@@ -43,7 +43,7 @@ def call(action, **details):
     return json.loads(registry.dispatch('hermes_pm_memory', {'action': action, 'details': details}, scope=str(home)))
 
 
-with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(scratch),
+with Manager(state, owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(scratch),
              knowledge_providers={'local:fixture-wiki': local_provider(scratch)}) as authority:
     request_id = accepted(authority, make_repo(scratch / 'repo'))
     authority.start_task(OWNER, request_id)
@@ -76,7 +76,7 @@ with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=memory_adapt
         tasks = {r['id']: r for r in owner.read_snapshot()['requests']}
         loaded = tasks[next_id]['memory_context']
         assert loaded['status'] == 'loaded' and loaded['thread_id'] != tasks[request_id]['session']['thread_id']
-        wire = [r for r in map(json.loads, (scratch / 'wire.jsonl').read_text().splitlines()) if r.get('method') == 'turn/start']
+        wire = [r for r in map(json.loads, (scratch / 'wire.jsonl').read_text().splitlines()) if r.get('method') == 'fixture/start']
         assert len(wire) == 2 and 'Retry only definite failures.' in wire[-1]['params']['input'][0]['text']
         assert native.unload('ghost-hermes-pm') and registry.get_entry('hermes_pm_memory', scope=str(home)) is None
 print('native load, Dashboard bridge, restart, teardown: OK')

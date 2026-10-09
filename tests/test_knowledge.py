@@ -239,7 +239,7 @@ def test_task_supplement_targets_original_active_turn_once_and_carries_facts_as_
     from test_task_execution import accepted, adapter_for
     from test_task_control import THREAD, TURN, wire
     provider = local_provider(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
                  knowledge_providers={'local:fixture-wiki': provider}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -250,7 +250,7 @@ def test_task_supplement_targets_original_active_turn_once_and_carries_facts_as_
             first = client.supplement_knowledge(query_id)
             repeated = client.supplement_knowledge(query_id)
             assert first['status'] == repeated['status'] == 'accepted'
-            steering = [r for r in wire(tmp_path) if r['method'] == 'turn/steer']
+            steering = [r for r in wire(tmp_path) if r['method'] == 'fixture/append']
             assert len(steering) == 1
             assert steering[0]['params']['threadId'] == THREAD and steering[0]['params']['expectedTurnId'] == TURN
             text = steering[0]['params']['input'][0]['text']
@@ -258,7 +258,7 @@ def test_task_supplement_targets_original_active_turn_once_and_carries_facts_as_
             assert 'untrusted source data' in text
             assert 'Current accepted goal' in text and 'Repository boundary' in text
             assert 'PRIVATE' not in text
-            assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+            assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/start']) == 1
             assert client.read_snapshot()['knowledge_queries'][0]['supplement']['instruction_id'].startswith('knowledge:')
 
 
@@ -304,7 +304,7 @@ def test_actual_registered_bot_messages_and_builders_complete_public_query_resul
     sender = VerifiedIdentity('fixture:lead', 'verified-native-participant')
     settings = {**CONFIG, 'registered_bots': [{'profile_id': b['sender_profile_id'], 'identity_ref': b['sender_identity_ref'],
         'app_id': b['app_id'], 'tenant_key': b['sender_tenant_key'], 'open_id': b['sender_open_id'], 'native_ids': b['sender_native_ids']} for b in source['wiki_bindings']]}
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), knowledge_providers={'local:fixture-wiki': provider}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), knowledge_providers={'local:fixture-wiki': provider}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
         manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
@@ -332,7 +332,7 @@ def test_actual_registered_bot_messages_and_builders_complete_public_query_resul
             query = lead.read_snapshot()['knowledge_queries'][0]
             assert query['status'] == 'found'
             assert query['supplement']['status'] == 'accepted'
-            assert len([r for r in wire(tmp_path) if r['method'] == 'turn/steer']) == 1
+            assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/append']) == 1
             assert owner.read_snapshot()['requests'][0]['id'] == request_id
 
 
@@ -387,8 +387,8 @@ def test_late_ended_returned_or_uncontrolled_material_never_starts_or_steers(tmp
         peer = tmp_path / 'original'
         original_state(peer, repo)
         read, control = adapters(peer)
-        original = {'observation_adapters': {'local:manual-daemon': read}, 'control_adapters': {'manual-daemon': control}}
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), knowledge_providers={'local:fixture-wiki': provider}, **original) as manager:
+        original = {'observation_adapters': {'local:manual-desktop': read}, 'control_adapters': {'manual-desktop': control}}
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), knowledge_providers={'local:fixture-wiki': provider}, **original) as manager:
         request_id = accepted(manager, repo)
         if original:
             manager.register_observation_source(OWNER, source())
@@ -410,7 +410,7 @@ def test_late_ended_returned_or_uncontrolled_material_never_starts_or_steers(tmp
             elif state == 'stopping':
                 client.control_task(request_id, 'stop', 'stop-before-material', expected_turn_id=TURN)
             elif state == 'disconnected':
-                manager.codex_adapter.close()
+                manager.dsh_adapter.close()
             elif state == 'returned':
                 assert client.return_session_control(request_id, 'materials-current-work')['status'] == 'returned'
             result = client.supplement_knowledge(query_id)
@@ -420,12 +420,12 @@ def test_late_ended_returned_or_uncontrolled_material_never_starts_or_steers(tmp
                 assert snapshot['requests'][0]['session']['control'] == 'observe_only'
                 assert snapshot['requests'][0]['repository_released'] is False
                 methods = [json.loads(line).get('method') for line in (peer / 'original-wire.jsonl').read_text().splitlines()]
-                assert methods.count('turn/start') == 0
+                assert methods.count('fixture/start') == 0
                 assert not (tmp_path / 'wire.jsonl').exists()
             else:
                 methods = [r['method'] for r in wire(tmp_path)]
-                assert methods.count('turn/start') == 1
-            assert 'turn/steer' not in methods
+                assert methods.count('fixture/start') == 1
+            assert 'fixture/append' not in methods
             assert client.read_snapshot()['knowledge_queries'][0]['materials']
 
 

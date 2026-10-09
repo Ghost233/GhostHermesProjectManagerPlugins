@@ -20,7 +20,7 @@ def setup(manager, root):
     manager.apply_directory_change(OWNER, 0, registration(make_repo(root / 'repo')))
     target = registration(root / 'repo')['profile']
     target.update(id='new-lead', native_profile='new-lead', identity_ref='fixture:new-lead',
-                  connection_refs={'bot': 'identity:new-bot', 'credential': 'native:new-key', 'codex': 'local:new-executor'})
+                  connection_refs={'bot': 'identity:new-bot', 'credential': 'native:new-key', 'dsh': 'local:new-executor'})
     manager.apply_directory_change(OWNER, 1, {'profile': target})
 
 

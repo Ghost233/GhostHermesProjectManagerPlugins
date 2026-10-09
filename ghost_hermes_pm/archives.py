@@ -8,7 +8,7 @@ import sqlite3
 from .manager import ManagementError, VerifiedIdentity, _public_text
 from .knowledge import _query_scope, _channel, _publication, NAMESPACE
 
-KINDS = {'hermes_local', 'feishu_remote', 'codex_history'}
+KINDS = {'hermes_local', 'feishu_remote', 'dsh_history'}
 RESULT_FIELDS = {'status','kind','records','requester','searched_scope','coverage','source_version','observed_at','old_entry','reason'}
 
 
@@ -25,10 +25,10 @@ def provider_binding(provider):
         stat=provider.path.stat()
         return _digest({'kind':provider.kind,'path':str(provider.path),'file_identity':[stat.st_dev,stat.st_ino],
             'sessions':provider.session_scopes,'files':provider.files})
-    from .archive_sources import FeishuArchiveProvider,CodexArchiveProvider
+    from .archive_sources import FeishuArchiveProvider,DshArchiveProvider
     if isinstance(provider,FeishuArchiveProvider):
         return _digest({'kind':provider.kind,'binding':provider.binding,'chats':provider.chat_scopes})
-    if isinstance(provider,CodexArchiveProvider):
+    if isinstance(provider,DshArchiveProvider):
         adapter=provider.adapter
         return _digest({'kind':provider.kind,'threads':provider.thread_scopes,'service_ref':adapter.service_ref,
             'endpoint_ref':adapter.endpoint_ref,'source_kind':adapter.source_kind})
@@ -326,7 +326,7 @@ def configured_providers(config, *, state_dir=None, credential_resolver=None):
         return {}
     if not isinstance(config, dict):
         raise ManagementError('invalid_change', 'Archive providers require explicit trusted original source references.')
-    from .archive_sources import FeishuArchiveProvider, CodexArchiveProvider, verify_feishu_source
+    from .archive_sources import FeishuArchiveProvider, DshArchiveProvider, verify_feishu_source
     from .observation import configured_observation_adapters
     result = {}
     for ref, value in config.items():
@@ -349,11 +349,11 @@ def configured_providers(config, *, state_dir=None, credential_resolver=None):
                 raise ManagementError('invalid_change', 'The original remote app identity is required.')
             client = Client.builder().app_id(binding['app_id']).app_secret(secret).build()
             result[ref] = FeishuArchiveProvider(client, binding, value['chat_scopes'], lambda native, binding=dict(binding): verify_feishu_source(native, binding))
-        elif kind == 'codex_history':
+        elif kind == 'dsh_history':
             if set(value) != {'kind', 'adapter', 'thread_scopes'} or state_dir is None:
-                raise ManagementError('invalid_change', 'Codex archives require an original read-only proxy configuration and trusted evidence directory.')
+                raise ManagementError('invalid_change', 'DSH archives require an existing backend read-only configuration and trusted evidence directory.')
             adapters = configured_observation_adapters([value['adapter']], state_dir)
-            result[ref] = CodexArchiveProvider(adapters[value['adapter']['service_ref']], value['thread_scopes'])
+            result[ref] = DshArchiveProvider(adapters[value['adapter']['service_ref']], value['thread_scopes'])
         else:
             raise ManagementError('invalid_change', 'Unknown original archive source kind.')
     return result

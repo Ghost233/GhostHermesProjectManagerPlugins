@@ -7,7 +7,7 @@ import yaml
 
 scratch = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(scratch / 'readiness-fixtures'))
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / '.hermes', Path.home() / '.dsh', Path.home() / '.codex']
 
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
@@ -37,7 +37,7 @@ from hermes_cli.plugins import get_plugin_manager
 from tools.registry import registry
 
 participant = VerifiedIdentity('fixture:lead', 'fixture-native-participant')
-with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(scratch)) as authority:
+with Manager(state, owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(scratch)) as authority:
     request_id = accepted(authority, make_repo(scratch / 'repo'))
     with ManagementServer(authority, {os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN']: participant}):
         plugin_manager = get_plugin_manager()

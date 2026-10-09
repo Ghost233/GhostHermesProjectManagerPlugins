@@ -39,7 +39,7 @@ def test_status_reporting_does_not_require_merge(tmp_path, criterion, expected_e
     subprocess.run(['git', '-C', str(repo), 'add', 'test_acceptance.py'], check=True)
     subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Owned Fixture', '-c', 'user.email=owned@example.invalid', 'commit', '-qm', 'Owned assertions'], check=True)
     scope = {**ISSUE, 'body': '- [ ] ' + criterion}
-    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo, scope)
         with ManagementServer(manager, {'owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'owner')

@@ -7,7 +7,7 @@ import yaml
 
 scratch = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(scratch / 'readiness-fixtures'))
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / '.hermes', Path.home() / '.dsh', Path.home() / '.codex']
 
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
@@ -41,7 +41,7 @@ participant = VerifiedIdentity('fixture:lead', 'fixture-native-participant')
 repo = make_repo(scratch / 'repo')
 peer = scratch / 'manual-peer'
 manual_state(peer, repo)
-with Manager(state, owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-daemon': observer(peer)}) as authority:
+with Manager(state, owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-desktop': observer(peer)}) as authority:
     request_id = accepted(authority, repo)
     authority.register_observation_source(OWNER, source())
     with ManagementServer(authority, {os.environ['HERMES_FIXTURE_PARTICIPANT_TOKEN']: participant}):

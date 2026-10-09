@@ -1,8 +1,10 @@
 # 选择性迁移到新 Profile
 
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
 `Manager.migrate_profile(identity, action, details)` 由认证 Unix bridge 的 `ManagementClient.migrate_profile`、Dashboard `/migration` 和已核验本人群消息共用。原生 `hermes_pm_migration` 只读 participant 自己可见的计划和事实；工具参数不接受本人身份、宿主路径或迁移动作。迁移计划与实际原生落盘、外部身份验收、旧入口停止和切换分别记录。
 
-本实现支持明确命名的 multiplexer satellite，包括项目负责人、总管和树外 Wiki/个人助手。原/目标保留各自已审定长期项目或独立范围。原 native Profile 名、identity、bot、native credential 和 Codex binding 不沿用；目标模型/provider/toolsets 按新职责重建。默认、launch、standalone、外部 bank 和缺少原执行控制证据的作用域保持受阻。原有精选项目记忆的 project/role/identity、own-task 验收限制不变；迁移不会改写旧精选 ledger 的身份。
+本实现支持明确命名的 multiplexer satellite，包括项目负责人、总管和树外 Wiki/个人助手。原/目标保留各自已审定长期项目或独立范围。原 native Profile 名、identity、bot、native credential 和 DSH binding 不沿用；目标模型/provider/toolsets 按新职责重建。默认、launch、standalone、外部 bank 和缺少原执行控制证据的作用域保持受阻。原有精选项目记忆的 project/role/identity、own-task 验收限制不变；迁移不会改写旧精选 ledger 的身份。
 
 ## 本人审定的不可变计划
 
@@ -75,7 +77,7 @@ native_profile_migration:
 
 新的 Feishu identity 验收调用实际 `NativeFeishuTransport.verify_identity()`，核对独立新 app/open ID 与新的 native credentials；准确旧/新 namespace、群和本人范围来自 Owner 已登记配置。目标 `connection_refs.bot` 使用 `identity:<app_id>:<open_id>`。只登记引用或填写报告不能替代实际 bot-info 成功；目标未装配真实受控 transport 时阻塞。机器人开通、租户权限、凭据签发/撤销、群邀请和外部 bank 授权仍由明确人工步骤完成。
 
-只有上述资料、授权和控制证据都满足，才向同一已核验 multiplexer 发原生 `serve-profile`，重读准确宿主/target serving 状态后解除目标 Manager admission gate。旧 Profile/入口保持封存，原 children 不自动恢复，旧 Codex/手动任务不自动续跑。成功后的同一原确认、prepare/check 返回带核实时间的同一 durable completed fact，不更新确认 version 或再做宿主动作。它表示该次切换的历史事实，当前运行状态仍由正常监督入口核对。
+只有上述资料、授权和控制证据都满足，才向同一已核验 multiplexer 发原生 `serve-profile`，重读准确宿主/target serving 状态后解除目标 Manager admission gate。旧 Profile/入口保持封存，原 children 不自动恢复，旧 DSH/手动任务不自动续跑。成功后的同一原确认、prepare/check 返回带核实时间的同一 durable completed fact，不更新确认 version 或再做宿主动作。它表示该次切换的历史事实，当前运行状态仍由正常监督入口核对。
 
 失败/未知结果保留同 ID、原 scope/digest、检查点和 target gate。准备或切换受阻可 `rollback`：验证原 Manager checkpoint 的 hash/integrity 与原计划，真实恢复到 Manager 自有 artifact；核对审定 target config/native memory 的检查点 bytes，并保留原生 parked intent。数据变化、未知 alias、未核实的运行执行或已实际切换后的停止覆盖不足时，保留材料并 blocked，不覆盖手工数据。
 
@@ -94,7 +96,7 @@ Dashboard 提供原材料 preview、不可变计划、selected ledger、人工�
 
 mandatory matrix 新增实际 migration case。真实固定 SDK fresh Profile、memory/USER/SOUL、审批批准/拒绝、原 SessionDB/archive保护/SQLite备份/完整查询、原 native gateway ControlSocket/serve/unserve 和普通插件 request hook 均执行。`AIAgent` 对自有 localhost OpenAI-compatible streaming peer 发真实请求并保存真实 prompt/messages/usage；Profile/bot/ticker 作用域使用已拥有的合成进程及当前退出事实，Feishu bot-info 为明确的外部服务响应 fixture。
 
-独立 named Wiki、Ghost 和 steward 三条 mandatory cases 逐个执行正常 SDK 的新会话、原 SourceGrant/完整历史查询、single-entry stop/manual等待/明确完成、切换及受阻回退；unrelated/default Profile 与 PID 保持运行。Wiki case 丢失实际宿主动作的 Manager receipt 后重启，原 scope/version/未知状态与原观察 PID 保留，实证无重复 RPC/自动恢复。developer case 的原独立 Codex 协议服务真实启动子进程，收到原 turn/interrupt 后打断确认连接；重启沿原 service/thread/turn 对账，未核实前保留占用及 source admission gate，terminal 后释放，只有一次 start/interrupt，无旧输入/审批/续跑。执行配置不复制旧 `codex-development.json` 的 GitHub user、token、container、provider/bank 或 PID；新 local executor 另行按新计划重建。当前业务 GitHub 必须实查 本机配置的授权 GitHub 账号，当前测试计划禁止 container/Docker；静态回执不会把此类账户/运行权限显示为已验证。
+独立 named 合成 Wiki、个人助手和 steward 三条 mandatory cases 逐个执行正常 SDK 的新会话、原 SourceGrant/完整历史查询、single-entry stop/manual等待/明确完成、切换及受阻回退；unrelated/default Profile 与 PID 保持运行。Wiki case 丢失实际宿主动作的 Manager receipt 后重启，原 scope/version/未知状态与原观察 PID 保留，实证无重复 RPC/自动恢复。迁移前 developer case 的原独立 Codex 协议服务真实启动子进程，收到原 turn/interrupt 后打断确认连接；重启沿原 service/thread/turn 对账，未核实前保留占用及 source admission gate，terminal 后释放，只有一次 start/interrupt，无旧输入/审批/续跑。执行配置不复制旧 `codex-development.json` 的 GitHub user、token、container、provider/bank 或 PID；新 local executor 另行按新计划重建。当前业务 GitHub 必须实查 本机配置的授权 GitHub 账号，当前测试计划禁止 container/Docker；静态回执不会把此类账户/运行权限显示为已验证。
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 \

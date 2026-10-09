@@ -1,5 +1,7 @@
 # 仓库队列与工作区交接（[按仓库排队并交接下一项 Issue](../../../../issues/18)）
 
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
 队列按规范的 Git common directory 串行外层任务，符号路径与 linked worktree 共用同一顺序。其他逻辑仓库可以同时运行自己的任务会话。Matt 子线程属于原外层占用，结束核对会遍历它们，不把内部并行再登记成外层请求。
 
 `accept_request` 保存冻结目标、验收、Issue URL/更新时间、规范仓库以及递增的 `queue.sequence`。受理、排队、占用、工作区交接受阻与交付分别保存。`start_task` 是明确执行要求：前项未释放时保存真实调用者和等待原因，返回 `repository_busy`；已核实停止或交付后，管理实例与 Gateway 监督循环只派发这些已有执行授权、已准备且仍符合基线的请求。未请求执行的受理不会自动开跑。超时、连接更换或未知后台不会按时间释放占用。
@@ -25,9 +27,9 @@
 
 ## 释放与明确继续
 
-普通交付在原执行及冻结验收证据之外，核对原 thread 的全部完整终态、同逻辑仓库已加载线程、Matt receiver 子线程、每个相关 thread 的全页后台列表与当前可信宿主的 process coverage。方法缺席、分页缺口、子执行未终结或进程覆盖未知时保持原占用。已核实交付保存完整源码提交（无源码变更也记录现有 HEAD）、源码 digest、工作区状态、遗留内容与执行结束证据；PR 审查与合并状态单列。
+普通交付在原执行及冻结验收证据之外，核对原 DSH Session 的全部完整终态、同逻辑仓库实际活动会话、Matt 子 agent、完整 job 范围与当前可信宿主的 process coverage。方法缺席、分页缺口、子执行未终结或进程覆盖未知时保持原占用。已核实交付保存完整源码提交（无源码变更也记录现有 HEAD）、源码 digest、工作区状态、遗留内容与执行结束证据；PR 审查与合并状态单列。
 
-停止遵守 [在原会话追加、停止和明确继续任务](../../../../issues/17) 的 `stop_records` 和原执行核实契约。明确继续登记新的 `execution_arrangements` 与新的队列 sequence/安排时间，关联原 request/thread/上一停止，排在当前待办之后；旧 `accepted_at` 不能让继续插队。排队的同一 instruction ID/内容返回 `queued`，变更内容拒绝；核实 idle、有效责任、原服务代次、当前准备及排他输入收据后才能对原 thread 发新 turn。旧停止证据保留，未知输入不重放。
+停止遵守 [在原会话追加、停止和明确继续任务](../../../../issues/17) 的 `stop_records` 和原执行核实契约。明确继续登记新的 `execution_arrangements` 与新的队列 sequence/安排时间，关联原 request/thread/上一停止，排在当前待办之后；旧 `accepted_at` 不能让继续插队。排队的同一 instruction ID/内容返回 `queued`，变更内容拒绝；核实 idle、有效责任、原服务代次、当前准备及排他输入收据后才能向原 DSH Session 提交已核验的新执行输入。旧停止证据保留，未知输入不重放。
 
 发现服务已加载的手动或未知执行时，按其真实 cwd 的 Git common directory 核对并保存 `queue.external_occupancy`。linked worktree 或子目录路径不能绕过外层串行。更换连接代次不能用新服务空列表释放旧占用；需要原服务核实或明确对账。
 
@@ -39,4 +41,4 @@
 
 公共令牌 bridge 驱动真实合成 JSONL 子进程，覆盖持久 FIFO/失联占用、双任务推进、两个逻辑仓库同时活动、错误基线/遗留文件保留、明确继续按新安排排队、同 common-dir alias 的手动执行、冻结 Issue 来源差异。真实 Git 核对全部在合成仓库中进行。
 
-上述协议 peer 和测试 verifier 明确是 synthetic fixtures。[执行一个 Codex Issue 并核对交付结果](../../../../issues/16) 的完整生产写入/工具边界、获准真实模型服务、当前宿主执行覆盖和真实群发送仍缺实际证据，生产启动/控制 gate 继续关闭。队列实现不把 RPC 形状、合成收据或 UI 状态变成真实能力验收。
+上述协议 peer 和测试 verifier 明确是 synthetic fixtures。[执行一个 Issue 并核对交付结果](../../../../issues/16) 的完整生产写入/工具边界、获准真实模型服务、当前宿主执行覆盖和真实群发送仍缺实际证据，生产启动/控制 gate 继续关闭。队列实现不把 RPC 形状、合成收据或 UI 状态变成真实能力验收。

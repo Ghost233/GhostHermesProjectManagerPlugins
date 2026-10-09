@@ -13,7 +13,7 @@ state = Path(sys.argv[1])
 settings = {}
 if len(sys.argv) > 2:
     from recovery_service_support import fixture_adapter
-    settings['codex_adapter'] = fixture_adapter(Path(sys.argv[2]), sys.argv[3])
+    settings['dsh_adapter'] = fixture_adapter(Path(sys.argv[2]), sys.argv[3])
 with Manager(state, owner_identity_ref=OWNER.subject, **settings) as manager:
     with ManagementServer(manager, {'recovery-owner': OWNER}):
         request_id = None

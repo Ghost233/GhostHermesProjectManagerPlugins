@@ -70,7 +70,7 @@ def tree(manager, root):
 
 def test_owner_archive_blocks_parent_and_child_until_original_execution_and_every_entry_stop_are_verified(tmp_path):
     host = ProfileHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), lifecycle_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), lifecycle_host=host) as manager:
         host.manager = manager
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         tree(manager, tmp_path)
@@ -100,13 +100,13 @@ def test_owner_archive_blocks_parent_and_child_until_original_execution_and_ever
             assert all(p['lifecycle'] == 'archived' for p in client.read_snapshot()['projects'])
             assert client.read_snapshot()['lifecycle_events'][0]['kind'] == 'archive_completed'
             client.lifecycle('archive', approval)
-        assert len([r for r in wire(tmp_path) if r['method'] == 'turn/interrupt']) == 1
+        assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/stop']) == 1
         assert len(host.calls) == 6
 
 
 def test_archive_cancels_unstarted_queue_and_restore_only_parent_keeps_old_work_stopped(tmp_path):
     host = ProfileHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), lifecycle_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), lifecycle_host=host) as manager:
         host.manager = manager
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         tree(manager, tmp_path)
@@ -135,7 +135,7 @@ def test_observe_only_execution_needs_explicit_owner_handling_and_current_termin
     host = ProfileHost()
     repo, peer = make_repo(tmp_path / 'repo'), tmp_path / 'manual'
     manual_state(peer, repo)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-daemon': observer(peer)}, lifecycle_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-desktop': observer(peer)}, lifecycle_host=host) as manager:
         host.manager = manager
         manager.apply_directory_change(OWNER, 0, registration(repo))
         manager.register_observation_source(OWNER, source())
@@ -175,7 +175,7 @@ def test_archive_never_creates_a_new_manual_control_grant_even_when_owner_has_a_
     read, control = adapters(peer)
     host = ProfileHost()
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, lifecycle_host=host,
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         host.manager = manager
         request_id, observed = setup(manager, repo)
         decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'observe-archive'})
@@ -228,7 +228,7 @@ def test_public_archive_then_restart_reconciles_the_original_real_process_withou
     host = ProfileHost()
     try:
         service_id = json.loads(service.stdout.readline())['service_id']
-        with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=fixture_adapter(peer, service_id), lifecycle_host=host) as manager:
+        with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=fixture_adapter(peer, service_id), lifecycle_host=host) as manager:
             host.manager = manager
             request_id = accepted(manager, make_repo(tmp_path / 'repo'))
             tree(manager, tmp_path)
@@ -236,7 +236,7 @@ def test_public_archive_then_restart_reconciles_the_original_real_process_withou
             pid = json.loads((peer / 'execution.json').read_text())['worker_pid']
             os.kill(pid, 0)
             # Lose the actual original connection after the service applied its interrupt.
-            (peer / 'drop.json').write_text(json.dumps(['turn/interrupt']))
+            (peer / 'drop.json').write_text(json.dumps(['fixture/stop']))
             archive = decide(manager, 'archive', {'profile_id': 'mono-lead', 'operation_id': 'process-archive'})
             assert archive['status'] != 'completed'
             assert manager.read_snapshot(OWNER)['requests'][0]['repository_released'] is False
@@ -255,7 +255,7 @@ def test_public_archive_then_restart_reconciles_the_original_real_process_withou
         execution = json.loads((peer / 'execution.json').read_text())
         assert execution['starts'] == 1 and execution['inputs'] == [] and execution['responses'] == []
         methods = [json.loads(line).get('method') for line in (peer / 'wire.jsonl').read_text().splitlines()]
-        assert methods.count('turn/interrupt') == methods.count('turn/start') == 1
+        assert methods.count('fixture/stop') == methods.count('fixture/start') == 1
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
     finally:

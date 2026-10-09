@@ -33,21 +33,21 @@ for line in sys.stdin:
         log.write(json.dumps(request) + '\n')
     method, params = request['method'], request.get('params', {})
     state()
-    if method == 'initialized':
+    if method == 'fixture/ready':
         continue
-    if method == 'initialize':
-        result = {'userAgent': 'codex-cli/0.160.1', 'codexHome': str(root / 'codex-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
-    elif method == 'permissionProfile/list':
+    if method == 'fixture/connect':
+        result = {'userAgent': 'fixture-cli/fixture-v1', 'fixtureHome': str(root / 'fixture-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
+    elif method == 'fixture/policy':
         result = {'data': [{'id': 'fixture-boundary', 'allowed': True}], 'nextCursor': None}
-    elif method == 'thread/loaded/list':
+    elif method == 'fixture/loaded':
         result = {'data': list(threads), 'nextCursor': None}
-    elif method == 'thread/start':
+    elif method == 'fixture/create':
         sequence += 1
         thread_id = 'queue-thread-' + str(sequence)
-        thread = {'id': thread_id, 'cwd': params['cwd'], 'cliVersion': '0.160.1', 'status': {'type': 'idle'}, 'turns': [], 'canAcceptDirectInput': True}
+        thread = {'id': thread_id, 'cwd': params['cwd'], 'cliVersion': 'fixture-v1', 'status': {'type': 'idle'}, 'turns': [], 'canAcceptDirectInput': True}
         threads[thread_id] = thread
         result = {'thread': thread, 'model': 'fixture-model', 'cwd': params['cwd'], 'activePermissionProfile': {'id': params['permissions']}, 'runtimeWorkspaceRoots': params['runtimeWorkspaceRoots']}
-    elif method == 'turn/start':
+    elif method == 'fixture/start':
         records = committed_requests(method)
         assert any(r.get('session', {}).get('thread_id') == params['threadId'] and not r.get('repository_released') for r in records)
         sequence += 1
@@ -56,13 +56,13 @@ for line in sys.stdin:
         thread['turns'].append(turn)
         thread['status'] = {'type': 'active', 'activeFlags': []}
         result = {'turn': turn}
-    elif method == 'thread/read':
+    elif method == 'fixture/read':
         result = {'thread': threads[params['threadId']]}
-    elif method == 'thread/backgroundTerminals/list':
+    elif method == 'fixture/background':
         path = root / 'queue-background.json'
         pages = json.loads(path.read_text()) if path.exists() else {}
         result = pages.get(params['threadId'], {}).get(params.get('cursor', ''), {'data': [], 'nextCursor': None})
-    elif method == 'turn/interrupt':
+    elif method == 'fixture/stop':
         result = {}
     else:
         print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported queue fixture method'}}), flush=True)

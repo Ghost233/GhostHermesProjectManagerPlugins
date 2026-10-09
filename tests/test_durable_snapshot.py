@@ -10,8 +10,8 @@ from test_task_execution import accepted, adapter_for
 
 
 def test_public_snapshot_observes_committed_intent_before_rpc_returns(tmp_path):
-    (tmp_path / 'behavior.json').write_text(json.dumps({'delay': {'turn/start': 1.0}}))
-    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    (tmp_path / 'behavior.json').write_text(json.dumps({'delay': {'fixture/start': 1.0}}))
+    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'fixture-entry': OWNER}), ThreadPoolExecutor(max_workers=1) as pool:
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
@@ -19,7 +19,7 @@ def test_public_snapshot_observes_committed_intent_before_rpc_returns(tmp_path):
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 wire = tmp_path / 'wire.jsonl'
-                if wire.exists() and any(json.loads(line)['method'] == 'turn/start' for line in wire.read_text().splitlines()):
+                if wire.exists() and any(json.loads(line)['method'] == 'fixture/start' for line in wire.read_text().splitlines()):
                     break
                 time.sleep(.01)
             else:
@@ -31,7 +31,7 @@ def test_public_snapshot_observes_committed_intent_before_rpc_returns(tmp_path):
 
 
 def test_committed_snapshot_does_not_reconcile_send_or_change_capability(tmp_path):
-    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'fixture-entry': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
@@ -94,7 +94,7 @@ def test_original_service_rejects_missing_durable_thread_before_send(tmp_path):
     from ghost_hermes_pm import ManagementError
     from test_task_execution import execution_registration
     adapter = adapter_for(tmp_path)
-    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         manager.apply_directory_change(OWNER, 0, execution_registration(make_repo(tmp_path / 'repo')))
         repository = manager.read_snapshot(OWNER)['projects'][0]['repo']
         proof = adapter.verify_start(repository)
@@ -102,7 +102,7 @@ def test_original_service_rejects_missing_durable_thread_before_send(tmp_path):
         with pytest.raises(ManagementError):
             adapter.start_turn(response['thread']['id'], 'Owned invalid order: no durable manager session yet.')
         observed = [json.loads(line) for line in (tmp_path / 'public-snapshots.jsonl').read_text().splitlines()]
-        assert observed[-1]['method'] == 'turn/start'
+        assert observed[-1]['method'] == 'fixture/start'
         assert not any(r.get('session', {}).get('thread_id') == response['thread']['id'] for r in observed[-1]['snapshot']['requests'])
         events = [json.loads(line) for line in (tmp_path / 'oracle-events.jsonl').read_text().splitlines()]
-        assert events[-1] == {'method': 'turn/start', 'requirement': 'thread must be durable before turn/start', 'satisfied': False}
+        assert events[-1] == {'method': 'fixture/start', 'requirement': 'thread must be durable before turn/start', 'satisfied': False}

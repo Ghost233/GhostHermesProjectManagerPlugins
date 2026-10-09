@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 
-from .codex import CodexStdioAdapter, repository_fingerprint
+from .dsh import DshRemoteAdapter, repository_fingerprint
 from .manager import ManagementError, _repository
 from .observation import READ_METHODS
 from .takeover import OriginalControlAdapter, CONTROL_METHODS
@@ -17,38 +17,40 @@ class OriginalRecoveryAdapter(OriginalControlAdapter):
     """A separate, host-verified proxy of an existing executor; never a new server."""
     def _proof(self, repository, context):
         binding = {'generation': self.generation, 'service_ref': self.service_ref, 'service_id': context['service_id'],
-                   'endpoint_ref': self.endpoint_ref, 'source_kind': self.source_kind, 'transport': 'original_proxy_stdio'}
+                   'endpoint_ref': self.endpoint_ref, 'source_kind': self.source_kind, 'transport': 'desktop_http_mux', 'engine': 'dsh'}
         if self.connection is not None:
             binding['platform'] = self.connection['platform']
+            binding['client_id'] = self.connection['client_id']
         proof = self.control_verifier(binding, repository, context) if callable(self.control_verifier) else None
         required = ('permission_profile', 'policy_digest', 'platform_enforcement', 'tool_paths', 'manual_execution_coverage', 'recovery')
-        if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in binding.items()) or proof.get('recovery_binding') != context or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']] or any(not isinstance(proof.get(k), str) or not proof[k] for k in required):
+        if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in binding.items()) or proof.get('recovery_binding') != context or proof.get('repository_fingerprint') != repository_fingerprint(repository) or proof.get('runtime_roots') != [repository['worktree']] or any(not isinstance(proof.get(k), str) or not proof[k] for k in required) or not proof['permission_profile'].startswith('host:') or not isinstance(proof.get('backend_instance_ref'), str) or not proof['backend_instance_ref']:
             raise ManagementError('capability_unverified', 'Fresh host evidence for this original executor, session and boundary is missing; matching history cannot recover control.')
         return proof
 
     def verify_recovery(self, repository, context):
+        self.control_repository = repository
+        self.bind_repository(context['thread_id'], repository)
         self.origin_proof = self._proof(repository, context)
         self.connect()
         self.origin_proof = self._proof(repository, context)
+        self._control_proof = self.origin_proof
         return self.origin_proof
 
-    def _write(self, envelope):
-        method = envelope.get('method')
+    def _guard_request(self, method, params):
         if method in READ_METHODS:
-            return CodexStdioAdapter._write(self, envelope)
-        if method is not None and method not in CONTROL_METHODS:
-            raise ManagementError('forbidden', 'Recovery cannot create, resume or fork a thread or replace the original service.')
+            return DshRemoteAdapter._guard_request(self, method, params)
+        if method not in CONTROL_METHODS:
+            raise ManagementError('forbidden', 'Recovery cannot create a session or replace the original DSH backend.')
         authority = self.authority() if callable(self.authority) else None
         context = (self.origin_proof or {}).get('recovery_binding', {})
         if not authority or authority['status'] != 'active' or authority['id'] != context.get('request_id'):
             raise ManagementError('forbidden', 'Recovered observation does not grant new current-work authority.')
-        params = envelope.get('params', {})
-        if method is None:
-            incoming = self._server_requests.get((type(envelope.get('id')), envelope.get('id')))
-            params = incoming['envelope'].get('params', {}) if incoming else {}
-        if params.get('threadId') != authority['thread_id'] or method in {'turn/steer', 'turn/interrupt'} and params.get('expectedTurnId', params.get('turnId')) != authority['turn_id'] or method is None and params.get('turnId') != authority['turn_id']:
+        target = params.get('_authority', {})
+        if target.get('thread_id') != authority['thread_id'] or target.get('turn_id') != authority['turn_id']:
             raise ManagementError('binding_conflict', 'Recovered input must identify the same original task and current turn.')
-        return CodexStdioAdapter._write(self, envelope)
+        action = 'stop' if method == 'session/cancel' else 'human_response' if method in {'$events/result', 'userQuestions/answer'} else 'append'
+        self.verify_control(self.control_repository, action, self.origin_proof)
+        return DshRemoteAdapter._guard_request(self, method, params)
 
     def verify_control(self, repository, action, expected_capability):
         context = dict(expected_capability['recovery_binding'])
@@ -60,6 +62,7 @@ class OriginalRecoveryAdapter(OriginalControlAdapter):
         if any(proof.get(k) != expected_capability.get(k) for k in ('permission_profile', 'policy_digest', 'runtime_roots')) or action != 'related_execution' and proof.get('control_access') != 'verified-original-input-path' or not isinstance(proof.get('task_control'), dict) or not isinstance(proof['task_control'].get(action), str) or not proof['task_control'][action]:
             raise ManagementError('capability_unverified', 'The current recovered action and immutable original boundary have no fresh proof.')
         self.origin_proof = proof
+        self._control_proof = proof
         return proof
 
 
@@ -149,7 +152,7 @@ def reconcile_task(manager, identity, request_id):
                     record.setdefault('connection_history', []).append({k: session.get(k) for k in ('service_ref', 'service_id', 'generation', 'endpoint_ref')})
                     session.pop('pid', None)
                     session.update(generation=adapter.generation, capability=proof, recovery_ref=session['service_ref'],
-                        endpoint_ref=adapter.endpoint_ref, source_kind=adapter.source_kind, transport='original_proxy_stdio')
+                        endpoint_ref=adapter.endpoint_ref, source_kind=adapter.source_kind, transport='desktop_http_mux')
                     bind_recovery(manager, record, adapter)
                     record['execution_capability'] = {'status': 'verified', 'enabled': session['control'] == 'assigned_task', 'connection': adapter.connection, 'proof': proof}
                     with manager._db:
@@ -224,33 +227,34 @@ def verify_directory(path):
             row = database.execute('SELECT schema_version, version, payload FROM directory WHERE id=1').fetchone()
             if not row or type(row[1]) is not int or row[1] < 0:
                 raise ValueError('Authoritative directory row is missing.')
-            if row[0] != 1:
-                raise ManagementError('unknown_version', 'Directory schema requires a verified upgrade; no recovery writes were performed.')
+            if row[0] != 2:
+                raise ManagementError('unknown_version', 'Existing executor state requires an explicit verified migration; no recovery writes were performed.')
             payload = json.loads(row[2])
             if not isinstance(payload, dict) or any(not isinstance(payload.get(k), dict) for k in ('projects', 'profiles')):
                 raise ValueError('Directory material is incomplete.')
+            if payload.get('executor_engine') != 'dsh':
+                raise ManagementError('unknown_version', 'The executor state is not registered for DSH; existing data was preserved.')
     except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
         raise ManagementError('unavailable', 'Persistent directory is unavailable or corrupt; preserve it for recovery and do not dispatch.') from exc
 
 
 def configured_recovery_adapters(configs, state_dir):
-    """Fixed native original endpoints, backed by fresh hashed host validation."""
+    """Fixed existing DSH backends, backed by fresh hashed recovery receipts."""
     from pathlib import Path
+    from .observation import resolved_configuration
     if not configs:
         return {}
-    allowed = {'executable', 'cwd', 'environment', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref'}
     if not isinstance(configs, list):
-        raise ManagementError('invalid_change', 'Recovery requires an explicit native original endpoint list.')
+        raise ManagementError('invalid_change', 'Recovery requires an explicit native existing-backend list.')
     adapters = {}
     for config in configs:
-        if not isinstance(config, dict) or set(config) != allowed or any(not isinstance(config.get(k), str) or not config[k] for k in allowed - {'environment'}) or not Path(config['executable']).is_absolute() or not Path(config['endpoint']).is_absolute() or config['service_ref'] in adapters:
-            raise ManagementError('invalid_change', 'Specify fixed executable, source kind, original endpoint and explicit environment; no new server or default socket is accepted.')
-        command = [config['executable'], 'app-server', 'proxy', '--sock', config['endpoint']]
-        frozen = json.loads(json.dumps(config))
-        def verifier(binding, repository, context, frozen=frozen, command=command):
+        frozen, runtime = resolved_configuration(config)
+        if config['service_ref'] in adapters:
+            raise ManagementError('invalid_change', 'Recovery service bindings must be unique.')
+        def verifier(binding, repository, context, frozen=frozen):
             try:
                 base = Path(state_dir).resolve()
-                manifest = base / 'codex-recovery.json'
+                manifest = base / 'dsh-recovery.json'
                 if manifest != manifest.resolve() or manifest.stat().st_size > 65536:
                     raise ValueError('Invalid recovery manifest.')
                 reference = json.loads(manifest.read_text())[context['request_id']]
@@ -261,20 +265,18 @@ def configured_recovery_adapters(configs, state_dir):
                 if hashlib.sha256(raw).hexdigest() != reference['sha256']:
                     raise ValueError('Recovery receipt digest changed.')
                 report = json.loads(raw)
-                now = datetime.now(timezone.utc)
-                verified = datetime.fromisoformat(report['verified_at'])
-                expires = datetime.fromisoformat(report['expires_at'])
-                if not verified.tzinfo or not expires.tzinfo or not verified <= now < expires or (expires - verified).total_seconds() > 300 or report.get('recovery_binding') != context or report.get('endpoint_ref') != frozen['endpoint_ref'] or report.get('endpoint_sha256') != hashlib.sha256(frozen['endpoint'].encode()).hexdigest() or report.get('source_kind') != frozen['source_kind']:
-                    raise ValueError('The fresh original executor/session scope is missing or expired.')
-                connection = {'generation': binding['generation'], 'service_id': binding['service_id'], 'platform': binding.get('platform', report.get('platform'))}
+                if not isinstance(report, dict) or report.get('recovery_binding') != context or report.get('endpoint_ref') != frozen['endpoint_ref'] or report.get('endpoint_sha256') != hashlib.sha256(frozen['base_url'].encode()).hexdigest() or report.get('source_kind') != frozen['source_kind'] or not isinstance(report.get('backend_instance_ref'), str) or not report['backend_instance_ref']:
+                    raise ValueError('The original DSH instance/session scope differs.')
+                connection = {**binding, 'platform': binding.get('platform', report.get('platform'))}
                 from .validation import validate_receipts
-                proof = validate_receipts(report, connection, repository, command, frozen['environment'], state_dir, startup_kind='recovery')
+                proof = validate_receipts(report, connection, repository, frozen, state_dir, startup_kind='recovery')
                 return {**proof, **binding, 'recovery_binding': context, 'work_incomplete': report.get('work_incomplete'),
-                    'control_access': 'verified-original-input-path'}
+                    'backend_instance_ref': report['backend_instance_ref'], 'control_access': 'verified-original-input-path'}
             except (OSError, ValueError, KeyError, TypeError) as exc:
-                raise ManagementError('capability_unverified', 'Fresh hashed original-service restart/connection, authorization and boundary evidence is unavailable; recovery control remains disabled.') from exc
-        adapters[config['service_ref']] = OriginalRecoveryAdapter(command, cwd=config['cwd'], env=config['environment'],
-            service_ref=config['service_ref'], source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'], verifier=verifier)
+                raise ManagementError('capability_unverified', 'Fresh hashed original DSH restart, authorization and boundary evidence is unavailable; recovery control remains disabled.') from exc
+        adapters[config['service_ref']] = OriginalRecoveryAdapter(runtime['base_url'], cookie=runtime['cookie'],
+            service_ref=config['service_ref'], source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'],
+            verifier=verifier, expected_home=config.get('expected_home'))
     return adapters
 
 

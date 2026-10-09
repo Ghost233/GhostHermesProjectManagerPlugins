@@ -28,7 +28,7 @@ def accept_mono(root, manager, client, mono, request_id):
 
 def test_curated_global_index_requires_real_public_complete_and_withdraws_after_input_change(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, request_id, child_id = combination(manager, tmp_path)
         with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
             client = ManagementClient(tmp_path / 'state', 'lead')
@@ -67,7 +67,7 @@ def test_curated_global_index_requires_real_public_complete_and_withdraws_after_
 
 def test_restart_without_original_watch_host_withholds_old_global_memory_and_cannot_load_it(tmp_path):
     host = FixtureHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, request_id, child_id = combination(manager, tmp_path)
         with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
             client = ManagementClient(tmp_path / 'state', 'lead')
@@ -102,7 +102,7 @@ def test_curating_global_memory_waits_for_the_delayed_original_host_check(tmp_pa
                 time.sleep(3.5)
             return super().read_input_changes(context)
     host = DelayedHost()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, request_id, child_id = combination(manager, tmp_path)
         with ManagementServer(manager, {'lead': LEAD}):
             client = ManagementClient(tmp_path / 'state', 'lead')
@@ -127,7 +127,7 @@ def test_curating_global_memory_waits_for_the_delayed_original_host_check(tmp_pa
 def test_lost_curation_reply_preserves_the_same_durable_entry_without_replay(tmp_path):
     host = FixtureHost()
     state = tmp_path / 'state'
-    with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with Manager(state, owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, request_id, child_id = combination(manager, tmp_path)
         with ManagementServer(manager, {'lead': LEAD}):
             client = ManagementClient(state, 'lead')

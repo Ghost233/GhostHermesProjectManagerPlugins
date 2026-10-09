@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ghost_hermes_pm import Manager, ManagementError
 from readiness_support import ReadyManager as Manager
-from ghost_hermes_pm.codex import repository_fingerprint
+from ghost_hermes_pm.dsh import repository_fingerprint
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo
 from test_task_execution import accepted, adapter_for
@@ -14,7 +14,7 @@ from test_task_control import THREAD, TURN, wire
 
 
 def recovery_adapter(root, service_id, **changes):
-    from ghost_hermes_pm.recovery import OriginalRecoveryAdapter
+    from normalized_executor_fixture import SyntheticRecoveryAdapter as OriginalRecoveryAdapter
     peer = root / 'original'
     peer.mkdir(exist_ok=True)
     def verifier(binding, repository, context):
@@ -28,15 +28,15 @@ def recovery_adapter(root, service_id, **changes):
             'task_control': {k: 'synthetic-original-only' for k in ('append', 'stop', 'continue', 'idle_input', 'related_execution', 'human_response')},
             **changes}
     return OriginalRecoveryAdapter([sys.executable, str(Path(__file__).with_name('takeover_fixture_server.py')), str(peer)],
-        cwd=peer, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(peer / 'synthetic-home')},
-        service_ref='local:fixture-stdio', source_kind='daemon', endpoint_ref='local:original-fixture', verifier=verifier, timeout=1)
+        cwd=peer, env={'PATH': '/usr/bin:/bin', 'FIXTURE_HOME': str(peer / 'synthetic-home')},
+        service_ref='local:fixture-stdio', source_kind='desktop', endpoint_ref='local:original-fixture', verifier=verifier, timeout=1)
 
 
 def original_state(root, repo, *, status='inProgress'):
     peer = root / 'original'
     peer.mkdir(exist_ok=True)
     (peer / 'original-state.json').write_text(json.dumps({'thread': {'id': THREAD, 'cwd': str(repo),
-        'cliVersion': '0.160.1', 'canAcceptDirectInput': True,
+        'cliVersion': 'fixture-v1', 'canAcceptDirectInput': True,
         'status': {'type': 'active' if status == 'inProgress' else 'idle', 'activeFlags': []},
         'turns': [{'id': TURN, 'status': status, 'itemsView': 'full', 'items': []}]}}))
 
@@ -48,7 +48,7 @@ def methods(root):
 
 def test_restart_recovers_original_running_monitor_and_stop_intent_without_double_execution(tmp_path):
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         task = manager.start_task(OWNER, request_id)
         service_id = task['session']['service_id']
@@ -73,14 +73,14 @@ def test_restart_recovers_original_running_monitor_and_stop_intent_without_doubl
             assert stopped['stop']['status'] == 'confirmed'
             assert stopped['recovery']['status'] == 'explicit_stop_preserved'
             client.reconcile_task(request_id)
-    assert not {'thread/start', 'thread/resume', 'thread/fork', 'turn/start', 'turn/steer'} & set(methods(tmp_path))
-    assert methods(tmp_path).count('turn/interrupt') == 1
-    assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+    assert not {'fixture/create', 'thread/resume', 'thread/fork', 'fixture/start', 'fixture/append'} & set(methods(tmp_path))
+    assert methods(tmp_path).count('fixture/stop') == 1
+    assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/start']) == 1
 
 
 def test_restart_only_continues_verified_incomplete_stopped_original_work_once(tmp_path):
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
     original_state(tmp_path, repo, status='interrupted')
@@ -96,17 +96,17 @@ def test_restart_only_continues_verified_incomplete_stopped_original_work_once(t
             assert resumed['session']['turn_id'] == 'continued-original-turn'
             assert resumed['repository_released'] is False
             client.reconcile_task(request_id)
-    assert methods(tmp_path).count('turn/start') == 1
+    assert methods(tmp_path).count('fixture/start') == 1
     state = json.loads((tmp_path / 'original' / 'original-state.json').read_text())
     assert state['thread']['turns'][0]['id'] == TURN
-    assert not {'thread/start', 'thread/resume', 'thread/fork', 'turn/steer'} & set(methods(tmp_path))
+    assert not {'fixture/create', 'thread/resume', 'thread/fork', 'fixture/append'} & set(methods(tmp_path))
 
 
 def test_reconnect_old_human_request_points_to_original_interface_and_never_reuses_approval(tmp_path):
     import pytest
     from test_questions import question_adapter, emit, user_question, replies
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
         emit(tmp_path, user_question())
@@ -138,7 +138,7 @@ def test_corrupt_durable_directory_blocks_restart_without_starting_any_service(t
     database.chmod(0o600)
     before = database.read_bytes()
     with pytest.raises(ManagementError) as failure:
-        Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path))
+        Manager(state, owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path))
     assert failure.value.code == 'unavailable'
     assert database.read_bytes() == before
     assert not (tmp_path / 'wire.jsonl').exists()
@@ -149,7 +149,7 @@ def test_dashboard_uses_same_recovery_outcome_and_retains_last_confirmation_offl
     from fastapi.testclient import TestClient
     from ghost_hermes_pm.dashboard import create_router
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         manager.start_task(OWNER, request_id)
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject) as manager:
@@ -177,13 +177,12 @@ def test_dashboard_uses_same_recovery_outcome_and_retains_last_confirmation_offl
 
 def test_native_recovery_configuration_never_connects_without_current_hashed_original_receipt(tmp_path):
     from ghost_hermes_pm.recovery import configured_recovery_adapters
-    config = {'executable': sys.executable, 'cwd': str(tmp_path),
-        'environment': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(tmp_path / 'isolated-home')},
-        'service_ref': 'local:fixture-stdio', 'source_kind': 'daemon',
-        'endpoint': str(tmp_path / 'original.sock'), 'endpoint_ref': 'local:original-fixture'}
+    from test_dsh_engine_transition import dsh_config
+    config = {**dsh_config('http://127.0.0.1:9'),
+        'service_ref': 'local:fixture-stdio', 'endpoint_ref': 'local:original-fixture'}
     adapter = configured_recovery_adapters([config], tmp_path / 'state')['local:fixture-stdio']
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         manager.start_task(OWNER, request_id)
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, recovery_adapters={adapter.service_ref: adapter}) as manager:
@@ -192,6 +191,43 @@ def test_native_recovery_configuration_never_connects_without_current_hashed_ori
         assert task['repository_released'] is False
         assert adapter.connection is None
         assert task['session']['service_id'].startswith('local:fixture-stdio:')
+
+
+def test_native_dsh_recovery_connection_does_not_renew_control_from_history():
+    import hashlib
+    from dsh_fixture_server import remote_peer
+    from ghost_hermes_pm.recovery import OriginalRecoveryAdapter
+    repository = {'worktree': '/synthetic/project', 'logical_id': 'synthetic-logical', 'test_artifact_paths': []}
+    with remote_peer() as (url, peer):
+        service_id = 'dsh:' + hashlib.sha256(url.encode()).hexdigest() + ':' + hashlib.sha256(b'/synthetic/home').hexdigest()
+        context = {'service_id': service_id, 'request_id': 'synthetic-original-work',
+            'thread_id': 'session-fixture', 'turn_id': 'dsh-turn:1', 'previous_generation': 'synthetic-previous-generation'}
+        def verifier(binding, actual, scope):
+            return {**binding, 'recovery_binding': scope, 'permission_profile': 'host:synthetic-policy', 'policy_digest': 'synthetic-policy',
+                'repository_fingerprint': repository_fingerprint(actual), 'runtime_roots': [actual['worktree']],
+                'platform_enforcement': 'synthetic-proof', 'tool_paths': 'synthetic-proof', 'manual_execution_coverage': 'synthetic-proof',
+                'recovery': 'synthetic-proof', 'backend_instance_ref': 'fixture:synthetic-http-peer',
+                'control_access': 'verified-original-input-path',
+                'task_control': {action: 'synthetic-proof' for action in ('append', 'stop', 'continue', 'idle_input', 'related_execution', 'human_response')},
+                'exclusive_input': {'kind': 'exclusive_original_input', 'evidence': 'fixture:synthetic-input-lease',
+                    'generation': binding['generation'], 'service_id': service_id, 'repository_fingerprint': repository_fingerprint(actual),
+                    'thread_id': context['thread_id'], 'turn_id': context['turn_id']}}
+        adapter = OriginalRecoveryAdapter(url, cookie='synthetic-auth=value', service_ref='local:synthetic-recovery',
+            source_kind='desktop', endpoint_ref='local:synthetic-endpoint', verifier=verifier, timeout=1)
+        try:
+            adapter.verify_recovery(repository, context)
+            assert adapter.read_thread('session-fixture')['turns'][0]['status'] == 'completed'
+            with pytest.raises(ManagementError) as observation:
+                adapter.interrupt_turn('session-fixture', 'dsh-turn:1')
+            assert observation.value.code == 'forbidden'
+            assert all(call['method'] not in {'session/create', 'session/prompt', 'session/cancel'} for call in peer['calls'])
+            adapter.authority = lambda: {'id': context['request_id'], 'status': 'active', 'thread_id': context['thread_id'], 'turn_id': context['turn_id']}
+            with pytest.raises(ManagementError):
+                adapter.interrupt_turn('session-fixture', 'foreign-turn')
+            assert adapter.interrupt_turn('session-fixture', 'dsh-turn:1') == {'accepted': True}
+            assert [call['method'] for call in peer['calls']].count('session/cancel') == 1
+        finally:
+            adapter.close()
 
 
 def test_abrupt_manager_process_restart_reclaims_only_its_proven_orphan_socket(tmp_path):
@@ -223,10 +259,10 @@ def test_abrupt_manager_process_restart_reclaims_only_its_proven_orphan_socket(t
 def test_unknown_append_outcome_prevents_automatic_replay_or_continuation(tmp_path):
     import pytest
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
-        (tmp_path / 'behavior.json').write_text(json.dumps({'omit_response': 'turn/steer'}))
+        (tmp_path / 'behavior.json').write_text(json.dumps({'omit_response': 'fixture/append'}))
         with pytest.raises(ManagementError):
             manager.control_task(OWNER, request_id, 'append', 'unknown-append', 'Only this original work.', TURN)
     original_state(tmp_path, repo, status='interrupted')
@@ -237,13 +273,13 @@ def test_unknown_append_outcome_prevents_automatic_replay_or_continuation(tmp_pa
         assert task['recovery']['status'] == 'outcome_unknown_preserved'
         assert task['controls'][0]['phase'] == 'outcome_unknown'
         assert task['repository_released'] is False
-    assert not {'turn/start', 'turn/steer'} & set(methods(tmp_path))
-    assert len([r for r in wire(tmp_path) if r['method'] == 'turn/steer']) == 1
+    assert not {'fixture/start', 'fixture/append'} & set(methods(tmp_path))
+    assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/append']) == 1
 
 
 def test_same_history_on_foreign_original_executor_does_not_recover_identity(tmp_path):
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
     original_state(tmp_path, repo)
@@ -262,7 +298,7 @@ def test_changed_responsibility_blocks_all_recovery_writes_and_dispatch(tmp_path
     import pytest
     from test_task_execution import execution_registration
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
         correction = execution_registration(repo)['profile']
@@ -285,15 +321,15 @@ def test_returned_manual_control_remains_observation_after_restart(tmp_path):
     peer = tmp_path / 'original'
     manual_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-daemon': read},
-                 control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-desktop': read},
+                 control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         manager.take_over_session(OWNER, request_id, observed['id'], 'manual-current-work', ORIGINAL_TURN)
         manager.return_session_control(OWNER, request_id, 'manual-current-work')
         service_id = manager.read_snapshot(OWNER)['requests'][0]['session']['service_id']
     recovery = recovery_adapter(tmp_path, service_id, permission_profile='original-fixture-policy', policy_digest='original-fixture-policy-digest')
-    recovery.service_ref = 'local:manual-daemon-control'
-    recovery.endpoint_ref = 'local:registered-daemon'
+    recovery.service_ref = 'local:manual-desktop-control'
+    recovery.endpoint_ref = 'local:registered-desktop'
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, recovery_adapters={recovery.service_ref: recovery}) as manager:
         task = manager.reconcile_task(OWNER, request_id)
         assert task['execution'] == 'running'
@@ -301,7 +337,7 @@ def test_returned_manual_control_remains_observation_after_restart(tmp_path):
         assert task['session']['control'] == 'observe_only'
         assert manager.read_snapshot(OWNER)['control_grants'][0]['status'] == 'returned'
         assert task['repository_released'] is False
-    assert 'turn/interrupt' not in methods(tmp_path)
+    assert 'fixture/stop' not in methods(tmp_path)
 
 
 def test_real_process_and_connection_interruptions_recover_same_live_task_and_durable_stop(tmp_path):
@@ -333,7 +369,7 @@ def test_real_process_and_connection_interruptions_recover_same_live_task_and_du
                 assert task['repository_released'] is False
                 assert json.loads((peer / 'execution.json').read_text())['worker_pid'] == worker_pid
                 os.kill(worker_pid, 0)
-                (peer / 'drop.json').write_text(json.dumps(['turn/steer']))
+                (peer / 'drop.json').write_text(json.dumps(['fixture/append']))
                 with pytest.raises(ManagementError):
                     client.control_task(request_id, 'append', 'lost-append', 'Original work only.', task['session']['turn_id'])
                 disconnected = client.refresh_task(request_id)
@@ -380,7 +416,7 @@ def test_registered_original_endpoint_cannot_be_replaced_during_recovery(tmp_pat
         env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.PIPE, text=True)
     try:
         service_id = json.loads(service.stdout.readline())['service_id']
-        with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=fixture_adapter(peer, service_id)) as manager:
+        with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=fixture_adapter(peer, service_id)) as manager:
             request_id = accepted(manager, make_repo(tmp_path / 'repo'))
             manager.start_task(OWNER, request_id)
         replacement = fixture_adapter(peer, service_id, recover=True)
@@ -400,7 +436,7 @@ def test_registered_original_endpoint_cannot_be_replaced_during_recovery(tmp_pat
 
 def test_missing_current_process_exit_proof_keeps_stop_and_occupancy_unverified(tmp_path):
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
         manager.control_task(OWNER, request_id, 'stop', 'stop-before-crash', expected_turn_id=TURN)
@@ -412,13 +448,13 @@ def test_missing_current_process_exit_proof_keeps_stop_and_occupancy_unverified(
         assert task['stop']['status'] == 'processing'
         assert task['repository_released'] is False
         assert 'process coverage' in task['stop']['reason']
-    assert 'turn/start' not in methods(tmp_path)
+    assert 'fixture/start' not in methods(tmp_path)
 
 
 def test_only_new_live_rpc_can_receive_one_fresh_answer_after_reconnect(tmp_path):
     from test_questions import user_question
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
     original_state(tmp_path, repo)
@@ -440,12 +476,12 @@ def test_only_new_live_rpc_can_receive_one_fresh_answer_after_reconnect(tmp_path
             duplicate = client.answer_human_request(request_id, live['id'], 'fresh-answer', response)
             assert sent['reply']['sent'] == 'sent'
             assert duplicate['duplicate'] is True
-    assert json.loads(peer.read_text())['responses'] == [{'id': 'fresh-incoming-rpc', 'result': {'answers': {'colour': {'answers': ['Blue']}}}}]
+    assert json.loads(peer.read_text())['responses'] == [{'id': 'fresh-incoming-rpc', 'result': {'answers': [{'id': 'colour', 'selected': [], 'custom': 'Blue'}]}}]
 
 
 def test_unloaded_running_history_cannot_restore_live_task_monitoring(tmp_path):
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
     original_state(tmp_path, repo)
@@ -465,7 +501,7 @@ def test_unloaded_running_history_cannot_restore_live_task_monitoring(tmp_path):
 def test_sent_answer_without_original_resolution_prevents_automatic_continuation(tmp_path):
     from test_questions import question_adapter, emit, user_question, replies
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=question_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=question_adapter(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
         emit(tmp_path, user_question())
@@ -482,13 +518,13 @@ def test_sent_answer_without_original_resolution_prevents_automatic_continuation
         assert task['repository_released'] is False
         assert task['human_requests'][0]['resolution'] != 'resolved'
     assert len(replies(tmp_path)) == 1
-    assert 'turn/start' not in methods(tmp_path)
+    assert 'fixture/start' not in methods(tmp_path)
 
 
 @pytest.mark.parametrize('turn_status', ['inProgress', 'completed'])
 def test_new_live_natural_question_after_recovery_can_be_answered_without_reviving_history(tmp_path, turn_status):
     repo = make_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         service_id = manager.start_task(OWNER, request_id)['session']['service_id']
     original_state(tmp_path, repo)
@@ -511,4 +547,4 @@ def test_new_live_natural_question_after_recovery_can_be_answered_without_revivi
         assert natural['method'] == 'natural_language'
         assert natural['resolution'] == 'pending' and natural['control_enabled'] is True
         manager.answer_human_request(OWNER, request_id, natural['id'], 'fresh-natural-answer', {'answers': {'answer': ['Blue']}})
-    assert methods(tmp_path).count('turn/steer' if turn_status == 'inProgress' else 'turn/start') == 1
+    assert methods(tmp_path).count('fixture/append' if turn_status == 'inProgress' else 'fixture/start') == 1

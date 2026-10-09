@@ -22,7 +22,7 @@ def acknowledge(manager, project_id='mono', profile_id='mono-lead', suffix='seco
 
 
 def test_busy_repository_persists_fifo_reason_and_unknown_occupancy_across_restart(tmp_path):
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         first = accepted(manager, make_repo(tmp_path / 'repo'))
         second = acknowledge(manager)
         with ManagementServer(manager, {'queue-owner': OWNER}):
@@ -37,7 +37,7 @@ def test_busy_repository_persists_fifo_reason_and_unknown_occupancy_across_resta
             assert records[second]['queue']['blocked_by'] == [first]
             assert records[second]['queue']['sequence'] > records[first]['queue']['sequence']
             assert any('排队' in s['text'] for p in records[second]['outbox'] for s in p['segments'])
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as restarted:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as restarted:
         records = {r['id']: r for r in restarted.read_snapshot(OWNER)['requests']}
         assert records[first]['execution'] == 'unverified'
         assert records[first]['queue']['status'] == 'occupied'
@@ -58,7 +58,7 @@ def commit_repo(path):
 
 def test_next_task_requires_own_explicit_baseline_and_preserves_dirty_workspace(tmp_path):
     repo, head = commit_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         with ManagementServer(manager, {'queue-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'queue-owner')
@@ -79,12 +79,12 @@ def test_next_task_requires_own_explicit_baseline_and_preserves_dirty_workspace(
             assert (repo / 'source.py').read_text() == 'user changes remain\n'
             assert (repo / 'notes.txt').read_text() == 'untracked user notes\n'
         methods = [json.loads(line)['method'] for line in (tmp_path / 'wire.jsonl').read_text().splitlines()] if (tmp_path / 'wire.jsonl').exists() else []
-        assert 'thread/start' not in methods
+        assert 'fixture/create' not in methods
 
 
 def test_ordinary_delivery_cannot_release_repository_with_unknown_process_coverage(tmp_path):
     repo, head = commit_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path, {'process_coverage': None})) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path, {'process_coverage': None})) as manager:
         request_id = accepted(manager, repo)
         with ManagementServer(manager, {'queue-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'queue-owner')
@@ -111,7 +111,7 @@ def queue_adapter(root):
 def register_project(manager, repo, name):
     value = registration(repo, name, name + '-lead')
     value['profile']['identity_ref'] = 'fixture:' + name
-    value['profile']['connection_refs']['codex'] = 'local:fixture-stdio'
+    value['profile']['connection_refs']['dsh'] = 'local:fixture-stdio'
     manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], value)
 
 
@@ -119,7 +119,7 @@ def test_confirmed_delivery_advances_only_prepared_head_and_other_repository_run
     from test_task_execution import prepare_fixture
     repo, head = commit_repo(tmp_path / 'repo')
     other, _ = commit_repo(tmp_path / 'other')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path)) as manager:
         first = accepted(manager, repo)
         second = acknowledge(manager)
         prepare_fixture(manager, second, repo)
@@ -154,7 +154,7 @@ def test_confirmed_delivery_advances_only_prepared_head_and_other_repository_run
 def test_explicit_continue_joins_current_queue_after_new_work_instead_of_old_acceptance_time(tmp_path):
     from test_task_execution import prepare_fixture
     repo, head = commit_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path)) as manager:
         first = accepted(manager, repo)
         with ManagementServer(manager, {'queue-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'queue-owner')
@@ -190,7 +190,7 @@ def test_issue_source_difference_is_visible_without_replacing_frozen_accepted_sc
     class Source:
         def read_issue(self, url):
             return {**ISSUE, 'url': url, 'body': ISSUE['body'] + '\n- [ ] Newly added scope', 'updated_at': '2026-10-07T04:00:00Z'}
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), delivery_source=Source()) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), delivery_source=Source()) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'queue-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'queue-owner')
@@ -201,7 +201,7 @@ def test_issue_source_difference_is_visible_without_replacing_frozen_accepted_sc
             assert updated['issue_source']['current']['updated_at'] == '2026-10-07T04:00:00Z'
             assert any('来源变化' in s['text'] for p in updated['outbox'] for s in p['segments'])
             client.start_task(request_id)
-        prompt = next(json.loads(line) for line in (tmp_path / 'wire.jsonl').read_text().splitlines() if json.loads(line)['method'] == 'turn/start')['params']['input'][0]['text']
+        prompt = next(json.loads(line) for line in (tmp_path / 'wire.jsonl').read_text().splitlines() if json.loads(line)['method'] == 'fixture/start')['params']['input'][0]['text']
         assert 'Newly added scope' not in prompt
         assert ISSUE['body'] in prompt
 
@@ -211,9 +211,9 @@ def test_linked_worktree_alias_cannot_bypass_manually_loaded_repository_executio
     repo, head = commit_repo(tmp_path / 'repo')
     linked = tmp_path / 'linked'
     subprocess.run(['git', '-C', str(repo), 'worktree', 'add', '-q', '-b', 'manual-branch', str(linked)], check=True)
-    (tmp_path / 'queue-external.json').write_text(json.dumps({'manual-thread': {'id': 'manual-thread', 'cwd': str(linked), 'cliVersion': '0.160.1',
+    (tmp_path / 'queue-external.json').write_text(json.dumps({'manual-thread': {'id': 'manual-thread', 'cwd': str(linked), 'cliVersion': 'fixture-v1',
         'canAcceptDirectInput': True, 'status': {'type': 'active', 'activeFlags': []}, 'turns': [{'id': 'manual-turn', 'status': 'inProgress', 'itemsView': 'full', 'items': []}]}}))
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path)) as manager:
         first = accepted(manager, repo)
         register_project(manager, linked, 'alias')
         second = acknowledge(manager, 'alias', 'alias-lead', 'alias-request')
@@ -229,12 +229,12 @@ def test_linked_worktree_alias_cannot_bypass_manually_loaded_repository_executio
             records = {r['id']: r for r in client.read_snapshot()['requests']}
             assert records[first]['queue']['logical_repository'] == records[second]['queue']['logical_repository'] == str(repo / '.git')
             assert records[first]['queue']['status'] == 'external_unknown'
-            assert not any(json.loads(line)['method'] in {'thread/start', 'turn/start'} for line in (tmp_path / 'wire.jsonl').read_text().splitlines())
+            assert not any(json.loads(line)['method'] in {'fixture/create', 'fixture/start'} for line in (tmp_path / 'wire.jsonl').read_text().splitlines())
 
 
 def test_existing_issue17_durable_session_retains_occupancy_when_queue_schema_is_added(tmp_path):
     import sqlite3
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
     # A legacy on-disk fixture, not an assertion through private manager internals.
@@ -245,7 +245,7 @@ def test_existing_issue17_durable_session_retains_occupancy_when_queue_schema_is
         for field in ('queue', 'preparation', 'accepted_repository'):
             record.pop(field, None)
         db.execute('UPDATE directory SET payload=?', (json.dumps(payload),))
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as restarted:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as restarted:
         with ManagementServer(restarted, {'queue-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'queue-owner')
             task = client.read_snapshot()['requests'][0]
@@ -262,7 +262,7 @@ def test_existing_issue17_durable_session_retains_occupancy_when_queue_schema_is
 def test_unmerged_delivery_is_not_implicitly_reused_as_next_issue_baseline(tmp_path):
     import hashlib
     repo, baseline = commit_repo(tmp_path / 'repo')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path)) as manager:
         first = accepted(manager, repo)
         with ManagementServer(manager, {'queue-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'queue-owner')
@@ -304,7 +304,7 @@ async def test_group_and_dashboard_share_preparation_queue_reason_and_frozen_sou
             return {**ISSUE, 'url': url, 'body': ISSUE['body'] + '\nNew source context.', 'updated_at': '2026-10-07T04:00:00Z'}
     repo, head = commit_repo(tmp_path / 'repo')
     surface, transport = object(), Transport()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), delivery_source=Source()) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), delivery_source=Source()) as manager:
         manager.apply_directory_change(OWNER, 0, execution_registration(repo))
         intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda _: ISSUE)
         intake.attach_transport(surface, transport)
@@ -348,8 +348,8 @@ def test_preservation_acknowledgment_identifies_first_modified_file_without_trim
         subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'leading filename baseline'], check=True)
         head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
     (repo / filename).write_text('pre-existing user content\n')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path)) as manager:
-        manager.apply_directory_change(OWNER, 0, {**registration(repo), 'profile': {**registration(repo)['profile'], 'connection_refs': {'codex': 'local:fixture-stdio'}}})
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path)) as manager:
+        manager.apply_directory_change(OWNER, 0, {**registration(repo), 'profile': {**registration(repo)['profile'], 'connection_refs': {'dsh': 'local:fixture-stdio'}}})
         request_id = acknowledge(manager, suffix='dirty-intake')
         with ManagementServer(manager, {'queue-owner': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'queue-owner')

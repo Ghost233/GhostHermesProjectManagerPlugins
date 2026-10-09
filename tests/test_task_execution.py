@@ -1,3 +1,7 @@
+"""Business execution via explicit normalized fixtures, plus native DSH admission tests.
+
+Fixture subprocess messages and synthetic host receipts are not live DSH acceptance.
+"""
 import json
 import sys
 from pathlib import Path
@@ -5,7 +9,8 @@ from types import SimpleNamespace
 
 from ghost_hermes_pm import Manager
 from readiness_support import ReadyManager as Manager
-from ghost_hermes_pm.codex import CodexStdioAdapter, repository_fingerprint
+from normalized_executor_fixture import SyntheticExecutorAdapter
+from ghost_hermes_pm.dsh import repository_fingerprint
 from ghost_hermes_pm.transport import ManagementClient, ManagementServer
 from test_directory import OWNER, make_repo, registration
 from test_requests import MESSAGE, ISSUE
@@ -23,15 +28,15 @@ def adapter_for(root, control_proof=None):
         proof.update(control_proof or {})
         return proof
     import ghost_hermes_pm
-    return CodexStdioAdapter([sys.executable, str(Path(__file__).with_name('codex_fixture_server.py')), str(root)],
-                            cwd=root, env={'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(root / 'codex-home'), 'HERMES_FIXTURE_PLUGIN_ROOT': str(Path(ghost_hermes_pm.__file__).resolve().parent.parent)},
+    return SyntheticExecutorAdapter([sys.executable, str(Path(__file__).with_name('executor_fixture_server.py')), str(root)],
+                            cwd=root, env={'PATH': '/usr/bin:/bin', 'FIXTURE_HOME': str(root / 'fixture-home'), 'HERMES_FIXTURE_PLUGIN_ROOT': str(Path(ghost_hermes_pm.__file__).resolve().parent.parent)},
                             service_ref='local:fixture-stdio', verifier=verifier, timeout=2)
 
 
 
 def execution_registration(repo):
     value = registration(repo)
-    value['profile']['connection_refs']['codex'] = 'local:fixture-stdio'
+    value['profile']['connection_refs']['dsh'] = 'local:fixture-stdio'
     return value
 
 def prepare_fixture(manager, request_id, repo):
@@ -59,7 +64,7 @@ def test_public_bridge_starts_one_issue_and_registers_thread_durably_before_turn
     account = 'example-user'
     scope = {**ISSUE, 'url': 'https://github.com/example-org/fixture/issues/15'}
     source = SimpleNamespace(expected_account=account, read_issue=lambda url: scope)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter, delivery_source=source) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter, delivery_source=source) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'), scope)
         with ManagementServer(manager, {'fixture-entry': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
@@ -74,9 +79,9 @@ def test_public_bridge_starts_one_issue_and_registers_thread_durably_before_turn
         assert task['session']['turn_id'] == '00000000-0000-7000-8000-000000000017'
         wire = [json.loads(line) for line in (tmp_path / 'wire.jsonl').read_text().splitlines()]
         methods = [r['method'] for r in wire]
-        assert methods.count('thread/start') == methods.count('turn/start') == 1
-        assert methods.index('thread/start') < methods.index('turn/start')
-        prompt = next(r for r in wire if r['method'] == 'turn/start')['params']['input'][0]['text']
+        assert methods.count('fixture/create') == methods.count('fixture/start') == 1
+        assert methods.index('fixture/create') < methods.index('fixture/start')
+        prompt = next(r for r in wire if r['method'] == 'fixture/start')['params']['input'][0]['text']
         assert ISSUE['body'] in prompt and ISSUE['updated_at'] in prompt
         assert 'Matt' in prompt and str(tmp_path / 'repo') in prompt
         assert 'expected account from the protected local execution configuration' in prompt
@@ -89,7 +94,7 @@ def test_public_bridge_starts_one_issue_and_registers_thread_durably_before_turn
 
 def test_public_refresh_distinguishes_waiting_turn_end_and_delivery(tmp_path):
     adapter = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'fixture-entry': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
@@ -107,7 +112,7 @@ def test_public_refresh_distinguishes_waiting_turn_end_and_delivery(tmp_path):
             assert ended['repository_released'] is False
             assert ended['test_evidence'] == []
         wire = [json.loads(line)['method'] for line in (tmp_path / 'wire.jsonl').read_text().splitlines()]
-        assert wire.count('thread/start') == wire.count('turn/start') == 1
+        assert wire.count('fixture/create') == wire.count('fixture/start') == 1
         assert 'thread/resume' not in wire
 
 
@@ -115,7 +120,7 @@ def test_public_delivery_uses_recorded_test_execution_without_forcing_pr(tmp_pat
     import pytest
     from ghost_hermes_pm import ManagementError
     adapter = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'fixture-entry': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
@@ -136,16 +141,16 @@ def test_public_delivery_uses_recorded_test_execution_without_forcing_pr(tmp_pat
             assert delivered['pr_status'] == 'none'
             assert delivered['repository_released'] is True
             assert delivered['test_evidence'][0]['command'] == 'python -m pytest tests/test_fixture.py -q'
-            assert delivered['test_evidence'][0]['source'] == 'codex_command_execution'
+            assert delivered['test_evidence'][0]['source'] == 'dsh_command_execution'
             assert delivered['delivery_evidence']['issue_updated_at'] == ISSUE['updated_at']
 
 
 def test_failed_thread_boundary_is_durable_and_never_starts_or_replays_turn(tmp_path):
     import pytest
     from ghost_hermes_pm import ManagementError
-    (tmp_path / 'behavior.json').write_text(json.dumps({'thread/start': {'activePermissionProfile': None}}))
+    (tmp_path / 'behavior.json').write_text(json.dumps({'fixture/create': {'activePermissionProfile': None}}))
     adapter = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with pytest.raises(ManagementError) as denied:
             manager.start_task(OWNER, request_id)
@@ -157,15 +162,15 @@ def test_failed_thread_boundary_is_durable_and_never_starts_or_replays_turn(tmp_
             manager.start_task(OWNER, request_id)
         assert duplicate.value.code == 'binding_conflict'
         wire = [json.loads(line)['method'] for line in (tmp_path / 'wire.jsonl').read_text().splitlines()]
-        assert wire.count('thread/start') == 1
-        assert 'turn/start' not in wire
+        assert wire.count('fixture/create') == 1
+        assert 'fixture/start' not in wire
 
 
 def test_same_repository_competition_and_new_generation_cannot_resume_execution(tmp_path):
     import pytest
     from ghost_hermes_pm import ManagementError
     adapter = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
         second = manager.accept_request(OWNER, 'mono', 'mono-lead', {**MESSAGE, 'message_id': 'om_second'}, ISSUE)['request']['id']
@@ -176,7 +181,7 @@ def test_same_repository_competition_and_new_generation_cannot_resume_execution(
             manager.start_task(OWNER, second)
         assert busy.value.code == 'repository_busy'
     replacement = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=replacement) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=replacement) as manager:
         observed = manager.refresh_task(OWNER, request_id)
         assert observed['execution'] == 'unverified'
         assert observed['repository_released'] is False
@@ -187,10 +192,10 @@ def test_same_repository_competition_and_new_generation_cannot_resume_execution(
 
 def test_stdio_oversized_response_preserves_unknown_execution_and_repository_occupancy(tmp_path):
     adapter = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
-        (tmp_path / 'behavior.json').write_text(json.dumps({'oversized': 'thread/read'}))
+        (tmp_path / 'behavior.json').write_text(json.dumps({'oversized': 'fixture/read'}))
         result = manager.refresh_task(OWNER, request_id)
         assert result['execution'] == 'unverified'
         assert result['repository_released'] is False
@@ -201,9 +206,9 @@ def test_stdio_oversized_response_preserves_unknown_execution_and_repository_occ
 def test_unknown_turn_start_is_not_replayed_after_timeout_or_restart(tmp_path):
     import pytest
     from ghost_hermes_pm import ManagementError
-    (tmp_path / 'behavior.json').write_text(json.dumps({'omit_response': 'turn/start'}))
+    (tmp_path / 'behavior.json').write_text(json.dumps({'omit_response': 'fixture/start'}))
     adapter = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with pytest.raises(ManagementError) as timeout:
             manager.start_task(OWNER, request_id)
@@ -211,54 +216,63 @@ def test_unknown_turn_start_is_not_replayed_after_timeout_or_restart(tmp_path):
         with pytest.raises(ManagementError):
             manager.start_task(OWNER, request_id)
         assert manager.read_snapshot(OWNER)['requests'][0]['session']['start_phase'] == 'turn_start_intent'
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         with pytest.raises(ManagementError):
             manager.start_task(OWNER, request_id)
     methods = [json.loads(line)['method'] for line in (tmp_path / 'wire.jsonl').read_text().splitlines()]
-    assert methods.count('thread/start') == methods.count('turn/start') == 1
+    assert methods.count('fixture/create') == methods.count('fixture/start') == 1
 
 
 def test_static_dashboard_capability_claim_cannot_enable_missing_host_proof(tmp_path):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-    from ghost_hermes_pm.codex import configured_adapter
+    from ghost_hermes_pm.dsh import configured_adapter
     from ghost_hermes_pm.dashboard import create_router
-    config = {'command': [sys.executable, str(Path(__file__).with_name('codex_fixture_server.py')), str(tmp_path)],
-              'cwd': str(tmp_path), 'environment': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(tmp_path / 'codex-home')}, 'service_ref': 'local:fixture-stdio'}
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=configured_adapter(config, tmp_path / 'state')) as manager:
-        request_id = accepted(manager, make_repo(tmp_path / 'repo'))
-        with ManagementServer(manager, {'fixture-entry': OWNER}):
-            app = FastAPI(); app.include_router(create_router(lambda request: ManagementClient(tmp_path / 'state', 'fixture-entry')))
-            browser = TestClient(app)
-            forged = browser.post('/task', json={'action': 'verify', 'request_id': request_id, 'verifier': True, 'enabled': True})
-            assert forged.status_code == 422
-            proof = browser.post('/task', json={'action': 'verify', 'request_id': request_id}).json()
-            assert proof['enabled'] is False
-            assert proof['connection']['generation']
-            repository = manager.read_snapshot(OWNER)['projects'][0]['repo']
-            (tmp_path / 'state' / 'codex-validation.json').write_text(json.dumps({
-                'generation': proof['connection']['generation'], 'service_id': proof['connection']['service_id'],
-                'repository_fingerprint': repository_fingerprint(repository), 'permission_profile': 'fixture-boundary',
-                'runtime_roots': [repository['worktree']], 'policy_digest': 'static-claim',
-                'platform_enforcement': 'passed', 'tool_paths': 'passed', 'task_start': 'passed', 'model': 'fixture-model'}))
-            assert browser.post('/task', json={'action': 'verify', 'request_id': request_id}).json()['enabled'] is False
-            assert browser.post('/task', json={'action': 'start', 'request_id': request_id}).status_code == 422
-        methods = [json.loads(line)['method'] for line in (tmp_path / 'wire.jsonl').read_text().splitlines()]
-        assert 'thread/start' not in methods and 'turn/start' not in methods
+    from dsh_fixture_server import remote_peer
 
+    with remote_peer() as (url, peer):
+        config = {'mode': 'remote', 'base_url': url, 'cookie': 'synthetic-auth=value',
+                  'service_ref': 'local:fixture-stdio', 'source_kind': 'desktop',
+                  'endpoint_ref': 'local:synthetic-desktop', 'expected_home': '/synthetic/home'}
+        with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject,
+                     dsh_adapter=configured_adapter(config, tmp_path / 'state')) as manager:
+            request_id = accepted(manager, make_repo(tmp_path / 'repo'))
+            with ManagementServer(manager, {'fixture-entry': OWNER}):
+                app = FastAPI()
+                app.include_router(create_router(lambda request: ManagementClient(tmp_path / 'state', 'fixture-entry')))
+                browser = TestClient(app)
+                forged = browser.post('/task', json={'action': 'verify', 'request_id': request_id,
+                                                     'verifier': True, 'enabled': True})
+                assert forged.status_code == 422
+                proof = browser.post('/task', json={'action': 'verify', 'request_id': request_id}).json()
+                assert proof['enabled'] is False
+                assert proof['connection']['engine'] == 'dsh'
+                repository = manager.read_snapshot(OWNER)['projects'][0]['repo']
+                (tmp_path / 'state' / 'dsh-validation.json').write_text(json.dumps({
+                    'engine': 'dsh', 'generation': proof['connection']['generation'],
+                    'service_id': proof['connection']['service_id'],
+                    'repository_fingerprint': repository_fingerprint(repository),
+                    'permission_profile': 'host:fixture-boundary', 'runtime_roots': [repository['worktree']],
+                    'policy_digest': 'static-claim', 'platform_enforcement': 'passed',
+                    'tool_paths': 'passed', 'task_start': 'passed', 'model': 'fixture-model'}))
+                assert browser.post('/task', json={'action': 'verify', 'request_id': request_id}).json()['enabled'] is False
+                assert browser.post('/task', json={'action': 'start', 'request_id': request_id}).status_code == 422
+            assert peer['prompts'] == []
+            assert all(call['method'] not in {'session/create', 'session/prompt', 'session/cancel', '$events/result'}
+                       for call in peer['calls'])
 
 def test_public_start_budget_handles_slow_service_without_duplicate_mutation(tmp_path):
-    (tmp_path / 'behavior.json').write_text(json.dumps({'delay': {'thread/start': 3.2}}))
+    (tmp_path / 'behavior.json').write_text(json.dumps({'delay': {'fixture/create': 3.2}}))
     adapter = adapter_for(tmp_path)
     adapter.timeout = 5
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'fixture-entry': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
             assert client.start_task(request_id)['status'] == 'running'
             assert client.read_snapshot()['requests'][0]['execution'] == 'running'
         methods = [json.loads(line)['method'] for line in (tmp_path / 'wire.jsonl').read_text().splitlines()]
-        assert methods.count('thread/start') == methods.count('turn/start') == 1
+        assert methods.count('fixture/create') == methods.count('fixture/start') == 1
 
 
 def test_issue_requiring_merge_keeps_delivery_unmet_but_records_actual_pr_state(tmp_path):
@@ -277,7 +291,7 @@ def test_issue_requiring_merge_keeps_delivery_unmet_but_records_actual_pr_state(
         def read_branch(self, repository_url, branch):
             return head
     source = Source()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), delivery_source=source) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), delivery_source=source) as manager:
         manager.apply_directory_change(OWNER, 0, execution_registration(repo))
         scope = {**ISSUE, 'body': '- [ ] Run fixture tests\n- [ ] Merge PR into main'}
         request_id = manager.accept_request(OWNER, 'mono', 'mono-lead', MESSAGE, scope)['request']['id']
@@ -313,7 +327,7 @@ async def _feishu_start(tmp_path):
     from ghost_hermes_pm.messages import FeishuEntry
     from test_feishu_entry import CONFIG, Gateway, Transport, event
     adapter, transport = object(), Transport()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         manager.apply_directory_change(OWNER, 0, execution_registration(make_repo(tmp_path / 'repo')))
         intake = FeishuEntry(lambda: manager, OWNER.subject, CONFIG, lambda _: ISSUE)
         intake.attach_transport(adapter, transport)
@@ -324,7 +338,7 @@ async def _feishu_start(tmp_path):
         assert await intake.receive(command, Gateway(adapter)) == {'action': 'skip'}
         task = manager.read_snapshot(OWNER)['requests'][0]
         assert task['execution'] == 'running'
-        assert any('Codex 已核实运行' in s['text'] for s in transport.sent)
+        assert any('DSH 已核实运行' in s['text'] for s in transport.sent)
         assert transport.sent[-1]['reply_to'] == task['task_start_anchor']['message_id']
         assert transport.sent[-1]['mention_open_id'] is None
 
@@ -362,7 +376,7 @@ def test_dirty_source_changes_cannot_be_delivered_as_unchanged_head_commit(tmp_p
     subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'baseline'], check=True)
     head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
     (repo / 'source.py').write_text('preexisting user change\n')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         manager.start_task(OWNER, request_id)
         (repo / 'source.py').write_text('new uncommitted task change\n')
@@ -382,10 +396,10 @@ def test_directory_correction_cannot_reassign_old_task_or_use_wrong_executor(tmp
     import pytest
     from ghost_hermes_pm import ManagementError
     for change in ({'capability': 'non_development'}, {'identity_ref': 'fixture:new-lead'},
-                   {'connection_refs': {'codex': 'local:different-executor'}}):
+                   {'connection_refs': {'dsh': 'local:different-executor'}}):
         case = tmp_path / str(len(list(tmp_path.iterdir())))
         case.mkdir()
-        with Manager(case / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(case)) as manager:
+        with Manager(case / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(case)) as manager:
             repo = make_repo(case / 'repo')
             request_id = accepted(manager, repo)
             correction = execution_registration(repo)['profile']
@@ -393,13 +407,13 @@ def test_directory_correction_cannot_reassign_old_task_or_use_wrong_executor(tmp
             manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': correction})
             with pytest.raises(ManagementError):
                 manager.start_task(OWNER, request_id)
-            assert manager.codex_adapter.connection is None
+            assert manager.dsh_adapter.connection is None
             assert manager.read_snapshot(OWNER)['requests'][0].get('session') is None
 
 
 def test_existing_thread_observation_keeps_original_repository_after_directory_correction(tmp_path):
     adapter = adapter_for(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter) as manager:
         repo = make_repo(tmp_path / 'repo')
         request_id = accepted(manager, repo)
         manager.start_task(OWNER, request_id)
@@ -410,14 +424,14 @@ def test_existing_thread_observation_keeps_original_repository_after_directory_c
         assert observed['session']['logical_repository'] == str(repo / '.git')
         assert observed['repository_released'] is False
         methods = [json.loads(line)['method'] for line in (tmp_path / 'wire.jsonl').read_text().splitlines()]
-        assert methods.count('thread/start') == methods.count('turn/start') == 1
-        assert methods[-1] == 'thread/read'
+        assert methods.count('fixture/create') == methods.count('fixture/start') == 1
+        assert methods[-1] == 'fixture/read'
 
 
 def test_plain_echo_cannot_be_relabelled_as_a_passing_test(tmp_path):
     import pytest
     from ghost_hermes_pm import ManagementError
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         repo = make_repo(tmp_path / 'repo')
         request_id = accepted(manager, repo)
         manager.start_task(OWNER, request_id)
@@ -438,7 +452,7 @@ def test_executor_cannot_write_authoritative_manager_receipts_inside_repository(
     repo = make_repo(tmp_path / 'repo')
     adapter = adapter_for(tmp_path)
     with pytest.raises(ManagementError) as overlap:
-        Manager(repo / 'manager-state', owner_identity_ref=OWNER.subject, codex_adapter=adapter)
+        Manager(repo / 'manager-state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter)
     assert overlap.value.code == 'unsafe_state'
     assert not (repo / 'manager-state').exists()
     assert adapter.connection is None

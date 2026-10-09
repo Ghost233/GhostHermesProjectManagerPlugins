@@ -4,36 +4,35 @@ import hashlib
 import json
 from pathlib import Path
 
-from .codex import CodexStdioAdapter, repository_fingerprint
-from .codex_unix_read_proxy import READ_METHODS
+from .dsh import DshRemoteAdapter, repository_fingerprint, READ_METHODS
 from .manager import ManagementError
 from .queue import logical_repository
 
-SOURCE_KINDS = {'daemon', 'independent_cli', 'desktop'}
+SOURCE_KINDS = {'desktop', 'web'}
 
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-class ReadOnlyCodexAdapter(CodexStdioAdapter):
-    def __init__(self, command, *, cwd, env, service_ref, source_kind, endpoint_ref, verifier=None, timeout=10, transport='original_proxy_stdio'):
-        super().__init__(command, cwd=cwd, env=env, service_ref=service_ref, timeout=timeout)
+class ReadOnlyDshAdapter(DshRemoteAdapter):
+    def __init__(self, base_url, *, cookie='', service_ref, source_kind, endpoint_ref, verifier=None, timeout=10, expected_home=None):
+        super().__init__(base_url, cookie=cookie, service_ref=service_ref, timeout=timeout, expected_home=expected_home)
         if source_kind not in SOURCE_KINDS or not isinstance(endpoint_ref, str) or not endpoint_ref.startswith('local:'):
             raise ManagementError('invalid_change', 'An explicit original local endpoint and individual source kind are required.')
         self.source_kind, self.endpoint_ref, self.observation_verifier = source_kind, endpoint_ref, verifier
-        if transport not in {'original_proxy_stdio', 'original_unix_websocket'}:
-            raise ManagementError('invalid_change', 'Select an explicit registered observation transport.')
-        self.transport = transport
+        self.transport = 'desktop_http_mux'
 
     def proof(self):
+        connection = DshRemoteAdapter.connect(self)
         binding = {'generation': self.generation, 'service_ref': self.service_ref, 'source_kind': self.source_kind,
-                   'endpoint_ref': self.endpoint_ref, 'transport': self.transport}
+                   'endpoint_ref': self.endpoint_ref, 'transport': self.transport,
+                   'service_id': connection['service_id'], 'client_id': connection['client_id']}
         proof = self.observation_verifier(binding) if callable(self.observation_verifier) else None
-        if not isinstance(proof, dict) or any(proof.get(k) != v for k, v in binding.items()) or any(not isinstance(proof.get(k), str) or not proof[k] for k in ('original_executor_id', 'provenance', 'evidence_ref')) or not isinstance(proof.get('supported_methods'), list) or not {'thread/read', 'thread/list', 'thread/loaded/list'}.issubset(proof['supported_methods']) or not isinstance(proof.get('source_kinds'), list) or not proof['source_kinds'] or any(not isinstance(method, str) or method not in READ_METHODS for method in proof['supported_methods']) or any(kind not in {'cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'} for kind in proof['source_kinds']):
+        if not isinstance(proof, dict) or proof.get('engine') != 'dsh' or any(proof.get(k) != v for k, v in binding.items()) or proof.get('original_executor_id') != connection['service_id'] or any(not isinstance(proof.get(k), str) or not proof[k] for k in ('backend_instance_ref', 'provenance', 'evidence_ref')) or not isinstance(proof.get('supported_methods'), list) or not {'session/list', 'session/projections', 'session/follow'}.issubset(proof['supported_methods']) or not isinstance(proof.get('source_kinds'), list) or not proof['source_kinds'] or any(not isinstance(method, str) or method not in READ_METHODS for method in proof['supported_methods']) or any(kind not in SOURCE_KINDS for kind in proof['source_kinds']) or proof['source_kinds'] != [self.source_kind]:
             raise ManagementError('capability_unverified', 'Current original-executor identity and actual read capabilities require trusted host evidence; matching history is insufficient.')
         from .manager import _public_text
-        for key in ('original_executor_id', 'provenance', 'evidence_ref'):
+        for key in ('original_executor_id', 'backend_instance_ref', 'provenance', 'evidence_ref'):
             _public_text(proof[key])
         return proof
 
@@ -42,14 +41,18 @@ class ReadOnlyCodexAdapter(CodexStdioAdapter):
         if self.connection and self.connection.get('control') == 'observe_only' and self.connection.get('service_id') != proof['original_executor_id']:
             raise ManagementError('binding_conflict', 'The existing original-service connection conflicts with current host identity evidence.')
         connection = super().connect()
-        self.connection.update(service_id=proof['original_executor_id'], transport=self.transport, endpoint_ref=self.endpoint_ref,
+        if connection['service_id'] != proof['original_executor_id']:
+            raise ManagementError('binding_conflict', 'The original DSH backend connection differs from the current host proof.')
+        self.connection.update(transport=self.transport, endpoint_ref=self.endpoint_ref,
                                source_kind=self.source_kind, control='observe_only')
         return dict(self.connection)
 
-    def _write(self, envelope):
-        if envelope.get('method') not in READ_METHODS or 'result' in envelope or 'error' in envelope:
-            raise ManagementError('forbidden', 'Observation transport permits only the explicit read-method allowlist; server requests receive no reply.')
-        super()._write(envelope)
+    def _guard_request(self, method, params):
+        if method not in READ_METHODS:
+            raise ManagementError('forbidden', 'Observation permits only original DSH reads; questions and approvals receive no reply.')
+        if method not in self.proof()['supported_methods']:
+            raise ManagementError('capability_unverified', 'This current original DSH source has no verified capability for the requested read method.')
+        return super()._guard_request(method, params)
 
     def _call(self, method, params):
         if method not in READ_METHODS:
@@ -58,7 +61,7 @@ class ReadOnlyCodexAdapter(CodexStdioAdapter):
 
     def read_thread(self, thread_id, include_turns=True):
         self.connect()
-        thread = self._call('thread/read', {'threadId': thread_id, 'includeTurns': include_turns}).get('thread')
+        thread = super().read_thread(thread_id, include_turns=include_turns)
         if not isinstance(thread, dict) or thread.get('id') != thread_id or not isinstance(thread.get('status'), dict):
             raise ManagementError('capability_unverified', 'Original executor returned incomplete or conflicting thread identity.')
         return thread
@@ -66,7 +69,7 @@ class ReadOnlyCodexAdapter(CodexStdioAdapter):
 
 
 def _ended(adapter, thread, proof, allowed_repositories):
-    if proof.get('runtime_coverage') != 'complete' or 'thread/backgroundTerminals/list' not in proof['supported_methods']:
+    if proof.get('runtime_coverage') != 'complete' or proof.get('runtime_evidence', {}).get('background_and_children') != 'verified':
         return False
     pending, seen = [thread], set()
     while pending:
@@ -80,9 +83,7 @@ def _ended(adapter, thread, proof, allowed_repositories):
             return False
         turns = current.get('turns', [])
         if current.get('historyMode') == 'paginated':
-            if 'thread/turns/list' not in proof['supported_methods']:
-                return False
-            turns = adapter._pages('thread/turns/list', {'threadId': current['id'], 'limit': 100, 'itemsView': 'full', 'sortDirection': 'asc'})
+            return False  # A bounded follow snapshot is not complete historical execution coverage.
         if not isinstance(turns, list) or not turns:
             return False
         for turn in turns:
@@ -102,7 +103,9 @@ def _ended(adapter, thread, proof, allowed_repositories):
                         if logical_repository(metadata.get('cwd')) not in allowed_repositories:
                             return False
                         pending.append(adapter.read_thread(child, include_turns=True))
-        if adapter.background_terminals(current['id']):
+        from .control import background_activity
+        backgrounds, _ = background_activity(adapter, current['id'])
+        if backgrounds:
             return False
     return True
 
@@ -161,11 +164,9 @@ def refresh_manual_sessions(manager, identity, scope=None):
                 loaded = adapter.loaded_threads()
                 if any(not isinstance(i, str) or not i for i in loaded):
                     raise ManagementError('capability_unverified', 'Loaded-list coverage is malformed.')
-                listed = []
-                for archived in (False, True):
-                    listed.extend(adapter._pages('thread/list', {'limit': 100, 'sourceKinds': proof['source_kinds'], 'archived': archived, 'useStateDbOnly': True}))
+                listed = adapter.list_sessions()
                 if any(not isinstance(t, dict) or not isinstance(t.get('id'), str) for t in listed):
-                    raise ManagementError('capability_unverified', 'State-database thread-list coverage is malformed.')
+                    raise ManagementError('capability_unverified', 'DSH session-list coverage is malformed.')
                 ids = set(loaded) | {t['id'] for t in listed}
                 seen = set()
                 for thread_id in sorted(ids):
@@ -196,8 +197,8 @@ def refresh_manual_sessions(manager, identity, scope=None):
                     if record['source_id'] == source['id'] and set(record['project_ids']) & project_ids and record['id'] not in seen:
                         record.update(state='unknown', blocks_repository=True, reason='Prior original execution was not found in complete current reads; disappearance is not termination.')
                 source.update(status='verified', reason=None, last_verified_at=_now(), scope={**binding, 'coverage': 'connected_executor_only',
-                    'source_kinds': proof['source_kinds'], 'read_methods': proof['supported_methods'], 'indexed_history': 'state_db_only',
-                    'archive_filters': [False, True], 'runtime_coverage': proof.get('runtime_coverage', 'unknown'), 'global_execution_coverage': 'unknown'})
+                    'source_kinds': proof['source_kinds'], 'read_methods': proof['supported_methods'], 'indexed_history': 'registered_backend_only',
+                    'archived_history_coverage': 'unverified', 'runtime_coverage': proof.get('runtime_coverage', 'unknown'), 'global_execution_coverage': 'unknown'})
             except ManagementError as exc:
                 source.update(status='conflict' if exc.code == 'binding_conflict' else 'unknown', reason=str(exc), last_observation_attempt_at=_now())
                 for record in sessions.values():
@@ -211,7 +212,7 @@ def refresh_manual_sessions(manager, identity, scope=None):
             relevant = [s for s in sessions.values() if s['logical_repository'] == record['queue']['logical_repository']]
             sources = [s for s in data.get('manual_sources', {}).values() if record['queue']['logical_repository'] in s.get('logical_repositories', {}).values()]
             if relevant or sources:
-                text = '手动 Codex 只观察；不改变原执行。\n' + '\n'.join(s['source_kind'] + ' / ' + s['thread_id'] + '：' + s['state'] + '；权限 observe_only；核实 ' + s['last_verified_at'] for s in relevant)
+                text = '手动 DSH 只观察；不改变原执行。\n' + '\n'.join(s['source_kind'] + ' / ' + s['thread_id'] + '：' + s['state'] + '；权限 observe_only；核实 ' + s['last_verified_at'] for s in relevant)
                 text += '\n范围：仅实际已连接原执行器；其他服务活动仍未知。'
                 text += '\n来源：' + '; '.join(s['kind'] + ' ' + s['status'] + ('：' + s['reason'] if s.get('reason') else '') for s in sources)
                 report_key = hashlib.sha256(json.dumps([(s['id'], s['state'], s.get('reason')) for s in relevant] + [(s['id'], s['status'], s.get('reason')) for s in sources], sort_keys=True).encode()).hexdigest()
@@ -253,23 +254,54 @@ def reconcile_connections(manager, data):
                     session.update(state='unknown', blocks_repository=True, reason=reason)
 
 
+def original_configuration(config, *, extra=()):
+    """Freeze a native DSH endpoint binding without retaining plaintext credentials."""
+    return resolved_configuration(config, extra=extra)[0]
+
+
+def resolved_configuration(config, *, extra=()):
+    """Freeze an explicitly configured native endpoint without retaining its cookie."""
+    if isinstance(config, dict) and config.get('mode') == 'remote':
+        config = {key: value for key, value in config.items() if key != 'mode'}
+    required = {'base_url', 'service_ref', 'source_kind', 'endpoint_ref'} | set(extra)
+    allowed = required | {'expected_home', 'transport', 'cookie'}
+    if not isinstance(config, dict) or set(config) - allowed or not required <= set(config) or any(not isinstance(config.get(k), str) or not config[k] for k in required) or config['source_kind'] not in SOURCE_KINDS or not config['service_ref'].startswith('local:') or not config['endpoint_ref'].startswith('local:') or config.get('transport', 'desktop_http_mux') != 'desktop_http_mux' or not isinstance(config.get('cookie', ''), str):
+        raise ManagementError('invalid_change', 'Register an existing DSH Desktop or Web endpoint and exact native binding; legacy process and socket configuration is unsupported.')
+    frozen = json.loads(json.dumps(config))
+    frozen['transport'] = 'desktop_http_mux'
+    runtime = dict(frozen)
+    cookie = frozen.pop('cookie', '')
+    frozen['credential_sha256'] = hashlib.sha256(cookie.encode()).hexdigest()
+    runtime['cookie'] = cookie
+    return frozen, runtime
+
+
+def fresh_report(report):
+    try:
+        now = datetime.now(timezone.utc)
+        verified, expires = (datetime.fromisoformat(report[k]) for k in ('verified_at', 'expires_at'))
+        if report.get('engine') != 'dsh' or not verified.tzinfo or not expires.tzinfo or not verified <= now < expires or (expires - verified).total_seconds() > 300:
+            raise ValueError('The current DSH binding is missing or expired.')
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ManagementError('capability_unverified', 'A fresh DSH-only capability receipt is required.') from exc
+
+
 def configured_observation_adapters(configs, state_dir):
-    """Native host settings and hashed host evidence; no commands from HTTP/chat."""
+    """Native fixed backend settings and hashed evidence; no endpoints from chat."""
     import sys
     if not configs:
         return {}
     if not isinstance(configs, list):
         raise ManagementError('invalid_change', 'Observation adapters require an explicit native configuration list.')
     adapters = {}
-    allowed = {'executable', 'cwd', 'environment', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref'}
     for config in configs:
-        if not isinstance(config, dict) or set(config) - (allowed | {'transport'}) or not allowed.issubset(config) or config.get('transport', 'original_proxy_stdio') not in {'original_proxy_stdio', 'original_unix_websocket'} or any(not isinstance(config.get(k), str) or not config[k] for k in ('executable', 'cwd', 'service_ref', 'source_kind', 'endpoint', 'endpoint_ref')) or not Path(config['executable']).is_absolute() or not Path(config['endpoint']).is_absolute() or config['service_ref'] in adapters:
-            raise ManagementError('invalid_change', 'Specify the fixed executable, original endpoint, source kind and explicit environment; no default socket or owned server is accepted.')
-        frozen = dict(config)
+        frozen, runtime = resolved_configuration(config)
+        if config['service_ref'] in adapters:
+            raise ManagementError('invalid_change', 'Observation service bindings must be unique.')
         def verifier(binding, frozen=frozen):
             try:
                 base = Path(state_dir).resolve()
-                manifest = base / 'codex-observation.json'
+                manifest = base / 'dsh-observation.json'
                 if manifest != manifest.resolve() or manifest.stat().st_size > 65536:
                     raise ValueError('Invalid observation manifest.')
                 reference = json.loads(manifest.read_text())[frozen['service_ref']]
@@ -280,21 +312,20 @@ def configured_observation_adapters(configs, state_dir):
                 if hashlib.sha256(raw).hexdigest() != reference['sha256']:
                     raise ValueError('Receipt digest mismatch.')
                 receipt = json.loads(raw)
-                expected = {**binding, 'binary_sha256': hashlib.sha256(Path(frozen['executable']).read_bytes()).hexdigest(),
+                fresh_report(receipt)
+                expected = {**binding, 'engine': 'dsh',
                     'configuration_sha256': hashlib.sha256(json.dumps(frozen, sort_keys=True).encode()).hexdigest(),
-                    'endpoint_sha256': hashlib.sha256(frozen['endpoint'].encode()).hexdigest(), 'platform': sys.platform,
-                    'original_endpoint_verified': 'PASS', 'observation_read_only': 'PASS', 'provenance': 'trusted_host_original_executor'}
-                if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in expected.items()) or not isinstance(receipt.get('read_cases'), dict) or any(receipt['read_cases'].get(k) != 'PASS' for k in ('initialize', 'thread/read', 'thread/list', 'thread/loaded/list', 'no_execution_writes', 'original_request_routing', 'unsupported_scope', 'disconnect')):
-                    raise ValueError('Original source verification is missing or belongs to another binding.')
+                    'endpoint_sha256': hashlib.sha256(frozen['base_url'].encode()).hexdigest(), 'platform': sys.platform,
+                    'original_endpoint_verified': 'PASS', 'observation_read_only': 'PASS', 'provenance': 'trusted_host_original_dsh'}
+                cases = ('session/list', 'session/projections', 'session/follow', 'no_execution_writes', 'original_request_routing', 'unsupported_scope', 'disconnect')
+                if not isinstance(receipt, dict) or any(receipt.get(k) != v for k, v in expected.items()) or not isinstance(receipt.get('read_cases'), dict) or any(receipt['read_cases'].get(k) != 'PASS' for k in cases):
+                    raise ValueError('Original source verification belongs to another backend or binding.')
                 if any(receipt['read_cases'].get(method) != 'PASS' for method in receipt.get('supported_methods', [])):
-                    raise ValueError('A declared read method lacks actual bound method evidence.')
+                    raise ValueError('A declared native read method lacks bound evidence.')
                 return {**receipt, 'evidence_ref': str(receipt_path)}
             except (OSError, ValueError, TypeError, KeyError) as exc:
-                raise ManagementError('capability_unverified', 'No current hashed host evidence verifies this approved original endpoint and read capabilities; observation remains unavailable.') from exc
-        transport = config.get('transport', 'original_proxy_stdio')
-        command = [config['executable'], 'app-server', 'proxy', '--sock', config['endpoint']]
-        if transport == 'original_unix_websocket':
-            command = [sys.executable, str(Path(__file__).with_name('codex_unix_read_proxy.py')), '--sock', config['endpoint']]
-        adapters[config['service_ref']] = ReadOnlyCodexAdapter(command,
-            cwd=config['cwd'], env=config['environment'], service_ref=config['service_ref'], source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'], verifier=verifier, transport=transport)
+                raise ManagementError('capability_unverified', 'No fresh hashed host evidence verifies the original DSH endpoint and read scope.') from exc
+        adapters[config['service_ref']] = ReadOnlyDshAdapter(runtime['base_url'], cookie=runtime['cookie'],
+            service_ref=config['service_ref'], source_kind=config['source_kind'], endpoint_ref=config['endpoint_ref'],
+            verifier=verifier, expected_home=config.get('expected_home'))
     return adapters

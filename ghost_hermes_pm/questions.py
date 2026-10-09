@@ -11,8 +11,7 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-APPROVAL_METHODS = {'item/commandExecution/requestApproval', 'item/fileChange/requestApproval',
-                    'item/permissions/requestApproval'}
+APPROVAL_METHODS = {'approval/request'}
 
 
 def _describe(manager, envelope):
@@ -21,7 +20,7 @@ def _describe(manager, envelope):
     description = {'category': 'original_interface', 'answerable': False, 'blocking': None}
     if not isinstance(params, dict):
         return description
-    if method not in APPROVAL_METHODS | {'item/tool/requestUserInput'}:
+    if method not in APPROVAL_METHODS | {'user-questions/request'}:
         return description
     description['blocking'] = True if method in APPROVAL_METHODS else params.get('isBlocking') if type(params.get('isBlocking')) is bool else None
     raw_questions = params.get('questions', [])
@@ -30,7 +29,7 @@ def _describe(manager, envelope):
         for question in raw_questions:
             if not isinstance(question, dict):
                 continue
-            content.extend(question[k] for k in ('id', 'header', 'question') if isinstance(question.get(k), str))
+            content.extend(question[k] for k in ('id', 'header', 'question', 'detail') if isinstance(question.get(k), str))
             if isinstance(question.get('options'), list):
                 for option in question['options']:
                     if isinstance(option, dict):
@@ -42,20 +41,20 @@ def _describe(manager, envelope):
         sensitive = True
     if sensitive:
         return {**description, 'category': 'sensitive'}
+    if method in APPROVAL_METHODS:
+        operation = params.get('native_frame') if isinstance(params.get('native_frame'), dict) else params
+        return {**description, 'category': 'approval', 'answerable': False,
+            'operation_id': hashlib.sha256(json.dumps(operation, sort_keys=True).encode()).hexdigest(), 'scope': 'turn'}
     if not all(isinstance(params.get(k), str) and params[k] for k in ('threadId', 'turnId', 'itemId')):
         return description
-    if method in APPROVAL_METHODS:
-        operation = {k: params[k] for k in ('kind', 'command', 'cwd', 'environmentId', 'reason', 'networkApprovalContext', 'permissions', 'grantRoot', 'commandActions', 'additionalPermissions', 'availableDecisions') if k in params}
-        if method == 'item/commandExecution/requestApproval':
-            operation.setdefault('kind', 'command')
-        return {'category': 'approval', 'blocking': True, 'answerable': (method != 'item/commandExecution/requestApproval' or operation.get('kind') == 'command' and bool(params.get('command') or params.get('networkApprovalContext'))) and not params.get('additionalPermissions') and not params.get('availableDecisions') and not params.get('grantRoot'), 'operation': operation,
-            'operation_id': hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest(), 'scope': 'turn'}
     questions = params.get('questions')
-    if type(params.get('isBlocking')) is not bool or not isinstance(questions, list) or not questions or any(not isinstance(q, dict) or not isinstance(q.get('id'), str) or not q['id'] or not isinstance(q.get('question'), str) or not isinstance(q.get('header'), str) or type(q.get('isSecret', False)) is not bool or type(q.get('isOther', False)) is not bool or q.get('options') is not None and (not isinstance(q['options'], list) or any(not isinstance(o, dict) or not isinstance(o.get('label'), str) or not isinstance(o.get('description'), str) for o in q['options'])) for q in questions) or len({q['id'] for q in questions}) != len(questions):
+    if not isinstance(questions, list) or not questions or any(not isinstance(q, dict) or not isinstance(q.get('id'), str) or not q['id'] or not isinstance(q.get('question'), str) or q.get('header') is not None and not isinstance(q['header'], str) or q.get('detail') is not None and not isinstance(q['detail'], str) or q.get('multiSelect') is not None and type(q['multiSelect']) is not bool or q.get('options') is not None and (not isinstance(q['options'], list) or any(not isinstance(o, dict) or not isinstance(o.get('label'), str) or o.get('description') is not None and not isinstance(o['description'], str) for o in q['options'])) for q in questions) or len({q['id'] for q in questions}) != len(questions):
         return description
-    approval_content = any(re.search(r'(?i)approv|authoriz|permission|grant access|command|shell|stdin|network|socket|execute|run.*script|allow (?:running|executing|access|network)|批准|授权|命令|权限|网络|执行|联网|允许.*(?:运行|访问)', text) for text in content)
-    return {'category': 'approval' if approval_content else 'question' if params['isBlocking'] else 'nonblocking',
-        'blocking': params['isBlocking'], 'answerable': not approval_content, 'questions': questions}
+    approval_content = any(q.get('intent') is not None for q in questions) or any(re.search(r'(?i)approv|authoriz|permission|grant access|command|shell|stdin|network|socket|execute|run.*script|allow (?:running|executing|access|network)|批准|授权|命令|权限|网络|执行|联网|允许.*(?:运行|访问)', text) for text in content)
+    return {'category': 'approval' if approval_content else 'nonblocking' if params.get('isBlocking') is False else 'question',
+        'blocking': params.get('isBlocking') if type(params.get('isBlocking')) is bool else None,
+        'answerable': not approval_content and params.get('native_response_available') is True,
+        'questions': questions}
 
 
 def sync_human_requests(manager, record, adapter, thread=None, live_events=()):
@@ -67,13 +66,54 @@ def sync_human_requests(manager, record, adapter, thread=None, live_events=()):
         key = hashlib.sha256(json.dumps([session['service_id'], session['generation'], type(envelope['id']).__name__, envelope['id']], sort_keys=True).encode()).hexdigest()
         question = next((q for q in requests if q['id'] == key), None)
         description = _describe(manager, envelope)
-        if envelope['method'] == 'item/fileChange/requestApproval' and description['category'] == 'approval':
-            description = _file_operation(manager, record, envelope, description, thread)
+        native_frame = params.get('native_frame')
+        frame_digest = hashlib.sha256(json.dumps(native_frame, sort_keys=True).encode()).hexdigest() if isinstance(native_frame, dict) else None
+        if params.get('notification_only') is True:
+            valid = (params.get('notice_current') is True and incoming['state'] == 'notice'
+                and adapter.generation == session['generation']
+                and (adapter.connection or {}).get('service_id') == session['service_id']
+                and params.get('turnId') == session['turn_id'] and session.get('control') == 'assigned_task'
+                and not record.get('repository_released') and record.get('task_delivery') != 'delivered'
+                and record.get('execution') not in {'stopping', 'stopped'})
+            if question is not None and question.get('source_frame_sha256') != frame_digest:
+                valid = False
+            if question is None:
+                question = {'id': key, 'rpc_id': envelope['id'], 'method': envelope['method'], 'service_id': session['service_id'],
+                    'generation': session['generation'], 'thread_id': session['thread_id'], 'turn_id': params.get('turnId'),
+                    'source_frame_sha256': frame_digest, 'item_id': params.get('itemId'), 'received_at': _now(), 'reply': None,
+                    'execution_result': 'unverified', 'original_interface': {'service_ref': adapter.service_ref,
+                        'thread_id': session['thread_id'], 'item_id': params.get('itemId'), 'url': None,
+                        'availability': 'original_client_required'}}
+                requests.append(question)
+            if description.get('category') == 'sensitive':
+                question.pop('questions', None)
+            question.update({**description, 'notification_only': True, 'answerable': False, 'control_enabled': False,
+                'approval_id': params.get('approvalId'), 'notice_uncertainty': params.get('notice_uncertainty'),
+                'resolution': 'pending' if valid else 'resolved' if incoming['state'] == 'resolved' else
+                              'unverified' if incoming['state'] == 'notice_unverified' else 'expired'})
+            continue
+        if question is not None and question.get('source_frame_sha256'):
+            if question['source_frame_sha256'] != frame_digest or question['method'] != envelope['method'] or params.get('threadId') != question['thread_id']:
+                question.update(resolution='expired', answerable=False, control_enabled=False)
+                continue
+            if incoming['state'] != 'pending':
+                question.update(answerable=False, control_enabled=False)
+                if incoming['state'] not in {'resolved', 'outcome_unknown'}:
+                    question['resolution'] = 'expired'
+                    continue
+            elif not question.get('reply') and question['generation'] == adapter.generation == session['generation'] and question['service_id'] == (adapter.connection or {}).get('service_id') == session['service_id'] and session.get('control') == 'assigned_task' and not record.get('repository_released') and record.get('task_delivery') != 'delivered' and record.get('execution') not in {'stopping', 'stopped'}:
+                current_turn = params.get('turnId')
+                active_turns = [turn.get('id') for turn in (thread or {}).get('turns', []) if turn.get('status') == 'inProgress']
+                if current_turn == session['turn_id'] and (thread or {}).get('status', {}).get('type') == 'active' and active_turns == [current_turn] and question.get('turn_id') in {None, current_turn}:
+                    question.update(turn_id=current_turn, item_id=params.get('itemId'), **description)
+                    if question['resolution'] == 'unverified':
+                        question['resolution'] = 'pending'
         if question is not None and question.get('operation_id') != description.get('operation_id'):
             question['resolution'] = 'expired'
         if question is None:
             question = {'id': key, 'rpc_id': envelope['id'], 'method': envelope['method'], 'service_id': session['service_id'],
                 'generation': session['generation'], 'thread_id': session['thread_id'], 'turn_id': params.get('turnId'),
+                'source_frame_sha256': frame_digest,
                 'item_id': params.get('itemId'), 'approval_id': params.get('approvalId'), 'received_at': _now(), 'reply': None,
                 'resolution': 'pending', 'execution_result': 'unverified', **description,
                 'original_interface': {'service_ref': adapter.service_ref, 'thread_id': session['thread_id'],
@@ -83,6 +123,8 @@ def sync_human_requests(manager, record, adapter, thread=None, live_events=()):
             question['resolution'] = 'resolved'
         elif incoming['state'] == 'outcome_unknown':
             question['resolution'] = 'outcome_unknown'
+        elif question['turn_id'] is None:
+            question['resolution'] = 'unverified'
         elif question['turn_id'] != session['turn_id'] or record.get('repository_released') or session.get('control') != 'assigned_task':
             question['resolution'] = 'expired'
         if thread is not None:
@@ -95,6 +137,9 @@ def sync_human_requests(manager, record, adapter, thread=None, live_events=()):
     if thread is not None:
         _natural_question(manager, record, thread, live_events)
     for question in requests:
+        if question.get('notification_only') is True:
+            question.update(answerable=False, control_enabled=False)
+            continue
         if question['method'] == 'natural_language' and question['resolution'] == 'pending':
             turn = next((t for t in (thread or {}).get('turns', []) if t.get('id') == question['turn_id']), None)
             messages = [i for i in (turn or {}).get('items', []) if i.get('type') == 'agentMessage']
@@ -103,56 +148,9 @@ def sync_human_requests(manager, record, adapter, thread=None, live_events=()):
                 question['resolution'] = 'expired'
         try:
             adapter.verify_control(session['repository'], 'human_response', session['capability'])
-            question['control_enabled'] = question['resolution'] == 'pending' and session.get('control') == 'assigned_task' and not record.get('repository_released') and record.get('task_delivery') != 'delivered' and record.get('execution') not in {'stopping', 'stopped'}
+            question['control_enabled'] = question['resolution'] == 'pending' and question.get('answerable') is True and session.get('control') == 'assigned_task' and not record.get('repository_released') and record.get('task_delivery') != 'delivered' and record.get('execution') not in {'stopping', 'stopped'}
         except ManagementError:
             question['control_enabled'] = False
-
-
-def _file_operation(manager, record, envelope, description, thread):
-    params, session = envelope['params'], record['session']
-    turn = next((t for t in (thread or {}).get('turns', []) if t.get('id') == params['turnId']), None)
-    item = next((i for i in (turn or {}).get('items', []) if i.get('id') == params['itemId'] and i.get('type') == 'fileChange'), None)
-    changes = (item or {}).get('changes')
-    if not isinstance(changes, list) or not changes or any(not isinstance(c, dict) or not isinstance(c.get('path'), str) or not isinstance(c.get('diff'), str) for c in changes):
-        return {**description, 'answerable': False}
-    try:
-        _public_text(json.dumps(changes), manager._sensitive_values())
-        for change in changes:
-            _within_repository(session, change['path'], write=True)
-    except ManagementError:
-        return {'category': 'sensitive', 'answerable': False, 'blocking': True}
-    return {**description, 'operation': {**description['operation'], 'changes': changes},
-        'operation_id': hashlib.sha256(json.dumps([params, changes], sort_keys=True).encode()).hexdigest()}
-
-
-def _within_repository(session, supplied, write=False):
-    from pathlib import Path
-    repo = session['repository']
-    if not isinstance(supplied, str) or not supplied or len(supplied) > 4096 or not Path(supplied).is_absolute():
-        raise ManagementError('invalid_change', 'Permission paths require a bounded absolute original repository location.')
-    try:
-        path = Path(supplied).resolve()
-    except OSError as exc:
-        raise ManagementError('invalid_change', 'The permission path could not be resolved safely.') from exc
-    if not path.is_relative_to(Path(repo['worktree'])) or write and any(path.is_relative_to(Path(child['worktree'])) or Path(child['worktree']).is_relative_to(path) for child in repo['nested_repositories']):
-        raise ManagementError('forbidden', 'Additional permission cannot expand the original repository or its read-only child boundary.')
-
-
-def _permission_boundary(session, granted):
-    if set(granted) - {'network', 'fileSystem'} or 'network' in granted and not isinstance(granted['network'], dict):
-        raise ManagementError('invalid_change', 'Only explicit supported granted permission fields are accepted.')
-    if granted.get('network', {}).get('enabled') is True:
-        raise ManagementError('capability_unverified', 'The original task has no verified network expansion authority; use its original interface.')
-    filesystem = granted.get('fileSystem', {})
-    if not isinstance(filesystem, dict) or set(filesystem) - {'read', 'write'}:
-        raise ManagementError('capability_unverified', 'Additional filesystem entry/glob semantics require original-interface verification.')
-    for access, paths in filesystem.items():
-        if paths is None:
-            continue
-        if not isinstance(paths, list):
-            raise ManagementError('invalid_change', 'Permission paths must be an explicit list.')
-        for path in paths:
-            _within_repository(session, path, write=access == 'write')
 
 
 def _natural_question(manager, record, thread, live_events=()):
@@ -172,8 +170,8 @@ def _natural_question(manager, record, thread, live_events=()):
     key = hashlib.sha256(json.dumps([session['service_id'], session['generation'], session['thread_id'], session['turn_id'], 'natural_language', item['id']]).encode()).hexdigest()
     if any(q['id'] == key for q in record['human_requests']):
         return
-    description = _describe(manager, {'method': 'item/tool/requestUserInput', 'params': {'threadId': session['thread_id'], 'turnId': session['turn_id'], 'itemId': item['id'], 'isBlocking': True,
-        'questions': [{'id': 'answer', 'header': 'Original question', 'question': text, 'isSecret': False, 'isOther': True, 'options': None}]}})
+    description = _describe(manager, {'method': 'user-questions/request', 'params': {'threadId': session['thread_id'], 'turnId': session['turn_id'], 'itemId': item['id'], 'isBlocking': True,
+        'native_response_available': True, 'questions': [{'id': 'answer', 'header': 'Original question', 'question': text, 'isSecret': False, 'isOther': True, 'options': None}]}})
     description['blocking'] = None
     description['source_digest'] = hashlib.sha256(text.encode()).hexdigest()
     record['human_requests'].append({'id': key, 'method': 'natural_language', 'service_id': session['service_id'],
@@ -183,45 +181,29 @@ def _natural_question(manager, record, thread, live_events=()):
             'url': None, 'availability': 'original_client_required'}})
 
 
-def _subset(granted, requested):
-    if isinstance(granted, dict):
-        return isinstance(requested, dict) and all(k in requested and _subset(v, requested[k]) for k, v in granted.items())
-    if isinstance(granted, list):
-        return isinstance(requested, list) and all(v in requested for v in granted)
-    return type(granted) is type(requested) and granted == requested
-
-
 def _response(manager, question, response, session):
     _public_text(json.dumps(response), manager._sensitive_values())
-    if question['method'] in APPROVAL_METHODS:
-        allowed = {'decision', 'operation_id', 'scope'}
-        permissions_request = question['method'] == 'item/permissions/requestApproval'
-        if permissions_request:
-            allowed.add('permissions')
-        if set(response) - allowed or response.get('operation_id') != question['operation_id'] or response.get('scope') != 'turn' or response.get('decision') not in {'accept', 'decline', 'cancel'}:
-            raise ManagementError('invalid_change', 'Approval requires the exact operation ID, explicit decision and turn scope.')
-        if permissions_request:
-            granted = response.get('permissions')
-            requested = question['operation'].get('permissions')
-            if not isinstance(granted, dict) or not _subset(granted, requested) or (response['decision'] != 'accept' and granted):
-                raise ManagementError('invalid_change', 'Only an explicitly approved requested permission subset can be granted.')
-            _permission_boundary(session, granted)
-            return {'permissions': granted, 'scope': 'turn'}
-        if question['method'] == 'item/commandExecution/requestApproval' and question['operation'].get('cwd') is not None:
-            _within_repository(session, question['operation']['cwd'])
-        return {'decision': response['decision']}
+    if question['method'] in APPROVAL_METHODS or question.get('category') == 'approval':
+        raise ManagementError('capability_unverified', 'Original DSH execution-approval semantics are unverified; handle the exact operation in its original interface.')
     if set(response) != {'answers'} or not isinstance(response['answers'], dict) or set(response['answers']) != {q['id'] for q in question['questions']}:
-        raise ManagementError('invalid_change', 'Answers must correspond to every original question ID.')
+        raise ManagementError('invalid_change', 'Answers must correspond to every original DSH question ID.')
+    answers = []
     for question_spec in question['questions']:
         values = response['answers'][question_spec['id']]
         if not isinstance(values, list) or not values or len(values) > 100:
             raise ManagementError('invalid_change', 'Each question requires bounded text answers.')
-        options = question_spec.get('options')
-        for text in values:
-            _public_text(text, manager._sensitive_values())
-            if options and question_spec.get('isOther') is not True and text not in {o.get('label') for o in options if isinstance(o, dict)}:
-                raise ManagementError('invalid_change', 'Select one of the original allowed options.')
-    return {'answers': {key: {'answers': value} for key, value in response['answers'].items()}}
+        labels = {o['label'] for o in question_spec.get('options', []) or []}
+        selected, custom = [], []
+        for value in values:
+            _public_text(value, manager._sensitive_values())
+            if value in labels:
+                selected.append(value)
+            else:
+                custom.append(value)
+        if len(selected) != len(set(selected)) or question_spec.get('multiSelect') is not True and len(selected) > 1:
+            raise ManagementError('invalid_change', 'Select only the original permitted DSH options and selection count.')
+        answers.append({'id': question_spec['id'], 'selected': selected, **({'custom': '\n'.join(custom)} if custom else {})})
+    return {'answers': answers}
 
 
 def answer_human_request(manager, identity, request_id, human_request_id, reply_id, response, source_anchor=None, *, factual_evidence=None):
@@ -304,7 +286,7 @@ def notify_human_requests(manager, identity, request_id):
             text = ('人工请求：' + question['id'] + '\n分类：' + question['category'] +
                     '\n答复收到：' + ('是' if reply else '否') + '；送回：' + (reply.get('sent') or '未送回') +
                     '；原请求已处理：' + question['resolution'] + '；执行结果：' + question['execution_result'])
-            if question['category'] in {'question', 'nonblocking'}:
+            if question['category'] in {'question', 'nonblocking'} and question.get('answerable') is True and question.get('control_enabled') is True:
                 text += '\n' + '\n'.join(q['question'] for q in question.get('questions', []))
                 text += '\n本人可回复：回答 ' + question['id'] + '：答案'
             elif question['category'] == 'approval' and question['answerable']:
@@ -381,11 +363,7 @@ def associate_human_reply(manager, identity, project_id, profile_id, message, te
         record, q = candidates[0]
         if decision:
             response = {'decision': 'accept' if decision.group(1) == '批准' else 'decline', 'operation_id': decision.group(3), 'scope': decision.group(4)}
-            if q['method'] == 'item/permissions/requestApproval':
-                try:
-                    response['permissions'] = json.loads(decision.group(5)) if decision.group(5) else {} if response['decision'] == 'decline' else None
-                except ValueError as exc:
-                    raise ManagementError('invalid_change', 'Permission approval requires a valid explicit JSON subset.') from exc
+
         else:
             if q['category'] not in {'question', 'nonblocking'} or len(q.get('questions', [])) != 1:
                 raise ManagementError('invalid_change', 'Use explicit operation approval or answer multiple questions in Dashboard.')

@@ -23,7 +23,7 @@ def test_verified_owner_accepts_issue_once_with_fixed_scope_and_waiting_executio
     assert len(tasks) == 1
     assert tasks[0]['accepted_scope']['body'] == 'Acceptance: preserve the original request.'
     assert tasks[0]['execution'] == 'waiting'
-    assert tasks[0]['unexecuted_reason'] == 'Codex execution is not enabled.'
+    assert tasks[0]['unexecuted_reason'] == 'DSH execution is not enabled.'
     assert tasks[0]['delivery'] == 'pending'
     assert tasks[0]['source_anchor']['message_id'] == 'om_request'
 

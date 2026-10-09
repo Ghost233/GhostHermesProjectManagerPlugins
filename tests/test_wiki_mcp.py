@@ -300,7 +300,7 @@ def test_configured_original_mcp_completes_registered_mentions_and_supplements_o
         'native_ids': b['sender_native_ids']} for b in source['wiki_bindings']]}
     with mcp_peer(pack) as peer:
         providers = configured_providers(provider_config(peer, 'public'), credential_resolver=lambda ref: 'synthetic-wiki-token')
-        with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
+        with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
                 knowledge_providers=providers) as manager:
             request_id = accepted(manager, make_repo(tmp_path / 'repo'))
             manager.start_task(OWNER, request_id)
@@ -330,9 +330,9 @@ def test_configured_original_mcp_completes_registered_mentions_and_supplements_o
                 query = lead.read_snapshot()['knowledge_queries'][0]
                 assert query['materials'] and query['requester'] == sender.subject
                 assert query['result_anchor']['message_id'] == 'om_wiki_1'
-                steering = [r for r in wire(tmp_path) if r['method'] == 'turn/steer']
+                steering = [r for r in wire(tmp_path) if r['method'] == 'fixture/append']
                 assert len(steering) == (1 if case == 'active-fact' else 0)
-                assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+                assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/start']) == 1
                 if steering:
                     assert steering[0]['params']['expectedTurnId'] == TURN
                     assert 'untrusted source data' in steering[0]['params']['input'][0]['text']

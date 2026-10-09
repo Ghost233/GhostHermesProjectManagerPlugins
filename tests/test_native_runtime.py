@@ -43,6 +43,21 @@ def test_sdk_loaded_driver_runs_real_owned_process_without_host_path_repair(prep
         'owned_process_smoke_runner.py', False, '', prepared_native_sdk)
 
 
+def test_original_sdk_loads_mapped_project_executors_and_unloads_then_reloads_them(prepared_native_sdk):
+    configured = os.environ.get('DSH_TEST_SDK_ROOT')
+    if not configured or not (Path(configured) / '@deepseek-ai/dsh/lib/profile-boot.js').is_file():
+        if configured or os.environ.get('DSH_REQUIRE_SDK_SMOKE') == '1':
+            pytest.fail('Mapped executor smoke requires an explicit original DSH_TEST_SDK_ROOT.')
+        pytest.skip('Original DSH fixture absent; this skip does not verify mapped native loading.')
+    dsh_sdk = Path(configured).resolve(strict=True)
+    before = source_snapshot(dsh_sdk)
+    try:
+        test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(
+            'dsh_executors_smoke_runner.py', False, '', prepared_native_sdk)
+    finally:
+        assert source_snapshot(dsh_sdk) == before, 'Mapped native loading must not change any original DSH source file.'
+
+
 @pytest.mark.parametrize('runner,artifact_mismatch,unload_stage', [('maintenance_smoke_runner.py', False, ''), ('wiki_mcp_smoke_runner.py', False, ''), ('migration_smoke_runner.py', False, ''), ('lifecycle_smoke_runner.py', False, ''), ('notifications_smoke_runner.py', False, ''), ('recovery_smoke_runner.py', False, ''), ('memory_smoke_runner.py', False, ''), ('collaboration_smoke_runner.py', False, ''), ('manual_control_smoke_runner.py', False, ''), ('archive_smoke_runner.py', False, ''), ('knowledge_smoke_runner.py', False, ''), ('manual_observation_smoke_runner.py', False, ''), ('repository_queue_smoke_runner.py', False, ''), ('questions_smoke_runner.py', False, ''), ('task_control_smoke_runner.py', False, ''), ('native_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, ''), ('owned_feishu_smoke_runner.py', False, 'ordinary'), ('owned_feishu_smoke_runner.py', False, 'verify'), ('owned_feishu_smoke_runner.py', False, 'issue'), ('owned_feishu_smoke_runner.py', False, 'issue_queue'), ('owned_feishu_smoke_runner.py', False, 'send'), ('owned_feishu_smoke_runner.py', False, 'connected'), ('owned_feishu_smoke_runner.py', False, 'failure_replay'), ('owned_feishu_smoke_runner.py', False, 'failure_optional')])
 def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resources(runner, artifact_mismatch, unload_stage, prepared_native_sdk, migration_entity=''):
     sdk = prepared_native_sdk
@@ -67,7 +82,7 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
         if runner in {'wiki_mcp_smoke_runner.py', 'recovery_smoke_runner.py', 'archive_smoke_runner.py', 'task_control_smoke_runner.py', 'repository_queue_smoke_runner.py', 'manual_observation_smoke_runner.py', 'questions_smoke_runner.py', 'manual_control_smoke_runner.py', 'knowledge_smoke_runner.py', 'memory_smoke_runner.py'}:
             fixtures = scratch / ('takeover-fixtures' if runner == 'manual_control_smoke_runner.py' else 'manual-fixtures' if runner == 'manual_observation_smoke_runner.py' else 'queue-fixtures' if runner == 'repository_queue_smoke_runner.py' else 'control-fixtures')
             fixtures.mkdir()
-            for name in ('test_task_control.py', 'test_task_execution.py', 'test_directory.py', 'test_requests.py', 'codex_fixture_server.py', 'test_repository_queue.py', 'queue_fixture_server.py', 'test_manual_observation.py', 'manual_fixture_server.py', 'test_questions.py', 'questions_fixture_server.py', 'test_manual_control.py', 'takeover_fixture_server.py', 'test_knowledge.py', 'test_wiki_mcp.py', 'test_feishu_entry.py', 'test_archives.py', 'recovery_service_support.py', 'recovery_service_fixture.py'):
+            for name in ('test_task_control.py', 'test_task_execution.py', 'test_directory.py', 'test_requests.py', 'executor_fixture_server.py', 'test_repository_queue.py', 'queue_fixture_server.py', 'test_manual_observation.py', 'manual_fixture_server.py', 'test_questions.py', 'questions_fixture_server.py', 'test_manual_control.py', 'takeover_fixture_server.py', 'test_knowledge.py', 'test_wiki_mcp.py', 'test_feishu_entry.py', 'test_archives.py', 'recovery_service_support.py', 'recovery_service_fixture.py'):
                 shutil.copy2(ROOT / 'tests' / name, fixtures / name)
         if runner == 'memory_smoke_runner.py':
             for name in ('test_project_memory.py', 'memory_fixture_server.py'):
@@ -87,15 +102,18 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
         if runner in {'collaboration_smoke_runner.py', 'notifications_smoke_runner.py'}:
             fixtures = scratch / 'collaboration-fixtures'
             fixtures.mkdir()
-            for name in ('test_collaboration.py', 'test_directory.py', 'test_requests.py', 'test_task_execution.py', 'test_task_control.py', 'codex_fixture_server.py', 'test_questions.py', 'questions_fixture_server.py'):
+            for name in ('test_collaboration.py', 'test_directory.py', 'test_requests.py', 'test_task_execution.py', 'test_task_control.py', 'executor_fixture_server.py', 'test_questions.py', 'questions_fixture_server.py'):
                 shutil.copy2(ROOT / 'tests' / name, fixtures / name)
         for fixture_dir in scratch.glob('*-fixtures'):
             shutil.copy2(ROOT / 'tests' / 'readiness_support.py', fixture_dir / 'readiness_support.py')
+            shutil.copy2(ROOT / 'tests' / 'normalized_executor_fixture.py', fixture_dir / 'normalized_executor_fixture.py')
         env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HERMES_HOME': str(home),
                'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'), 'PYTHONDONTWRITEBYTECODE': '1',
                'PYTHONPATH': str(staged), 'HERMES_TEST_SDK_ROOT': str(sdk), 'HERMES_FIXTURE_OWNER_TOKEN': 'synthetic-owner-credential',
                'HERMES_FIXTURE_PARTICIPANT_TOKEN': 'synthetic-participant-credential',
                'HERMES_FIXTURE_APP_SECRET': 'synthetic-unused-secret'}
+        if runner == 'dsh_executors_smoke_runner.py':
+            env['DSH_TEST_SDK_ROOT'] = str(Path(os.environ['DSH_TEST_SDK_ROOT']).resolve(strict=True))
         if runner == 'maintenance_smoke_runner.py':
             fixtures = scratch / 'maintenance-fixtures'
             fixtures.mkdir()
@@ -118,7 +136,7 @@ def test_native_sdk_loads_user_plugin_and_dashboard_backend_and_releases_resourc
         assert source_snapshot(sdk) == sdk_before, 'The complete original SDK source inventory and every SHA must remain unchanged.'
         assert result.returncode == 0, result.stdout + result.stderr
         assert 'synthetic-owned-process-secret' not in result.stdout + result.stderr
-        if runner in PROTECTED_RUNNERS or runner == 'owned_process_smoke_runner.py':
+        if runner in PROTECTED_RUNNERS or runner in {'owned_process_smoke_runner.py', 'dsh_executors_smoke_runner.py'}:
             expected = {'native_smoke': 'passed'}
             assert json.loads((scratch / 'native-smoke-result.json').read_text()) == expected
             assert result.stdout == '', 'The smoke uses explicit IPC results, never a console footer.'

@@ -91,7 +91,7 @@ async def test_owner_group_deactivation_waits_for_explicit_manual_handling_and_k
     manual_state(peer, repo)
     host = MaintenanceHost(tmp_path / 'host')
     with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, maintenance_host=host,
-                 observation_adapters={'local:manual-daemon': observer(peer)}) as manager:
+                 observation_adapters={'local:manual-desktop': observer(peer)}) as manager:
         register(manager, repo)
         manager.register_observation_source(OWNER, source())
         entry, gateway, transport = group_entry(manager)

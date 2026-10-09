@@ -19,7 +19,7 @@ def test_public_delivery_requires_executed_assertions(tmp_path, flags):
     (repo / 'test_assertions.py').write_text('def test_assertion():\n    assert True\n')
     (repo / 'test_no_assertions.py').write_text('import pytest\n@pytest.mark.skip(reason="fixture")\ndef test_skipped():\n    assert False\n')
     from readiness_support import ReadyManager
-    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo)
         with ManagementServer(manager, {'fixture-entry': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
@@ -42,7 +42,7 @@ def test_public_delivery_honors_frozen_merge_requirement(tmp_path, criterion):
     repo = make_repo(tmp_path / 'repo')
     scope = {**ISSUE, 'body': '- [ ] ' + criterion}
     from readiness_support import ReadyManager
-    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         request_id = accepted(manager, repo, scope)
         with ManagementServer(manager, {'fixture-entry': OWNER}):
             client = ManagementClient(tmp_path / 'state', 'fixture-entry')
@@ -96,7 +96,7 @@ def test_native_global_host_has_real_authorized_preparation(tmp_path):
     from readiness_support import ReadyManager
     config = {'host_id': 'local:approved-original-host', 'generation': 'owned-native-generation', 'runner': [sys.executable], 'watcher': [sys.executable, '-c', 'import time; time.sleep(60)'], 'tests': {'unit': ['-c', 'assert True']}, 'environment': {'PATH': '/usr/bin:/bin'}}
     host = configured_global_validation_host(config, tmp_path / 'state')
-    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with ReadyManager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         subprocess.run(['git', '-C', str(child), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-qm', 'different child materialization'], check=True)
         planned = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']})
@@ -194,7 +194,7 @@ def test_native_runner_executes_fixed_test_and_original_watch_invalidates_pass(t
     config = {'host_id': 'local:controlled-native-host', 'generation': 'synthetic-original-generation', 'runner': [sys.executable], 'watcher': [sys.executable, *watcher], 'tests': {'unit': ['-c', 'from pathlib import Path; assert Path("child/source.py").read_text() == "baseline\\n"; print("1 assertion passed")']}, 'environment': {'PATH': '/usr/bin:/bin'}}
     state = tmp_path / 'state'
     host = configured_global_validation_host(config, state)
-    with ReadyManager(state, owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
+    with ReadyManager(state, owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path), global_validation_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         details = {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'), 'children': [{'request_id': kid, 'path': 'child'}], 'test_ids': ['unit']}
         first = manager.global_validation(LEAD, 'plan', details)
@@ -238,35 +238,79 @@ def test_native_runner_executes_fixed_test_and_original_watch_invalidates_pass(t
             assert client.read_snapshot()['global_validations'][-1]['status'] == 'invalidated'
 
 
-def test_native_codex_archive_configuration_uses_original_proxy_and_public_grant(tmp_path):
+def test_native_dsh_archive_configuration_uses_original_remote_and_public_grant(tmp_path):
+    from datetime import datetime, timedelta, timezone
     import hashlib
-    from pathlib import Path
     from ghost_hermes_pm.archives import configured_providers
     from ghost_hermes_pm.observation import READ_METHODS
+    from archive_fixture_server import archive_journal
+    from dsh_fixture_server import remote_peer
     from test_archives import setup_archive, migration_registration
-    peer = {'thread': {'id': 'original-thread', 'status': {'type': 'idle'}, 'updatedAt': 1, 'historyMode': 'paginated', 'turns': []}, 'turns': {'': {'data': [{'id': 'turn-1', 'itemsView': 'full'}], 'nextCursor': None}}, 'items': {'turn-1': {'': {'data': [{'id': 'item-1', 'type': 'userMessage', 'text': 'Original executor requirement'}], 'nextCursor': None}}}}
-    (tmp_path / 'archive-peer.json').write_text(json.dumps(peer))
-    binary = tmp_path / 'original-proxy'
-    fixture = Path(__file__).with_name('archive_fixture_server.py')
-    binary.write_text('#!' + sys.executable + '\nimport os,runpy,sys\nsys.argv=[' + repr(str(fixture)) + ',os.environ["OWNED_ARCHIVE_ROOT"]]\nrunpy.run_path(sys.argv[0],run_name="__main__")\n')
-    binary.chmod(0o700)
-    state = tmp_path / 'state'; state.mkdir(mode=0o700)
-    config = {'executable': str(binary), 'cwd': str(tmp_path), 'environment': {'PATH': '/usr/bin:/bin', 'CODEX_HOME': str(tmp_path / 'synthetic-home'), 'OWNED_ARCHIVE_ROOT': str(tmp_path)}, 'service_ref': 'local:original-proxy', 'source_kind': 'daemon', 'endpoint': str(tmp_path / 'original.sock'), 'endpoint_ref': 'local:original-socket'}
-    providers = configured_providers({'local:old-hermes': {'kind': 'codex_history', 'adapter': config, 'thread_scopes': {'public': ['original-thread']}}}, state_dir=state)
-    provider = providers['local:old-hermes']; adapter = provider.adapter
-    binding = {'generation': adapter.generation, 'service_ref': config['service_ref'], 'source_kind': config['source_kind'], 'endpoint_ref': config['endpoint_ref'], 'transport': 'original_proxy_stdio'}
-    # The original endpoint proof is substituted at the external trusted-host artifact boundary.
-    proof = {**binding, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'configuration_sha256': hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest(), 'endpoint_sha256': hashlib.sha256(config['endpoint'].encode()).hexdigest(), 'platform': sys.platform, 'original_endpoint_verified': 'PASS', 'observation_read_only': 'PASS', 'provenance': 'trusted_host_original_executor', 'original_executor_id': 'controlled-original-peer', 'supported_methods': sorted(READ_METHODS), 'source_kinds': ['cli'], 'read_cases': dict.fromkeys(READ_METHODS | {'no_execution_writes', 'original_request_routing', 'unsupported_scope', 'disconnect'}, 'PASS')}
-    directory = state / 'observation-evidence'; directory.mkdir()
-    path = directory / 'fixture-original.json'; path.write_text(json.dumps(proof))
-    (state / 'codex-observation.json').write_text(json.dumps({config['service_ref']: {'path': 'observation-evidence/fixture-original.json', 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}}))
-    manager, viewer, _ = setup_archive(tmp_path, provider)
-    registration = migration_registration(); registration.update(id='original-codex', kind='codex_history')
-    with manager, ManagementServer(manager, {'new': viewer}):
-        manager.register_archive_source(OWNER, registration)
-        result = ManagementClient(state, 'new').query_archive('original-codex', 'configured-original', 'requirement', ['public'], True)
-        assert result['status'] == 'complete'
-        assert result['coverage']['original_executor_id'] == 'controlled-original-peer'
-        assert result['records'][0]['locator'] == 'codex-archive:original-thread/turn-1#item-1'
-    wire = [json.loads(line)['method'] for line in (tmp_path / 'archive-wire.jsonl').read_text().splitlines()]
-    assert set(wire) <= {'initialize', 'initialized', 'thread/read', 'thread/turns/list', 'thread/items/list'}
+
+    # Actual native HTTP/mux shapes; all source values and host receipts are synthetic.
+    records = [{'type': 'event', 'event': event} for event in archive_journal()]
+    with remote_peer(behavior={'records': records}) as (url, peer):
+        state = tmp_path / 'state'
+        state.mkdir(mode=0o700)
+        config = {'base_url': url, 'cookie': 'synthetic-auth=value',
+                  'service_ref': 'local:original-dsh', 'source_kind': 'desktop',
+                  'endpoint_ref': 'local:original-desktop', 'expected_home': '/synthetic/home'}
+        providers = configured_providers({'local:old-hermes': {
+            'kind': 'dsh_history', 'adapter': config,
+            'thread_scopes': {'public': ['session-fixture']}}}, state_dir=state)
+        adapter = providers['local:old-hermes'].adapter
+        now = datetime.now(timezone.utc)
+        frozen = {key: value for key, value in config.items() if key != 'cookie'}
+        frozen.update(transport='desktop_http_mux',
+                      credential_sha256=hashlib.sha256(b'synthetic-auth=value').hexdigest())
+        endpoint_digest = hashlib.sha256(url.encode()).hexdigest()
+        original_id = 'dsh:' + endpoint_digest + ':' + hashlib.sha256(b'/synthetic/home').hexdigest()
+        proof = {'engine': 'dsh', 'generation': adapter.generation,
+                 'service_ref': config['service_ref'], 'source_kind': 'desktop',
+                 'endpoint_ref': config['endpoint_ref'], 'transport': 'desktop_http_mux',
+                 'service_id': original_id, 'client_id': 'fixture-client',
+                 'configuration_sha256': hashlib.sha256(json.dumps(frozen, sort_keys=True).encode()).hexdigest(),
+                 'endpoint_sha256': endpoint_digest, 'platform': sys.platform,
+                 'original_endpoint_verified': 'PASS', 'observation_read_only': 'PASS',
+                 'provenance': 'trusted_host_original_dsh',
+                 'backend_instance_ref': 'fixture:synthetic-desktop-instance',
+                 'original_executor_id': original_id,
+                 'supported_methods': sorted(READ_METHODS), 'source_kinds': ['desktop'],
+                 'read_cases': dict.fromkeys(READ_METHODS | {
+                     'no_execution_writes', 'original_request_routing', 'unsupported_scope', 'disconnect'}, 'PASS'),
+                 'verified_at': now.isoformat(), 'expires_at': (now + timedelta(seconds=120)).isoformat()}
+        directory = state / 'observation-evidence'
+        directory.mkdir()
+        path = directory / 'fixture-dsh.json'
+        path.write_text(json.dumps(proof))
+        (state / 'dsh-observation.json').write_text(json.dumps({
+            config['service_ref']: {'path': 'observation-evidence/fixture-dsh.json',
+                                   'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}}))
+        manager, viewer, _ = setup_archive(tmp_path, providers['local:old-hermes'])
+        registration = migration_registration()
+        registration.update(id='original-dsh', kind='dsh_history')
+        with manager, ManagementServer(manager, {'new': viewer}):
+            manager.register_archive_source(OWNER, registration)
+            result = ManagementClient(state, 'new').query_archive(
+                'original-dsh', 'configured-original', 'requirement', ['public'], True)
+            assert result['status'] == 'complete'
+            assert result['coverage']['original_executor_id'] == original_id
+            assert result['coverage']['compressed_history'] == 'durable_journal_only_model_context_not_reconstructed'
+            assert result['records'][1]['locator'] == 'dsh-archive:session-fixture#1'
+            assert result['records'][1]['payload']['data']['content'][0]['text'] == 'Original retry requirement'
+            assert manager.read_snapshot(OWNER)['requests'] == []
+        assert adapter._closed
+        assert peer['prompts'] == []
+        assert {call['method'] for call in peer['calls']} == {'session/list'}
+        assert {frame.get('endpoint') for frame in peer['streams'] if frame['type'] == 'open'} == {'$events', 'session/follow'}
+
+
+def test_native_dsh_archive_configuration_refuses_legacy_process_and_socket_bindings(tmp_path):
+    from ghost_hermes_pm.archives import configured_providers
+    legacy = {'executable': '/synthetic/old-cli', 'cwd': '/synthetic/project',
+              'environment': {}, 'service_ref': 'local:old-process', 'source_kind': 'desktop',
+              'endpoint': '/synthetic/old.sock', 'endpoint_ref': 'local:old-socket'}
+    with pytest.raises(ManagementError) as error:
+        configured_providers({'local:old': {'kind': 'dsh_history', 'adapter': legacy,
+                                            'thread_scopes': {'public': ['old-session']}}}, state_dir=tmp_path)
+    assert error.value.code == 'invalid_change'

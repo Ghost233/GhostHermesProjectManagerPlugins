@@ -10,22 +10,22 @@ for line in sys.stdin:
     assert 'method' in request and 'result' not in request, 'Observer must not answer server requests.'
     method, params = request['method'], request.get('params', {})
     state = json.loads((root / 'manual-state.json').read_text())
-    if method == 'initialized':
+    if method == 'fixture/ready':
         continue
     if method in state.get('unsupported', []):
         print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Read method unavailable'}}), flush=True)
         continue
-    if method == 'initialize':
-        result = {'userAgent': 'codex-cli/0.160.1', 'codexHome': str(root / 'synthetic-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
+    if method == 'fixture/connect':
+        result = {'userAgent': 'fixture-cli/fixture-v1', 'fixtureHome': str(root / 'synthetic-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
         if state.get('approval_request'):
-            print(json.dumps({'id': 'manual-approval', 'method': 'item/commandExecution/requestApproval', 'params': {'threadId': 'manual-thread', 'command': 'synthetic private operation'}}), flush=True)
-    elif method == 'thread/loaded/list':
+            print(json.dumps({'id': 'manual-approval', 'method': 'dsh/approvalRequired', 'params': {'threadId': 'manual-thread', 'command': 'synthetic private operation'}}), flush=True)
+    elif method == 'fixture/loaded':
         result = state.get('loaded_pages', {}).get(params.get('cursor', ''), {'data': state.get('loaded', []), 'nextCursor': None})
-    elif method == 'thread/list':
+    elif method == 'fixture/list':
         result = state.get('list_pages', {}).get(params.get('cursor', ''), {'data': [state['threads'][i] for i in state.get('listed', [])], 'nextCursor': None, 'backwardsCursor': None})
-    elif method == 'thread/read':
+    elif method == 'fixture/read':
         result = {'thread': state['threads'][params['threadId']]}
-    elif method == 'thread/backgroundTerminals/list':
+    elif method == 'fixture/background':
         result = state.get('background_pages', {}).get(params.get('cursor', ''), {'data': [], 'nextCursor': None})
     else:
         raise RuntimeError('Read-only peer received forbidden method: ' + method)

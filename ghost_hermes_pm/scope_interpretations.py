@@ -12,7 +12,7 @@ def _authorization(record, data):
     profile = data['profiles'].get(record['profile_id'], {})
     responsibility = {key: profile.get(key) for key in record['accepted_responsibility']}
     repository = data['projects'].get(record['project_id'], {}).get('repo')
-    if responsibility != record['accepted_responsibility'] or profile.get('connection_refs', {}).get('codex') != record.get('accepted_codex_ref') or _digest(repository) != record.get('accepted_repository_fingerprint'):
+    if responsibility != record['accepted_responsibility'] or profile.get('connection_refs', {}).get('dsh') != record.get('accepted_dsh_ref') or _digest(repository) != record.get('accepted_repository_fingerprint'):
         return None
     session = record.get('session', {})
     return _digest({'responsibility': responsibility, 'repository': repository,

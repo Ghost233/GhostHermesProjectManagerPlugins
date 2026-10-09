@@ -18,7 +18,7 @@ def approval(client, operation_id, **extra):
 
 
 def test_owner_maintenance_pauses_new_execution_and_dispatch_but_existing_supervision_continues(tmp_path):
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path)) as manager:
         first = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, first)
         second = manager.accept_request(OWNER, 'mono', 'mono-lead', {**MESSAGE, 'message_id': 'queued'}, ISSUE)['request']['id']
@@ -39,13 +39,13 @@ def test_owner_maintenance_pauses_new_execution_and_dispatch_but_existing_superv
             snapshot = client.read_snapshot()
             assert snapshot['maintenance']['mode'] == 'maintenance'
             assert {r['id'] for r in snapshot['requests']} == {first, second}
-            assert not any(r['method'] == 'turn/interrupt' for r in wire(tmp_path))
+            assert not any(r['method'] == 'fixture/stop' for r in wire(tmp_path))
 
 
 def test_checkpoint_requires_real_terminal_coverage_and_no_inflight_native_requests(tmp_path):
     from maintenance_fixture_host import MaintenanceHost
     host = MaintenanceHost(tmp_path / 'host')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), maintenance_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), maintenance_host=host) as manager:
         first = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, first)
         with ManagementServer(manager, {'owner': OWNER}):
@@ -66,7 +66,7 @@ def test_checkpoint_requires_real_terminal_coverage_and_no_inflight_native_reque
             assert checkpoint['checkpoint']['directory']['status'] == 'verified'
             assert set(checkpoint['checkpoint']['native']['categories']) == {'config', 'data', 'archive'}
             assert host.effects == []
-            assert not any(r['method'] == 'turn/interrupt' for r in wire(tmp_path))
+            assert not any(r['method'] == 'fixture/stop' for r in wire(tmp_path))
 
 
 def test_deactivate_interrupts_owned_execution_preserves_queue_and_reenable_reconciles_without_restart(tmp_path):
@@ -75,7 +75,7 @@ def test_deactivate_interrupts_owned_execution_preserves_queue_and_reenable_reco
     repo = make_repo(tmp_path / 'repo')
     keep = repo / 'keep.txt'
     keep.write_text('Preserved work\n')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), maintenance_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), maintenance_host=host) as manager:
         first = accepted(manager, repo)
         manager.start_task(OWNER, first)
         second = manager.accept_request(OWNER, 'mono', 'mono-lead', {**MESSAGE, 'message_id': 'queued'}, ISSUE)['request']['id']
@@ -96,8 +96,8 @@ def test_deactivate_interrupts_owned_execution_preserves_queue_and_reenable_reco
             assert next(r for r in snapshot['requests'] if r['id'] == second)['execution'] == 'waiting'
             assert restored['reconciliation'][0]['status'] == 'explicit_stop_preserved'
             assert keep.read_text() == 'Preserved work\n'
-            assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
-            assert len([r for r in wire(tmp_path) if r['method'] == 'turn/interrupt']) == 1
+            assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/start']) == 1
+            assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/stop']) == 1
 
 
 def test_failed_switch_restores_checkpoint_data_but_preserves_live_authority_stop_intent_and_health(tmp_path):
@@ -107,7 +107,7 @@ def test_failed_switch_restores_checkpoint_data_but_preserves_live_authority_sto
     repo = make_repo(tmp_path / 'repo')
     preserved = repo / 'user.txt'
     preserved.write_text('Do not reset or clean me\n')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path), maintenance_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path), maintenance_host=host) as manager:
         request_id = accepted(manager, repo)
         manager.start_task(OWNER, request_id)
         manager.control_task(OWNER, request_id, 'stop', 'explicit-before-maintenance', expected_turn_id=TURN)
@@ -145,7 +145,7 @@ def test_failed_switch_restores_checkpoint_data_but_preserves_live_authority_sto
             assert denied.value.code == 'forbidden'
             assert after['notifications']['health']['supervision'] != 'running'
             assert preserved.read_text() == 'Do not reset or clean me\n'
-            assert len([r for r in wire(tmp_path) if r['method'] == 'turn/start']) == 1
+            assert len([r for r in wire(tmp_path) if r['method'] == 'fixture/start']) == 1
 
 
 def test_observed_manual_execution_requires_owner_handling_without_automatic_interrupt(tmp_path):
@@ -154,7 +154,7 @@ def test_observed_manual_execution_requires_owner_handling_without_automatic_int
     host = MaintenanceHost(tmp_path / 'host')
     repo, peer = make_repo(tmp_path / 'repo'), tmp_path / 'manual'
     manual_state(peer, repo)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-daemon': observer(peer)}, maintenance_host=host) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, observation_adapters={'local:manual-desktop': observer(peer)}, maintenance_host=host) as manager:
         from test_directory import registration
         manager.apply_directory_change(OWNER, 0, registration(repo))
         manager.register_observation_source(OWNER, source())
@@ -299,7 +299,7 @@ def test_unknown_notification_delivery_remains_a_handoff_blocker_after_original_
     from maintenance_fixture_host import MaintenanceHost
     from test_notifications import Clock, accepted as notified_task, register_entry
     host, clock = MaintenanceHost(tmp_path / 'host'), Clock()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
                  maintenance_host=host, notification_clock=clock) as manager:
         request_id = notified_task(manager, make_repo(tmp_path / 'repo'))
         register_entry(manager)
@@ -358,7 +358,7 @@ def test_unknown_original_global_validation_run_blocks_handoff_until_reconciled_
     from test_global_validation import UnknownStartHost, combination, git, LEAD
     from test_repository_queue import queue_adapter
     validator, host = UnknownStartHost(), MaintenanceHost(tmp_path / 'host')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=queue_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=queue_adapter(tmp_path),
                  global_validation_host=validator, maintenance_host=host) as manager:
         mono, child, parent, kid = combination(manager, tmp_path)
         validation = manager.global_validation(LEAD, 'plan', {'request_id': parent, 'mono_commit': git(mono, 'rev-parse', 'HEAD'),

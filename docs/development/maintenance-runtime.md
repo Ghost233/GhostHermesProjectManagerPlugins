@@ -1,14 +1,16 @@
 # 维护原生运行边界（[维护升级、主动停用并从检查点回退](../../../../issues/31)）
 
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
 统一管理入口的 `maintenance(action, details)` 接收 `enter`、`deactivate`、`check`、`checkpoint`、`switch`、`rollback`、`reenable`。Owner 在 `enter/deactivate` 审定当前目录 revision、完整 Profile ID 列表、原版本及目标源码；`switch/rollback/reenable` 再审定当前目录 revision 与同一完整范围。已有 operation ID 的意图、原版本和目标不可改写。群与 Dashboard 共用此入口，机器人/model 的只读 token 不构成 Owner 决定。页面与群的操作方式另见维护入口文档。
 
 `expected_release` 为 `plugin_version/source_digest/sdk_version/sdk_source_digest` 四个字段；`target_release` 为固定 `id/plugin_version/source_digest`。维护暂停新受理、新执行、继续与队列派发；已有原服务监督、观察与允许的停止仍可运行。配置了原生维护 Host 后，当前版本未知或实际 SDK registry 指向旧 bytecode，同样阻止新执行、派发与迁移。原 schema 未知或 SQLite 不可用仍沿重启对账的原 guard 拒绝打开 writable authority。
 
 ## 交接、检查点、停用与恢复
 
-`check/checkpoint` 重新读原线程、全部相关子线程、后台终端分页与进程覆盖；完整原回合结束和监督消失是不同结果。未处理的发送/启动/控制/人工回送 outcome、在途投递、手动执行与原 Host 完整覆盖均参与门禁。手动只观察不会获得新控制授权，Owner 须实际处理、在 `check` 提交 `handled_manual_session_ids`，并再次从原来源核实 inactive。检查点在原统一 gate 持久化后采用 SQLite backup；原 Host 的配置、数据和档案须逐项覆盖、有受控 artifact、SHA256 与一致性证据。
+`check/checkpoint` 重新读原 DSH Session、全部相关子 agent、job 范围与进程覆盖；完整原回合结束和监督消失是不同结果。未处理的发送/启动/控制/人工回送 outcome、在途投递、手动执行与原 Host 完整覆盖均参与门禁。手动只观察不会获得新控制授权，Owner 须实际处理、在 `check` 提交 `handled_manual_session_ids`，并再次从原来源核实 inactive。检查点在原统一 gate 持久化后采用 SQLite backup；原 Host 的配置、数据和档案须逐项覆盖、有受控 artifact、SHA256 与一致性证据。
 
-主动 `deactivate` 先持久化 intent，对已持有控制权的原任务按原 thread/turn interrupt，再核实停止。没有启动的任务与队列保持，已有工作区改动保持；返回控制或只观察的原执行不会被擅自中断。完整条件未达时显示 blocked/processing。业务停用保留管理和监督服务，不卸载整个多 Profile 宿主。`reenable` 在 gate 仍关闭时先做原服务对账；明确停止、封存与未知 outcome 不自动重启，成功后才解除 gate。
+主动 `deactivate` 先持久化 intent，对已持有控制权的原任务按原 DSH Session cancel，再核实停止。没有启动的任务与队列保持，已有工作区改动保持；返回控制或只观察的原执行不会被擅自中断。完整条件未达时显示 blocked/processing。业务停用保留管理和监督服务，不卸载整个多 Profile 宿主。`reenable` 在 gate 仍关闭时先做原服务对账；明确停止、封存与未知 outcome 不自动重启，成功后才解除 gate。
 
 检查点中的 Manager SQLite 是一致性/恢复证据，回退不覆盖当前 authority 数据库。真实 data-only restore 仅作用于原 Host 批准的原文件范围；当前 SourceGrant、控制 grant、明确 stop/archive intent 与通知健康继续保留。新收紧的 SourceGrant 在 rollback 后仍拒绝原已撤销访问。原生配置授权 digest 改变则拒绝覆盖旧配置；restore 后还须验证各 artifact hash、实际原版本、授权未扩大、旧入口/任务未启动。Native Host 绑定 Manager 时拒绝把 `manager.sqlite3`、其 WAL/SHM、`notification-health.json`、`manager-runtime.json` 和 socket 纳入外部 restore scope。不得 reset、clean 或替换工作仓库。
 
@@ -32,7 +34,7 @@
 
 公共离线路径使用实际 SQLite、临时 Git、原 JSONL 执行 peer、原观察 peer和明确人工 native boundary。固定 SDK 场景使用 pristine `bd0affe5e5f723579df8902852f5d0c47795f355` 的真实 loader/control socket/registry/native hook/management server；外部 verifier 仅覆盖拥有的人工 gateway、无模型/外部任务的明确运行范围及显式配置/data/archive 文件。测试副本通过 SDK 公开 build-stamp writer 声明固定 core 构建 metadata；此 metadata 与新插件实际执行 fingerprint、控制效果分开，不是生产版本发布证明。场景实际覆盖旧桥关闭、失 ACK、原 ID 新桥 check、切换失败、真实文件回退、恢复对账、强制卸载及 stale bytecode。
 
-父规格全部已有切片、获准真实群/Profile/服务/仓库、当前模型端点、完整资料/进程/保留保护和正式安装计划继续独立执行。本票不替代前票测试，不操作本人当前任务，不迁移真实资料。Dashboard 的 `release_verified` 仍为 false；没有当前真实验证的能力不能作为已启用发布。本地已批准资源可以只读预检，但原真实模型端点和原 Codex 控制/全资料保护的 unknown/blocked 门槛不会被人工 fixture report 消除。
+父规格全部已有切片、获准真实群/Profile/服务/仓库、当前模型端点、完整资料/进程/保留保护和正式安装计划继续独立执行。本票不替代前票测试，不操作本人当前任务，不迁移真实资料。Dashboard 的 `release_verified` 仍为 false；没有当前真实验证的能力不能作为已启用发布。本地已批准资源可以只读预检，但原真实模型端点和原 DSH 控制/全资料保护的 unknown/blocked 门槛不会被人工 fixture report 消除。
 
 ## 当前入口权限与未决原操作
 

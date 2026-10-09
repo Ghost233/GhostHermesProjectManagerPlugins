@@ -1,4 +1,4 @@
-"""Synthetic 0.160.1 JSONL peer, never a real service acceptance result."""
+"""Synthetic fixture-v1 JSONL peer, never a real service acceptance result."""
 import json
 import os
 import sys
@@ -36,25 +36,25 @@ for line in sys.stdin:
     if behavior.get('rpc_error') == method:
         print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported fixture method'}}), flush=True)
         continue
-    if method == 'initialized':
+    if method == 'fixture/ready':
         continue
-    if method == 'initialize':
-        value = {'userAgent': 'codex-cli/0.160.1', 'codexHome': str(root / 'codex-home'),
+    if method == 'fixture/connect':
+        value = {'userAgent': 'fixture-cli/fixture-v1', 'fixtureHome': str(root / 'fixture-home'),
                  'platformFamily': 'unix', 'platformOs': 'fixture'}
         print(json.dumps({'method': 'remoteControl/status/changed', 'params': {'status': 'disabled'}}), flush=True)
-    elif method == 'permissionProfile/list':
+    elif method == 'fixture/policy':
         value = {'data': [{'id': 'fixture-boundary', 'description': 'Synthetic verified policy', 'allowed': True}], 'nextCursor': None}
-    elif method == 'thread/loaded/list':
+    elif method == 'fixture/loaded':
         value = json.loads((root / 'loaded.json').read_text()) if (root / 'loaded.json').exists() else {'data': [], 'nextCursor': None}
-    elif method == 'thread/list':
+    elif method == 'fixture/list':
         value = {'data': [], 'nextCursor': None, 'backwardsCursor': None}
-    elif method == 'thread/start':
-        thread = {'id': thread_id, 'cwd': params['cwd'], 'cliVersion': '0.160.1',
+    elif method == 'fixture/create':
+        thread = {'id': thread_id, 'cwd': params['cwd'], 'cliVersion': 'fixture-v1',
                   'status': {'type': 'idle'}, 'canAcceptDirectInput': True, 'turns': []}
         value = {'thread': thread, 'model': 'fixture-model', 'cwd': params['cwd'],
                  'activePermissionProfile': {'id': params['permissions'], 'extends': ':read-only'},
                  'runtimeWorkspaceRoots': params['runtimeWorkspaceRoots']}
-    elif method == 'turn/start':
+    elif method == 'fixture/start':
         records = committed_requests(method)
         require(any(r.get('session', {}).get('thread_id') == thread_id for r in records), 'thread must be durable before turn/start', method)
         if params.get('clientUserMessageId'):
@@ -64,7 +64,7 @@ for line in sys.stdin:
         value = {'turn': {'id': turn_id, 'status': 'inProgress', 'items': [], 'itemsView': 'full'}}
         thread['status'] = {'type': 'active', 'activeFlags': []}
         thread['turns'] = [value['turn']]
-    elif method == 'turn/steer':
+    elif method == 'fixture/append':
         if behavior.get('steer_active_turn'):
             turn_id = behavior['steer_active_turn']
             thread['turns'] = [{'id': turn_id, 'status': 'inProgress', 'itemsView': 'full', 'items': []}]
@@ -76,14 +76,14 @@ for line in sys.stdin:
         with (root / 'applied-inputs.jsonl').open('a') as applied:
             applied.write(json.dumps({'thread_id': thread_id, 'turn_id': turn_id, 'instruction_id': params['clientUserMessageId']}) + '\n')
         value = {'turnId': turn_id}
-    elif method == 'turn/interrupt':
+    elif method == 'fixture/stop':
         records = committed_requests(method)
         require(any(r.get('stop', {}).get('status') == 'processing' for r in records), 'stop intent must be durable before interrupt', method)
         value = {}
-    elif method == 'thread/backgroundTerminals/list':
+    elif method == 'fixture/background':
         pages = json.loads((root / 'background.json').read_text()) if (root / 'background.json').exists() else {'': {'data': [], 'nextCursor': None}}
         value = pages[params.get('cursor', '')]
-    elif method == 'thread/read':
+    elif method == 'fixture/read':
         state = json.loads((root / 'observed.json').read_text()) if (root / 'observed.json').exists() else {}
         thread.update(state)
         others = json.loads((root / 'threads.json').read_text()) if (root / 'threads.json').exists() else {}

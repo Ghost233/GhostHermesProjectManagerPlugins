@@ -19,7 +19,7 @@ if os.environ.get('HERMES_TEST_OWNED_UNLOAD_STAGE') in {'failure_replay', 'failu
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
         path = Path(os.fsdecode(args[0])).resolve()
-        if any(path.is_relative_to(protected_home / p) for p in ('.hermes', '.config', '.local/state/hermes')) or (path.name == '.env' and not path.is_relative_to(scratch)):
+        if any(path.is_relative_to(protected_home / p) for p in ('.hermes', '.dsh', '.config', '.local/state/hermes')) or (path.name == '.env' and not path.is_relative_to(scratch)):
             raise RuntimeError('Owned smoke refused real configuration/credential files.')
     if event == 'socket.connect' and isinstance(args[1], tuple):
         raise RuntimeError('Owned smoke refused external HTTP.')
@@ -77,12 +77,12 @@ for profile in ('steward', 'mono-lead', 'child'):
 (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 import ghost_hermes_pm.github as external_issue
 external_issue.GitHubDeliverySource.read_issue = lambda self, url: IssueSource().read_issue(url)
-import ghost_hermes_pm.codex as original_codex
-original_codex.configured_adapter = lambda config, directory: question_adapter(scratch)
+import ghost_hermes_pm.dsh as original_dsh
+original_dsh.configured_adapter = lambda config, directory: question_adapter(scratch)
 from native_fixture_boundary import install
 install(home / 'plugins' / 'ghost-hermes-pm', {
     'github': lambda module: setattr(module.GitHubDeliverySource, 'read_issue', lambda self, url: IssueSource().read_issue(url)),
-    'codex': lambda module: setattr(module, 'configured_adapter', lambda config, directory: question_adapter(scratch))})
+    'dsh': lambda module: setattr(module, 'configured_adapter', lambda config, directory: question_adapter(scratch))})
 plugins = get_plugin_manager()
 plugins.discover_and_load()
 
@@ -148,10 +148,10 @@ async def main():
     await plugins.ainvoke_hook('pre_gateway_dispatch', event=object(), gateway=runners[0])
     owner = ManagementClient(state, 'synthetic-owner-credential')
     repo = scratch / 'mono'; repo.mkdir(); subprocess.run(['git', 'init', '-q', str(repo)], check=True)
-    owner.apply_directory_change(0, {'enable_profile': 'mono-lead', 'project': {'id': 'mono', 'name': 'Synthetic mono', 'repo_path': str(repo)}, 'profile': {'id': 'mono-lead', 'native_profile': 'mono-lead', 'identity_ref': 'fixture:lead', 'role': 'project_lead', 'capability': 'development', 'project_id': 'mono', 'connection_refs': {'codex': 'local:fixture-stdio'}}})
+    owner.apply_directory_change(0, {'enable_profile': 'mono-lead', 'project': {'id': 'mono', 'name': 'Synthetic mono', 'repo_path': str(repo)}, 'profile': {'id': 'mono-lead', 'native_profile': 'mono-lead', 'identity_ref': 'fixture:lead', 'role': 'project_lead', 'capability': 'development', 'project_id': 'mono', 'connection_refs': {'dsh': 'local:fixture-stdio'}}})
     owner.apply_directory_change(1, {'enable_profile': 'steward', 'profile': {'id': 'steward', 'native_profile': 'steward', 'identity_ref': STEWARD.subject, 'role': 'steward', 'capability': 'non_development', 'project_id': None}})
     child_repo = scratch / 'child-repo'; child_repo.mkdir(); subprocess.run(['git', 'init', '-q', str(child_repo)], check=True)
-    owner.apply_directory_change(2, {'enable_profile': 'child', 'project': {'id': 'child-project', 'name': 'Explicit SDK child', 'repo_path': str(child_repo)}, 'profile': {'id': 'child', 'native_profile': 'child', 'identity_ref': 'fixture:child', 'role': 'subproject_lead', 'capability': 'development', 'project_id': 'child-project', 'parent_profile_id': 'mono-lead', 'connection_refs': {'codex': 'local:fixture-stdio'}}})
+    owner.apply_directory_change(2, {'enable_profile': 'child', 'project': {'id': 'child-project', 'name': 'Explicit SDK child', 'repo_path': str(child_repo)}, 'profile': {'id': 'child', 'native_profile': 'child', 'identity_ref': 'fixture:child', 'role': 'subproject_lead', 'capability': 'development', 'project_id': 'child-project', 'parent_profile_id': 'mono-lead', 'connection_refs': {'dsh': 'local:fixture-stdio'}}})
     owner.collaborate('register_channels', {'channels': channels})
     incoming = raw(channels[0], '项目 mono https://github.com/example-user/fixture/issues/15', 'om_sdk_owner_goal')
     runners[0].authorized = False

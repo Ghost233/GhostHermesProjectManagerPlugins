@@ -102,7 +102,7 @@ def test_dashboard_reads_authoritative_acceptance_delivery_and_unexecuted_reason
                 assert task['acceptance'] == 'accepted'
                 assert task['delivery'] == 'failed'
                 assert task['execution'] == 'waiting'
-                assert task['unexecuted_reason'] == 'Codex execution is not enabled.'
+                assert task['unexecuted_reason'] == 'DSH execution is not enabled.'
             offline = browser.get('/snapshot').json()
             assert offline['status'] == 'unverified'
             assert offline['requests'][0] == task

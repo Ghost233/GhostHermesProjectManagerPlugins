@@ -7,7 +7,7 @@ import yaml
 
 scratch = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(scratch / 'readiness-fixtures'))
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / '.hermes', Path.home() / '.dsh', Path.home() / '.codex']
 
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
@@ -39,7 +39,7 @@ from tools.registry import registry
 
 participant = VerifiedIdentity('fixture:lead', 'fixture-native-participant')
 provider = local_provider(scratch)
-with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(scratch),
+with Manager(state, owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(scratch),
              knowledge_providers={'local:fixture-wiki': provider}) as authority:
     request_id = accepted(authority, make_repo(scratch / 'repo'))
     authority.start_task(OWNER, request_id)
@@ -64,7 +64,7 @@ with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(
             'query_knowledge': lambda self, *args, **kwargs: authority.query_knowledge(participant, *args, **kwargs)})(), scratch, request_id, query_id='sdk-facts')
         supplied = json.loads(registry.dispatch('hermes_pm_knowledge', {'action': 'supplement', 'query_id': query_id}, scope=str(home)))
         assert supplied['status'] == 'accepted', supplied
-        assert len([r for r in wire(scratch) if r['method'] == 'turn/steer']) == 1
+        assert len([r for r in wire(scratch) if r['method'] == 'fixture/append']) == 1
         assert plugin_manager.unload('ghost-hermes-pm')
         assert registry.get_entry('hermes_pm_knowledge', scope=str(home)) is None
 print('native load, Dashboard bridge, restart, teardown: OK')

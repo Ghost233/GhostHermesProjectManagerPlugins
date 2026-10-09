@@ -45,7 +45,7 @@ def main():
     before = fingerprint(root)
     record = {'source_before': before, 'commands': [], 'preparation': [], 'command_exit_code': None,
               'validation_exit_code': 3, 'reason': None, 'mode': 'command' if args.command else 'full', 'started_at_ns': time.time_ns(),
-              'environment': {key: environment.get(key) for key in ('HERMES_TEST_SDK_ROOT', 'HERMES_REQUIRE_SDK_SMOKE', 'HERMES_TEST_SESSION_PYTHON')}}
+              'environment': {key: environment.get(key) for key in ('HERMES_TEST_SDK_ROOT', 'HERMES_REQUIRE_SDK_SMOKE', 'HERMES_TEST_SESSION_PYTHON', 'DSH_TEST_SDK_ROOT', 'DSH_REQUIRE_SDK_SMOKE')}}
     def interrupted(*_):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
@@ -62,6 +62,10 @@ def main():
             sdk = environment.get('HERMES_TEST_SDK_ROOT')
             if not sdk or not Path(sdk).is_dir():
                 raise ValueError('Prepare the fixed Hermes SDK and set HERMES_TEST_SDK_ROOT before full validation.')
+            dsh_sdk = environment.get('DSH_TEST_SDK_ROOT')
+            if not dsh_sdk or not Path(dsh_sdk).is_dir():
+                raise ValueError('Prepare the original DSH SDK before full validation.')
+            environment['DSH_REQUIRE_SDK_SMOKE'] = '1'
             session_python = environment.get('HERMES_TEST_SESSION_PYTHON')
             if session_python:
                 session = execute([session_python, '-c', 'import json,sys; print(json.dumps(list(sys.version_info[:3])))'], root, environment, artifacts, 'sdk-runtime')
@@ -82,7 +86,8 @@ def main():
             diff = ['git', 'diff', '--check'] + ([args.diff_base, 'HEAD'] if args.diff_base else [])
             commands = [[args.python, '-m', 'ruff', 'check', '--no-cache', '--select', 'F821', 'ghost_hermes_pm', 'tests', 'tools', '__init__.py'],
                         [args.python, '-m', 'pytest', '-q', '--basetemp=' + base],
-                        [args.node, '--check', 'dashboard/dist/index.js'], diff]
+                        [args.node, '--check', 'dashboard/dist/index.js'],
+                        [args.node, '--check', 'ghost_hermes_pm/owned_native_host.mjs'], diff]
         record['validation_exit_code'] = 0
         for number, command in enumerate(commands):
             result = execute(command, root, environment, artifacts, number)

@@ -154,38 +154,112 @@ def test_checkpoint_daily_rotation_and_restore_query_preserve_source_and_longter
         assert owner.restore_archive('baseline-28','restore-28') == restored
 
 
-def test_codex_archive_full_turn_item_pagination_is_original_read_only_and_compaction_gaps_explicit(tmp_path):
-    import sys
-    from pathlib import Path
-    from ghost_hermes_pm.archive_sources import CodexArchiveProvider
-    from ghost_hermes_pm.observation import ReadOnlyCodexAdapter, READ_METHODS
-    state={'thread':{'id':'old-thread','status':{'type':'idle'},'updatedAt':7,'historyMode':'paginated','turns':[]},
-        'turns':{'':{'data':[{'id':'turn-1','itemsView':'summary','startedAt':3}],'nextCursor':'turn-page-2'},
-            'turn-page-2':{'data':[{'id':'turn-2','itemsView':'full','startedAt':4}],'nextCursor':None}},
-        'items':{'turn-1':{'':{'data':[{'id':'i1','type':'userMessage','text':'Original requirement'}],'nextCursor':'item-page-2'},
-            'item-page-2':{'data':[{'id':'i2','type':'agentMessage','text':'Actual response'}],'nextCursor':None}},
-            'turn-2':{'':{'data':[{'id':'i3','type':'contextCompaction'}],'nextCursor':None}}}}
-    (tmp_path/'archive-peer.json').write_text(json.dumps(state))
-    adapter=ReadOnlyCodexAdapter([sys.executable,str(Path(__file__).with_name('archive_fixture_server.py')),str(tmp_path)],
-        cwd=tmp_path,env={'PATH':'/usr/bin:/bin','CODEX_HOME':str(tmp_path/'synthetic-home')},service_ref='local:original',source_kind='daemon',endpoint_ref='local:original',
-        verifier=lambda binding:{**binding,'original_executor_id':'fixture-original','supported_methods':list(READ_METHODS),'source_kinds':['cli'],
-            'evidence_ref':'fixture-current-peer-binding','provenance':'synthetic-original-proxy'})
-    try:
-        provider=CodexArchiveProvider(adapter,{'public':['old-thread']})
-        manager,viewer,_=setup_archive(tmp_path,provider)
-        registration=migration_registration();registration['id']='old-codex';registration['kind']='codex_history'
-        with manager,ManagementServer(manager,{'new':viewer}):
-            manager.register_archive_source(OWNER,registration)
-            result=ManagementClient(tmp_path/'state','new').query_archive('old-codex','codex-query','requirement',['public'],True)
-            assert result['status']=='incomplete'
-            assert result['coverage']['pages']==5
-            assert len(result['records'])==3
-            assert 'pre-compaction' in result['coverage']['missing'][0]
-        assert adapter._closed, 'Manager lifecycle must close the owned read-only archive proxy.'
-        wire=[json.loads(line)['method'] for line in (tmp_path/'archive-wire.jsonl').read_text().splitlines()]
-        assert set(wire)<={'initialize','initialized','thread/read','thread/turns/list','thread/items/list'}
-    finally:
-        adapter.close()
+def dsh_archive_manager(tmp_path, adapter):
+    from ghost_hermes_pm.archive_sources import DshArchiveProvider
+    provider = DshArchiveProvider(adapter, {'public': ['archive-session']})
+    manager, viewer, _ = setup_archive(tmp_path, provider)
+    registration = migration_registration()
+    registration.update(id='old-dsh', kind='dsh_history')
+    manager.register_archive_source(OWNER, registration)
+    return manager, viewer
+
+
+def test_dsh_archive_retains_full_native_compaction_journal_without_claiming_model_context(tmp_path):
+    from archive_fixture_server import JournalReadOnlySource
+    adapter = JournalReadOnlySource()
+    manager, viewer = dsh_archive_manager(tmp_path, adapter)
+    with manager, ManagementServer(manager, {'new': viewer}):
+        client = ManagementClient(tmp_path / 'state', 'new')
+        result = client.query_archive('old-dsh', 'journal-query', 'retry', ['public'], True)
+        assert result['status'] == 'complete'
+        assert result['coverage']['end_confirmed'] is True
+        assert result['coverage']['compressed_history'] == 'durable_journal_only_model_context_not_reconstructed'
+        assert result['coverage']['parent_threads'] == 'excluded_without_separate_source_grant'
+        assert result['coverage']['original_rows'] == 6
+        assert [row['payload']['type'] for row in result['records']] == [
+            'turn/start', 'user/message', 'compaction/start', 'compaction/summary', 'compaction/end', 'turn/end']
+        assert result['records'][1]['payload']['data']['content'][0]['text'] == 'Original retry requirement'
+        assert result['records'][3]['payload']['data']['summary'][0]['text'] == 'Earlier retry summary'
+        assert result['records'][1]['locator'] == 'dsh-archive:archive-session#1'
+        assert result['old_entry'] == 'not_started'
+        assert client.read_snapshot()['requests'] == []
+        assert client.query_archive('old-dsh', 'journal-query', 'retry', ['public'], True) == result
+        assert adapter.reads == [('archive-session', True), ('archive-session', True)]
+    assert adapter._closed, 'Manager unload must close only its owned source client.'
+
+
+def test_dsh_archive_rejects_missing_or_reordered_native_prefix_and_partial_coverage(tmp_path):
+    from copy import deepcopy
+    from archive_fixture_server import JournalReadOnlySource, archive_journal, archive_thread
+    journals = [
+        archive_thread(archive_journal()[1:]),
+        archive_thread(list(reversed(archive_journal()))),
+        archive_thread(history_mode='paginated'),
+        archive_thread(archive_journal(), cursor=6),
+    ]
+    malformed = deepcopy(archive_journal())
+    malformed[3]['data'] = 'not-a-native-payload'
+    journals.append(archive_thread(malformed))
+    for index, snapshot in enumerate(journals):
+        root = tmp_path / str(index)
+        root.mkdir()
+        adapter = JournalReadOnlySource(snapshot)
+        manager, viewer = dsh_archive_manager(root, adapter)
+        with manager:
+            result = manager.query_archive(viewer, 'old-dsh', 'invalid-journal', 'retry', ['public'], True)
+            assert result['status'] == 'blocked'
+            assert result['records'] == []
+            assert result['old_entry'] == 'not_started'
+            assert manager.read_snapshot(OWNER)['requests'] == []
+        assert adapter._closed
+
+
+def test_dsh_archive_changed_cursor_is_incomplete_and_does_not_reread_on_duplicate(tmp_path):
+    from archive_fixture_server import JournalReadOnlySource, archive_journal, archive_thread
+    changed = archive_journal() + [{'type': 'session/title', 'seq': 6, 'time': 7,
+                                   'data': {'title': 'Synthetic later title'}}]
+    adapter = JournalReadOnlySource(archive_thread(), archive_thread(changed, cursor=6))
+    manager, viewer = dsh_archive_manager(tmp_path, adapter)
+    with manager:
+        result = manager.query_archive(viewer, 'old-dsh', 'changed-journal', 'retry', ['public'], True)
+        assert result['status'] == 'incomplete'
+        assert result['coverage']['missing'] == ['archive-session:changed-during-pagination']
+        assert result['coverage']['end_confirmed'] is False
+        assert len(result['records']) == 6
+        assert manager.query_archive(viewer, 'old-dsh', 'changed-journal', 'retry', ['public'], True) == result
+        assert len(adapter.reads) == 2
+
+
+def test_dsh_archive_empty_complete_journal_and_missing_grant_remain_separate(tmp_path):
+    import pytest
+    from ghost_hermes_pm.manager import ManagementError
+    from archive_fixture_server import JournalReadOnlySource, archive_thread
+    adapter = JournalReadOnlySource(archive_thread([], cursor=-1))
+    manager, viewer = dsh_archive_manager(tmp_path, adapter)
+    with manager:
+        result = manager.query_archive(viewer, 'old-dsh', 'empty-journal', 'retry', ['public'], True)
+        assert result['status'] == 'complete'
+        assert result['coverage']['original_rows'] == 0
+        assert result['records'] == []
+        with pytest.raises(ManagementError):
+            manager.query_archive(viewer, 'old-dsh', 'ungranted', 'retry', ['private'], True)
+        assert len(adapter.reads) == 2
+
+
+def test_dsh_archive_missing_native_page_capability_does_not_claim_complete_coverage(tmp_path):
+    from archive_fixture_server import JournalReadOnlySource
+    class NoPageSource(JournalReadOnlySource):
+        def proof(self):
+            proof = super().proof()
+            proof['supported_methods'].remove('session/page')
+            return proof
+    adapter = NoPageSource()
+    manager, viewer = dsh_archive_manager(tmp_path, adapter)
+    with manager:
+        result = manager.query_archive(viewer, 'old-dsh', 'missing-page', 'retry', ['public'], True)
+        assert result['status'] == 'blocked'
+        assert result['records'] == []
+        assert adapter.reads == []
 
 
 def test_feishu_remote_source_real_sdk_builders_follow_pages_and_permission_loss_is_partial(tmp_path):

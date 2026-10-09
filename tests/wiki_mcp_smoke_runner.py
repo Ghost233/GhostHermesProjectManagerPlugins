@@ -7,7 +7,7 @@ import sys
 import yaml
 
 scratch = Path(sys.argv[1]).resolve()
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / '.hermes', Path.home() / '.dsh', Path.home() / '.codex']
 allowed_ports = set()
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):

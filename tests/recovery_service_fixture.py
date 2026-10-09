@@ -1,4 +1,4 @@
-"""Owned test service and separate JSONL proxy; never uses a real Codex home."""
+"""Owned test service and separate JSONL proxy; never uses a real DSH home."""
 import json
 import os
 from pathlib import Path
@@ -43,18 +43,18 @@ def run_service(root):
                         state['responses'].append(request)
                         save()
                         continue
-                    if method == 'initialized':
+                    if method == 'fixture/ready':
                         continue
-                    if method == 'initialize':
-                        result = {'userAgent': 'codex-cli/0.160.1', 'codexHome': str(root / 'isolated-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
-                    elif method == 'permissionProfile/list':
+                    if method == 'fixture/connect':
+                        result = {'userAgent': 'fixture-cli/fixture-v1', 'fixtureHome': str(root / 'isolated-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
+                    elif method == 'fixture/policy':
                         result = {'data': [{'id': 'fixture-boundary', 'allowed': True}], 'nextCursor': None}
-                    elif method == 'thread/loaded/list':
+                    elif method == 'fixture/loaded':
                         result = {'data': [state['thread']['id']] if state['thread'] else [], 'nextCursor': None}
-                    elif method == 'thread/start':
-                        state['thread'] = {'id': 'owned-original-thread', 'cwd': params['cwd'], 'cliVersion': '0.160.1', 'canAcceptDirectInput': True, 'status': {'type': 'idle'}, 'turns': []}
+                    elif method == 'fixture/create':
+                        state['thread'] = {'id': 'owned-original-thread', 'cwd': params['cwd'], 'cliVersion': 'fixture-v1', 'canAcceptDirectInput': True, 'status': {'type': 'idle'}, 'turns': []}
                         result = {'thread': state['thread'], 'cwd': params['cwd'], 'activePermissionProfile': {'id': 'fixture-boundary'}, 'runtimeWorkspaceRoots': [params['cwd']]}
-                    elif method == 'turn/start':
+                    elif method == 'fixture/start':
                         nonlocal worker
                         if worker is not None:
                             raise RuntimeError('Duplicate execution reached the owned original service.')
@@ -65,15 +65,15 @@ def run_service(root):
                         worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'], env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         state['worker_pid'] = worker.pid
                         result = {'turn': turn}
-                    elif method == 'turn/steer':
+                    elif method == 'fixture/append':
                         state['inputs'].append(params)
                         result = {'turnId': params['expectedTurnId']}
-                    elif method == 'turn/interrupt':
+                    elif method == 'fixture/stop':
                         stop_worker()
                         result = {}
-                    elif method == 'thread/backgroundTerminals/list':
+                    elif method == 'fixture/background':
                         result = {'data': [], 'nextCursor': None}
-                    elif method == 'thread/read':
+                    elif method == 'fixture/read':
                         result = {'thread': state['thread']}
                     else:
                         raise RuntimeError('Unexpected operation: ' + str(method))

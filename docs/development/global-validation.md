@@ -1,5 +1,7 @@
 # mono 稳定组合全局验证（[验证 mono 交付组合并按 Issue 返工](../../../../issues/27)）
 
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
 `Manager.global_validation(identity, action, details)`、令牌 bridge 的 `ManagementClient.global_validation(action, details)`、Dashboard `POST /global-validation` 与 `hermes_pm_global_validation` 共用一个权威管理实例。身份来自原入口；请求不接受 actor、权限或测试通过声明。原生 participant 工具只允许本人的既定 mono 职责，不能借 Owner credential 或运行 child 物化。
 
 ## 固定本轮交付

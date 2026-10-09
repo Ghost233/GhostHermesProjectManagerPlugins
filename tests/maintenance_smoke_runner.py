@@ -16,7 +16,7 @@ sys.path.insert(0, str(scratch / 'readiness-fixtures'))
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
         path = Path(os.fsdecode(args[0])).resolve()
-        if any(path.is_relative_to(Path.home() / p) for p in ('.hermes', '.codex')) or path.name == '.env' and not path.is_relative_to(scratch):
+        if any(path.is_relative_to(Path.home() / p) for p in ('.hermes', '.dsh', '.codex')) or path.name == '.env' and not path.is_relative_to(scratch):
             raise RuntimeError('Maintenance smoke refused production homes and credentials.')
     if event == 'socket.connect' and isinstance(args[1], tuple):
         raise RuntimeError('Maintenance smoke refused external network.')

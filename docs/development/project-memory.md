@@ -1,5 +1,7 @@
 # 已知事实答复与所属项目记忆（[用已知资料答复并回写项目记忆](../../../../issues/26)）
 
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
 公开管理入口为 `manage_memory(identity, action, details)`；Dashboard `/memory`、原生 `hermes_pm_memory` 工具和 `ManagementClient.manage_memory` 共用相同身份、来源范围与控制规则。`details` 只接受所选操作的准确字段，不能指定 actor、role、Owner origin、任意资料路径或借用权限。原生工具使用独立 participant 凭据，拒绝 Owner token alias。
 
 ## 已知事实答复
@@ -34,7 +36,7 @@
 
 `preference` 只有直接核验的 Owner 入口可调用，必须给出 `profile_id/entry_id/statement/scope`。scope 明确为所属项目、原任务或总管全局；缺失范围不会被推断。一次任务选择不能加载到后续任务，旧的已确认任务决定仍是历史事实，不能被提升为永久偏好。纠正继续保留替代关系。
 
-`load` 给出已受理新 `request_id` 与必要 `entry_ids`，仅准备该任务自己的精选上下文。任务已有 session 时拒绝假称加载。`start_task` 在实际创建原任务前重新核对材料、来源范围和版本，在真实 `turn/start` 输入中引用这些资料；只有确认原服务 receipt 才记录 `loaded`、实际 thread/turn/generation、加载时间与整段输入 digest。未知启动结果保持待核实。
+`load` 给出已受理新 `request_id` 与必要 `entry_ids`，仅准备该任务自己的精选上下文。任务已有 session 时拒绝假称加载。`start_task` 在实际创建原任务前重新核对材料、来源范围和版本，在原 DSH Session 的实际 prompt 输入中引用这些资料；只有确认原服务受理及输入对应才记录 `loaded`、实际 Session/turn/generation、加载时间与整段输入 digest。未知启动结果保持待核实。
 
 `supplement`（操作名 `supplement`）用于本人／负责人明确影响当前任务：给出 `request_id/entry_ids/expected_turn_id`，核对实际唯一活动回合、原执行器、责任与当前 grant，再沿 `control_task append` 送入。写入记忆本身不发输入，不改变运行会话已加载状态。重复或未知补入保留原 ID，不开新回合；归还后或空闲时不补入。
 

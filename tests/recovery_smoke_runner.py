@@ -8,7 +8,7 @@ import yaml
 
 scratch = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(scratch / 'readiness-fixtures'))
-protected = [Path.home() / '.hermes', Path.home() / '.codex']
+protected = [Path.home() / '.hermes', Path.home() / '.dsh', Path.home() / '.codex']
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
         path = Path(os.fsdecode(args[0])).resolve()
@@ -42,7 +42,7 @@ service = subprocess.Popen([sys.executable, str(scratch / 'control-fixtures' / '
 participant = VerifiedIdentity('fixture:lead', 'fixture-native-participant')
 try:
     service_id = json.loads(service.stdout.readline())['service_id']
-    with Manager(state, owner_identity_ref=OWNER.subject, codex_adapter=fixture_adapter(peer, service_id)) as authority:
+    with Manager(state, owner_identity_ref=OWNER.subject, dsh_adapter=fixture_adapter(peer, service_id)) as authority:
         request_id = accepted(authority, make_repo(scratch / 'repo'))
         authority.start_task(OWNER, request_id)
     plugin_manager = get_plugin_manager()

@@ -53,7 +53,7 @@ from run_agent import AIAgent
 db = SessionDB(db_path=home / 'state.db')
 agent = AIAgent(model='synthetic-model', provider='custom', api_mode='chat_completions',
     base_url=f'http://127.0.0.1:{server.server_address[1]}/v1', api_key='synthetic-test-key',
-    enabled_toolsets=['memory'], session_id=sys.argv[1], session_db=db, platform='cli',
+    enabled_toolsets=['memory'], session_id=sys.argv[1], session_db=db, platform='desktop',
     skip_context_files=True, load_soul_identity=True, skip_background_review=True,
     quiet_mode=True, max_iterations=1, cwd=str(home))
 try:

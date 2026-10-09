@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 
 from .manager import ManagementError, _repository
-from .codex import repository_fingerprint
+from .dsh import repository_fingerprint
 
 
 def _responsible(manager, identity, request_id, data):
@@ -17,6 +17,8 @@ def _responsible(manager, identity, request_id, data):
 
 
 def _current_assignment(manager, record, data):
+    if record.get('executor_engine') != 'dsh':
+        raise ManagementError('binding_conflict', 'The accepted work belongs to another executor and requires explicit migration.')
     profile = data['profiles'].get(record['profile_id'])
     accepted = record.get('accepted_responsibility')
     if not profile or not isinstance(accepted, dict) or any(profile.get(k) != v for k, v in accepted.items()) or profile.get('project_id') != record['project_id'] or profile.get('capability') != 'development' or profile.get('role') not in {'project_lead', 'subproject_lead'}:
@@ -25,11 +27,11 @@ def _current_assignment(manager, record, data):
         from .takeover import _assignment
         _assignment(record, data)
         return
-    service_ref = profile.get('connection_refs', {}).get('codex')
+    service_ref = profile.get('connection_refs', {}).get('dsh')
     from .takeover import executor_for
     adapter = executor_for(manager, record)
-    if adapter is None or service_ref != adapter.service_ref or (record.get('accepted_codex_ref') is not None and record['accepted_codex_ref'] != service_ref):
-        raise ManagementError('capability_unverified', 'The actual executor does not match the responsible Profile local Codex binding.')
+    if adapter is None or service_ref != adapter.service_ref or (record.get('accepted_dsh_ref') is not None and record['accepted_dsh_ref'] != service_ref):
+        raise ManagementError('capability_unverified', 'The actual executor does not match the responsible Profile local DSH binding.')
     if record.get('accepted_repository_fingerprint') != repository_fingerprint(data['projects'][record['project_id']]['repo']):
         raise ManagementError('capability_unverified', 'The repository boundary differs from the accepted task scope.')
     repository = data['projects'][record['project_id']]['repo']
@@ -44,9 +46,10 @@ def start_task(manager, identity, request_id):
         require_active(data, record['profile_id'], record['project_id'])
         if record.get('archive_stop_intent'):
             raise ManagementError('lifecycle_blocked', 'This unstarted work was archived; accept a new explicit request.')
-        adapter = manager.codex_adapter
+        from .takeover import executor_for
+        adapter = executor_for(manager, record)
         if adapter is None:
-            raise ManagementError('capability_unverified', 'Codex execution is not enabled.')
+            raise ManagementError('capability_unverified', 'DSH execution is not enabled.')
         _current_assignment(manager, record, data)
         if record.get('session'):
             raise ManagementError('binding_conflict', 'This task already has a session or an unresolved start intent; reconcile it first.')
@@ -62,6 +65,14 @@ def start_task(manager, identity, request_id):
         if repository_fingerprint(actual) != repository_fingerprint(repository):
             raise ManagementError('capability_unverified', 'The registered repository layout changed; execution evidence is invalid.')
         baseline = require_preparation(manager, identity, record, version, data)
+        if getattr(adapter, 'transport', None) == 'owned_native':
+            previous = [item for item in data['requests'].values() if item['id'] != request_id
+                        and item.get('session', {}).get('service_ref') == adapter.service_ref]
+            prepare = getattr(adapter, 'prepare_new_work', None)
+            if previous and callable(prepare):
+                if any(not item.get('repository_released') for item in previous):
+                    raise ManagementError('repository_busy', 'Earlier work still owns this SDK instance.')
+                prepare(previous_scope_released=True)
         from .memory import start_context
         memory_text = start_context(manager, identity, record, data)
         version, data = manager._load()
@@ -136,13 +147,15 @@ def start_task(manager, identity, request_id):
                           execution_capability={'status': 'verified', 'enabled': True, 'connection': adapter.connection, 'proof': proof})
             with manager._db:
                 manager._save(version + 3, data)
+            from .takeover import bind_executor
+            bind_executor(manager, record)
         except ManagementError as exc:
             record.update(execution='unverified', unexecuted_reason=str(exc))
             with manager._db:
                 current, _ = manager._load()
                 manager._save(current, data)
             raise
-        manager.publish_request_message(identity, request_id, 'progress', 'Codex 已核实运行。Issue：' + record['accepted_scope']['url'] +
+        manager.publish_request_message(identity, request_id, 'progress', 'DSH 已核实运行。Issue：' + record['accepted_scope']['url'] +
                                         '\n原会话：' + thread['id'] + '\n交付：尚未满足验收；PR：无。')
         return {'status': 'running', 'request_id': request_id, 'session': record['session']}
 
@@ -222,7 +235,7 @@ def refresh_task(manager, identity, request_id, *, sampling=False):
                                      'cwd': item.get('cwd'), 'status': item['status'], 'exit_code': item.get('exitCode'),
                                      'executed_tests': executed_tests(command, item.get('aggregatedOutput') or ''),
                                      'output_digest': hashlib.sha256((item.get('aggregatedOutput') or '').encode()).hexdigest(),
-                                     'source': 'codex_command_execution', 'service_id': session['service_id'],
+                                     'source': 'dsh_command_execution', 'service_id': session['service_id'],
                                      'generation': session['generation'], 'observed_at': record['last_execution_verified_at']})
                 from .notifications import observe
                 observe(manager, record, thread, turn, items, events)
@@ -258,9 +271,10 @@ def verify_task_execution(manager, identity, request_id):
         version, data = manager._load()
         record = _responsible(manager, identity, request_id, data)
         repository = data['projects'][record['project_id']]['repo']
-        adapter = manager.codex_adapter
+        from .takeover import executor_for
+        adapter = executor_for(manager, record)
         if adapter is None:
-            result = {'status': 'blocked', 'enabled': False, 'reason': 'No registered local stdio executor.'}
+            result = {'status': 'blocked', 'enabled': False, 'reason': 'No DSH execution instance matches this task binding.'}
         else:
             try:
                 _current_assignment(manager, record, data)

@@ -1,6 +1,8 @@
 # 只读迁移档案、原生保留与恢复
 
-来源工单：[只读查询旧档案并验证永久保护](../../../../issues/28)，父规格 `docs/specs/hermes-plugin-v1.md` 的旧档案与永久保护约束。首个可审查增量从公共 token API 查询合成 SQLite 原始/压缩历史，查询前后数据库字节一致；后续测试使用固定 pristine SDK 和隔离合成 HOME。实际用户旧资料、群、原 Codex 服务、记忆服务均未迁移或查询，执行阶段 gate 保持原状态。
+2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+
+来源工单：[只读查询旧档案并验证永久保护](../../../../issues/28)，父规格 `docs/specs/hermes-plugin-v1.md` 的旧档案与永久保护约束。首个可审查增量从公共 token API 查询合成 SQLite 原始/压缩历史，查询前后数据库字节一致；后续测试使用固定 pristine SDK 和隔离合成 HOME。实际用户旧资料、群、原 DSH 服务、记忆服务均未迁移或查询，执行阶段 gate 保持原状态。
 
 ## 来源与身份
 
@@ -19,13 +21,13 @@
 
 - **Hermes 本地**：显式普通文件 SQLite，`mode=ro`、`query_only=ON`、单一读事务。沿压缩祖先/唯一 continuation，排除 native `_is_explicit_fork_child_row(include_reset=True)` 所定义 branch/delegate/reset/tool。逐段 keyset 分页包含 inactive、compacted、summary、工具/模型原字段；保留原生 BLOB display identity 的 hex 编码。不存在的段、分叉歧义、循环、无法读的原字段均不能宣称完整。检索补读相邻上下文；完整请求返回实际原始行及必要 summary，而非只返回摘要。另可登记明确 ID 与批准绝对路径的 UTF-8 封存文件，读前后核对普通文件绑定与 stat；不扫描未登记目录。
 - **飞书远端**：`FeishuArchiveProvider` 接受可信宿主的实际 client、确切 app/tenant/bot 绑定及 chat scope。每次要求当前来源身份证据；真实 `ListMessageRequest` GET 顺序分页，核对 chat/message identity、`has_more`、token 唯一性。无权、已删除内容、重复游标或分页无法结束明确 incomplete。真实端点尚未验收；没有原服务证据时保持 capability_unverified。公开 API 不可注入证明。
-- **Codex 历史**：复用 [只观察手动会话并保护仓库占用](../../../../issues/19) `ReadOnlyCodexAdapter` 原执行器身份/connection generation。只允许 read RPC，完整读取 turn 与 item 的全部 cursor 分页、核对读前后线程版本。不给同 HOME 的新 app-server 当原执行器，不遍历未经单独授权的 fork/subagent 祖先。`contextCompaction` 的压缩前上下文若仅通过 API 无法证明，返回明确缺口；pagination 尾部出现不代表压缩前原文已恢复。
+- **DSH 历史**：沿已登记实际实例的只读 Session 历史／事件接入，完整读取授权 Session 范围的 page／follow，核对 generation、durable 游标连续性、读前后版本及压缩前材料覆盖。专用实例不提供 Desktop 历史覆盖；Desktop 须有获准独立原生连接，否则不可查询并说明覆盖未知，不克隆或读取相同历史冒充原实例。只读不调用 create／resume／prompt／answer；未经授权的 fork／子 agent 祖先不随父会话开放。无法证明完整原文时返回 incomplete，不以摘要或尾页冒充恢复。旧执行器原始历史只按既有授权保留为受保护静态资料，不继续接入其在线服务。
 
-正式 native 的 `archive_providers` 支持明确 `kind`：`hermes_local` 保留现有 `path/session_scopes/files`；`feishu_remote` 接受 `binding={app_id,tenant_key,bot_open_id}`、`chat_scopes` 和原生 `credential_ref`，秘密只在 RAM 中构造原 app 的 SDK client，每次原 bot-info 与 tenant/query 均须核对实际来源；`codex_history` 接受 `thread_scopes` 及完整 `adapter` 配置，复用原始只读 observation proxy 的 `executable/cwd/environment/service_ref/source_kind/endpoint/endpoint_ref` 和当前 `codex-observation.json` hashed receipt。原服务不支持完整 turn/item 读取、来源权限或宿主证明缺失时仍 unverified/incomplete。SourceGrant 和固定 provider binding 继续约束公开查询，不自动授予全历史或恢复执行。测试协议替身不等于真实旧服务验收。
+正式 native 的 `archive_providers` 分别登记 `hermes_local`、`feishu_remote` 和 DSH 当前历史来源。Hermes 和飞书的原授权、分页、身份、凭据及完整性规则保持；DSH 来源绑定明确 Session scopes、原 `DshRemoteAdapter` 只读能力、服务／实例、认证引用及当前代证据。不接受旧执行器 provider 作为在线来源，不自动迁移旧 receipt 或恢复执行。具体来源字段须与当前实现及真实接口验证一致；SourceGrant、固定 provider binding 和公开共享范围继续核对。测试替身不是实际旧资料或原服务验收。
 
 ## 永久保护的证据边界
 
-查询不写 pin、不重新开启旧 Profile、bot 或 Codex。`protect_archive(source_id, protection_id)` 是单独 Owner 操作，先持久 pin intent，先只读核对明确 scope 覆盖全部 original session、原 schema version/表/列/主键与实际 SDK 的内存参考 schema 相容。范围不全或旧/未知 schema 在 writable SessionDB 初始化前拒绝，不能用保护操作隐式迁移。通过后再调用实际 `SessionDB.set_session_pinned()` 覆盖全部压缩段，创建一致性独立副本并调用实际 `maybe_auto_prune_and_vacuum(retention_days=0, min_interval_hours=0, vacuum=False)`。副本增加已结束且 archived 的 unpinned 控制 session，必须真实被删除，受保护原文/summary/compacted 行版本必须保留。receipt 状态为 `verified_native_cleanup_copy`；snapshot 另核对当前 pin 状态，外部 unpin 或来源改变不能沿用过去证明，`permanent_protection` 与普通工具读/写/删边界始终明确 unverified。receipt 明确记录 SDK 源码哈希、session 范围、原生清理结果与独立副本证明范围；缺 SDK、缺历史或能力失败保持 unverified，不能以 archive 标志替代证明。失败 pin 可能部分完成，应按已持久 operation 核对，不能换 ID 盲重试。
+查询不写 pin、不重新开启旧 Profile、bot 或 DSH。`protect_archive(source_id, protection_id)` 是单独 Owner 操作，先持久 pin intent，先只读核对明确 scope 覆盖全部 original session、原 schema version/表/列/主键与实际 SDK 的内存参考 schema 相容。范围不全或旧/未知 schema 在 writable SessionDB 初始化前拒绝，不能用保护操作隐式迁移。通过后再调用实际 `SessionDB.set_session_pinned()` 覆盖全部压缩段，创建一致性独立副本并调用实际 `maybe_auto_prune_and_vacuum(retention_days=0, min_interval_hours=0, vacuum=False)`。副本增加已结束且 archived 的 unpinned 控制 session，必须真实被删除，受保护原文/summary/compacted 行版本必须保留。receipt 状态为 `verified_native_cleanup_copy`；snapshot 另核对当前 pin 状态，外部 unpin 或来源改变不能沿用过去证明，`permanent_protection` 与普通工具读/写/删边界始终明确 unverified。receipt 明确记录 SDK 源码哈希、session 范围、原生清理结果与独立副本证明范围；缺 SDK、缺历史或能力失败保持 unverified，不能以 archive 标志替代证明。失败 pin 可能部分完成，应按已持久 operation 核对，不能换 ID 盲重试。
 
 固定 SDK 指针：`hermes_state_sessions.py:SessionSessionsMixin.set_session_pinned`（pin 还会取消普通 hidden，可见性改变是此明确 Owner 操作的一部分）；`hermes_state_maintenance.py:SessionMaintenanceMixin.maybe_auto_prune_and_vacuum` / `_prune_filter_where`；`hermes_state_messages.py:_is_explicit_fork_child_row`。原生验收在合成原数据库实际执行 auto cleanup，pinned 压缩链及原磁盘 transcripts 保留，archived-unpinned session 和 transcript 真实删除。此实证覆盖固定 SDK / 合成授权来源，未宣称用户原库或全部外部写/清理路径已验收。没有普通工具 unpin、缩短保留或原资料删除接口；本人如需删除，必须另行明确原范围与副本影响，现有日副本轮换只删除插件自有副本。
 
@@ -35,7 +37,7 @@ Owner `backup_archive(source_id, backup_id, kind)` 只允许 `baseline` 或 `che
 
 可信 Gateway 生命周期每天按 UTC 日历检查变化，启动补作当日最新实际数据；停机期间未运行的日期不伪造。无变化不新增。每天的最新变化副本按固定版本 ID 登记，同日重启后新版替代旧日副本，最近 7 个日期轮换。原资料、baseline 和长期 checkpoint 均保留。超过统一 bridge 的正常操作预算后回应 outcome_unknown，应从相同持久 query/protection/backup/restore ID 核对，不盲目换 ID 重试。版本变化失败及 blocked 状态可核对，不宣称未运行的每日任务已通过。
 
-Owner `restore_archive(backup_id, restore_id)` 验证 retained hash、授权/范围和 SQLite integrity，将数据恢复到新的插件自有 artifact，实际打开恢复产物并完整再查询、核对原版本与材料。原资料和当前目录/Profile 状态不被覆盖；返回 `profile_state=not_restored`、`old_entry=not_started`。metadata 记录来源、SourceGrant revision、manifest、coverage，恢复不使旧配置成为新授权。飞书原库、原 Codex 原服务及记忆服务的原地恢复能力单列 unverified；本票 local artifact restore 不冒充外部服务恢复或正式迁移。
+Owner `restore_archive(backup_id, restore_id)` 验证 retained hash、授权/范围和 SQLite integrity，将数据恢复到新的插件自有 artifact，实际打开恢复产物并完整再查询、核对原版本与材料。原资料和当前目录/Profile 状态不被覆盖；返回 `profile_state=not_restored`、`old_entry=not_started`。metadata 记录来源、SourceGrant revision、manifest、coverage，恢复不使旧配置成为新授权。飞书原库、原 DSH 原服务及记忆服务的原地恢复能力单列 unverified；本票 local artifact restore 不冒充外部服务恢复或正式迁移。
 
 ## 可重复验证
 

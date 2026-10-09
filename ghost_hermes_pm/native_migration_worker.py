@@ -184,7 +184,7 @@ def _prepare(root, work, operation, approval):
     result = {'status': state, 'native_state': 'parked_created', 'selection_ledger': ledger, 'needs_human': needs,
         'material_receipt': {'profile': target['native_profile'], 'identity_ref': target['identity_ref'], 'plan_digest': operation['digest'],
                              'execution_config': config, 'credentials': 'fresh_not_copied', 'external_bank': 'not_copied',
-                             'legacy_codex_development_config': 'not_copied',
+                             'legacy_development_config': 'not_copied',
                              'new_execution_review': 'Rebuild the new local executor; configure the expected GitHub account privately and verify it for every business operation; keep container/Docker disabled under the current plan.',
                              'session': 'not_yet_verified'}}
     files = {str(p.relative_to(staged)): _hash(p.read_bytes()) for p in (staged / 'config.yaml', staged / 'SOUL.md')}

@@ -66,7 +66,7 @@ unrelated_pid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep
 manual_pid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'], env={'PATH': '/usr/bin:/bin'}) if global_entry else None
 manual_id = 'observed-chat:' + old_name
 old_db = SessionDB(db_path=old_home / 'state.db')
-old_db.create_session('old-original-session', 'cli', profile_name=old_name)
+old_db.create_session('old-original-session', 'desktop', profile_name=old_name)
 old_db.append_message('old-original-session', 'user', 'Original history stays queryable under a new explicit grant.')
 old_db.append_message('old-original-session', 'assistant', 'Retain the complete original history; do not clone the Wiki connection.')
 old_db.close()
@@ -173,14 +173,14 @@ if entity == 'developer':
     original_adapter = fixture_adapter(original_peer, original_service_id)
 try:
     with Manager(state, owner_identity_ref=OWNER.subject, migration_host=migration_host, lifecycle_host=lifecycle_host,
-                 archive_providers={'local:original-history': archive_provider}, codex_adapter=original_adapter) as manager:
+                 archive_providers={'local:original-history': archive_provider}, dsh_adapter=original_adapter) as manager:
         old = registration(make_repo(scratch / 'repo'), profile_id=old_name)
         if global_entry:
             old['profile'].update(role=role, capability='non_development', project_id=None, parent_profile_id=None)
-        old['profile']['connection_refs'] = {'bot': 'identity:cli_old:ou_old', 'credential': 'native:old-credential', **({'codex': 'local:fixture-stdio'} if entity == 'developer' else {})}
+        old['profile']['connection_refs'] = {'bot': 'identity:cli_old:ou_old', 'credential': 'native:old-credential', **({'dsh': 'local:fixture-stdio'} if entity == 'developer' else {})}
         manager.apply_directory_change(OWNER, 0, old)
         target = {**old['profile'], 'id': new_name, 'native_profile': new_name, 'identity_ref': viewer.subject,
-                  'connection_refs': {'bot': 'identity:cli_new:ou_new', 'credential': 'native:new-credential', 'codex': 'local:new-executor'}}
+                  'connection_refs': {'bot': 'identity:cli_new:ou_new', 'credential': 'native:new-credential', 'dsh': 'local:new-executor'}}
         manager.apply_directory_change(OWNER, 1, {'profile': target})
         wiki = {'id': 'wiki', 'native_profile': 'wiki', 'identity_ref': 'fixture:wiki', 'role': 'independent',
                 'capability': 'non_development', 'project_id': None, 'parent_profile_id': None,
@@ -207,7 +207,7 @@ try:
                 started = owner.start_task(request['id'])
                 original_worker_pid = json.loads((original_peer / 'execution.json').read_text())['worker_pid']
                 os.kill(original_worker_pid, 0)
-                (original_peer / 'drop.json').write_text(json.dumps(['turn/interrupt']))
+                (original_peer / 'drop.json').write_text(json.dumps(['fixture/stop']))
             preview = owner.migrate_profile('preview', {'source_profile_id': old_name})
             selected = [{**next(e for e in preview['materials'] if e['kind'] == kind), 'text': text}
                 for kind, text in [('knowledge', 'Only selected material.'), ('persona', 'A careful new persona.')]]
@@ -220,7 +220,7 @@ try:
             key = {'plan_id': plan['id'], 'digest': plan['digest']}
             prepared = owner.migrate_profile('prepare', key)
             assert prepared['status'] == 'prepared'
-            assert prepared['material_receipt']['legacy_codex_development_config'] == 'not_copied'
+            assert prepared['material_receipt']['legacy_development_config'] == 'not_copied'
             assert not (home / 'profiles' / new_name / 'codex-development.json').exists()
             assert new_name not in peer.served_profile_names()
             shutil.copytree(home / 'plugins' / 'ghost-hermes-pm', home / 'profiles' / new_name / 'plugins' / 'ghost-hermes-pm')
@@ -292,8 +292,8 @@ try:
                 execution = json.loads((original_peer / 'execution.json').read_text())
                 assert execution['starts'] == 1 and execution['inputs'] == [] and execution['responses'] == []
                 methods = [json.loads(line).get('method') for line in (original_peer / 'wire.jsonl').read_text().splitlines()]
-                assert methods.count('turn/interrupt') == methods.count('turn/start') == 1
-                assert not {'thread/resume', 'thread/fork', 'turn/steer'} & set(methods)
+                assert methods.count('fixture/stop') == methods.count('fixture/start') == 1
+                assert not {'thread/resume', 'thread/fork', 'fixture/append'} & set(methods)
                 try:
                     os.kill(original_worker_pid, 0)
                     raise AssertionError('Original execution remained alive')

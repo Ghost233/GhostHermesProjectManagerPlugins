@@ -47,7 +47,7 @@ def prepared_facts(manager, owner, requester, request_id, query_id='known-policy
 
 def test_responsible_lead_answers_actual_fact_request_with_sources_once(tmp_path):
     provider = local_provider(tmp_path)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': provider}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -64,7 +64,7 @@ def test_responsible_lead_answers_actual_fact_request_with_sources_once(tmp_path
             assert lead.answer_from_knowledge(request_id, question['id'], query_id, ['retry:3'])['duplicate'] is True
         sent = replies(tmp_path)
         assert len(sent) == 1
-        answer = sent[0]['result']['answers']['policy']['answers'][0]
+        answer = next(value for value in sent[0]['result']['answers'] if value['id'] == 'policy')['custom']
         assert 'Retry only definite failures.' in answer and 'retry.md#L3' in answer and 'sha256:' in answer
 
 
@@ -85,7 +85,7 @@ def test_accepted_facts_are_curated_with_fixed_result_indexes_and_loaded_only_in
     from test_repository_queue import acknowledge
     provider = local_provider(tmp_path)
     source_before = (tmp_path / 'source' / 'retry.md').read_bytes()
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': provider}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -117,7 +117,7 @@ def test_accepted_facts_are_curated_with_fixed_result_indexes_and_loaded_only_in
             old_session = next(r for r in owner.read_snapshot()['requests'] if r['id'] == request_id)['session']
             assert loaded['turn_id'] != old_session['turn_id'] and loaded['thread_id'] != old_session['thread_id']
             assert loaded['input_digest']
-        inputs = [r for r in map(json.loads, (tmp_path / 'wire.jsonl').read_text().splitlines()) if r.get('method') == 'turn/start']
+        inputs = [r for r in map(json.loads, (tmp_path / 'wire.jsonl').read_text().splitlines()) if r.get('method') == 'fixture/start']
         assert len(inputs) == 2
         first, followup = [r['params']['input'][0]['text'] for r in inputs]
         assert 'Retry only definite failures.' not in first
@@ -127,7 +127,7 @@ def test_accepted_facts_are_curated_with_fixed_result_indexes_and_loaded_only_in
 
 def test_only_explicit_owner_scope_updates_preferences_and_corrections_keep_old_material(tmp_path):
     from test_repository_queue import acknowledge
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path)) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
             owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
@@ -158,7 +158,7 @@ def test_only_explicit_owner_scope_updates_preferences_and_corrections_keep_old_
     'Can we authorize running retry delivery commands?', 'What is the missing delivery date?',
 ])
 def test_decisions_new_work_owner_only_and_unverifiable_questions_stay_with_owner(tmp_path, text):
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -177,7 +177,7 @@ def test_decisions_new_work_owner_only_and_unverifiable_questions_stay_with_owne
 
 def test_expired_idle_fact_cannot_start_execution_and_original_owner_decision_can_be_curated(tmp_path):
     from test_questions import TURN
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -197,14 +197,14 @@ def test_expired_idle_fact_cannot_start_execution_and_original_owner_decision_ca
             assert entry['kind'] == 'accepted_result' and 'scope' not in entry
             with pytest.raises(ManagementError):
                 lead.answer_from_knowledge(request_id, choice['id'], query, ['retry:3'])
-        assert len([r for r in map(json.loads, (tmp_path / 'wire.jsonl').read_text().splitlines()) if r.get('method') == 'turn/start']) == 1
+        assert len([r for r in map(json.loads, (tmp_path / 'wire.jsonl').read_text().splitlines()) if r.get('method') == 'fixture/start']) == 1
 
 
 def test_role_memories_remain_separate_and_superiors_keep_only_necessary_result_indexes(tmp_path):
     from test_directory import registration
     child = VerifiedIdentity('fixture:child', 'synthetic-child')
     steward = VerifiedIdentity('fixture:steward', 'synthetic-steward')
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path)) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
         change = registration(make_repo(tmp_path / 'child'), 'child', 'child-lead')
@@ -237,7 +237,7 @@ def test_role_memories_remain_separate_and_superiors_keep_only_necessary_result_
 
 def test_unrelated_returned_fact_and_source_grant_revocation_cannot_answer_or_load(tmp_path):
     from test_repository_queue import acknowledge
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -273,8 +273,8 @@ def test_memory_update_requires_explicit_effective_original_control_to_affect_ru
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control}) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control}) as manager:
         request_id, observed = setup(manager, repo)
         with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
             owner, lead = ManagementClient(tmp_path / 'state', 'owner'), ManagementClient(tmp_path / 'state', 'lead')
@@ -295,14 +295,14 @@ def test_memory_update_requires_explicit_effective_original_control_to_affect_ru
         assert len(after['inputs']) == 1 and 'cite evidence' in after['inputs'][0]['input'][0]['text']
         assert not (tmp_path / 'wire.jsonl').exists()
         methods = [r.get('method') for r in map(json.loads, (peer / 'original-wire.jsonl').read_text().splitlines())]
-        assert methods.count('turn/steer') == 1 and 'turn/start' not in methods and 'thread/start' not in methods
+        assert methods.count('fixture/append') == 1 and 'fixture/start' not in methods and 'fixture/create' not in methods
 
 
 def test_dashboard_and_participant_memory_actions_share_identity_scope_and_loading_rules(tmp_path):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from ghost_hermes_pm.dashboard import create_router
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path)) as manager:
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path)) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         with ManagementServer(manager, {'owner': OWNER, 'lead': LEAD}):
             app = FastAPI()
@@ -326,7 +326,7 @@ def test_dashboard_and_participant_memory_actions_share_identity_scope_and_loadi
 def test_unaccepted_classifications_and_sensitive_or_temporary_content_never_become_long_term_facts(tmp_path, kind):
     provider = local_provider(tmp_path)
     provider.documents[0]['kind'] = kind
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=memory_adapter(tmp_path),
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=memory_adapter(tmp_path),
                  knowledge_providers={'local:fixture-wiki': provider}) as manager:
         request_id = accepted(manager, make_repo(tmp_path / 'repo'))
         manager.start_task(OWNER, request_id)
@@ -343,7 +343,7 @@ def test_unaccepted_classifications_and_sensitive_or_temporary_content_never_bec
                 owner.record_memory_preference('mono-lead', 'unsafe-preference', 'API_KEY=synthetic-sensitive-value', {'kind': 'project', 'id': 'mono'})
             with pytest.raises(ManagementError):
                 lead.curate_project_memory('mono-lead', 'temporary-status', request_id,
-                    {'facts': [], 'decisions': [], 'include_delivery': True, 'temporary_status': 'Codex claims complete'})
+                    {'facts': [], 'decisions': [], 'include_delivery': True, 'temporary_status': 'DSH claims complete'})
             assert lead.read_project_memory('mono-lead')['entries'] == []
 
 
@@ -354,8 +354,8 @@ def test_factual_answer_uses_manual_original_service_and_returned_grant_cannot_a
     peer = tmp_path / 'original'
     original_state(peer, repo)
     read, control = adapters(peer)
-    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, codex_adapter=adapter_for(tmp_path),
-                 observation_adapters={'local:manual-daemon': read}, control_adapters={'manual-daemon': control},
+    with Manager(tmp_path / 'state', owner_identity_ref=OWNER.subject, dsh_adapter=adapter_for(tmp_path),
+                 observation_adapters={'local:manual-desktop': read}, control_adapters={'manual-desktop': control},
                  knowledge_providers={'local:fixture-wiki': local_provider(tmp_path)}) as manager:
         request_id, observed = setup(manager, repo)
         manager.apply_directory_change(OWNER, manager.read_snapshot(OWNER)['version'], {'profile': WIKI})
@@ -377,5 +377,5 @@ def test_factual_answer_uses_manual_original_service_and_returned_grant_cannot_a
         wire = list(map(json.loads, (peer / 'original-wire.jsonl').read_text().splitlines()))
         sent = [r for r in wire if 'method' not in r]
         assert len(sent) == 1 and sent[0]['id'] == 61 and 'retry.md#L3' in json.dumps(sent[0])
-        assert not any(r.get('method') in {'turn/start', 'thread/start', 'thread/resume', 'thread/fork'} for r in wire)
+        assert not any(r.get('method') in {'fixture/start', 'fixture/create', 'thread/resume', 'thread/fork'} for r in wire)
         assert not (tmp_path / 'wire.jsonl').exists()

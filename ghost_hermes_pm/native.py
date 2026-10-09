@@ -18,6 +18,23 @@ def _credential(reference):
     return get_secret(reference.removeprefix('native:'))
 
 
+def _configured_executors(configurations, state_dir):
+    """Construct only explicitly bound project executors from protected native settings."""
+    if not isinstance(configurations, dict) or any(not isinstance(ref, str) or not ref.startswith('local:')
+            or not isinstance(config, dict) or config.get('service_ref') != ref for ref, config in configurations.items()):
+        raise ManagementError('invalid_change', 'Native DSH executors require a reference map matching each inner service_ref.')
+    from .dsh import configured_adapter
+    adapters = {}
+    try:
+        for reference, config in configurations.items():
+            adapters[reference] = configured_adapter(config, state_dir)
+    except Exception:
+        for adapter in adapters.values():
+            adapter.close()
+        raise
+    return adapters
+
+
 def register_native(ctx):
     from .migration_capture import capture_request
     ctx.register_hook('pre_api_request', capture_request)
@@ -103,17 +120,25 @@ def register_native(ctx):
                     raise ManagementError('invalid_change', 'Native role ingress credentials must be distinct from Owner and model-facing credentials.')
                 credentials[native_token] = VerifiedIdentity(entry['identity_ref'], 'native-collaboration-ingress')
             intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, *credentials)))
-            from .codex import configured_adapter
+            for legacy_key in ('codex_stdio', 'codex_observation', 'codex_manual_control', 'codex_recovery'):
+                if ctx.get_config(legacy_key) not in (None, {}, []):
+                    raise ManagementError('invalid_change', 'Legacy executor configuration is unsupported; explicitly configure the existing DSH backend.')
+            from .dsh import configured_adapter
             from .github import GitHubDeliverySource
             from .observation import configured_observation_adapters
             from .knowledge import configured_providers
             from .archives import configured_providers as configured_archives
-            observation_adapters = configured_observation_adapters(ctx.get_config('codex_observation', []), state_dir)
+            observation_adapters = configured_observation_adapters(ctx.get_config('dsh_observation', []), state_dir)
             from .takeover import configured_control_adapters
-            control_adapters = configured_control_adapters(ctx.get_config('codex_manual_control', []), state_dir)
+            control_adapters = configured_control_adapters(ctx.get_config('dsh_manual_control', []), state_dir)
             from .recovery import configured_recovery_adapters
-            recovery_adapters = configured_recovery_adapters(ctx.get_config('codex_recovery', []), state_dir)
-            codex_adapter = configured_adapter(ctx.get_config('codex_stdio', {}), state_dir)
+            recovery_adapters = configured_recovery_adapters(ctx.get_config('dsh_recovery', []), state_dir)
+            dsh_adapter = configured_adapter(ctx.get_config('dsh_execution', {}), state_dir)
+            dsh_adapters = _configured_executors(ctx.get_config('dsh_executors', {}), state_dir)
+            for configured in (dsh_adapter, *dsh_adapters.values(), *observation_adapters.values(), *control_adapters.values(), *recovery_adapters.values()):
+                cookie = getattr(configured, 'cookie', '')
+                if cookie:
+                    intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, cookie)))
             from .native_lifecycle import configured_lifecycle_host
             from .native_migration import configured_migration_host
             from .native_maintenance import configured_maintenance_host
@@ -125,7 +150,7 @@ def register_native(ctx):
                     intake.secret_values = tuple(dict.fromkeys((*intake.secret_values, value)))
                 return value
             manager = Manager(state_dir, owner_identity_ref=owner, sensitive_values=lambda: intake.secret_values,
-                              codex_adapter=codex_adapter, delivery_source=GitHubDeliverySource(state_dir, expected_account=_credential(ctx.get_config('github_account_ref'))), observation_adapters=observation_adapters, control_adapters=control_adapters,
+                              dsh_adapter=dsh_adapter, dsh_adapters=dsh_adapters, delivery_source=GitHubDeliverySource(state_dir, expected_account=_credential(ctx.get_config('github_account_ref'))), observation_adapters=observation_adapters, control_adapters=control_adapters,
                               knowledge_providers=configured_providers(ctx.get_config('knowledge_providers', {}), credential_resolver=knowledge_credential),
                               archive_providers=configured_archives(ctx.get_config('archive_providers', {}), state_dir=state_dir, credential_resolver=knowledge_credential), recovery_adapters=recovery_adapters,
                               global_validation_host=configured_global_validation_host(ctx.get_config('global_validation_host'), state_dir),
@@ -170,7 +195,7 @@ def register_native(ctx):
 
             ctx.spawn_task(supervise_notifications(), name='hermes-pm-notification-supervision')
 
-            if codex_adapter is not None or recovery_adapters or observation_adapters or manager.knowledge_providers or control_adapters or manager.archive_providers or intake.collaboration_entry:
+            if dsh_adapter is not None or dsh_adapters or recovery_adapters or observation_adapters or manager.knowledge_providers or control_adapters or manager.archive_providers or intake.collaboration_entry:
                 async def supervise_single_issue():
                     import asyncio
                     identity = VerifiedIdentity(owner, 'verified-manager-supervision')
@@ -360,7 +385,7 @@ def register_native(ctx):
             return json.dumps({'status': 'rejected', 'code': exc.code, 'message': str(exc)})
 
     ctx.register_tool(name='hermes_pm_observe', toolset='hermes_pm',
-        schema={'name': 'hermes_pm_observe', 'description': 'Read registered original Codex sources without session control.',
+        schema={'name': 'hermes_pm_observe', 'description': 'Read registered original DSH sources without session control.',
             'parameters': {'type': 'object', 'properties': {'scope': {'type': 'string'}}, 'additionalProperties': False}},
         handler=observe, description='Observe registered original executors only')
 

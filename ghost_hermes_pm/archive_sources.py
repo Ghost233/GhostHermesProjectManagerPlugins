@@ -1,9 +1,9 @@
-"""Read-only Feishu pagination and original-executor Codex history adapters."""
+"""Read-only Feishu pagination and original-executor DSH history adapters."""
 import json
 
 from .archives import _result, _digest
 from .manager import ManagementError
-from .observation import ReadOnlyCodexAdapter
+from .observation import ReadOnlyDshAdapter
 
 
 def verify_feishu_source(client, binding):
@@ -76,12 +76,12 @@ class FeishuArchiveProvider:
         return _result(self.kind,requester,scope_ids,question,complete,records,coverage,_digest(records))
 
 
-class CodexArchiveProvider:
-    kind = 'codex_history'
+class DshArchiveProvider:
+    kind = 'dsh_history'
 
     def __init__(self,adapter,thread_scopes):
-        if not isinstance(adapter,ReadOnlyCodexAdapter) or not isinstance(thread_scopes,dict):
-            raise ManagementError('invalid_change','Codex archives require an original-executor read-only adapter and explicit thread scopes.')
+        if not isinstance(adapter,ReadOnlyDshAdapter) or not isinstance(thread_scopes,dict):
+            raise ManagementError('invalid_change','DSH archives require an original-executor read-only adapter and explicit thread scopes.')
         self.adapter,self.thread_scopes=adapter,dict(thread_scopes)
 
     def close(self):
@@ -90,51 +90,32 @@ class CodexArchiveProvider:
     def query(self,requester,scope_ids,question,complete=False):
         adapter=self.adapter
         proof=adapter.proof()
-        required={'thread/read','thread/turns/list','thread/items/list'}
+        required={'session/list','session/follow','session/page'}
         if not required<=set(proof['supported_methods']):
-            raise ManagementError('capability_unverified','Original executor full turn/item pagination capability is unavailable.')
+            raise ManagementError('capability_unverified','Original DSH journal pagination capability is unavailable.')
         threads=list(dict.fromkeys(t for s in scope_ids for t in self.thread_scopes.get(s,[])))
         if not threads or any(s not in self.thread_scopes for s in scope_ids):
-            raise ManagementError('forbidden','The original Codex source has no allowed thread scope.')
-        records,missing,pages,versions,seen=[],[],0,[],set()
-        def read_pages(method,params):
-            nonlocal pages
-            items,cursors=[],set()
-            while True:
-                result=adapter._call(method,params)
-                pages+=1
-                if not isinstance(result.get('data'),list) or 'nextCursor' not in result:
-                    raise ManagementError('archive_incomplete','Codex history pagination end could not be confirmed.')
-                items.extend(result['data'])
-                cursor=result['nextCursor']
-                if cursor is None:
-                    return items
-                if not isinstance(cursor,str) or not cursor or cursor in cursors or len(cursors)>=100:
-                    raise ManagementError('archive_incomplete','Codex history cursor repeated or exceeded the bounded read budget.')
-                cursors.add(cursor)
-                params={**params,'cursor':cursor}
+            raise ManagementError('forbidden','The original DSH source has no allowed session scope.')
+        records,missing,versions=[],[],[]
         for thread_id in threads:
             thread=adapter.read_thread(thread_id,include_turns=True)
-            versions.append((thread_id,thread.get('updatedAt')))
-            # A branch/subagent does not authorize the ancestor's private history.
-            turns=read_pages('thread/turns/list',{'threadId':thread_id,'limit':100,'itemsView':'full','sortDirection':'asc'})
-            for turn in turns:
-                if not isinstance(turn,dict) or not isinstance(turn.get('id'),str) or not isinstance(turn.get('itemsView'),str):
-                    raise ManagementError('archive_incomplete','Original Codex turn identity and item coverage are missing.')
-                tid=turn['id']
-                items=read_pages('thread/items/list',{'threadId':thread_id,'turnId':tid,'limit':100,'sortDirection':'asc'})
-                for item in items:
-                    if not isinstance(item,dict) or not isinstance(item.get('id'),str) or (thread_id,tid,item['id']) in seen:
-                        raise ManagementError('archive_incomplete','Codex original items overlap or lack stable identity.')
-                    seen.add((thread_id,tid,item['id']))
-                    if item.get('type')=='contextCompaction':
-                        missing.append(thread_id+':'+tid+':pre-compaction-context-not-proved-by-api')
-                    records.append({'id':item['id'],'thread_id':thread_id,'turn_id':tid,'text':json.dumps(item,ensure_ascii=False),
-                        'timestamp':turn.get('startedAt'),'locator':'codex-archive:'+thread_id+'/'+tid+'#'+item['id'],'payload':item})
-            after=adapter.read_thread(thread_id,include_turns=False)
-            if after.get('updatedAt')!=thread.get('updatedAt'):
+            events=thread.get('nativeEvents')
+            cursor=thread.get('journalCursor')
+            if thread.get('historyMode')!='full' or type(cursor)is not int or cursor < -1 or not isinstance(events,list) or any(not isinstance(e,dict) or type(e.get('seq'))is not int for e in events) or [e['seq'] for e in events]!=list(range(cursor+1)):
+                raise ManagementError('archive_incomplete','A complete contiguous original DSH journal prefix was not established.')
+            versions.append((thread_id,cursor))
+            for event in events:
+                if not isinstance(event.get('type'),str) or not isinstance(event.get('data'),dict):
+                    raise ManagementError('archive_incomplete','Original DSH journal event identity or payload is incomplete.')
+                # Retain source-native records and distinguish them from model-context coverage.
+                records.append({'id':str(event['seq']),'thread_id':thread_id,
+                    'text':json.dumps(event,ensure_ascii=False),'timestamp':event.get('time'),
+                    'locator':'dsh-archive:'+thread_id+'#'+str(event['seq']),'payload':event})
+            after=adapter.read_thread(thread_id,include_turns=True)
+            if after.get('journalCursor')!=cursor:
                 missing.append(thread_id+':changed-during-pagination')
-        coverage={'thread_ids':threads,'pages':pages,'end_confirmed':not missing,'compressed_history':'compaction_gaps_explicit',
+        coverage={'thread_ids':threads,'pages':'adapter_verified_contiguous_journal','end_confirmed':not missing,
+            'compressed_history':'durable_journal_only_model_context_not_reconstructed',
             'missing':missing,'original_executor_id':proof['original_executor_id'],'generation':adapter.generation,
             'identity_evidence_ref':proof['evidence_ref'],'parent_threads':'excluded_without_separate_source_grant'}
         return _result(self.kind,requester,scope_ids,question,complete,records,coverage,_digest({'versions':versions,'records':records}))
