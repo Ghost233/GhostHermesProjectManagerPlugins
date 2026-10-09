@@ -53,6 +53,7 @@ assert str(plugin_root) not in sys.path, 'SDK loading must not be repaired by th
 async def main():
     for index in range(2):
         runner = object.__new__(GatewayRunner)
+        runner._shutdown_event = asyncio.Event()
         runner.adapters, runner._profile_adapters = {}, {}
         runner.config = GatewayConfig()
         runner._primary_profile_name = 'default'

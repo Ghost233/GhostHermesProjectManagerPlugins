@@ -73,10 +73,10 @@ def register_native(ctx):
                 manager.close()
             runtime = 'manager_unavailable'
 
-    async def start_for_gateway(event=None, gateway=None):
+    async def start_authority(gateway=None):
         nonlocal resources, runtime
         with intake.lifecycle_lock:
-            if intake.closed or resources is not None or event is None or gateway is None or not callable(getattr(gateway, 'wait_for_shutdown', None)):
+            if intake.closed or resources is not None or gateway is None or not callable(getattr(gateway, 'wait_for_shutdown', None)):
                 return
             if manager_profile != registered_profile or not state_dir or not owner:
                 return
@@ -254,13 +254,33 @@ def register_native(ctx):
                         await asyncio.sleep(5)
                 ctx.spawn_task(supervise_single_issue(), name='hermes-pm-single-issue-supervision')
 
+    async def start_for_gateway(event=None, gateway=None):
+        if event is not None:
+            await start_authority(gateway)
+
     async def dispatch(event=None, gateway=None, **kwargs):
         await start_for_gateway(event, gateway)
 
     def owned_factory(config):
         from .owned_feishu import OwnedFeishuAdapter
+        async def connected_authority(transport, generation):
+            intake.require_active(generation)
+            if adapter.transport is not transport or adapter._close_requested or not adapter._connect_requested:
+                raise ManagementError('unavailable', 'The connected platform changed before verification.')
+            binding = adapter.bindings[0]
+            recipient = await transport.verify_identity(binding)
+            intake.require_active(generation)
+            if adapter.transport is not transport or adapter._close_requested or not adapter._connect_requested:
+                raise ManagementError('unavailable', 'The connected platform stopped during verification.')
+            if recipient != {'app_id': binding['app_id'], 'open_id': binding['recipient_open_id']}:
+                raise ManagementError('unauthorized', 'The connected platform identity is unverified.')
+            gateway = getattr(adapter, 'gateway_runner', None)
+            native_profile = adapter._owner_transport_profile() or getattr(gateway, '_primary_profile_name', None)
+            if native_profile == registered_profile:
+                await start_authority(gateway)
         try:
-            adapter = OwnedFeishuAdapter(config, intake, start_for_gateway, registered_home)
+            adapter = OwnedFeishuAdapter(config, intake, start_for_gateway, registered_home,
+                                         connected_authority=connected_authority)
         except ManagementError:
             # Native registry logs factory exceptions with full source paths.
             # A known admission refusal must stay a generic unavailable result.

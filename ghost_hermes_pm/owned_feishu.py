@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 
 
 class OwnedFeishuAdapter(BasePlatformAdapter):
-    def __init__(self, config, intake, ensure_manager, manager_home):
+    def __init__(self, config, intake, ensure_manager, manager_home, *, connected_authority=None):
         self.intake, self.ensure_manager, self.manager_home = intake, ensure_manager, manager_home
+        self.connected_authority = connected_authority
         if intake.settings.get('enabled') is not True or not intake.settings.get('verification_ref') or manager_home is None:
             raise ManagementError('unavailable', 'Owned Feishu intake is not enabled by trusted management configuration.')
         extra = dict(config.extra or {})
@@ -145,9 +146,13 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
                 self.transport = transport
                 if not await transport.start():
                     raise ManagementError('unavailable', 'Owned platform connection is unverified.')
-                if self.intake.closed or self._close_requested or generation != self.intake.generation:
+                if self.intake.closed or self._close_requested or not self._connect_requested or generation != self.intake.generation:
                     raise ManagementError('unavailable', 'The owner changed during connection.')
                 self.intake.attach_transport(self, transport)
+                if self.connected_authority is not None:
+                    await self.connected_authority(transport, generation)
+                if self.intake.closed or self._close_requested or not self._connect_requested or generation != self.intake.generation:
+                    raise ManagementError('unavailable', 'The owner changed during connection verification.')
                 self._ordinary_active = True
                 self._mark_connected()
                 if callable(getattr(transport, 'activate', None)):
