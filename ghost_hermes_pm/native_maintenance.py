@@ -55,7 +55,7 @@ def loaded_fact(ctx, entry_function):
     manifest = getattr(ctx, 'manifest', None)
     if manifest is None or not getattr(manifest, 'path', None):
         return {'status': 'unverified', 'plugin_version': 'unknown', 'reason': 'No actual native manifest registration.'}
-    root = _ordinary(Path(manifest.path), True)
+    root = _ordinary(Path(manifest.path).resolve(strict=True), True)
     compiled = compile(_ordinary(root / 'ghost_hermes_pm' / 'native.py').read_text(), str(root / 'ghost_hermes_pm' / 'native.py'), 'exec')
     expected = next(code for code in compiled.co_consts if isinstance(code, types.CodeType) and code.co_name == 'register_native')
     import uuid

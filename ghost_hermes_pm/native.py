@@ -254,7 +254,7 @@ def register_native(ctx):
                         await asyncio.sleep(5)
                 ctx.spawn_task(supervise_single_issue(), name='hermes-pm-single-issue-supervision')
 
-    async def dispatch(event=None, gateway=None):
+    async def dispatch(event=None, gateway=None, **kwargs):
         await start_for_gateway(event, gateway)
 
     def owned_factory(config):
