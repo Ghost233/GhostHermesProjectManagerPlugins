@@ -165,7 +165,11 @@ async def _observe_questions(intake, record, carrier, events, projections, gener
     for question in rounds:
         if question['id'] not in active_ids:
             question['state'] = 'settled' if any(row['callId'] == question['id'] for row in native['settled']) else 'expired'
-        if question.get('reply_status') == 'queued' and question['kind'] == 'structured':
+        pending_reply = question.get('reply_status') in {'intent', 'queued', 'outcome_unknown'}
+        if pending_reply and (question['generation'] != execution['generation']
+                              or question['session_id'] != execution['session_id']):
+            raise ManagementError('binding_conflict', 'Original question acknowledgement belongs to another execution.')
+        if pending_reply and question['kind'] == 'structured' and question.get('reply_path') in {'live', 'continued'}:
             batch = [question['answers'][q['id']] for q in question['questions']]
             settled = any(row['callId'] == question['id'] and row['answers'] == batch for row in native['settled'])
             source = ('user/message' if question.get('reply_path') == 'continued' else 'tool/result')
@@ -177,7 +181,7 @@ async def _observe_questions(intake, record, carrier, events, projections, gener
                              and event['data']['message'].get('isError') is not True)]
             if settled and matching:
                 question.update(reply_status='accepted', state='settled', admitted_seq=matching[-1]['seq'])
-        elif question.get('reply_status') == 'queued' and question['kind'] == 'natural':
+        elif pending_reply and question['kind'] == 'natural' and question.get('request_id'):
             matching = [event for event in events if event['type'] == 'user/message' and event['seq'] > question['source_seq']
                    and event['data'].get('source', {}).get('kind') == 'user'
                    and event['data']['source'].get('rpcId') == question.get('request_id')]
@@ -348,18 +352,19 @@ async def process_reply(intake, prepared, generation):
             if pending:
                 status, text = 'partial', '已记录本次答复；待答：' + '、'.join(pending) + '。收齐本轮后才送回原工作。'
             else:
+                question['reply_path'] = ('continued' if active[0]['state'] == 'continued' else 'live') if question['kind'] == 'structured' else 'natural'
+                if question['kind'] == 'natural':
+                    question['request_id'] = 'answer-' + prepared.envelope['message_id']
                 question['reply_status'] = 'intent'
                 intake._save_execution(record, fields=['questions'])
                 try:
                     batch = {'answers': [question['answers'][q['id']] for q in question['questions']]}
                     if question['kind'] == 'structured' and active[0]['state'] == 'continued':
-                        question['reply_path'] = 'continued'
                         accepted = await asyncio.to_thread(owned_call, carrier, 'userQuestions/answer',
                             {'agentId': execution['session_id'], 'callId': question['id'], 'answer': batch})
                         if accepted is not True:
                             raise ManagementError('binding_conflict', 'The original continued question is no longer answerable.')
                     elif question['kind'] == 'structured':
-                        question['reply_path'] = 'live'
                         packet = await asyncio.to_thread(carrier.event_frames)
                         await asyncio.to_thread(owned_call, carrier, '$events/result', {'clientId': packet['client_id'],
                             'eventId': question['event_id'], 'outcome': {'kind': 'result', 'value': batch}})
@@ -369,7 +374,6 @@ async def process_reply(intake, prepared, generation):
                         inbox = projections.get('inbox')
                         if not isinstance(inbox, dict) or any(inbox.values()) or session.get('agentAvailable') is not True:
                             raise ManagementError('outcome_unknown', 'Original ordinary input state is unavailable.')
-                        question['request_id'] = 'answer-' + prepared.envelope['message_id']
                         request = {'sessionId': execution['session_id'], 'requestId': question['request_id'],
                             'mode': 'steer' if session['running'] else 'queue',
                             'content': [{'type': 'text', 'text': question['answers']['answer'].get('custom', prepared.command)}]}

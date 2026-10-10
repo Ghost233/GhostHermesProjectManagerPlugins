@@ -14,6 +14,8 @@ from .repository_questions import _NAMESPACE, question_destination
 
 
 _TERMINAL = {'released', 'stopped', 'budget_stopped', 'execution_failed', 'outcome_unknown'}
+_CARD_BINDING = ('work_id', 'card_id', 'generation', 'session_id', 'approval_id', 'call_id',
+                 'command_sha256', 'arguments_sha256')
 
 
 def _decision(command):
@@ -59,6 +61,113 @@ def _material(intake, request, operation, workspace):
     if len(text) > 6000 or re.search(r'password|passwd|credential|secret|token|api[_ -]?key|private[_ -]?key|密码|密钥|凭据|令牌', text, re.I):
         return None
     return text
+
+
+def _approval_binding_digest(notice):
+    return hashlib.sha256(json.dumps({key: notice[key] for key in _CARD_BINDING}, sort_keys=True).encode()).hexdigest()
+
+
+def _approval_card(record, notice):
+    execution = record['dsh_execution']
+    elements = [{'tag': 'div', 'text': {'tag': 'plain_text', 'content':
+        '任务：' + record['issue']['title'] + '\n总 Issue：' + record['issue']['url']
+        + '\n任务标签：' + execution['native_title'] + '\n审批 ID：' + notice['approval_id']}}]
+    if notice['answerable'] and notice.get('material'):
+        elements.append({'tag': 'div', 'text': {'tag': 'plain_text', 'content': notice['material']}})
+    if not notice['answerable']:
+        status = '原操作包含无法安全公开的必要材料；审批保持受阻。'
+    elif notice['state'] == 'resolved':
+        status = '原审批：' + {'allowed-once': '已允许本次操作', 'rejected': '已拒绝操作',
+            'cancelled': '已取消', 'unavailable': '不可用，操作未获许可'}[notice['outcome']]
+        status += '\n原工具：' + {'pending': '尚未结束', 'failed': '失败', 'settled': '已结束'}[notice['operation_state']]
+    elif execution['state'] in _TERMINAL:
+        status = '原工作已结束；审批已失效，不能再决定。'
+    elif notice.get('reply_status') == 'outcome_unknown':
+        status = '决定回送尚未确认；正在核对原审计，按钮已停用。原工具结果另行核对。'
+    elif notice.get('reply_status'):
+        status = '本人决定已受理；正在核对原审批。原工具尚未结束，执行结果另行通知。'
+    else:
+        status = '等待本人决定；仅允许上述本次操作，不改变常驻权限。文字审批 ID 答复仍可使用。'
+    elements.append({'tag': 'div', 'text': {'tag': 'plain_text', 'content': status}})
+    if (notice['answerable'] and notice['state'] == 'pending' and not notice.get('reply_status')
+            and execution['state'] not in _TERMINAL):
+        values = {'kind': 'hermes-operation-approval', 'approval_id': notice['approval_id'],
+                  'binding_sha256': _approval_binding_digest(notice)}
+        elements.append({'tag': 'action', 'actions': [
+            {'tag': 'button', 'text': {'tag': 'plain_text', 'content': label}, 'type': style,
+             'value': {**values, 'outcome': outcome}}
+            for label, style, outcome in (('批准一次', 'primary', 'allowed-once'), ('拒绝', 'danger', 'rejected'))]})
+    return {'config': {'wide_screen_mode': True, 'update_multi': True},
+            'header': {'template': 'orange', 'title': {'tag': 'plain_text', 'content': '具体执行审批'}},
+            'elements': elements}
+
+
+def prepare_card_action(intake, payload, adapter):
+    if intake.closed or intake.settings.get('enabled') is not True or not intake.settings.get('verification_ref'):
+        return None
+    try:
+        header, event = payload['header'], payload['event']
+        operator, context, action = event['operator'], event['context'], event['action']
+        value = action['value']
+        if (header['event_type'] != 'card.action.trigger' or not isinstance(header['event_id'], str)
+            or not header['event_id'] or action['tag'] != 'button' or not isinstance(value, dict)
+            or set(value) != {'kind', 'approval_id', 'binding_sha256', 'outcome'}
+            or value['kind'] != 'hermes-operation-approval' or value['outcome'] not in {'allowed-once', 'rejected'}):
+            return None
+        bindings = [binding for binding in intake.settings.get('bindings', [])
+            if binding.get('verification_ref') and binding['app_id'] == header['app_id']
+            and binding['transport_tenant_key'] == header['tenant_key'] and binding['chat_id'] == context['open_chat_id']
+            and binding['owner_open_id'] == operator['open_id'] and binding['sender_tenant_key'] == operator['tenant_key']
+            and {operator.get(key) for key in ('user_id', 'open_id', 'union_id')} & set(binding['owner_native_ids'])]
+        if len(bindings) != 1:
+            return None
+        binding = bindings[0]
+        profiles = binding.get('target_profiles', [binding['profile_id']])
+        matches = [(record, notice) for record in intake.snapshot()['work'] if record['profile_id'] in profiles
+            for notice in record.get('dsh_execution', {}).get('approvals', [])
+            if notice.get('request_renderer') == 'interactive' and notice.get('request_notice') == 'delivered'
+            and notice.get('request_message_id') == context['open_message_id'] and notice['approval_id'] == value['approval_id']
+            and all(notice.get('delivery', {}).get(key) == binding[key] for key in _NAMESPACE)
+            and notice['answerable'] and notice['state'] == 'pending' and not notice.get('reply_status')
+            and record['dsh_execution']['state'] not in _TERMINAL
+            and notice['generation'] == record['dsh_execution']['generation']
+            and notice['session_id'] == record['dsh_execution']['session_id']
+            and notice['work_id'] == record['id'] and notice['card_id'] == record['card_id']
+            and value['binding_sha256'] == _approval_binding_digest(notice)]
+        transport = next((transport for current, transport in intake.transports if current is adapter), None)
+        if len(matches) != 1 or transport is None:
+            return None
+        record, notice = matches[0]
+        envelope = {key: binding[key] for key in _NAMESPACE}
+        envelope.update(tenant_key=operator['tenant_key'], sender_open_id=operator['open_id'],
+            message_id=context['open_message_id'], parent_id=context['open_message_id'],
+            event_id=header['event_id'], card_binding_sha256=value['binding_sha256'])
+        command = ('批准一次' if value['outcome'] == 'allowed-once' else '拒绝') + ' 审批 ' + notice['approval_id']
+        from .simple_development import WorkMessage
+        return WorkMessage(payload, adapter, transport, binding, envelope, record['target'], command,
+                           None, record['id'], action='approval_card')
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def _refresh_approval_card(intake, record, notice, transport, generation):
+    if notice.get('request_renderer') != 'interactive' or not notice.get('request_message_id'):
+        return
+    card = _approval_card(record, notice)
+    digest = hashlib.sha256(json.dumps(card, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    updates = notice.setdefault('card_updates', {})
+    if digest in updates:
+        return
+    intake.require_active(generation)
+    updates[digest] = 'intent'
+    intake._save_execution(record, fields=['approvals'])
+    try:
+        response = await transport.update_card({'message_id': notice['request_message_id'], 'card': card})
+        intake.require_active(generation)
+        updates[digest] = response.get('status', 'unknown')
+    except (AttributeError, ManagementError, OSError, TimeoutError):
+        updates[digest] = 'unknown'
+    intake._save_execution(record, fields=['approvals'])
 
 
 def _update_outcome(notice, events, turn, status):
@@ -139,7 +248,8 @@ async def _observe_approvals(intake, record, carrier, events, generation):
                    'session_id': execution['session_id'], 'work_id': record['id'], 'card_id': record['card_id']}
         notice = next((row for row in notices if row['approval_id'] == status['approval_id']), None)
         if notice is None:
-            notice = {**binding, 'state': 'pending', 'answerable': _material(intake, request, operation, record['target']['repo_path']) is not None}
+            material = _material(intake, request, operation, record['target']['repo_path'])
+            notice = {**binding, 'state': 'pending', 'answerable': material is not None, 'material': material}
             notices.append(notice)
         elif any(notice.get(key) != value for key, value in binding.items()):
             raise ManagementError('binding_conflict', 'Original approval audit binding changed.')
@@ -152,11 +262,13 @@ async def _observe_approvals(intake, record, carrier, events, generation):
         if await transport.verify_identity(recipient) != {'app_id': recipient['app_id'], 'open_id': recipient['recipient_open_id']}:
             raise ManagementError('binding_conflict', 'Original approval notification recipient is unverified.')
         intake.require_active(generation)
+        await _refresh_approval_card(intake, record, notice, transport, generation)
         kind = ('settlement' if notice['state'] == 'resolved' and notice.get('result_notice')
                 and notice['operation_state'] != 'pending' else 'result' if notice['state'] == 'resolved' else 'request')
         if notice.get(kind + '_notice'):
             continue
         if kind == 'request':
+            notice['request_renderer'] = 'interactive'
             text = ('具体执行审批\n任务：' + record['issue']['title'] + '\n总 Issue：' + record['issue']['url']
                     + '\n任务标签：' + execution['native_title'] + '\n审批 ID：' + notice['approval_id'])
             if notice['answerable']:
@@ -175,15 +287,20 @@ async def _observe_approvals(intake, record, carrier, events, generation):
         notice[kind + '_notice'] = 'intent'
         intake._save_execution(record, fields=['approvals'])
         anchor = record['source_anchor']
-        response = await transport.send({'uuid': hashlib.sha256((record['id'] + notice['approval_id'] + kind).encode()).hexdigest()[:32],
+        segment = {'uuid': hashlib.sha256((record['id'] + notice['approval_id'] + kind).encode()).hexdigest()[:32],
             'text': text, 'chat_id': anchor['chat_id'], 'reply_to': anchor['message_id'],
-            'mention_open_id': recipient['owner_open_id'], 'thread_id': anchor.get('thread_id')})
+            'mention_open_id': recipient['owner_open_id'], 'thread_id': anchor.get('thread_id')}
+        if kind == 'request':
+            segment['card'] = _approval_card(record, notice)
+        response = await transport.send(segment)
         intake.require_active(generation)
         notice[kind + '_notice'] = response.get('status', 'unknown')
         if response.get('status') == 'delivered':
             notice[kind + '_message_id'] = response['message_id']
             if kind == 'request':
                 notice['delivery'] = {key: recipient[key] for key in _NAMESPACE}
+                digest = hashlib.sha256(json.dumps(segment['card'], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                notice.setdefault('card_updates', {})[digest] = 'delivered'
         intake._save_execution(record, fields=['approvals'])
     intake._save_execution(record, fields=['approvals'])
 
@@ -211,7 +328,7 @@ def prepare_approval_reply(intake, event, adapter, binding, envelope, command, a
 
 async def _reply_notice(intake, prepared, generation, text):
     intake.require_active(generation)
-    response = await prepared.transport.send({'uuid': hashlib.sha256(('approval-reply:' + prepared.envelope['message_id']).encode()).hexdigest()[:32],
+    response = await prepared.transport.send({'uuid': hashlib.sha256(('approval-reply:' + prepared.envelope.get('event_id', prepared.envelope['message_id'])).encode()).hexdigest()[:32],
         'text': text, 'chat_id': prepared.envelope['chat_id'], 'reply_to': prepared.envelope['message_id']})
     intake.require_active(generation)
     return response.get('status', 'unknown')
@@ -243,6 +360,9 @@ async def process_approval_reply(intake, prepared, generation):
                 or notice['card_id'] != record['card_id'] or execution['state'] in _TERMINAL
                 or any(notice['delivery'].get(key) != prepared.envelope.get(key) for key in _NAMESPACE)):
                 raise ManagementError('binding_conflict', 'Original approval reply binding is no longer current.')
+            if (prepared.action == 'approval_card'
+                and prepared.envelope.get('card_binding_sha256') != _approval_binding_digest(notice)):
+                raise ManagementError('binding_conflict', 'Original approval card binding changed.')
             intake._verified_card(record, Path(record['target']['repo_path']).resolve(strict=True), record['card_id'])
             carrier = attach_existing_owned(intake, record)
             events, _ = await asyncio.to_thread(original_history, carrier, execution['session_id'], record['target']['repo_path'])
@@ -255,14 +375,16 @@ async def process_approval_reply(intake, prepared, generation):
             _update_outcome(notice, events, turn, status)
             if notice.get('reply_status') or status['state'] == 'resolved':
                 intake._save_execution(record, fields=['approvals'])
+                await _refresh_approval_card(intake, record, notice, prepared.transport, generation)
                 return {'status': notice.get('reply_status', 'settled'), 'duplicate': True}
             if ('endSeq' in turn or turn['id'] != notice['turn_id']
                 or hashlib.sha256(operation['command'].encode()).hexdigest() != notice['command_sha256']
                 or hashlib.sha256(json.dumps(operation, sort_keys=True).encode()).hexdigest() != notice['arguments_sha256']):
                 raise ManagementError('binding_conflict', 'Original approval command or turn changed.')
             intake.require_active(generation)
-            notice.update(reply_status='intent', reply_message_id=prepared.envelope['message_id'], requested_outcome=outcome)
+            notice.update(reply_status='intent', reply_message_id=prepared.envelope.get('event_id', prepared.envelope['message_id']), requested_outcome=outcome)
             intake._save_execution(record, fields=['approvals'])
+            await _refresh_approval_card(intake, record, notice, prepared.transport, generation)
             rpc_id = str(uuid.uuid4())
             binding = {key: notice[key] for key in ('approval_id', 'call_id', 'command_sha256', 'generation', 'session_id')}
             try:
@@ -281,6 +403,7 @@ async def process_approval_reply(intake, prepared, generation):
             except (ManagementError, OSError, TimeoutError):
                 notice['reply_status'] = 'outcome_unknown'
             intake._save_execution(record, fields=['approvals'])
+            await _refresh_approval_card(intake, record, notice, prepared.transport, generation)
             text = ('审批回送结果尚未确认；保留当前操作，核对原审计后才确认，不会重复发送。'
                     if notice['reply_status'] == 'outcome_unknown' else '本次审批决定已送回同一原操作；执行结果另行通知。')
             await _reply_notice(intake, prepared, generation, text)

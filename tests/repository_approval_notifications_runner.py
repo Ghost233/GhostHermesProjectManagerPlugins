@@ -100,17 +100,24 @@ async def main():
     adapter = runner._create_adapter(platform, PlatformConfig(enabled=True, extra={
         'app_id': 'cli_fixture', 'app_secret': 'synthetic-unused-secret', 'require_mention': True,
         'default_group_policy': 'open', 'allow_bots': 'none'}))
+    binding = adapter.bindings[0]
     runner.adapters[platform] = adapter
     runner._wire_adapter_handlers(adapter)
     native = service_client('cli_fixture')
     native.request = lambda request: types.SimpleNamespace(code=0, raw=types.SimpleNamespace(
         content=b'{"code":0,"bot":{"open_id":"ou_lead","activate_status":2}}'))
     sent = []
+    updated = []
     def reply(request):
         sent.append(request)
         return ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_sent_' + str(len(sent)),
             'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     native.im.v1.message.reply = reply
+    def patch(request):
+        updated.append(request)
+        from lark_oapi.api.im.v1 import PatchMessageResponse
+        return PatchMessageResponse({'code': 0})
+    native.im.v1.message.patch = patch
     worker = carrier = None
     passed = False
     try:
@@ -142,8 +149,9 @@ async def main():
         assert notice['work_id'] == original['id'] and notice['card_id'] == original['card_id']
         assert notice['generation'] == execution['generation'] and notice['session_id'] == execution['session_id']
         request_message = next(message for message in sent if '审批 ID：' + notice['approval_id'] in message.request_body.content)
-        request_text = ''.join(item['text'] for row in json.loads(request_message.request_body.content)['zh_cn']['content']
-                               for item in row if item['tag'] == 'text')
+        assert request_message.request_body.msg_type == 'interactive'
+        request_card = json.loads(request_message.request_body.content)
+        request_text = '\n'.join(element['text']['content'] for element in request_card['elements'] if 'text' in element)
         assert "printf 'approved\\n' > approval-result.txt" in request_text
         assert 'workspace-write' in request_text
         assert execution['native_identity']['generation'] == execution['generation']
@@ -170,7 +178,25 @@ async def main():
             await receive(adapter, raw(mid, '@_user_1 ' + text, parent_id=parent, sender=sender))
         events, _ = await asyncio.to_thread(supervision.original_history, carrier, execution['session_id'], str(repo))
         assert not any(e['type'] == 'approval/decided' for e in events)
-        if reply_mode.startswith('lark'):
+        def card_payload(event_id, value):
+            return {'schema': '2.0', 'header': {'event_type': 'card.action.trigger', 'event_id': event_id,
+                'app_id': binding['app_id'], 'tenant_key': binding['transport_tenant_key']},
+                'event': {'operator': {'open_id': binding['owner_open_id'], 'user_id': 'u_owner',
+                    'union_id': 'on_owner', 'tenant_key': binding['sender_tenant_key']},
+                    'context': {'open_message_id': notice['request_message_id'], 'open_chat_id': binding['chat_id']},
+                    'action': {'tag': 'button', 'value': value}}}
+        if reply_mode == 'card':
+            action = next(button for element in request_card['elements'] for button in element.get('actions', [])
+                          if button['value']['outcome'] == outcome)
+            bad_owner = card_payload('event-card-other', action['value'])
+            bad_owner['event']['operator']['open_id'] = 'ou_other'
+            await adapter.receive_payload(bad_owner)
+            bad_hash = card_payload('event-card-hash', {**action['value'], 'binding_sha256': 'f' * 64})
+            await adapter.receive_payload(bad_hash)
+            events, _ = await asyncio.to_thread(supervision.original_history, carrier, execution['session_id'], str(repo))
+            assert not any(e['type'] == 'approval/decided' for e in events)
+            await adapter.receive_payload(card_payload('event-card-owner', action['value']))
+        elif reply_mode.startswith('lark'):
             phrase = '批准一次' if outcome == 'allowed-once' else '拒绝'
             await receive(adapter, raw('om_exact_decision', '@_user_1 ' + phrase
                 + (' 审批 ' + notice['approval_id'] if reply_mode == 'lark-id' else ''),
@@ -190,10 +216,17 @@ async def main():
         await receive(adapter, raw('om_duplicate_decision', '@_user_1 批准一次', parent_id=notice['request_message_id']))
         after, _ = await asyncio.to_thread(supervision.original_history, carrier, execution['session_id'], str(repo))
         assert [event for event in after if event['type'] == 'approval/decided'] == decisions
+        if reply_mode == 'card':
+            await adapter.receive_payload(card_payload('event-card-duplicate', action['value']))
+            after, _ = await asyncio.to_thread(supervision.original_history, carrier, execution['session_id'], str(repo))
+            assert [event for event in after if event['type'] == 'approval/decided'] == decisions
         await wait_for(lambda: next((notice for notice in record()['dsh_execution']['approvals']
             if notice['approval_id'] == resolved['approval_id'] and notice.get('result_notice') == 'delivered'
             and notice.get('result_message_id')), None))
         assert any(('允许本次操作' if outcome == 'allowed-once' else '拒绝操作') in message.request_body.content for message in sent)
+        await wait_for(lambda: any('原工具：' + ('已结束' if outcome == 'allowed-once' else '失败') in request.request_body.content for request in updated))
+        assert all(request.message_id == notice['request_message_id'] for request in updated)
+        assert all(not any(element.get('actions') for element in json.loads(request.request_body.content)['elements']) for request in updated)
         await wait_for(lambda: record()['dsh_execution']['state'] == 'awaiting_acceptance')
         overlay = json.loads((instance / 'home/.hermes-owned-overlay.json').read_text())
         assert next(p for p in overlay if p.get('id') == 'web-runtime')['disabled'] is True

@@ -21,11 +21,17 @@ const eventControl = new AbortController();
 let eventClientId, eventFailure = false;
 const quote = value => "'" + String(value).replaceAll("'", "'\\''") + "'";
 const verificationDiagnostic = value => {
-  let text = JSON.stringify(value);
-  const key = config.runtime_configuration?.model?.configuration?.apiKeyEnv;
-  if (key && process.env[key]) text = text.replaceAll(process.env[key], '[REDACTED_CREDENTIAL]');
-  text = text.replace(/(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,})/g, '[REDACTED_CREDENTIAL]');
-  fs.writeFileSync(path.join(config.dsh_home, '.hermes-verification-diagnostic.json'), text, {mode: 0o600});
+  const summary = output => {
+    const text = typeof output?.text === 'string' ? output.text : '';
+    return {bytes: Buffer.byteLength(text), sha256: crypto.createHash('sha256').update(text).digest('hex'),
+      truncated: output?.truncated === true};
+  };
+  const diagnostic = {exit_code: Number.isInteger(value.exitCode) ? value.exitCode
+      : Number.isInteger(value.actual_exit_code) ? value.actual_exit_code : null,
+    aborted: value.aborted === true, timed_out: value.timedOut === true || value.timed_out === true,
+    error_type: ['Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError', 'AbortError', 'TimeoutError'].includes(value.type) ? value.type : value.type ? 'Error' : null,
+    stdout: summary(value.stdout), stderr: summary(value.stderr)};
+  fs.writeFileSync(path.join(config.dsh_home, '.hermes-verification-diagnostic.json'), JSON.stringify(diagnostic), {mode: 0o600});
 };
 async function verifyTests(testFiles) {
   if (!config.test_python || !config.test_runner_path || !Array.isArray(testFiles) || !testFiles.length

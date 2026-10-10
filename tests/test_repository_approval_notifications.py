@@ -11,7 +11,7 @@ from sdk_source_integrity import source_snapshot
 
 
 @pytest.mark.parametrize('outcome', ['allowed-once', 'rejected'])
-@pytest.mark.parametrize('reply_mode', ['native-ui', 'lark', 'lark-id'])
+@pytest.mark.parametrize('reply_mode', ['native-ui', 'lark', 'lark-id', 'card'])
 def test_headless_original_approval_accepts_only_the_bound_owner_decision(outcome, reply_mode):
     sdk = os.environ.get('HERMES_TEST_SDK_ROOT')
     dsh = os.environ.get('DSH_TEST_SDK_ROOT')

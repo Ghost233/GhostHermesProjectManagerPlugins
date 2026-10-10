@@ -373,7 +373,7 @@ class RepositoryIntake(FeishuEntry):
                 'chat_id': prepared.envelope['chat_id'], 'reply_to': prepared.envelope['message_id']})
             self.require_active(generation)
             return {'status': 'rejected', 'code': prepared.rejected}
-        if prepared.action == 'approval':
+        if prepared.action in {'approval', 'approval_card'}:
             from .repository_approvals import process_approval_reply
             return await process_approval_reply(self, prepared, generation)
         if prepared.action == 'question':
@@ -451,6 +451,46 @@ def register_simple_development(ctx):
     ctx.on_unload(intake.deactivate)
 
     class RepositoryFeishuAdapter(OwnedFeishuAdapter):
+        async def _handle_card_action_payload(self, payload):
+            from types import SimpleNamespace
+            from .repository_approvals import prepare_card_action
+            generation = intake.generation
+            if intake.closed or self._close_requested or not self._ordinary_active:
+                return
+            prepared = prepare_card_action(intake, payload, self)
+            if prepared is None or payload['header']['app_id'] != self._app_id:
+                return
+            operator = payload['event']['operator']
+            sender = SimpleNamespace(sender_type='user', tenant_key=operator['tenant_key'],
+                                     sender_id=SimpleNamespace(**operator))
+            message = SimpleNamespace(chat_type='group', chat_id=prepared.envelope['chat_id'], content='', mentions=[])
+            if self._base_admit(sender, message, card_action=True) is not None:
+                return
+            # An official callback supplies identity without becoming a chat turn.
+            source = self.build_source(chat_id=message.chat_id, chat_type='group',
+                user_id=operator.get('user_id') or operator['open_id'], user_id_alt=operator.get('union_id'),
+                is_bot=False, message_id=prepared.envelope['message_id'])
+            identity = self._canonicalize(source)
+            if identity is None:
+                return
+            runner = self.gateway_runner
+            try:
+                if runner._intake_adapter_for(source) is not self or runner._is_user_authorized_for_source(source) is not True:
+                    return
+                recipient = await prepared.transport.verify_identity(prepared.binding)
+                intake.require_active(generation)
+                if (recipient != {'app_id': prepared.binding['app_id'], 'open_id': prepared.binding['recipient_open_id']}
+                    or identity is None or not intake.in_scope(prepared, identity.runtime_profile)
+                    or runner._admit_bot_message_for_source(source) is not True):
+                    return
+                event_id = prepared.envelope['event_id']
+                if await self._is_duplicate('card-action:' + event_id):
+                    return
+                async with _async_profile_runtime_scope(home):
+                    await intake.process_prepared(prepared, generation)
+            except ManagementError:
+                return
+
         def _admit(self, sender, message):
             if sender.sender_type in {'bot', 'app'}:
                 ids = sender.sender_id
