@@ -55,23 +55,34 @@ def main():
         version = json.loads(Path(runtime['log']).read_text()) if runtime['actual_exit_code'] == 0 else []
         if version[:2] < [3, 11]:
             raise ValueError('Python >=3.11 is required before any validation command.')
-        commands = args.command[1:] if args.command[:1] == ['--'] else args.command
-        if commands:
-            commands = [commands]
-        else:
+        requested = args.command[1:] if args.command[:1] == ['--'] else args.command
+        pytest_args = None
+        if requested[1:3] == ['-m', 'pytest']:
+            pytest_args = requested[3:]
+        elif requested and Path(requested[0]).name == 'pytest':
+            pytest_args = requested[1:]
+        if not requested or pytest_args is not None:
             sdk = environment.get('HERMES_TEST_SDK_ROOT')
             if not sdk or not Path(sdk).is_dir():
-                raise ValueError('Prepare the fixed Hermes SDK and set HERMES_TEST_SDK_ROOT before full validation.')
+                raise ValueError('Prepare the fixed Hermes SDK and set HERMES_TEST_SDK_ROOT before pytest validation.')
             dsh_sdk = environment.get('DSH_TEST_SDK_ROOT')
             if not dsh_sdk or not Path(dsh_sdk).is_dir():
-                raise ValueError('Prepare the original DSH SDK before full validation.')
+                raise ValueError('Prepare the original DSH SDK before pytest validation.')
             environment['DSH_REQUIRE_SDK_SMOKE'] = '1'
+            record['environment']['DSH_REQUIRE_SDK_SMOKE'] = '1'
             session_python = environment.get('HERMES_TEST_SESSION_PYTHON')
             if session_python:
                 session = execute([session_python, '-c', 'import json,sys; print(json.dumps(list(sys.version_info[:3])))'], root, environment, artifacts, 'sdk-runtime')
                 record['preparation'].append(session)
                 if session['actual_exit_code'] != 0 or json.loads(Path(session['log']).read_text())[:2] < [3, 11]:
-                    raise ValueError('The SDK session Python >=3.11 must be prepared before full validation.')
+                    raise ValueError('The SDK session Python >=3.11 must be prepared before pytest validation.')
+            base = tempfile.mkdtemp(prefix='hc-', dir='/tmp')
+        if requested:
+            if pytest_args is not None:
+                commands = [[args.python, '-m', 'pytest', *pytest_args, '--maxfail=1', '-rs', '--basetemp=' + base]]
+            else:
+                commands = [requested]
+        else:
             lint = execute([args.python, '-m', 'ruff', '--version'], root, environment, artifacts, 'ruff')
             node = execute([args.node, '--version'], root, environment, artifacts, 'node')
             record['preparation'] += [lint, node]
@@ -82,11 +93,10 @@ def main():
             pinned = next(value.removeprefix('ruff==') for value in project['project']['optional-dependencies']['test'] if value.startswith('ruff=='))
             if Path(lint['log']).read_text().strip() != 'ruff ' + pinned:
                 raise ValueError('Installed Ruff differs from the pinned test dependency.')
-            base = tempfile.mkdtemp(prefix='hc-', dir='/tmp')
             diff = ['git', 'diff', '--check'] + ([args.diff_base, 'HEAD'] if args.diff_base else [])
             commands = [[args.python, 'tools/check_sdk_test_seams.py'],
                         [args.python, '-m', 'ruff', 'check', '--no-cache', '--select', 'F821', 'ghost_hermes_pm', 'tests', 'tools', '__init__.py'],
-                        [args.python, '-m', 'pytest', '-q', '--basetemp=' + base],
+                        [args.python, '-m', 'pytest', '-q', '--maxfail=1', '-rs', '--basetemp=' + base],
                         [args.node, '--check', 'dashboard/dist/index.js'],
                         [args.node, '--check', 'ghost_hermes_pm/owned_native_host.mjs'], diff]
         record['validation_exit_code'] = 0

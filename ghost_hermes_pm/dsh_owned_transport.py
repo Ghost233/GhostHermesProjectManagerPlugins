@@ -14,6 +14,7 @@ import uuid
 
 from .dsh_remote import FRAME_BOUND
 from .manager import ManagementError
+from .manager import _private_state_directory
 
 
 class NativeOwnedTransport:
@@ -277,3 +278,156 @@ class _OwnedStream:
             open_generation = not self.owner._closed
         if open_generation:
             self.owner._send({'op': 'cancel', 'streamId': self.identity, 'id': str(uuid.uuid4())})
+
+
+class PersistentOwnedTransport(NativeOwnedTransport):
+    """A supervisor connection to one managed, independently owned generation."""
+    def __init__(self, *, instance_dir, configuration, node_bin=None, timeout=10, environment=None):
+        import hashlib
+        self.instance_dir = _private_state_directory(instance_dir)
+        required = {'dsh_home', 'workspace', 'runtime_package_root', 'instance_id', 'generation', 'session_id'}
+        if not isinstance(configuration, dict) or not required <= set(configuration):
+            raise ManagementError('configuration_missing', 'An admitted owned generation configuration is required.')
+        super().__init__(dsh_home=configuration['dsh_home'], workspace=configuration['workspace'],
+                         runtime_package_root=configuration['runtime_package_root'], node_bin=node_bin, timeout=timeout)
+        self.config.update(configuration)
+        self.environment = dict(environment or {})
+        self.driver = Path(__file__).with_name('owned_persistent_host.mjs')
+        self._source_bindings.extend(self._path_binding(p) for p in (self.driver, self.driver.with_name('owned_runtime.mjs')))
+        digest = hashlib.sha256(str(self.instance_dir).encode()).hexdigest()[:20]
+        socket_dir = _private_state_directory('/private/tmp/hpm-dsh-' + digest)
+        self.socket_path = socket_dir / 'carrier.sock'
+        self.identity_path = self.instance_dir / 'native-identity.json'
+        self.birth_path = self.instance_dir / 'process-birth.json'
+        self.exit_path = self.instance_dir / 'native-exit.json'
+        self.configuration_path = self.instance_dir / 'native-configuration.json'
+        self.config.update(socket_path=str(self.socket_path), identity_path=str(self.identity_path), exit_path=str(self.exit_path))
+        self.config['source_bindings'] = self._source_bindings
+        self.config['configuration_sha256'] = hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest()
+
+    @staticmethod
+    def _path_binding(path):
+        import hashlib
+        binding = NativeOwnedTransport._path_binding(path)
+        if path.is_file():
+            binding['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return binding
+
+    def _start_original(self):
+        import fcntl
+        with self._lock:
+            if self._closed:
+                raise OSError('The supervisor connection has already detached.')
+        if self._started:
+            return
+        lock_fd = os.open(self.instance_dir / 'startup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            self._prepare_paths()
+            if not self.configuration_path.exists():
+                data = json.dumps(self.config)
+                fd = os.open(self.configuration_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'w') as target:
+                    target.write(data)
+                    target.flush()
+                    os.fsync(target.fileno())
+                home = Path(self.config['dsh_home'])
+                temporary = home / 'tmp'
+                temporary.mkdir(mode=0o700, exist_ok=True)
+                environment = {k: v for k, v in os.environ.items() if k in {'PATH', 'LANG', 'LC_ALL', 'TZ'}}
+                environment.update(HOME=str(home), DSH_HOME=str(home), DSH_TELEMETRY_DISABLED='1', TMPDIR=str(temporary), **self.environment)
+                with self._lock:
+                    if self._closed:
+                        raise OSError('The supervisor detached before native startup.')
+                    self._process = subprocess.Popen([self.node_bin, str(self.driver), str(self.configuration_path)],
+                        cwd=self.workspace, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, start_new_session=True)
+                import psutil
+                birth = {'pid': self._process.pid, 'created_at': psutil.Process(self._process.pid).create_time(),
+                         'generation': self.config['generation']}
+                fd = os.open(self.birth_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, 'w') as target:
+                    json.dump(birth, target)
+                    target.flush()
+                    os.fsync(target.fileno())
+            else:
+                if self.configuration_path.is_symlink():
+                    raise ManagementError('outcome_unknown', 'The original owned configuration must be reconciled.')
+                saved = json.loads(self.configuration_path.read_text())
+                if saved.get('configuration_sha256') != self.config['configuration_sha256']:
+                    raise ManagementError('binding_conflict', 'The admitted owned configuration changed.')
+                if saved.get('source_bindings') != self._source_bindings or saved.get('home_identity') != self._home_identity:
+                    raise ManagementError('binding_conflict', 'Original owned home or source identity changed.')
+            deadline = time.monotonic() + self.timeout
+            while not self.identity_path.exists() and time.monotonic() < deadline:
+                if self._process is not None and self._process.poll() is not None:
+                    break
+                time.sleep(0.02)
+            if not self.identity_path.exists() or self.identity_path.is_symlink():
+                raise ManagementError('outcome_unknown', 'The original owned startup remains unconfirmed; do not replace it.')
+            identity = json.loads(self.identity_path.read_text())
+            import psutil
+            if self.birth_path.is_symlink() or not self.birth_path.exists():
+                raise ManagementError('outcome_unknown', 'Original process creation remains unconfirmed.')
+            birth = json.loads(self.birth_path.read_text())
+            if (identity.get('pid') != birth.get('pid') or birth.get('generation') != self.config['generation']
+                or psutil.Process(birth['pid']).create_time() != birth.get('created_at')):
+                raise ManagementError('binding_conflict', 'Original process creation identity changed.')
+            for key in ('instance_id', 'generation', 'configuration_sha256'):
+                if identity.get(key) != self.config[key]:
+                    raise ManagementError('binding_conflict', 'The original owned identity changed.')
+            endpoint = self.socket_path.lstat()
+            if not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != os.getuid() or endpoint.st_mode & 0o077:
+                raise ManagementError('unsafe_state', 'The original owned connection is not private.')
+            channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            channel.settimeout(self.timeout)
+            channel.connect(str(self.socket_path))
+            channel.setblocking(False)
+            self._socket, self._started = channel, True
+            self._reader = threading.Thread(target=self._read, name='hermes-pm-persistent-carrier', daemon=True)
+            self._reader.start()
+            actual = self._rpc({'op': 'attach'})
+            if actual != identity or type(identity.get('pid')) is not int:
+                raise ManagementError('binding_conflict', 'The connected owned generation differs from its registered identity.')
+            os.kill(identity['pid'], 0)
+            self.native_identity = identity
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            channel = self._socket
+            if channel:
+                try:
+                    channel.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                channel.close()
+            self.close_outcome = {'kind': 'supervisor_detached', 'exit_code': None}
+        if self._reader and self._reader is not threading.current_thread():
+            self._reader.join(timeout=2)
+
+    def shutdown_owned(self):
+        self._start()
+        identity = dict(self.native_identity)
+        self._rpc({'op': 'shutdown'})
+        deadline = time.monotonic() + self.timeout
+        while self.socket_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.close()
+        if self._process is not None:
+            code = self._process.wait(timeout=self.timeout)
+        else:
+            while not self.exit_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            receipt = json.loads(self.exit_path.read_text()) if self.exit_path.exists() and not self.exit_path.is_symlink() else {}
+            code = receipt.get('exit_code') if all(receipt.get(k) == identity.get(k) for k in
+                       ('pid', 'generation', 'created_at_ms', 'configuration_sha256')) and receipt.get('shutdown_requested') is True else None
+        self.close_outcome = {'kind': 'original_exit' if code == 0 and not self.socket_path.exists() else 'unconfirmed',
+                              'exit_code': code, 'pid': identity['pid']}
+        if self.close_outcome['kind'] == 'original_exit':
+            self.socket_path.parent.rmdir()

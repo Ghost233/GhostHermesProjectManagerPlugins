@@ -2,12 +2,15 @@
 import os
 from pathlib import Path
 import sys
+import json
 
 
 scratch = Path(sys.argv[1]).resolve()
 scenario = sys.argv[2]
 model_address = None
 protected_home = Path.home()
+real_model = json.loads(Path(os.environ['HPM_NATIVE_REAL_MODEL_REFERENCE']).read_text()) if os.environ.get('HPM_NATIVE_REAL_MODEL_REFERENCE') else None
+approved_files = {Path(os.environ['HPM_NATIVE_REAL_MODEL_REFERENCE']).resolve(), Path(real_model['env_file']).resolve()} if real_model else set()
 for name in ('os-home', 'os-state', 'os-config'):
     (scratch / name).mkdir(mode=0o700)
 os.environ['HOME'] = str(scratch / 'os-home')
@@ -22,11 +25,11 @@ os.environ['HERMES_FEISHU_TEXT_BATCH_SPLIT_DELAY_SECONDS'] = '0.01'
 def audit(event, args):
     if event == 'open' and isinstance(args[0], (str, bytes)):
         path = Path(os.fsdecode(args[0])).resolve()
-        if any(path.is_relative_to(protected_home / p) for p in ('.hermes', '.config', '.local/state/hermes')):
+        if path not in approved_files and any(path.is_relative_to(protected_home / p) for p in ('.hermes', '.config', '.local/state/hermes')):
             raise RuntimeError('Smoke refuses existing personal runtime state.')
     if event == 'socket.connect' and isinstance(args[1], tuple) and args[1][:2] != model_address:
         raise RuntimeError('Smoke refuses external network access.')
-    if event == 'import' and args[0] == 'hermes_cli.main':
+    if event == 'import' and args[0] == 'hermes_cli.main' and scenario != 'worker_dispatch':
         raise RuntimeError('Intake cannot launch native workers.')
 
 
@@ -49,7 +52,12 @@ from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse  # no
 from tools.registry import registry  # noqa: E402
 
 home = scratch / 'home'
-model = OrdinaryModelService()
+if scenario in {'worker_dispatch', 'worker_query_race'}:
+    from simple_worker_model import WorkerModelService, execution_reference
+    model = WorkerModelService(scratch / 'state/repository-intake.lock' if scenario == 'worker_query_race' else None,
+                               refuse=os.environ.get('HPM_SYNTHETIC_WORKER_REFUSE') == '1')
+else:
+    model = OrdinaryModelService()
 model_address = ('127.0.0.1', model.server.server_port)
 state = scratch / 'state'
 repo = scratch / 'repo'
@@ -102,7 +110,12 @@ os.environ['SYNTHETIC_GH_STATE'] = str(scratch)
 os.environ['SYNTHETIC_GH_SCENARIO'] = scenario
 gh_config = scratch / 'gh-config'
 gh_config.mkdir(mode=0o700)
-(home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=u_owner,on_owner\nOPENAI_API_KEY=synthetic-model-only-key\n')
+model_key = 'synthetic-model-only-key'
+if real_model:
+    lines = Path(real_model['env_file']).read_text().splitlines()
+    model_key = next(line.split('=', 1)[1].strip().strip('\"\'') for line in lines if line.startswith(real_model['api_key_env'] + '='))
+(home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=u_owner,on_owner\nOPENAI_API_KEY=' + model_key + '\n')
+(home / '.env').chmod(0o600)
 binding = {'sender_tenant_key': 'tenant-owner', 'recipient_tenant_key': 'tenant-bot',
            'transport_tenant_key': 'tenant-app', 'verification_ref': 'fixture:identity-map',
            'app_id': 'cli_fixture', 'recipient_open_id': 'ou_lead', 'owner_open_id': 'ou_owner',
@@ -115,6 +128,16 @@ settings = {'state_dir': str(state), 'owner_identity_ref': 'fixture:owner',
                                    'github_config_dir': str(gh_config)},
             'feishu_intake': {'enabled': True, 'verification_ref': 'fixture:controlled-smoke',
                               'bindings': [binding]}}
+if scenario in {'worker_dispatch', 'worker_query_race'}:
+    binding['execution_ref'] = os.environ.get('HPM_NATIVE_EXECUTION_REFERENCE') or execution_reference(scratch, model.base_url, Path(os.environ['DSH_TEST_SDK_ROOT']))
+    os.environ['SYNTHETIC_GH_BODY'] = ('Create native-delivery.txt containing exactly native-worker followed by one newline. This bounded synthetic task has only three steps. '
+        + ('1. Load the tdd skill once with the original skill tool. ' if real_model else '1. Load the fixture-matt skill once with the original skill tool. ')
+        + 'Use the returned skill content; do not inspect skill directories or SKILL.md with Bash. '
+          "2. In one original Bash call, write native-delivery.txt, compare the target file's exact bytes, and print the target file. "
+          "Execute exactly this command: `printf 'native-worker\\n' > native-delivery.txt && printf 'native-worker\\n' | cmp - native-delivery.txt && cat native-delivery.txt`. "
+          'The only target file is native-delivery.txt and the exact target content is native-worker followed by one newline. '
+          '3. After the command exits successfully, give the final reply reporting the actual result, then await outer acceptance. '
+          'Do not run further commands or validations, ask additional questions, or change other files.')
 if scenario == 'delegation':
     settings['simple_development']['work_profiles'] = [dict(binding, native_profile='fixture-worker')]
     binding = dict(binding, profile_id='steward', project_id=None, capability='coordination',
@@ -136,8 +159,16 @@ if scenario == 'responsibility_conflict':
     settings['simple_development']['work_profiles'] = [dict(binding, profile_id='other-lead', native_profile='other-worker')]
 if scenario == 'configuration_repository':
     binding['repo_path'] = str(scratch / 'missing-repository')
-(home / 'config.yaml').write_text(yaml.safe_dump({'kanban': {'auto_decompose': scenario == 'configuration_auto_decompose'}, 'toolsets': ['kanban'],
-    'model': {'default': 'fixture-model', 'provider': 'custom', 'base_url': model.base_url, 'api_mode': 'chat_completions', 'context_length': 131072},
+(home / 'config.yaml').write_text(yaml.safe_dump({'kanban': {'auto_decompose': scenario == 'configuration_auto_decompose'}, 'toolsets': ['kanban', 'hermes_pm'] if scenario in {'worker_dispatch', 'worker_query_race'} else ['kanban'],
+    'platform_toolsets': {'cli': ['hermes_pm_supervision']},
+    'known_plugin_toolsets': {'cli': ['hermes_pm', 'hermes_pm_supervision']},
+    'tools': {'tool_search': {'enabled': 'off'}},
+    'model': {'default': real_model['model'] if real_model else 'fixture-model', 'provider': 'custom',
+              'base_url': real_model['base_url'] if real_model else model.base_url, 'api_mode': 'chat_completions',
+              'key_env': 'OPENAI_API_KEY',
+              'max_tokens': real_model['max_tokens_per_request'] if real_model else 256,
+              'context_length': real_model['context_window'] if real_model else 131072},
+    'agent': {'max_turns': 8},
     'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 plugins = get_plugin_manager()
 plugins.discover_and_load()
@@ -349,9 +380,140 @@ async def main():
     snapshot = json.loads(registry.dispatch('hermes_pm_snapshot', {}))
     assert snapshot['status'] == 'completed' and len(snapshot['work']) == 1, snapshot
     record = snapshot['work'][0]
-    expected_body = 'Verify the bounded acceptance.' if scenario == 'create_unknown' else 'Verify [binding:' if scenario in {'private_issue', 'private_all_bindings'} else 'Implement the requested feature and verify it.'
+    if scenario == 'worker_required':
+        refused = json.loads(registry.dispatch('hermes_pm_supervise', {}))
+        assert refused.get('status') == 'rejected' and refused.get('code') == 'worker_required', refused
+        forged = json.loads(registry.dispatch('hermes_pm_supervise', {'actor': 'owner', 'repo_path': str(repo)}))
+        assert forged.get('status') == 'rejected'
+        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == [record]
+    expected_body = 'Create native-delivery.txt' if scenario in {'worker_dispatch', 'worker_query_race'} else 'Verify the bounded acceptance.' if scenario == 'create_unknown' else 'Verify [binding:' if scenario in {'private_issue', 'private_all_bindings'} else 'Implement the requested feature and verify it.'
     assert expected_body in record['issue']['body']
     assert record['superior_profile_id'] == ('pm' if scenario == 'private_all_bindings' else 'steward')
+    if scenario in {'worker_dispatch', 'worker_query_race'}:
+        from simple_worker_evidence import verify_dsh_work, verify_hermes_worker, remember_worker
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli.kanban_db_dispatch import dispatch_once
+        from hermes_cli import kanban_db as kb
+        import time
+        assert 'dsh_execution' in record, {'record': record, 'sent': [m.request_body.content for m in sent]}
+        assert record['dsh_execution']['state'] == 'admitted', record
+        native_card = json.loads(registry.dispatch('kanban_show', {'task_id': record['card_id']}))['task']
+        assert 'hermes_pm_supervise({})' in native_card['body'] and 'not instructions for this outer worker' in native_card['body']
+        foreign_card = json.loads(registry.dispatch('kanban_create', {'title': 'Unrelated permission fixture',
+            'assignee': 'default', 'workspace_kind': 'dir', 'workspace_path': str(repo),
+            'initial_status': 'blocked', 'body': 'An unrelated fixture card; never part of the managed Issue.'}))['task_id']
+        model.foreign_task_id = foreign_card
+        if scenario == 'worker_query_race':
+            # Real original native records widen its real read-only verification window.
+            for index in range(190):
+                created = json.loads(registry.dispatch('kanban_create', {'title': 'Unmanaged fixture ' + str(index),
+                    'assignee': 'default', 'workspace_kind': 'dir', 'workspace_path': str(repo), 'project': '',
+                    'initial_status': 'blocked', 'body': 'Unrelated bounded synthetic verification context. ' * 18000}))
+                assert created.get('task_id'), created
+        with connect_closing() as db:
+            result = dispatch_once(db, max_spawn=1)
+            assert result.spawned, result
+            known_workers.append(remember_worker(db, record['card_id']))
+        if scenario == 'worker_query_race':
+            until = time.monotonic() + 30
+            while not model.query_ready.is_set() and time.monotonic() < until:
+                await asyncio.sleep(.01)
+            assert model.query_ready.is_set()
+            before_query = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution']
+            await receive(adapter, raw('om_live_status', text='@_user_1 核对 ' + record['id']))
+            import importlib
+            supervision = next(m for n, m in sys.modules.items() if n.endswith('.ghost_hermes_pm.repository_supervision'))
+            carrier_type = importlib.import_module(supervision.__package__ + '.dsh_owned_transport').PersistentOwnedTransport
+            saved_path = state / 'owned-work' / record['id'] / 'native-configuration.json'
+            cfg = json.loads(saved_path.read_text())
+            observed = carrier_type(instance_dir=str(saved_path.parent), configuration={k: v for k, v in cfg.items()
+                if k not in {'socket_path', 'identity_path', 'exit_path', 'configuration_sha256', 'source_bindings', 'home_identity'}}, timeout=15)
+            try:
+                until = time.monotonic() + 10
+                while time.monotonic() < until:
+                    events, _ = await asyncio.to_thread(supervision.original_history, observed, before_query['session_id'], str(repo))
+                    ends = [e for e in events if e['type'] == 'turn/end']
+                    with connect_closing() as db:
+                        terminal = kb.get_task(db, record['card_id'])
+                    if ends and terminal.status == 'blocked':
+                        break
+                    await asyncio.sleep(.05)
+                assert ends[-1]['data']['reason']['kind'] == 'completed' and terminal.status == 'blocked'
+                current = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                assert current['notification_claimed'] is True
+                assert all(current['dsh_execution'][k] == before_query[k] for k in ('generation', 'session_id', 'request_id', 'first_input'))
+                assert current['dsh_execution']['state'] == 'awaiting_acceptance', {'card_status': terminal.status,
+                    'original_turn_end': ends[-1], 'work_state': current['dsh_execution']['state']}
+            finally:
+                observed.close()
+        until = time.monotonic() + (180 if real_model else 60)
+        while time.monotonic() < until:
+            current = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            if current['dsh_execution']['state'] in {'awaiting_acceptance', 'budget_stopped', 'outcome_unknown'}:
+                break
+            if current['dsh_execution']['state'] == 'admitted':
+                import psutil
+                try:
+                    worker_process = psutil.Process(known_workers[-1]['pid'])
+                    if worker_process.status() == psutil.STATUS_ZOMBIE:
+                        break
+                except psutil.NoSuchProcess:
+                    break
+            await asyncio.sleep(.1)
+        assert current['dsh_execution']['state'] == 'awaiting_acceptance', current
+        assert (repo / 'native-delivery.txt').read_text() == 'native-worker\n'
+        await receive(adapter, raw('om_status', text='@_user_1 核对 ' + record['id']))
+        assert sent[-1].message_id == 'om_status' and '开发与测试结果待验收，尚未交付' in sent[-1].request_body.content
+        assert record['issue']['url'] in sent[-1].request_body.content
+        tasks = json.loads(registry.dispatch('kanban_list', {'limit': 200}))['tasks']
+        assert sum(record['issue']['url'] in row.get('body', '') or row['id'] == record['card_id'] for row in tasks) == 1, 'Worker cannot create a second outer queue.'
+        with connect_closing() as db:
+            run = kb.latest_run(db, record['card_id'])
+        import psutil
+        try:
+            await asyncio.to_thread(psutil.Process(run.worker_pid).wait, timeout=40)
+        except psutil.NoSuchProcess:
+            pass
+        with connect_closing() as db:
+            original = kb.get_task(db, record['card_id'])
+            run = kb.latest_run(db, record['card_id'])
+            assert original.status == 'blocked' and original.claim_lock is None and run.outcome == 'blocked'
+            assert kb.get_task(db, foreign_card).status == 'blocked' and kb.latest_run(db, foreign_card) is None
+        assert '[kanban-worker-exit] rc=0' in (home / 'kanban/logs' / (record['card_id'] + '.log')).read_text()
+        assert known_workers[0]['cli_toolsets'] == ['hermes_pm_supervision'], known_workers[0]
+        if not real_model:
+            assert all(row['authentication_accepted'] for row in model.requests)
+            worker_catalogs = [row['tool_names'] for row in model.requests if row['worker']]
+            assert all(
+                'hermes_pm_supervise' in names and all(name.startswith('kanban_') or name == 'hermes_pm_supervise' for name in names)
+                for names in worker_catalogs), {'actual_cli_toolsets': known_workers[0]['cli_toolsets'], 'actual_worker_catalogs': worker_catalogs}
+            assert any(row['worker'] and 'hermes_pm_supervise' in row['tool_names'] for row in model.requests)
+            assert any(not row['worker'] and 'bash' in row['tool_names'] for row in model.requests)
+            assert all(not row['outer_instructions_present'] for row in model.requests if not row['worker'])
+            assert any(not row['worker'] and row['skill_catalog'] and 'skill' in row['tool_names'] for row in model.requests), 'Original DSH must load the approved skill catalog.'
+        execution = current['dsh_execution']
+        import importlib
+        supervision = next(m for n, m in sys.modules.items() if n.endswith('.ghost_hermes_pm.repository_supervision'))
+        PersistentOwnedTransport = importlib.import_module(supervision.__package__ + '.dsh_owned_transport').PersistentOwnedTransport
+        native_config = json.loads((state / 'owned-work' / record['id'] / 'native-configuration.json').read_text())
+        dsh_evidence = verify_dsh_work(execution, native_config, skill_name='tdd' if real_model else 'fixture-matt')
+        hermes_evidence = verify_hermes_worker(home, record['card_id'], model_name=real_model['model'] if real_model else 'fixture-model',
+                                              base_url=real_model['base_url'] if real_model else model.base_url)
+        (scratch / 'worker-validation-evidence.json').write_text(json.dumps({'dsh': dsh_evidence, 'hermes': hermes_evidence,
+            'worker_cli_toolsets': known_workers[0]['cli_toolsets'],
+            'worker_advertised_catalogs': worker_catalogs if not real_model else None,
+            'real_model': bool(real_model), 'fake_model_requests': len(model.requests) if real_model else None}))
+        (scratch / 'worker-validation-evidence.json').chmod(0o600)
+        if real_model:
+            assert model.requests == [], 'Both real flags must leave the synthetic model service unused.'
+        carrier = PersistentOwnedTransport(instance_dir=str(state / 'owned-work' / record['id']),
+            configuration={k: v for k, v in native_config.items() if k not in {'socket_path', 'identity_path', 'exit_path', 'configuration_sha256', 'source_bindings', 'home_identity'}},
+            timeout=15)
+        carrier.shutdown_owned()
+        assert carrier.close_outcome['kind'] == 'original_exit', carrier.close_outcome
+        assert plugins.unload('ghost-hermes-pm')
+        (scratch / 'simple-smoke-result').write_text('passed')
+        return
     assert record['execution'] == 'not_enabled'
     card = json.loads(registry.dispatch('kanban_show', {'task_id': record['card_id']}))['task']
     assert card['status'] == 'blocked' and card['workspace_kind'] == 'dir'
@@ -389,15 +551,73 @@ async def main():
 
 
 native_runner = None
+known_workers = []
 
 
 async def with_cleanup():
+    primary = None
     try:
         await main()
+    except BaseException as error:
+        primary = error
+        raise
     finally:
+        cleanup_errors = []
+        worker_exits, carrier_exits = [], []
+        if scenario in {'worker_dispatch', 'worker_query_race'}:
+            import importlib
+            from simple_worker_evidence import cleanup_worker, carrier_exit_evidence
+            for worker in known_workers:
+                try:
+                    worker_exits.append(await asyncio.to_thread(cleanup_worker, worker, home))
+                    if primary is None:
+                        assert worker_exits[-1]['exit_code'] == 0
+                except Exception as error:
+                    cleanup_errors.append(type(error).__name__)
+            supervision = next(m for n, m in sys.modules.items() if n.endswith('.ghost_hermes_pm.repository_supervision'))
+            carrier_type = importlib.import_module(supervision.__package__ + '.dsh_owned_transport').PersistentOwnedTransport
+            for saved in (state / 'owned-work').glob('*/native-configuration.json'):
+                try:
+                    if not (saved.parent / 'native-exit.json').exists():
+                        config = json.loads(saved.read_text())
+                        carrier = carrier_type(instance_dir=str(saved.parent), configuration={k: v for k, v in config.items()
+                            if k not in {'socket_path', 'identity_path', 'exit_path', 'configuration_sha256', 'source_bindings', 'home_identity'}}, timeout=15)
+                        carrier.shutdown_owned()
+                        assert carrier.close_outcome['kind'] == 'original_exit'
+                    carrier_exits.append(carrier_exit_evidence(saved))
+                except Exception as error:
+                    cleanup_errors.append(type(error).__name__)
         if native_runner is not None:
-            await native_runner.stop()
+            try:
+                await native_runner.stop()
+            except Exception as error:
+                cleanup_errors.append(type(error).__name__)
         flush_log_queue()
+        if real_model:
+            for directory in (home / 'logs', home / 'kanban/logs', state):
+                for file in directory.rglob('*'):
+                    if file.is_file() and not file.is_symlink() and model_key.encode() in file.read_bytes():
+                        cleanup_errors.append('CredentialDiagnosticHit')
+        evidence = {'worker_exits': worker_exits, 'carrier_exits': carrier_exits,
+                    'logging_flushed_after_stop': True, 'credential_diagnostic_hits': cleanup_errors.count('CredentialDiagnosticHit'),
+                    'cleanup_errors': cleanup_errors, 'business_failed': primary is not None}
+        (scratch / 'cleanup-evidence.json').write_text(json.dumps(evidence))
+        (scratch / 'cleanup-evidence.json').chmod(0o600)
+        if primary is not None and known_workers:
+            try:
+                from simple_worker_evidence import worker_failure_diagnostics
+                diagnostics = {'business_failed': True, 'original_workers': worker_failure_diagnostics(home, known_workers)}
+                (scratch / 'worker-failure-evidence.json').write_text(json.dumps(diagnostics))
+                (scratch / 'worker-failure-evidence.json').chmod(0o600)
+                if real_model:
+                    assert model_key not in json.dumps(diagnostics), 'Credential appeared in diagnostic evidence.'
+            except Exception as error:
+                primary.add_note('Original worker diagnostic capture error: ' + type(error).__name__)
+        if cleanup_errors:
+            if primary is not None:
+                primary.add_note('Cleanup/diagnostic verification errors: ' + ','.join(cleanup_errors))
+            else:
+                raise AssertionError('Cleanup/diagnostic verification errors: ' + ','.join(cleanup_errors))
 
 
 try:
