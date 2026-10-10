@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.mark.parametrize('scenario', ['existing', 'create_unknown', 'private_issue', 'concurrent', 'delegation', 'authority',
     'wrong_card_assignee', 'wrong_card_path', 'wrong_card_body', 'wrong_card_duplicate', 'changed_card',
-    'issue_unavailable', 'issue_unavailable_unload'])
+    'issue_unavailable', 'issue_unavailable_unload', 'private_all_bindings',
+    'configuration_auto_decompose', 'configuration_repository', 'queued_rejection_unload', 'responsibility_conflict'])
 def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     if not configured:

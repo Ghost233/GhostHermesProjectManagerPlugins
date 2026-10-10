@@ -201,14 +201,25 @@ class RepositoryIntake(FeishuEntry):
     def _issue_material(self, material):
         _public_text(material, self.secret_values)
         fields = {'repo_path', 'repository', 'app_id', 'owner_open_id', 'recipient_open_id', 'chat_id',
-                  'sender_tenant_key', 'recipient_tenant_key', 'transport_tenant_key', 'native_profile', 'name'}
+                  'sender_tenant_key', 'recipient_tenant_key', 'transport_tenant_key', 'native_profile', 'name',
+                  'profile_id', 'project_id', 'superior_profile_id', 'open_id', 'tenant_key'}
         values = {self.github.account}
-        for binding in [*self.settings.get('bindings', []), *self.configuration.get('work_profiles', [])]:
-            values.update(v for k, v in binding.items() if k in fields and isinstance(v, str) and len(v) > 3)
+        # Reference fields do not add values to this native-binding scan.
+        # Names and descriptive project/Profile IDs become stable public refs.
+        for binding in [*self.settings.get('bindings', []), *self.settings.get('registered_bots', []),
+                        *self.configuration.get('work_profiles', [])]:
+            values.update(v for k, v in binding.items() if k in fields and isinstance(v, str) and v)
             values.update(binding.get('owner_native_ids', []))
+            values.update(binding.get('native_ids', []))
+        alternatives = []
         for value in sorted(values, key=len, reverse=True):
-            material = material.replace(value, '[binding:' + hashlib.sha256(value.encode()).hexdigest()[:12] + ']')
-        return material
+            escaped = re.escape(value)
+            # A short ASCII name is a complete token, not every occurrence of
+            # its letters within unrelated prose. Unicode names stay literal.
+            alternatives.append(r'(?<![A-Za-z0-9_])' + escaped + r'(?![A-Za-z0-9_])'
+                                if len(value) <= 3 and re.fullmatch(r'[A-Za-z0-9_]+', value) else escaped)
+        return re.sub('|'.join(alternatives),
+                      lambda found: '[binding:' + hashlib.sha256(found.group().encode()).hexdigest()[:12] + ']', material)
 
     def _accept(self, prepared, generation):
         self.require_active(generation)
@@ -304,14 +315,28 @@ class RepositoryIntake(FeishuEntry):
 
     async def process_prepared(self, prepared, generation=None):
         generation = self.generation if generation is None else generation
+        self.require_active(generation)
         async with self.lock:
+            self.require_active(generation)
             if prepared.rejected:
                 text = '敏感工作内容未受理；请在原生私有界面处理，不会公开或启动执行。' if prepared.rejected == 'sensitive' else '请明确已登记的仓库负责人及工作范围；当前目标缺失或超出职责，不会创建或启动执行。'
                 await prepared.transport.send({'uuid': hashlib.sha256(prepared.envelope['message_id'].encode()).hexdigest()[:32],
                     'text': text,
                     'chat_id': prepared.envelope['chat_id'], 'reply_to': prepared.envelope['message_id']})
+                self.require_active(generation)
                 return {'status': 'rejected'}
-            record = await asyncio.to_thread(self._accept, prepared, generation)
+            try:
+                record = await asyncio.to_thread(self._accept, prepared, generation)
+            except ManagementError as error:
+                self.require_active(generation)
+                if error.code not in {'configuration_missing', 'unauthorized'}:
+                    raise
+                text = '工作未受理：必要配置或本地仓库绑定尚未核验；不会创建 Issue 或外层卡。' if error.code == 'configuration_missing' else '工作未受理：当前请求超出已登记职责；不会修改既有工作或创建外层卡。'
+                await prepared.transport.send({'uuid': hashlib.sha256(prepared.envelope['message_id'].encode()).hexdigest()[:32],
+                    'text': text, 'chat_id': prepared.envelope['chat_id'], 'reply_to': prepared.envelope['message_id'],
+                    'thread_id': prepared.envelope.get('thread_id')})
+                self.require_active(generation)
+                return {'status': 'rejected', 'code': error.code}
             self.require_active(generation)
             if not record['notification_claimed'] or prepared.work_id:
                 record['notification_claimed'] = True

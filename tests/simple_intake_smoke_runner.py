@@ -6,6 +6,7 @@ import sys
 
 scratch = Path(sys.argv[1]).resolve()
 scenario = sys.argv[2]
+model_address = None
 protected_home = Path.home()
 for name in ('os-home', 'os-state', 'os-config'):
     (scratch / name).mkdir(mode=0o700)
@@ -23,10 +24,10 @@ def audit(event, args):
         path = Path(os.fsdecode(args[0])).resolve()
         if any(path.is_relative_to(protected_home / p) for p in ('.hermes', '.config', '.local/state/hermes')):
             raise RuntimeError('Smoke refuses existing personal runtime state.')
-    if event == 'socket.connect' and isinstance(args[1], tuple):
+    if event == 'socket.connect' and isinstance(args[1], tuple) and args[1][:2] != model_address:
         raise RuntimeError('Smoke refuses external network access.')
-    if event == 'import' and args[0] in {'hermes_cli.main', 'run_agent'}:
-        raise RuntimeError('Intake cannot start models or workers.')
+    if event == 'import' and args[0] == 'hermes_cli.main':
+        raise RuntimeError('Intake cannot launch native workers.')
 
 
 sys.addaudithook(audit)
@@ -41,13 +42,15 @@ import yaml  # noqa: E402
 from feishu_service_support import service_client, connect_service, receive  # noqa: E402
 from gateway.config import Platform, PlatformConfig, GatewayConfig  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
-from gateway.bot_loop_guard import BotLoopGuard, BotLoopGuardSettings  # noqa: E402
+from simple_model_boundary import OrdinaryModelService  # noqa: E402
 from hermes_cli.plugins import get_plugin_manager  # noqa: E402
 from gateway.platform_registry import platform_registry  # noqa: E402
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse  # noqa: E402
 from tools.registry import registry  # noqa: E402
 
 home = scratch / 'home'
+model = OrdinaryModelService()
+model_address = ('127.0.0.1', model.server.server_port)
 state = scratch / 'state'
 repo = scratch / 'repo'
 repo.mkdir()
@@ -67,8 +70,8 @@ if args[:2] == ['auth', 'switch']:
 elif args[:2] == ['api', 'user']:
     print('fixture-user')
 elif args[:2] == ['issue', 'view']:
-    if os.environ.get('SYNTHETIC_GH_SCENARIO', '').startswith('issue_unavailable') and not (base / 'issue-source-recovered').exists():
-        if os.environ['SYNTHETIC_GH_SCENARIO'] == 'issue_unavailable_unload':
+    if (os.environ.get('SYNTHETIC_GH_SCENARIO', '').startswith('issue_unavailable') or os.environ.get('SYNTHETIC_GH_SCENARIO') == 'queued_rejection_unload') and not (base / 'issue-source-recovered').exists():
+        if os.environ['SYNTHETIC_GH_SCENARIO'] in {'issue_unavailable_unload', 'queued_rejection_unload'}:
             import time
             (base / 'issue-view-entered').write_text('entered')
             until = time.monotonic() + 5
@@ -99,7 +102,7 @@ os.environ['SYNTHETIC_GH_STATE'] = str(scratch)
 os.environ['SYNTHETIC_GH_SCENARIO'] = scenario
 gh_config = scratch / 'gh-config'
 gh_config.mkdir(mode=0o700)
-(home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=u_owner,on_owner\n')
+(home / '.env').write_text('HERMES_PM_FEISHU_ALLOWED_USERS=u_owner,on_owner\nOPENAI_API_KEY=synthetic-model-only-key\n')
 binding = {'sender_tenant_key': 'tenant-owner', 'recipient_tenant_key': 'tenant-bot',
            'transport_tenant_key': 'tenant-app', 'verification_ref': 'fixture:identity-map',
            'app_id': 'cli_fixture', 'recipient_open_id': 'ou_lead', 'owner_open_id': 'ou_owner',
@@ -123,19 +126,25 @@ if scenario == 'authority':
     settings['feishu_intake']['registered_bots'] = [{'app_id': 'cli_fixture', 'profile_id': 'steward',
         'identity_ref': 'fixture:steward', 'tenant_key': 'tenant-steward', 'open_id': 'ou_steward',
         'native_ids': ['u_steward'], 'dispatch_profiles': ['lead']}]
-(home / 'config.yaml').write_text(yaml.safe_dump({'kanban': {'auto_decompose': False}, 'toolsets': ['kanban'],
+if scenario == 'private_all_bindings':
+    binding.update(profile_id='rd', project_id='p1', superior_profile_id='pm', name='甲')
+    settings['feishu_intake']['registered_bots'] = [{'app_id': 'cli_fixture', 'profile_id': 'q2',
+        'identity_ref': 'fixture:archive-safe', 'tenant_key': 'tenant-distinct', 'open_id': 'ou_distinct',
+        'native_ids': ['u_distinct'], 'dispatch_profiles': ['rd']}]
+if scenario == 'responsibility_conflict':
+    binding['target_profiles'] = ['lead', 'other-lead']
+    settings['simple_development']['work_profiles'] = [dict(binding, profile_id='other-lead', native_profile='other-worker')]
+if scenario == 'configuration_repository':
+    binding['repo_path'] = str(scratch / 'missing-repository')
+(home / 'config.yaml').write_text(yaml.safe_dump({'kanban': {'auto_decompose': scenario == 'configuration_auto_decompose'}, 'toolsets': ['kanban'],
+    'model': {'default': 'fixture-model', 'provider': 'custom', 'base_url': model.base_url, 'api_mode': 'chat_completions', 'context_length': 131072},
     'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
 plugins = get_plugin_manager()
 plugins.discover_and_load()
+from hermes_logging import setup_logging, flush_log_queue  # noqa: E402
+setup_logging(hermes_home=home, mode='gateway')
 assert platform_registry.get('hermes_feishu_pm') is not None
 assert platform_registry.get('feishu') is None
-
-
-class FixtureRunner(GatewayRunner):
-    async def _handle_message(self, event):
-        self.ordinary.append(event.message_id)
-    async def _handle_active_session_busy_message(self, event, key):
-        return False
 
 
 def raw(mid, text='@_user_1 派发 https://github.com/fixture-user/fixture/issues/7', sender=None, **changes):
@@ -152,15 +161,10 @@ def raw(mid, text='@_user_1 派发 https://github.com/fixture-user/fixture/issue
 
 
 async def main():
-    runner = object.__new__(FixtureRunner)
-    runner.config = GatewayConfig(multiplex_profiles=True)
+    global native_runner
+    runner = GatewayRunner(GatewayConfig(multiplex_profiles=False))
+    native_runner = runner
     runner.config.profile_routes = []
-    runner._primary_profile_name = 'default'
-    runner.adapters, runner._profile_adapters = {}, {}
-    runner.session_store, runner.pairing_store, runner.pairing_stores = None, None, {}
-    runner._busy_text_mode, runner._human_delay = 'steer', None
-    runner._bot_loop_guard = BotLoopGuard(settings=lambda: BotLoopGuardSettings(max_events=20))
-    runner.ordinary = []
     platform = Platform('hermes_feishu_pm')
     adapter = runner._create_adapter(platform, PlatformConfig(enabled=True, extra={
         'app_id': 'cli_fixture', 'app_secret': 'synthetic-unused-secret', 'require_mention': True,
@@ -169,8 +173,12 @@ async def main():
     runner.adapters[platform] = adapter
     runner._wire_adapter_handlers(adapter)
     native = service_client('cli_fixture')
-    native.request = lambda request: types.SimpleNamespace(code=0, raw=types.SimpleNamespace(
-        content=b'{"code":0,"bot":{"open_id":"ou_lead","activate_status":2}}'))
+    verifications = []
+    def verify(request):
+        verifications.append(request)
+        return types.SimpleNamespace(code=0, raw=types.SimpleNamespace(
+            content=b'{"code":0,"bot":{"open_id":"ou_lead","activate_status":2}}'))
+    native.request = verify
     sent = []
     def reply(request):
         sent.append(request)
@@ -178,17 +186,41 @@ async def main():
             'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     native.im.v1.message.reply = reply
     await connect_service(adapter, native)
-    if scenario.startswith('issue_unavailable'):
-        if scenario == 'issue_unavailable_unload':
+    if scenario.startswith('configuration_'):
+        await receive(adapter, raw('om_configuration'))
+        assert len(sent) == 1 and sent[0].message_id == 'om_configuration'
+        assert '配置' in sent[0].request_body.content and '未受理' in sent[0].request_body.content
+        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == []
+        assert not (scratch / 'gh-calls').exists()
+        from tools import kanban_tools  # noqa: F401
+        assert json.loads(registry.dispatch('kanban_list', {}))['count'] == 0
+        assert plugins.unload('ghost-hermes-pm')
+        await asyncio.sleep(0.05)
+        assert not adapter.is_connected
+        (scratch / 'simple-smoke-result').write_text('passed')
+        return
+    if scenario.startswith('issue_unavailable') or scenario == 'queued_rejection_unload':
+        if scenario in {'issue_unavailable_unload', 'queued_rejection_unload'}:
             receiving = asyncio.create_task(receive(adapter, raw('om_work')))
             for _ in range(250):
                 if (scratch / 'issue-view-entered').exists():
                     break
                 await asyncio.sleep(0.01)
             assert (scratch / 'issue-view-entered').exists()
+            queued = None
+            if scenario == 'queued_rejection_unload':
+                queued = asyncio.create_task(receive(adapter, raw('om_waiting', '@_user_1 派发 https://github.com/fixture-user/other/issues/7')))
+                for _ in range(250):
+                    if len(verifications) >= 2:
+                        break
+                    await asyncio.sleep(0.01)
+                assert len(verifications) == 2
+                await asyncio.sleep(0.01)
             assert plugins.unload('ghost-hermes-pm')
             (scratch / 'issue-view-release').write_text('release')
             await asyncio.wait_for(receiving, timeout=6)
+            if queued is not None:
+                await asyncio.wait_for(queued, timeout=6)
             assert sent == [], 'An ended plugin generation cannot emit failure replies.'
         else:
             await receive(adapter, raw('om_work'))
@@ -278,6 +310,12 @@ async def main():
         published = json.loads((scratch / 'created-issue').read_text())
         assert all(value not in published['body'] for value in (str(repo), 'ou_owner', 'oc_fixture'))
         assert '[binding:' in published['body']
+    elif scenario == 'private_all_bindings':
+        await receive(adapter, raw('om_work', '@_user_1 工作 Feature\nVerify rd p1 pm 甲 q2 ou_distinct u_distinct tenant-distinct; use fixture:archive-safe.'))
+        published = json.loads((scratch / 'created-issue').read_text())
+        for value in ('rd', 'p1', 'pm', '甲', 'q2', 'ou_distinct', 'u_distinct', 'tenant-distinct'):
+            assert value not in published['body'], (value, published['body'])
+        assert 'fixture:archive-safe' in published['body'], 'Safe configuration references are not native identity bindings.'
     elif scenario == 'concurrent':
         await asyncio.gather(*(receive(adapter, raw('om_work_' + str(i))) for i in range(5)))
     elif scenario == 'delegation':
@@ -297,6 +335,12 @@ async def main():
             'sender_id': {'open_id': 'ou_steward', 'user_id': 'u_steward'}}))
         await receive(adapter, raw('om_echo', '@_user_1 已收到', sender={'sender_type': 'app',
             'tenant_key': 'tenant-steward', 'sender_id': {'open_id': 'ou_steward', 'user_id': 'u_steward'}}))
+    elif scenario == 'responsibility_conflict':
+        await receive(adapter, raw('om_work', '@_user_1 派发 lead https://github.com/fixture-user/fixture/issues/7'))
+        before = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work']
+        await receive(adapter, raw('om_conflict', '@_user_1 派发 other-lead https://github.com/fixture-user/fixture/issues/7'))
+        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == before
+        assert len(sent) == 2 and sent[-1].message_id == 'om_conflict' and '职责' in sent[-1].request_body.content
     else:
         await receive(adapter, raw('om_work'))
         await receive(adapter, raw('om_work'))
@@ -305,9 +349,9 @@ async def main():
     snapshot = json.loads(registry.dispatch('hermes_pm_snapshot', {}))
     assert snapshot['status'] == 'completed' and len(snapshot['work']) == 1, snapshot
     record = snapshot['work'][0]
-    expected_body = 'Verify the bounded acceptance.' if scenario == 'create_unknown' else 'Verify [binding:' if scenario == 'private_issue' else 'Implement the requested feature and verify it.'
+    expected_body = 'Verify the bounded acceptance.' if scenario == 'create_unknown' else 'Verify [binding:' if scenario in {'private_issue', 'private_all_bindings'} else 'Implement the requested feature and verify it.'
     assert expected_body in record['issue']['body']
-    assert record['superior_profile_id'] == 'steward'
+    assert record['superior_profile_id'] == ('pm' if scenario == 'private_all_bindings' else 'steward')
     assert record['execution'] == 'not_enabled'
     card = json.loads(registry.dispatch('kanban_show', {'task_id': record['card_id']}))['task']
     assert card['status'] == 'blocked' and card['workspace_kind'] == 'dir'
@@ -315,8 +359,18 @@ async def main():
     assert record['issue']['url'] in card['body']
     assert expected_body in card['body']
     assert not (state / 'manager.sock').exists(), 'New work cannot open the old dispatch manager.'
-    assert len(sent) == (2 if scenario in {'create_unknown', 'private_issue'} else 3 if scenario == 'authority' else 1), len(sent)
-    assert runner.ordinary == (['om_text_role'] if scenario == 'authority' else []), runner.ordinary
+    if scenario == 'authority':
+        for _ in range(1000):
+            if any('Native ordinary reply.' in message.request_body.content for message in sent):
+                break
+            await asyncio.sleep(0.02)
+        assert any('Native ordinary reply.' in message.request_body.content for message in sent), {
+            'sent': [message.request_body.content for message in sent], 'model_requests': model.requests,
+            'native_diagnostics': (home / 'logs/gateway.log').read_text()[-6000:]}
+        assert model.requests, 'Original Gateway ordinary processing must reach the external model boundary.'
+    else:
+        assert len(sent) == (2 if scenario in {'create_unknown', 'private_issue', 'responsibility_conflict'} else 1), len(sent)
+        assert model.requests == [], 'The registered intake consumes work before native ordinary model processing.'
     listing = json.loads(registry.dispatch('kanban_list', {}))
     assert listing.get('count') == 1 and len(listing['tasks']) == 1, listing
     calls = [json.loads(line) for line in (scratch / 'gh-calls').read_text().splitlines()]
@@ -334,4 +388,19 @@ async def main():
     (scratch / 'simple-smoke-result').write_text('passed')
 
 
-asyncio.run(main())
+native_runner = None
+
+
+async def with_cleanup():
+    try:
+        await main()
+    finally:
+        if native_runner is not None:
+            await native_runner.stop()
+        flush_log_queue()
+
+
+try:
+    asyncio.run(with_cleanup())
+finally:
+    model.close()
