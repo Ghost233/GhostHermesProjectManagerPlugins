@@ -75,6 +75,8 @@ with (base / 'gh-calls').open('a') as log:
     log.write(json.dumps(args) + '\\n')
 if args[:2] == ['auth', 'switch']:
     pass
+elif args[:2] == ['auth', 'token']:
+    print('synthetic-configured-account-token')
 elif args[:2] == ['api', 'user']:
     print('fixture-user')
 elif args[:2] == ['issue', 'view']:
@@ -170,6 +172,17 @@ if scenario == 'configuration_repository':
               'context_length': real_model['context_window'] if real_model else 131072},
     'agent': {'max_turns': 8},
     'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
+if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'} and not real_model:
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_cli.providers import HERMES_OVERLAYS
+    from agent.models_dev import PROVIDER_TO_MODELS_DEV
+    prepared_config = yaml.safe_load((home / 'config.yaml').read_text())
+    prepared_config['model_catalog'] = {'excluded_providers': sorted({
+        *PROVIDER_REGISTRY, *HERMES_OVERLAYS, *PROVIDER_TO_MODELS_DEV, *PROVIDER_TO_MODELS_DEV.values(), 'custom'})}
+    prepared_config['models_dev'] = {'url': model.base_url.rsplit('/v1', 1)[0] + '/models-dev'}
+    (home / 'config.yaml').write_text(yaml.safe_dump(prepared_config))
+    os.environ.update(HTTP_PROXY=model.base_url, HTTPS_PROXY=model.base_url, ALL_PROXY=model.base_url,
+                      NO_PROXY='127.0.0.1,localhost')
 plugins = get_plugin_manager()
 plugins.discover_and_load()
 from hermes_logging import setup_logging, flush_log_queue  # noqa: E402
