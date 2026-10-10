@@ -36,6 +36,9 @@ def _configured_executors(configurations, state_dir):
 
 
 def register_native(ctx):
+    if ctx.get_config('simple_development', {}).get('enabled') is True:
+        from .simple_development import register_simple_development
+        return register_simple_development(ctx)
     from .migration_capture import capture_request
     ctx.register_hook('pre_api_request', capture_request)
     from .native_maintenance import loaded_fact
