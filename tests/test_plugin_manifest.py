@@ -1,4 +1,6 @@
 from pathlib import Path
+import asyncio
+import json
 
 import yaml
 
@@ -16,3 +18,16 @@ def test_manifest_declares_every_registered_tool(tmp_path, monkeypatch):
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
 
     assert set(manifest["provides_tools"]) == set(context.tools)
+
+
+def test_unconfigured_supervision_registration_does_not_enable_execution(tmp_path, monkeypatch):
+    home = tmp_path / "native-home"
+    fixture_native_home(monkeypatch, home)
+    context = Context({})
+    load_entry().register(context)
+
+    result = json.loads(asyncio.run(context.tools["hermes_pm_supervise"]({})))
+
+    assert result == {"status": "rejected", "code": "configuration_missing", "delivered": False}
+    assert not context.cleanups
+    assert not home.exists()

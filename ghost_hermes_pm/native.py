@@ -51,6 +51,14 @@ def register_native(ctx):
         schema={'name': 'hermes_pm_loaded_version', 'description': 'Read actual native registration and entry bytecode/source evidence captured when this plugin instance loaded.',
                 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
         handler=loaded_version, description='Read the actual loaded plugin registration; capability acceptance is separate')
+    async def unavailable_supervision(args):
+        return json.dumps({'status': 'rejected', 'code': 'configuration_missing', 'delivered': False})
+    ctx.register_tool(name='hermes_pm_supervise', toolset='hermes_pm_supervision',
+        schema={'name': 'hermes_pm_supervise',
+                'description': 'Supervise the current dispatcher-owned outer card with its dedicated original DSH instance. Caller identity and repository are never arguments.',
+                'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
+        handler=unavailable_supervision, is_async=True,
+        description='Supervision requires enabled repository configuration and the current original worker')
     state_dir = ctx.get_config('state_dir')
     manager_profile = ctx.get_config('manager_profile')
     owner = ctx.get_config('owner_identity_ref')

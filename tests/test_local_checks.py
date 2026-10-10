@@ -97,3 +97,72 @@ def test_wrapper_interruption_has_no_pass_without_terminal(tmp_path):
     assert process.returncode != 0 and record['validation_exit_code'] != 0
     assert record['command_exit_code'] is None
     assert record['commands'][0]['terminal'] is False
+
+
+def pytest_repo(tmp_path, monkeypatch, source):
+    root = owned_repo(tmp_path)
+    (root / 'test_owned.py').write_text(source)
+    for name in ('HERMES_TEST_SDK_ROOT', 'DSH_TEST_SDK_ROOT'):
+        reference = tmp_path / name.lower()
+        reference.mkdir()
+        monkeypatch.setenv(name, str(reference))
+    monkeypatch.delenv('DSH_REQUIRE_SDK_SMOKE', raising=False)
+    return root
+
+
+def run_pytest_check(tmp_path, root):
+    artifacts = tmp_path / 'pytest-artifacts'
+    result = subprocess.run([sys.executable, str(CHECKS), '--root', str(root), '--artifacts', str(artifacts),
+                             '--', sys.executable, '-m', 'pytest', '-q'], capture_output=True, text=True)
+    return result, json.loads((artifacts / 'result.json').read_text())
+
+
+def test_pytest_stops_at_first_failure_and_reports_skip_reason(tmp_path, monkeypatch):
+    root = pytest_repo(tmp_path, monkeypatch, '''import pytest
+from pathlib import Path
+
+def test_a_skip():
+    pytest.skip("owned skip reason")
+
+def test_b_first_error():
+    assert False, "owned first error"
+
+def test_c_must_not_run():
+    Path("late-test-ran").write_text("unexpected")
+''')
+    result, record = run_pytest_check(tmp_path, root)
+    log = Path(record['commands'][0]['log']).read_text()
+    assert not (root / 'late-test-ran').exists()
+    assert result.returncode == record['command_exit_code'] == 1
+    assert 'owned first error' in log and 'owned skip reason' in log
+
+
+def test_pytest_uses_prepared_sdk_flags_and_short_socket_directory(tmp_path, monkeypatch):
+    root = pytest_repo(tmp_path, monkeypatch, '''import os
+import socket
+
+def test_prepared_native_socket_directory(tmp_path):
+    assert os.environ["HERMES_REQUIRE_SDK_SMOKE"] == "1"
+    assert os.environ["DSH_REQUIRE_SDK_SMOKE"] == "1"
+    directory = tmp_path / ("x" * 30)
+    directory.mkdir()
+    connection = socket.socket(socket.AF_UNIX)
+    try:
+        connection.bind(str(directory / "state.sock"))
+    finally:
+        connection.close()
+''')
+    result, record = run_pytest_check(tmp_path, root)
+    assert result.returncode == record['validation_exit_code'] == 0
+    assert record['source_unchanged'] is True
+
+
+def test_pytest_requires_sdk_references_before_execution(tmp_path, monkeypatch):
+    root = owned_repo(tmp_path)
+    (root / 'test_owned.py').write_text('from pathlib import Path\ndef test_no_unprepared_run(): Path("unprepared-ran").write_text("unexpected")\n')
+    monkeypatch.delenv('HERMES_TEST_SDK_ROOT', raising=False)
+    monkeypatch.delenv('DSH_TEST_SDK_ROOT', raising=False)
+    result, record = run_pytest_check(tmp_path, root)
+    assert not (root / 'unprepared-ran').exists()
+    assert result.returncode == record['validation_exit_code'] == 3
+    assert record['command_exit_code'] is None
