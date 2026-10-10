@@ -245,7 +245,7 @@ async def observe_human_requests(intake):
     if os.environ.get('HERMES_KANBAN_RUN_ID'):
         return
     from .repository_questions import observe_questions
-    from .repository_approvals import observe_approvals
+    from .repository_approvals import observe_approvals, refresh_released_approval_cards
     carriers = {}
     try:
         while not intake.closed:
@@ -256,6 +256,11 @@ async def observe_human_requests(intake):
                         try:
                             await notify_acceptance(intake, record, intake.generation)
                         except ManagementError:
+                            pass
+                    if execution.get('state') == 'released':
+                        try:
+                            await refresh_released_approval_cards(intake, record, intake.generation)
+                        except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES):
                             pass
                     if not execution.get('native_identity') or execution.get('state') == 'released':
                         carrier = carriers.pop(record['id'], None)

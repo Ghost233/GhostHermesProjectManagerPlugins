@@ -178,6 +178,35 @@ async def _refresh_approval_card(intake, record, notice, transport, generation):
     intake._save_execution(record, fields=['approvals'])
 
 
+async def refresh_released_approval_cards(intake, record, generation):
+    if not record['dsh_execution'].get('approvals'):
+        return
+    async with intake.lock:
+        descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        await asyncio.to_thread(fcntl.flock, descriptor, fcntl.LOCK_EX)
+        try:
+            intake.require_active(generation)
+            fresh = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])
+            execution = fresh['dsh_execution']
+            if execution['state'] != 'released':
+                return
+            notices = [notice for notice in execution.get('approvals', [])
+                       if notice['state'] == 'resolved' and notice['operation_state'] != 'pending'
+                       and notice.get('card_updates', {}).get(hashlib.sha256(json.dumps(
+                           _approval_card(fresh, notice), sort_keys=True, ensure_ascii=False).encode()).hexdigest()) == 'failed']
+            destination = question_destination(intake, fresh) if notices else None
+            if destination is None:
+                return
+            transport, recipient = destination
+            if await transport.verify_identity(recipient) != {'app_id': recipient['app_id'], 'open_id': recipient['recipient_open_id']}:
+                raise ManagementError('binding_conflict', 'Original approval notification recipient is unverified.')
+            for notice in notices:
+                await _refresh_approval_card(intake, fresh, notice, transport, generation)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
 def _update_outcome(notice, events, turn, status):
     if status['state'] != 'resolved':
         return

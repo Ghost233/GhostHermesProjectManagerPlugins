@@ -2,6 +2,7 @@
 import json
 import asyncio
 import hashlib
+import time
 from copy import deepcopy
 from types import SimpleNamespace as NS
 
@@ -286,3 +287,50 @@ async def test_lifecycle_end_during_card_patch_never_submits_native_approval(pen
     with pytest.raises(ManagementError):
         await approvals.process_approval_reply(intake, prepared, 0)
     assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status,closed,expected', [('failed', False, 1), ('unknown', False, 0), ('failed', True, 0)])
+async def test_released_work_repairs_only_confirmed_failed_card_notification(pending_card, monkeypatch, tmp_path, status, closed, expected):
+    from ghost_hermes_pm import repository_supervision as supervision
+    from ghost_hermes_pm.repository_approvals import _approval_card
+    from ghost_hermes_pm.manager import ManagementError
+    intake, _, record, notice, binding = pending_card
+    adapter = NS(bindings=[binding])
+    record['source_anchor'] = {**notice['delivery'], 'message_id': 'om_task_start'}
+    record['dsh_execution'].update(state='released', native_identity={'pid': 999})
+    notice.update(state='resolved', outcome='allowed-once', operation_state='settled', reply_status='accepted')
+    digest = hashlib.sha256(json.dumps(_approval_card(record, notice), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    notice['card_updates'] = {digest: status}
+    notice['card_update_retries'] = {digest: {'attempts': 1, 'not_before': time.time() - 1}}
+    intake.generation, intake.closed, intake.lock = 0, closed, asyncio.Lock()
+    intake.lock_path = tmp_path / 'intake.lock'
+    intake.lock_path.write_bytes(b'')
+    intake._save_execution = lambda *args, **kwargs: None
+    def active(generation):
+        if intake.closed:
+            raise ManagementError('lifecycle_changed', 'Fixture owner unloaded.')
+    intake.require_active = active
+    calls = []
+    async def verify(recipient):
+        return {'app_id': binding['app_id'], 'open_id': binding['recipient_open_id']}
+    async def update(segment):
+        calls.append(segment)
+        return {'status': 'updated', 'code': 0}
+    intake.transports = [(adapter, NS(verify_identity=verify, update_card=update))]
+    def no_native(*args, **kwargs):
+        raise AssertionError('Released notifications cannot attach native execution or submit a decision.')
+    monkeypatch.setattr(supervision, 'attach_existing_owned', no_native)
+    monkeypatch.delenv('HERMES_KANBAN_RUN_ID', raising=False)
+    task = asyncio.create_task(supervision.observe_human_requests(intake))
+    try:
+        await asyncio.sleep(.3)
+    finally:
+        intake.closed = True
+        await asyncio.wait_for(task, 1)
+    assert len(calls) == expected
+    if expected:
+        assert calls[0]['message_id'] == 'om_approval' and buttons(calls[0]['card']) == []
+        assert notice['card_updates'][digest] == 'updated'
+    else:
+        assert notice['card_updates'][digest] == status
