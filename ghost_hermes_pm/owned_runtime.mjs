@@ -113,7 +113,8 @@ export async function bootOwnedRuntime(config) {
       if (agent.session.id !== config.session_id) throw new Error('Owned model Session differs.');
       if (state.started_at_ms === null) state.started_at_ms = Date.now();
       state.usage = readUsage(agent.session) ?? null;
-      const knownTokens = state.usage ? Object.values(state.usage).reduce((sum, value) => sum + (typeof value === 'number' ? value : 0), 0) : null;
+      const totals = state.usage?.totals;
+      const knownTokens = totals ? totals.uncachedInputTokens + totals.outputTokens + totals.cacheReadTokens + totals.cacheWriteTokens : null;
       if (state.requests >= budget.max_model_requests || knownTokens !== null && knownTokens >= budget.max_reported_tokens) {
         state.stop_reason = 'owned-budget-observed-limit'; save();
       }

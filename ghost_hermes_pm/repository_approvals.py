@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 import uuid
 
 from .dsh_events import approval_notice_status, fold_turns
@@ -156,17 +157,24 @@ async def _refresh_approval_card(intake, record, notice, transport, generation):
     card = _approval_card(record, notice)
     digest = hashlib.sha256(json.dumps(card, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     updates = notice.setdefault('card_updates', {})
-    if digest in updates:
+    if updates.get(digest) in {'intent', 'unknown', 'delivered', 'updated'}:
+        return
+    retries = notice.setdefault('card_update_retries', {})
+    retry = retries.setdefault(digest, {'attempts': 0, 'not_before': 0})
+    if time.time() < retry['not_before']:
         return
     intake.require_active(generation)
     updates[digest] = 'intent'
+    retry['attempts'] += 1
     intake._save_execution(record, fields=['approvals'])
     try:
         response = await transport.update_card({'message_id': notice['request_message_id'], 'card': card})
-        intake.require_active(generation)
         updates[digest] = response.get('status', 'unknown')
     except (AttributeError, ManagementError, OSError, TimeoutError):
         updates[digest] = 'unknown'
+    intake.require_active(generation)
+    if updates[digest] == 'failed':
+        retry['not_before'] = time.time() + min(60, 2 ** min(retry['attempts'], 6))
     intake._save_execution(record, fields=['approvals'])
 
 
@@ -385,6 +393,7 @@ async def process_approval_reply(intake, prepared, generation):
             notice.update(reply_status='intent', reply_message_id=prepared.envelope.get('event_id', prepared.envelope['message_id']), requested_outcome=outcome)
             intake._save_execution(record, fields=['approvals'])
             await _refresh_approval_card(intake, record, notice, prepared.transport, generation)
+            intake.require_active(generation)
             rpc_id = str(uuid.uuid4())
             binding = {key: notice[key] for key in ('approval_id', 'call_id', 'command_sha256', 'generation', 'session_id')}
             try:

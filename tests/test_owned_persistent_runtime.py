@@ -13,7 +13,7 @@ from sdk_source_integrity import source_snapshot
 
 class WorkModel:
     """A finite external model stream; original DSH handles every tool call."""
-    def __init__(self, command="printf 'bounded\\n' > delivery.txt", dangerous=False):
+    def __init__(self, command="printf 'bounded\\n' > delivery.txt", dangerous=False, cached=False):
         self.requests = []
         owner = self
 
@@ -34,7 +34,8 @@ class WorkModel:
                             'choices': [{'index': 0, 'delta': part, 'finish_reason': reason}]}
                     self.wfile.write(('data: ' + json.dumps(data) + '\n\n').encode())
                 self.wfile.write(('data: ' + json.dumps({'id': 'fixture-response', 'object': 'chat.completion.chunk', 'created': 1,
-                    'model': 'fixture-model', 'choices': [], 'usage': {'prompt_tokens': 12, 'completion_tokens': 8, 'total_tokens': 20}}) + '\n\n').encode())
+                    'model': 'fixture-model', 'choices': [], 'usage': {'prompt_tokens': 12, 'completion_tokens': 8, 'total_tokens': 20,
+                        **({'prompt_tokens_details': {'cached_tokens': 5, 'cache_write_tokens': 3}} if cached else {})}}) + '\n\n').encode())
                 self.wfile.write(b'data: [DONE]\n\n')
 
             def log_message(self, *_):
@@ -52,15 +53,19 @@ class WorkModel:
         assert not self.thread.is_alive()
 
 
-@pytest.mark.parametrize('max_requests', [1, 3])
-def test_original_work_input_once_and_observed_budget(max_requests):
+@pytest.mark.parametrize('max_requests,token_limit,cached,expected_requests', [
+    (1, 1000, False, 1), (3, 1000, False, 2),
+    (3, 20, False, 1), (3, 21, False, 2),
+    (3, 20, True, 1), (3, 21, True, 2),
+])
+def test_original_work_input_once_and_observed_budget(max_requests, token_limit, cached, expected_requests):
     configured = os.environ.get('DSH_TEST_SDK_ROOT')
     if not configured:
         pytest.skip('Original DSH SDK is absent.')
     sdk = Path(configured).resolve(strict=True)
     before = source_snapshot(sdk)
     from ghost_hermes_pm.dsh_owned_transport import PersistentOwnedTransport
-    model = WorkModel()
+    model = WorkModel(cached=cached)
     try:
         with tempfile.TemporaryDirectory(prefix='hpm-work-', dir='/tmp') as temporary:
             root = Path(temporary).resolve()
@@ -73,7 +78,7 @@ def test_original_work_input_once_and_observed_budget(max_requests):
                 'runtime_configuration': {'model': {'provider': 'fixture-provider', 'model': 'fixture-model', 'configuration': {
                     'api': 'openai-completions', 'baseURL': model.base_url, 'apiKeyEnv': 'DSH_FIXTURE_MODEL_KEY',
                     'models': [{'id': 'fixture-model', 'contextWindow': 16384, 'maxTokens': 256, 'input': ['text']}]}},
-                    'budget': {'max_wall_seconds': 15, 'max_model_requests': max_requests, 'max_reported_tokens': 1000,
+                    'budget': {'max_wall_seconds': 15, 'max_model_requests': max_requests, 'max_reported_tokens': token_limit,
                                'max_output_tokens_per_request': 256}}}
             carrier = PersistentOwnedTransport(instance_dir=str(state), configuration=settings, timeout=15,
                                                 environment={'DSH_FIXTURE_MODEL_KEY': 'synthetic-key'})
@@ -96,7 +101,16 @@ def test_original_work_input_once_and_observed_budget(max_requests):
                     time.sleep(.05)
                 assert (repo / 'delivery.txt').read_text() == 'bounded\n'
                 assert item['running'] is False
-                assert len(model.requests) == (1 if max_requests == 1 else 2)
+                budget = json.loads((state / 'home/.hermes-budget.json').read_text())
+                assert budget['usage']['totals'] == {
+                    'uncachedInputTokens': (4 if cached else 12) * expected_requests,
+                    'outputTokens': 8 * expected_requests,
+                    'cacheReadTokens': (5 if cached else 0) * expected_requests,
+                    'cacheWriteTokens': (3 if cached else 0) * expected_requests,
+                }, budget
+                assert len(model.requests) == expected_requests
+                assert all(sorted(t['function']['name'] for t in row['tools']) ==
+                           ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output'] for row in model.requests)
                 assert all(row.get('max_tokens', row.get('max_completion_tokens')) == 256 for row in model.requests)
                 stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session', 'sessionId': sid}, 'maxMessages': 500}})
                 try:
@@ -106,7 +120,7 @@ def test_original_work_input_once_and_observed_budget(max_requests):
                 assert snapshot['header']['id'] == sid and snapshot['header']['cwd'] == str(repo)
                 receipt = json.loads((state / 'home/.hermes-first-input.json').read_text())
                 assert receipt['status'] == 'accepted' and receipt['request_id'] == 'input-fixture-once'
-                if max_requests == 3:
+                if expected_requests == 2:
                     receipt['status'] = 'intent'
                     (state / 'home/.hermes-first-input.json').write_text(json.dumps(receipt))
                     count = len(model.requests)
@@ -114,7 +128,7 @@ def test_original_work_input_once_and_observed_budget(max_requests):
                         carrier.request('session/prompt', args, 'unknown-must-not-send')
                     time.sleep(.1)
                     assert len(model.requests) == count, 'Unknown first input cannot be resent or replaced.'
-                if max_requests == 1:
+                if expected_requests == 1:
                     # Original turnBoundary has no wire definition; require its durable cause instead.
                     ends = [r['event'] for r in snapshot['records'] if r['event']['type'] == 'turn/end']
                     assert len(ends) == 1 and ends[0]['data']['reason']['kind'] == 'aborted', ends

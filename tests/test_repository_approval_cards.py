@@ -1,5 +1,7 @@
 """Original Feishu card requests preserve one operation and one native decision."""
 import json
+import asyncio
+import hashlib
 from copy import deepcopy
 from types import SimpleNamespace as NS
 
@@ -207,3 +209,80 @@ def test_same_owned_native_dispatcher_preserves_message_receive_subscription():
 
     assert response.status_code == 200 and json.loads(response.content) == {'msg': 'success'}
     assert len(frames) == 1 and frames[0]['payload']['header']['event_type'] == 'im.message.receive_v1'
+
+
+@pytest.mark.asyncio
+async def test_confirmed_failed_card_update_retries_after_backoff_but_unknown_does_not(pending_card, monkeypatch):
+    import ghost_hermes_pm.repository_approvals as approvals
+    intake, _, record, notice, _ = pending_card
+    notice['reply_status'] = 'queued'
+    now = [100.0]
+    monkeypatch.setattr(approvals, 'time', NS(time=lambda: now[0]), raising=False)
+    intake.require_active = lambda generation: None
+    intake._save_execution = lambda *args, **kwargs: None
+    calls = []
+    async def update(value):
+        calls.append(value)
+        return {'status': 'failed', 'code': 503} if len(calls) == 1 else {'status': 'updated', 'code': 0}
+    transport = NS(update_card=update)
+    await approvals._refresh_approval_card(intake, record, notice, transport, 0)
+    await approvals._refresh_approval_card(intake, record, notice, transport, 0)
+    assert len(calls) == 1
+    now[0] += 60
+    await approvals._refresh_approval_card(intake, record, notice, transport, 0)
+    assert len(calls) == 2
+    await approvals._refresh_approval_card(intake, record, notice, transport, 0)
+    assert len(calls) == 2
+    notice['card_updates'] = {}
+    async def unknown(value):
+        calls.append(value)
+        return {'status': 'unknown'}
+    transport.update_card = unknown
+    await approvals._refresh_approval_card(intake, record, notice, transport, 0)
+    now[0] += 60
+    await approvals._refresh_approval_card(intake, record, notice, transport, 0)
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_end_during_card_patch_never_submits_native_approval(pending_card, tmp_path, monkeypatch):
+    import ghost_hermes_pm.repository_approvals as approvals
+    import ghost_hermes_pm.repository_supervision as supervision
+    from ghost_hermes_pm.manager import ManagementError
+    intake, _, record, notice, binding = pending_card
+    operation = {'command': 'printf fixture', 'sandbox_permissions': 'workspace-write'}
+    notice.update(turn_id='turn-fixture', event_id='event-native',
+        command_sha256=hashlib.sha256(operation['command'].encode()).hexdigest(),
+        arguments_sha256=hashlib.sha256(json.dumps(operation, sort_keys=True).encode()).hexdigest())
+    record['target']['repo_path'] = str(tmp_path)
+    intake.lock = asyncio.Lock()
+    intake.lock_path = tmp_path / 'approval.lock'
+    intake.lock_path.touch(mode=0o600)
+    intake._verified_card = lambda *args: record['card_id']
+    intake._save_execution = lambda *args, **kwargs: None
+    active = [True]
+    def check(generation):
+        if not active[0]: raise ManagementError('unavailable', 'Owner lifecycle ended.')
+    intake.require_active = check
+    calls = []
+    def request(*args):
+        calls.append(args)
+        return {'type': 'server-response', 'rpcId': args[-1], 'result': {'ok': True}}
+    carrier = NS(request=request, close=lambda: None, event_frames=lambda: {
+        'session_id': notice['session_id'], 'generation': notice['generation'], 'client_id': 'client-fixture',
+        'frames': [{'eventId': notice['event_id'], 'event': 'approval/request', 'agentId': notice['session_id'], 'request': {}}]})
+    async def update(value):
+        active[0] = False
+        return {'status': 'updated', 'code': 0}
+    async def send(value):
+        raise AssertionError('No message may be sent after the owner lifecycle ends.')
+    transport = NS(update_card=update, send=send)
+    monkeypatch.setattr(supervision, 'attach_existing_owned', lambda *args: carrier)
+    monkeypatch.setattr(supervision, 'original_history', lambda *args: ([], {}))
+    monkeypatch.setattr(approvals, '_source', lambda *args: ({'id': 'turn-fixture', 'startSeq': 0}, {'state': 'pending'}, operation))
+    prepared = NS(action='approval', rejected=None, command='批准一次', work_id=record['id'], transport=transport,
+                  envelope={**binding, 'parent_id': 'om_approval', 'message_id': 'om_owner'})
+
+    with pytest.raises(ManagementError):
+        await approvals.process_approval_reply(intake, prepared, 0)
+    assert calls == []
