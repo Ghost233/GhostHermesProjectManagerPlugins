@@ -334,3 +334,63 @@ async def test_released_work_repairs_only_confirmed_failed_card_notification(pen
         assert notice['card_updates'][digest] == 'updated'
     else:
         assert notice['card_updates'][digest] == status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stop', ['cancel', 'unload'])
+async def test_released_card_lock_wait_closes_descriptor_when_owner_stops(tmp_path, stop):
+    import fcntl
+    import os
+    from ghost_hermes_pm.repository_approvals import refresh_released_approval_cards
+    from ghost_hermes_pm.manager import ManagementError
+    path = tmp_path / 'intake.lock'
+    path.touch()
+    stat = path.stat()
+    def matching_descriptors():
+        descriptors = set()
+        for descriptor in range(4096):
+            try:
+                current = os.fstat(descriptor)
+            except OSError:
+                continue
+            if (current.st_dev, current.st_ino) == (stat.st_dev, stat.st_ino):
+                descriptors.add(descriptor)
+        return descriptors
+    holder = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    record = {'id': 'fixture-work', 'dsh_execution': {'state': 'released', 'approvals': [{'state': 'resolved'}]}}
+    intake = NS(lock=asyncio.Lock(), lock_path=path, closed=False, snapshot=lambda: {'work': [record]})
+    def active(generation):
+        if intake.closed:
+            raise ManagementError('lifecycle_changed', 'Fixture owner unloaded.')
+    intake.require_active = active
+    task = asyncio.create_task(refresh_released_approval_cards(intake, record, 0))
+    opened = set()
+    try:
+        deadline = asyncio.get_running_loop().time() + 1
+        while asyncio.get_running_loop().time() < deadline:
+            opened = matching_descriptors() - {holder}
+            if opened:
+                break
+            await asyncio.sleep(.01)
+        assert len(opened) == 1 and intake.lock.locked() and not task.done()
+        if stop == 'cancel':
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, .5)
+        else:
+            intake.closed = True
+            with pytest.raises(ManagementError, match='unloaded'):
+                await asyncio.wait_for(task, .5)
+        assert matching_descriptors() == {holder}
+        assert not intake.lock.locked()
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(.1)
+        for descriptor in opened & matching_descriptors():
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)

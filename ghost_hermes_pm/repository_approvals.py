@@ -183,8 +183,14 @@ async def refresh_released_approval_cards(intake, record, generation):
         return
     async with intake.lock:
         descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
-        await asyncio.to_thread(fcntl.flock, descriptor, fcntl.LOCK_EX)
         try:
+            while True:
+                intake.require_active(generation)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(.05)
             intake.require_active(generation)
             fresh = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])
             execution = fresh['dsh_execution']
