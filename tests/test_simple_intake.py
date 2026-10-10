@@ -17,10 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize('scenario', ['existing', 'create_unknown', 'private_issue', 'concurrent', 'delegation', 'authority',
     'wrong_card_assignee', 'wrong_card_path', 'wrong_card_body', 'wrong_card_duplicate', 'changed_card',
     'issue_unavailable', 'issue_unavailable_unload', 'private_all_bindings',
-    'configuration_auto_decompose', 'configuration_repository', 'queued_rejection_unload', 'responsibility_conflict', 'worker_required', 'worker_dispatch', 'worker_query_race'])
+    'configuration_auto_decompose', 'configuration_repository', 'queued_rejection_unload', 'responsibility_conflict', 'worker_required', 'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'])
 def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
     flags = ('HPM_NATIVE_REAL_MODEL_REFERENCE', 'HPM_NATIVE_EXECUTION_REFERENCE')
-    if scenario in {'worker_dispatch', 'worker_query_race'}:
+    if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'}:
         assert bool(os.environ.get(flags[0])) == bool(os.environ.get(flags[1])), 'Real model acceptance requires both approved references.'
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     if not configured:
@@ -29,7 +29,7 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
         pytest.skip('Set HERMES_TEST_SDK_ROOT; a skip does not establish native intake.')
     sdk = Path(configured).resolve(strict=True)
     before = source_snapshot(sdk)
-    dsh_before = source_snapshot(os.environ['DSH_TEST_SDK_ROOT']) if scenario in {'worker_dispatch', 'worker_query_race'} else None
+    dsh_before = source_snapshot(os.environ['DSH_TEST_SDK_ROOT']) if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'} else None
     scratch = Path(tempfile.mkdtemp(prefix='hpm-simple-', dir='/tmp')).resolve()
     cleaned = False
     passed = False
@@ -48,7 +48,7 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
                'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'),
                'HERMES_KANBAN_HOME': str(home), 'PYTHONDONTWRITEBYTECODE': '1',
                'PYTHONPATH': str(sdk), 'HERMES_TEST_SDK_ROOT': str(sdk)}
-        if scenario in {'worker_dispatch', 'worker_query_race'}:
+        if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'}:
             env['DSH_TEST_SDK_ROOT'] = os.environ['DSH_TEST_SDK_ROOT']
             for name in ('HPM_NATIVE_REAL_MODEL_REFERENCE', 'HPM_NATIVE_EXECUTION_REFERENCE'):
                 if name in os.environ:
@@ -81,7 +81,7 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
         assert source_snapshot(sdk) == before, 'Plugin intake cannot mutate original SDK source.'
         if dsh_before is not None:
             assert source_snapshot(os.environ['DSH_TEST_SDK_ROOT']) == dsh_before, 'Native worker cannot mutate original DSH SDK source.'
-        if scenario in {'worker_dispatch', 'worker_query_race'} and os.environ.get('HPM_NATIVE_EVIDENCE_DIR'):
+        if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'} and os.environ.get('HPM_NATIVE_EVIDENCE_DIR'):
             destination = Path(os.environ['HPM_NATIVE_EVIDENCE_DIR']).resolve(strict=True)
             import stat
             assert destination.is_dir() and destination.stat().st_uid == os.getuid() and stat.S_IMODE(destination.stat().st_mode) & 0o077 == 0

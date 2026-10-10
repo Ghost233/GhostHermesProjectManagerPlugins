@@ -5,11 +5,20 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import time
 import uuid
 
+import psutil
+
 from .manager import ManagementError
 from .repository_execution import execution_configuration
+
+_TRANSPORT_FAILURES = (OSError, TimeoutError, queue.Empty, psutil.NoSuchProcess, psutil.AccessDenied)
+
+
+def _unknown_transport(error):
+    return ManagementError('outcome_unknown', 'Original owned transport is unconfirmed (' + type(error).__name__ + '); reconcile the same execution.')
 
 
 def activate_work(intake, record, generation):
@@ -61,7 +70,10 @@ def native_call(ctx, name, args):
 
 def owned_call(carrier, method, request):
     rpc_id = str(uuid.uuid4())
-    envelope = carrier.request(method, {'_request': request} if method == 'session/list' else {'request': request}, rpc_id)
+    try:
+        envelope = carrier.request(method, {'_request': request} if method == 'session/list' else {'request': request}, rpc_id)
+    except _TRANSPORT_FAILURES as error:
+        raise _unknown_transport(error) from error
     if (envelope.get('type') != 'server-response' or envelope.get('rpcId') != rpc_id
         or envelope.get('result', {}).get('ok') is not True):
         raise ManagementError('outcome_unknown', 'Original owned execution response is unconfirmed.')
@@ -235,14 +247,23 @@ def register_repository_supervision(ctx, intake):
                             'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
                 await asyncio.sleep(.25)
             raise ManagementError('outcome_unknown', 'Original owned execution has no confirmed terminal boundary.')
-        except (ManagementError, OSError, ValueError, KeyError, TimeoutError):
+        except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES) as error:
+            original = error.__cause__ if isinstance(error, ManagementError) and isinstance(error.__cause__, _TRANSPORT_FAILURES) else error
             try:
                 intake.require_active(generation)
                 current_worker(ctx, intake, record)
                 execution['state'] = 'outcome_unknown'
+                if isinstance(original, _TRANSPORT_FAILURES):
+                    message = str(original)
+                    for secret in environment.values():
+                        if secret:
+                            message = message.replace(secret, '[REDACTED_CREDENTIAL]')
+                    execution['transport_failure'] = {'type': type(original).__name__, 'message': message}
                 intake._save_execution(record)
             except ManagementError:
                 pass
+            if isinstance(error, _TRANSPORT_FAILURES):
+                raise _unknown_transport(error) from error
             raise
         finally:
             carrier.close()

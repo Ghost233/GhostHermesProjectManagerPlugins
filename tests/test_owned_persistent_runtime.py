@@ -224,3 +224,128 @@ def test_reconnect_uses_same_original_owned_instance_and_session():
             second.shutdown_owned()
         assert second.close_outcome['kind'] == 'original_exit' and second.close_outcome['exit_code'] == 0
     assert source_snapshot(sdk) == before
+
+
+def test_silent_owned_response_is_typed_unknown_without_replacing_session():
+    """Stop only this original carrier; its unanswered public RPC must stay unknown."""
+    import signal
+    from ghost_hermes_pm.dsh_owned_transport import PersistentOwnedTransport
+    from ghost_hermes_pm.repository_supervision import owned_call
+    from ghost_hermes_pm.manager import ManagementError
+    configured = os.environ.get('DSH_TEST_SDK_ROOT')
+    if not configured:
+        if os.environ.get('DSH_REQUIRE_SDK_SMOKE') == '1':
+            pytest.fail('Original DSH SDK is required.')
+        pytest.skip('Original DSH SDK is absent.')
+    sdk = Path(configured).resolve(strict=True)
+    before = source_snapshot(sdk)
+    with tempfile.TemporaryDirectory(prefix='hpm-silent-', dir='/tmp') as temporary:
+        root = Path(temporary).resolve()
+        repo = root / 'repo'
+        repo.mkdir()
+        state = root / 'instance'
+        state.mkdir(mode=0o700)
+        configuration = {'dsh_home': str(state / 'home'), 'workspace': str(repo),
+            'runtime_package_root': str(sdk), 'instance_id': 'fixture-silent',
+            'generation': 'fixture-silent-generation', 'session_id': 'fixture-silent-session'}
+        carrier = PersistentOwnedTransport(instance_dir=str(state), configuration=configuration, timeout=15)
+        paused = False
+        try:
+            created = owned_call(carrier, 'session/create', {'sessionId': configuration['session_id'],
+                'cwd': str(repo), 'agentPreset': 'hermes-owned'})
+            assert created['sessionId'] == configuration['session_id']
+            identity = dict(carrier.native_identity)
+            os.kill(identity['pid'], signal.SIGSTOP)
+            paused = True
+            with pytest.raises(ManagementError) as failure:
+                owned_call(carrier, 'session/list', {})
+            assert failure.value.code == 'outcome_unknown'
+            import queue
+            assert isinstance(failure.value.__cause__, queue.Empty)
+            assert carrier.native_identity == identity
+            assert json.loads(carrier.identity_path.read_text()) == identity
+        finally:
+            if paused:
+                os.kill(carrier.native_identity['pid'], signal.SIGCONT)
+            carrier.shutdown_owned()
+        assert carrier.close_outcome['kind'] == 'original_exit'
+    assert source_snapshot(sdk) == before
+
+
+@pytest.mark.parametrize('error', [OSError('Original owned socket failed.'), TimeoutError('Original owned reply timed out.'),
+    __import__('psutil').NoSuchProcess(pid=987654321), __import__('psutil').AccessDenied(pid=987654321),
+    ValueError('Unexpected malformed request.'), KeyError('Unexpected missing field.')])
+def test_owned_response_preserves_known_failure_cause_and_does_not_retry(error):
+    """A failure-only peer tests normalization; no SDK class or successful reply is replaced."""
+    from types import SimpleNamespace
+    from ghost_hermes_pm.repository_supervision import owned_call
+    from ghost_hermes_pm.manager import ManagementError
+    calls = []
+    def request(*args):
+        calls.append(args)
+        raise error
+    known = not isinstance(error, (ValueError, KeyError))
+    with pytest.raises(ManagementError if known else type(error)) as failure:
+        owned_call(SimpleNamespace(request=request), 'session/list', {})
+    if known:
+        assert failure.value.code == 'outcome_unknown'
+        assert failure.value.__cause__ is error
+        assert type(error).__name__ in str(failure.value)
+    else:
+        assert failure.value is error, 'Programming errors must retain their original type.'
+    assert len(calls) == 1, 'An unknown original response is never automatically resent.'
+
+
+def test_disappeared_original_owned_pid_retains_configuration_and_session():
+    import signal
+    import psutil
+    from ghost_hermes_pm.dsh_owned_transport import PersistentOwnedTransport
+    from ghost_hermes_pm.repository_supervision import owned_call
+    from ghost_hermes_pm.manager import ManagementError
+    configured = os.environ.get('DSH_TEST_SDK_ROOT')
+    if not configured:
+        if os.environ.get('DSH_REQUIRE_SDK_SMOKE') == '1':
+            pytest.fail('Original DSH SDK is required.')
+        pytest.skip('Original DSH SDK is absent.')
+    sdk = Path(configured).resolve(strict=True)
+    before = source_snapshot(sdk)
+    with tempfile.TemporaryDirectory(prefix='hpm-lost-', dir='/tmp') as temporary:
+        root = Path(temporary).resolve()
+        repo = root / 'repo'
+        repo.mkdir()
+        state = root / 'instance'
+        state.mkdir(mode=0o700)
+        settings = {'dsh_home': str(state / 'home'), 'workspace': str(repo), 'runtime_package_root': str(sdk),
+            'instance_id': 'fixture-lost', 'generation': 'fixture-lost-generation', 'session_id': 'fixture-lost-session'}
+        carrier = PersistentOwnedTransport(instance_dir=str(state), configuration=settings, timeout=15)
+        resumed = None
+        try:
+            created = owned_call(carrier, 'session/create', {'sessionId': settings['session_id'],
+                'cwd': str(repo), 'agentPreset': 'hermes-owned'})
+            assert created['sessionId'] == settings['session_id']
+            saved = {path: path.read_bytes() for path in (carrier.configuration_path, carrier.identity_path, carrier.birth_path)}
+            identity = dict(carrier.native_identity)
+            birth = json.loads(carrier.birth_path.read_text())
+            original = psutil.Process(identity['pid'])
+            assert original.create_time() == birth['created_at']
+            carrier.close()
+            os.kill(identity['pid'], signal.SIGKILL)
+            assert original.wait(timeout=5) == -signal.SIGKILL
+            resumed = PersistentOwnedTransport(instance_dir=str(state), configuration=settings, timeout=15)
+            with pytest.raises(ManagementError) as failure:
+                owned_call(resumed, 'session/list', {})
+            assert failure.value.code == 'outcome_unknown'
+            assert isinstance(failure.value.__cause__, psutil.NoSuchProcess)
+            assert all(path.read_bytes() == value for path, value in saved.items())
+            assert not (state / 'home/.hermes-first-input.json').exists(), 'Lost original identity cannot send a new input.'
+        finally:
+            if resumed:
+                resumed.close()
+            carrier.close()
+            if carrier._process is not None and carrier._process.poll() is None:
+                carrier.shutdown_owned()
+            if carrier.socket_path.exists():
+                assert not carrier.socket_path.is_symlink()
+                carrier.socket_path.unlink()
+                carrier.socket_path.parent.rmdir()
+    assert source_snapshot(sdk) == before

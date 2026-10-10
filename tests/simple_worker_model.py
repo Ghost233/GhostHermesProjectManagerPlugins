@@ -7,12 +7,14 @@ import time
 
 
 class WorkerModelService:
-    def __init__(self, query_lock=None, refuse=False):
+    def __init__(self, query_lock=None, refuse=False, hold_dsh=False):
         self.requests = []
         self.worker_steps = 0
         self.dsh_steps = 0
         self.foreign_task_id = None
         self.query_ready = threading.Event()
+        self.dsh_ready = threading.Event()
+        self.dsh_release = threading.Event()
         service = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -55,6 +57,11 @@ class WorkerModelService:
                     call = (('skill', {'name': 'fixture-matt'}) if service.dsh_steps == 1 else
                         ('bash', {'description': 'Write and verify one bounded synthetic work result.',
                                  'command': "printf 'native-worker\\n' > native-delivery.txt && cat native-delivery.txt"}) if service.dsh_steps == 2 else None)
+                    if hold_dsh and service.dsh_steps == 1:
+                        service.dsh_ready.set()
+                        if not service.dsh_release.wait(timeout=45):
+                            raise AssertionError('Bounded external DSH response was not released.')
+                        call = None
                     if query_lock and service.dsh_steps == 3:
                         service.query_ready.set()
                         until = time.monotonic() + 10
@@ -91,6 +98,7 @@ class WorkerModelService:
         self.base_url = f'http://127.0.0.1:{self.server.server_port}/v1'
 
     def close(self):
+        self.dsh_release.set()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(2)
