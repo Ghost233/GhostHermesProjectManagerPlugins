@@ -1,0 +1,994 @@
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+import json
+import os
+import sqlite3
+import stat
+import subprocess
+import threading
+import re
+import hashlib
+import uuid
+
+
+@dataclass(frozen=True)
+class VerifiedIdentity:
+    """An identity established by a trusted entry adapter, never a request body."""
+    subject: str
+    source: str
+
+
+class ManagementError(Exception):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
+def _private_state_directory(path):
+    """Admit this plugin's private directory without changing preexisting permissions."""
+    requested = Path(path)
+    try:
+        if requested.is_symlink():
+            raise ManagementError('unsafe_state', 'Private runtime state must use its own local directory.')
+        directory = requested.resolve()
+        if directory.is_relative_to(Path(__file__).resolve().parents[1]) or any((parent / '.git').exists() or (parent / '.git').is_symlink() for parent in (directory, *directory.parents)):
+            raise ManagementError('unsafe_state', 'Private runtime state must remain outside source and Git worktrees.')
+        missing, current = [], directory
+        while not current.exists():
+            missing.append(current)
+            current = current.parent
+        for created in reversed(missing):
+            created.mkdir(mode=0o700, exist_ok=True)
+        info = directory.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ManagementError('unsafe_state', 'Private runtime state requires an owner-only directory; existing data was preserved.')
+        return directory
+    except (OSError, RuntimeError):
+        raise ManagementError('unsafe_state', 'Private runtime state could not be admitted; existing data was preserved.') from None
+
+
+def _public_text(text, sensitive_values=()):
+    if not isinstance(text, str) or not text.strip() or len(text) > 100000:
+        raise ManagementError('invalid_change', 'Bounded public material is required.')
+    if any(value and value in text for value in sensitive_values) or re.search(r'(?:password|passwd|secret|token|api[_ -]?key|private[_ -]?key)\s*[:=]\s*\S+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,}|-----BEGIN[^\n]*PRIVATE KEY', text, re.IGNORECASE):
+        raise ManagementError('invalid_change', 'Sensitive material must be handled in the original private interface.')
+
+
+def _message_anchor(message):
+    allowed = {'tenant_key', 'recipient_open_id', 'chat_id', 'message_id', 'sender_open_id',
+               'parent_id', 'root_id', 'thread_id', 'app_id', 'recipient_tenant_key', 'transport_tenant_key'}
+    required = _MESSAGE_NAMESPACE + ('message_id',)
+    if not isinstance(message, dict) or set(message) - allowed or any(not isinstance(message.get(k), str) or not message[k] for k in required) or any(v is not None and (not isinstance(v, str) or len(v) > 256) for v in message.values()):
+        raise ManagementError('invalid_change', 'Only verified scalar message and transport identities are accepted.')
+    return required
+
+
+_MESSAGE_NAMESPACE = ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                      'recipient_open_id', 'chat_id', 'sender_open_id')
+
+
+def _delivery_status(record):
+    statuses = [s['status'] for p in record['outbox'] for s in p['segments']]
+    for state in ('unknown', 'sending', 'failed', 'pending'):
+        if state in statuses:
+            return state
+    return 'delivered' if statuses else 'pending'
+
+
+def _git(path, *args):
+    result = subprocess.run(['git', '-C', str(path), *args], capture_output=True,
+                            text=True, env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+                                            'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'})
+    if result.returncode:
+        raise ManagementError('invalid_repository', 'The existing path must be a Git worktree.')
+    return result.stdout if '-z' in args else result.stdout.strip()
+
+
+def _repository(value):
+    try:
+        if not Path(value['repo_path']).is_absolute():
+            raise ValueError('Repository path must be absolute.')
+        path = Path(value['repo_path']).resolve(strict=True)
+        top = Path(_git(path, 'rev-parse', '--show-toplevel')).resolve()
+        if top != path:
+            raise ValueError('Register the repository root, not a child directory.')
+        common = Path(_git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+        git_dir = Path(_git(path, 'rev-parse', '--absolute-git-dir')).resolve()
+        nested = []
+        for current, dirs, files in os.walk(path):
+            dirs[:] = sorted(d for d in dirs if d != '.git' and not Path(current, d).is_symlink())
+            candidate = Path(current)
+            if candidate != path and ('.git' in files or (candidate / '.git').is_dir()):
+                nested.append({'worktree': str(candidate.resolve()),
+                               'git_dir': str(Path(_git(candidate, 'rev-parse', '--absolute-git-dir')).resolve()),
+                               'common_dir': str(Path(_git(candidate, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()),
+                               'access': 'read_only'})
+        artifacts = []
+        protected = [path / '.git', git_dir, common] + [Path(r['worktree']) for r in nested]
+        for supplied in value.get('test_artifact_paths', []):
+            artifact = Path(supplied).resolve()
+            if not Path(supplied).is_absolute() or not artifact.is_relative_to(path) or artifact == path:
+                raise ValueError('Test artifacts must be in an explicit subdirectory of the registered worktree.')
+            if any(artifact.is_relative_to(p) or p.is_relative_to(artifact) for p in protected):
+                raise ValueError('Test artifacts cannot overlap Git metadata or nested read-only repositories.')
+            artifacts.append(str(artifact))
+        return {'worktree': str(path), 'common_dir': str(common), 'git_dir': str(git_dir),
+                'logical_id': str(common), 'nested_repositories': nested,
+                'test_artifact_paths': artifacts}
+    except OSError:
+        raise ManagementError('invalid_repository', 'The configured local repository could not be read.') from None
+    except (ValueError, TypeError) as exc:
+        raise ManagementError('invalid_repository', str(exc)) from exc
+
+
+class Manager:
+    """One authoritative directory. Callers enter with verified subjects, not claimed roles."""
+    def __init__(self, state_dir, *, owner_identity_ref, sensitive_values=(), dsh_adapter=None, dsh_adapters=None, delivery_source=None, knowledge_providers=None, observation_adapters=None, control_adapters=None, archive_providers=None, recovery_adapters=None, global_validation_host=None, profile_readiness_host=None, lifecycle_host=None, migration_host=None, maintenance_host=None, notification_clock=None):
+        import time
+        self.notification_clock = notification_clock or time.time
+        self._notification_generation = str(uuid.uuid4())
+        self.owner_identity_ref = owner_identity_ref
+        self.dsh_adapter = dsh_adapter
+        if dsh_adapters is not None and not isinstance(dsh_adapters, dict):
+            raise ManagementError('invalid_change', 'DSH executors require a protected reference-to-adapter mapping.')
+        self.dsh_adapters = dict(dsh_adapters or {})
+        if any(not isinstance(ref, str) or not ref.startswith('local:') or getattr(adapter, 'service_ref', None) != ref
+               for ref, adapter in self.dsh_adapters.items()):
+            raise ManagementError('invalid_change', 'Each DSH executor reference must exactly match its native adapter binding.')
+        if dsh_adapter is not None and dsh_adapter.service_ref in self.dsh_adapters and self.dsh_adapters[dsh_adapter.service_ref] is not dsh_adapter:
+            raise ManagementError('invalid_change', 'A singular and mapped DSH executor cannot share a reference with different instances.')
+        self.delivery_source = delivery_source
+        self.global_validation_host = global_validation_host
+        self.profile_readiness_host = profile_readiness_host
+        self.lifecycle_host = lifecycle_host
+        self.migration_host = migration_host
+        self.maintenance_host = maintenance_host
+        self.knowledge_providers = dict(knowledge_providers or {})
+        self.archive_providers = dict(archive_providers or {})
+        self.observation_adapters = dict(observation_adapters or {})
+        self.control_adapters = dict(control_adapters or {})
+        self.recovery_adapters = dict(recovery_adapters or {})
+        self._sensitive_values = sensitive_values if callable(sensitive_values) else lambda: tuple(sensitive_values)
+        self.state_dir = _private_state_directory(state_dir)
+        bind_maintenance = getattr(self.maintenance_host, 'bind_manager_state', None)
+        if callable(bind_maintenance):
+            bind_maintenance(self.state_dir)
+        self._lock = threading.RLock()
+        self._inflight = set()
+        from .recovery import verify_directory
+        database = self.state_dir / 'manager.sqlite3'
+        if database.exists() or database.is_symlink():
+            database_info = database.lstat()
+            if not stat.S_ISREG(database_info.st_mode) or database_info.st_uid != os.getuid() or database_info.st_nlink != 1 or stat.S_IMODE(database_info.st_mode) & 0o077:
+                raise ManagementError('unsafe_state', 'Private runtime database must be an owner-only regular file; existing data was preserved.')
+            verify_directory(database)
+        else:
+            descriptor = os.open(database, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+        self._db = sqlite3.connect(database, check_same_thread=False)
+        self._db.execute('CREATE TABLE IF NOT EXISTS directory (id INTEGER PRIMARY KEY CHECK(id=1), schema_version INTEGER NOT NULL, version INTEGER NOT NULL, payload TEXT NOT NULL)')
+        self._db.execute('INSERT OR IGNORE INTO directory VALUES(1, 2, 0, ?)',
+                         (json.dumps({'executor_engine': 'dsh', 'projects': {}, 'profiles': {}, 'last_verified_at': None}),))
+        self._db.commit()
+        version, data = self._load()
+        from .queue import ensure_queues
+        if ensure_queues(data):
+            with self._db:
+                self._save(version, data)
+
+    def close(self):
+        from .notifications import shutdown
+        shutdown(self)
+        with self._lock:
+            closed = set()
+            for adapter in (self.dsh_adapter, *self.dsh_adapters.values(), *self.observation_adapters.values(), *self.control_adapters.values(), *self.recovery_adapters.values()):
+                if adapter is not None and id(adapter) not in closed:
+                    adapter.close()
+                    closed.add(id(adapter))
+            from .archive_sources import DshArchiveProvider
+            for provider in self.archive_providers.values():
+                if isinstance(provider, DshArchiveProvider):
+                    provider.close()
+            close_global_host = getattr(self.global_validation_host, 'close', None)
+            if callable(close_global_host):
+                close_global_host()
+            self._db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def _load(self):
+        schema, version, payload = self._db.execute('SELECT schema_version, version, payload FROM directory WHERE id=1').fetchone()
+        if schema != 2:
+            raise ManagementError('unknown_version', 'Existing executor state requires an explicit verified migration; it was preserved.')
+        data = json.loads(payload)
+        if data.get('executor_engine') != 'dsh':
+            raise ManagementError('unknown_version', 'The executor state is not registered for DSH; no execution or migration is permitted.')
+        from .notifications import reconcile as reconcile_notifications
+        reconcile_notifications(self, data)
+        data.setdefault('requests', {})
+        data.setdefault('clarifications', {})
+        data.setdefault('intake_failures', {})
+        data.setdefault('knowledge_sources', {})
+        data.setdefault('knowledge_queries', {})
+        for query in data['knowledge_queries'].values():
+            for publication in query['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
+        for query in data.get('archive_queries', {}).values():
+            for publication in query.get('outbox', []):
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
+        from .observation import reconcile_connections
+        reconcile_connections(self, data)
+        from .takeover import reconcile_grants
+        reconcile_grants(self, data)
+        for record in data['requests'].values():
+            session = record.get('session')
+            from .takeover import executor_for
+            executor = executor_for(self, record)
+            for question in record.get('human_requests', []):
+                if question.get('resolution') == 'pending' and (record.get('repository_released') or record.get('outer_task_status') == 'stopped' or record.get('task_delivery') == 'delivered' or session and session.get('control') != 'assigned_task'):
+                    question['resolution'] = 'expired'
+                    question['control_enabled'] = False
+                if question.get('resolution') == 'pending' and (executor is None or executor.generation != question['generation'] or executor._closed):
+                    question['resolution'] = 'unverified'
+                    question['control_enabled'] = False
+                    if question.get('reply', {}) and question['reply'].get('sent') == 'intent':
+                        question['reply']['sent'] = 'outcome_unknown'
+            if session and not record.get('repository_released') and (executor is None or executor.generation != session['generation'] or executor._closed):
+                if record['execution'] not in {'unverified', 'stopping'}:
+                    record['last_confirmed_execution'] = record['execution']
+                record['execution'] = 'stopping' if record.get('stop', {}).get('status') == 'processing' else 'unverified'
+                record['unexecuted_reason'] = 'Original executor generation unavailable; reconciliation required.'
+            for publication in record['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                        segment['status'] = 'unknown'
+                        if segment['attempts']:
+                            segment['attempts'][-1]['status'] = 'unknown'
+            record['delivery'] = _delivery_status(record)
+        for handoff in data.get('collaboration', {}).get('handoffs', {}).values():
+            for segment in handoff['segments']:
+                if segment['status'] == 'sending' and segment['uuid'] not in self._inflight:
+                    segment['status'] = 'unknown'
+                    segment['attempts'][-1]['status'] = 'unknown'
+        from .global_validation import reconcile_inputs
+        if reconcile_inputs(self, data):
+            already_in_transaction = self._db.in_transaction
+            self._save(version, data)
+            version += 1
+            if not already_in_transaction:
+                self._db.commit()
+        if self.maintenance_host is not None:
+            from .maintenance import _runtime
+            try:
+                current = _runtime(self)
+                data['native_runtime_version_gate'] = {'status': 'verified', 'plugin_version': current['plugin_version'], 'verified_at': current['verified_at']}
+            except (ManagementError, OSError) as exc:
+                data['native_runtime_version_gate'] = {'status': 'unverified', 'reason': str(exc)}
+        from .queue import refresh
+        refresh(data)
+        return version, data
+
+    def _principal(self, identity, data):
+        from .snapshots import principal
+        return principal(identity, data, self.owner_identity_ref)
+
+    def read_snapshot(self, identity, scope=None, *, committed=False):
+        if committed:
+            from .snapshots import SnapshotReader
+            return SnapshotReader(self.state_dir, owner_identity_ref=self.owner_identity_ref, sensitive_values=self._sensitive_values).read_snapshot(identity, scope)
+        with self._lock:
+            version, data = self._load()
+            from .snapshots import directory_view
+            principal, projects, profiles, requests, visible_ids = directory_view(identity, self.owner_identity_ref, data, scope)
+            for request in requests:
+                capability = request.get('execution_capability', {})
+                if capability.get('enabled'):
+                    try:
+                        from .takeover import executor_for
+                        actual_executor = executor_for(self, request)
+                        if actual_executor is None:
+                            raise ManagementError('capability_unverified', 'Original executor unavailable.')
+                        from .execution import _current_assignment
+                        _current_assignment(self, request, data)
+                        if request.get('session', {}).get('origin') == 'manual_takeover' and data.get('control_grants', {}).get(request.get('control_grant_id'), {}).get('status') != 'active':
+                            raise ManagementError('capability_unverified', 'The current-work manual grant is inactive.')
+                    except ManagementError as exc:
+                        capability.update(enabled=False, status='blocked', reason=str(exc))
+            from .takeover import executor_for
+            original_interface_requests = []
+            if principal is None:
+                seen = set()
+                for adapter in (self.dsh_adapter, *self.dsh_adapters.values()):
+                    if adapter is None or id(adapter) in seen or not adapter.connection:
+                        continue
+                    seen.add(id(adapter))
+                    original_interface_requests.extend({'rpc_id': r['envelope']['id'], 'method': r['envelope']['method'],
+                        'service_id': adapter.connection['service_id'], 'generation': adapter.generation,
+                        'thread_id': None, 'url': None, 'answerable': False, 'resolution': r['state'],
+                        'availability': 'original_client_required'} for r in adapter.server_requests(None))
+            from .collaboration import snapshot as collaboration_snapshot
+            role_snapshot = collaboration_snapshot(data, principal, visible_ids)
+            from .knowledge import snapshot_knowledge
+            from .notifications import snapshot as notification_snapshot
+            from .archives import snapshot_archives
+            from .maintenance import snapshot as maintenance_snapshot
+            return {'maintenance': maintenance_snapshot(self, data, principal), **snapshot_archives(self, identity, data), **snapshot_knowledge(identity, data), 'status': 'completed', 'version': version, 'last_verified_at': data['last_verified_at'],
+                    'projects': projects, 'profiles': profiles, 'requests': requests,
+                    'notifications': notification_snapshot(self, data, {p['id'] for p in projects}),
+                    'directory_audit': [a for a in data.get('directory_audit', []) if principal is None or principal['role'] == 'steward' or all(c['id'] in (visible_ids if c['kind'] == 'profile' else {p['id'] for p in projects}) for c in a['changes'])],
+                    'manual_sources': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sources', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
+                    'manual_sessions': [{**s, 'project_ids': [i for i in s['project_ids'] if i in {p['id'] for p in projects}]} for s in data.get('manual_sessions', {}).values() if set(s['project_ids']) & {p['id'] for p in projects}],
+                    'manual_capabilities': [{'kind': kind, 'status': 'verified' if any(s['kind'] == kind and s['status'] == 'verified' and set(s['project_ids']) & {p['id'] for p in projects} for s in data.get('manual_sources', {}).values()) else 'unknown'} for kind in ('desktop', 'web')],
+                    'original_interface_requests': original_interface_requests,
+                    'control_grants': [g for g in data.get('control_grants', {}).values() if g['request_id'] in {r['id'] for r in requests}],
+                    'collaboration': role_snapshot,
+                    'global_validations': [a for a in data.get('global_validations', {}).values() if a['profile_id'] in visible_ids],
+                    'lifecycle_operations': [a for a in data.get('lifecycle_operations', {}).values() if a['profile_id'] in visible_ids],
+                    'lifecycle_events': [a for a in data.get('lifecycle_events', {}).values() if a['profile_id'] in visible_ids],
+                    'migration_plans': [a for a in data.get('migration_plans', {}).values() if principal is None or a['plan']['target_profile_id'] in visible_ids],
+                    'clarifications': [c for c in data['clarifications'].values() if c['profile_id'] in visible_ids], 'runtime': 'directory_available',
+                    'intake_failures': [f for f in data['intake_failures'].values() if f['profile_id'] in visible_ids],
+                    'intake_conditions': data.get('intake_conditions', {'enabled': False, 'runtime_route': 'not_enabled',
+                        'compatibility': 'unverified', 'real_connect': 'unverified', 'real_group_acceptance': 'unverified'}),
+                    'execution': 'available' if any(r.get('execution_capability', {}).get('enabled') and executor_for(self, r) and r['execution_capability'].get('connection', {}).get('generation') == executor_for(self, r).generation and not executor_for(self, r)._closed for r in requests) else 'not_enabled',
+                    'needs_human': ['Capabilities require current service, permission and channel evidence.']}
+
+    def manage_notifications(self, identity, action, details):
+        from .notifications import manage
+        return manage(self, identity, action, details)
+
+    def run_notifications(self, identity):
+        from .notifications import run
+        return run(self, identity)
+
+    def accept_request(self, identity, project_id, profile_id, message, issue, *, delegation_id=None):
+        """Accept an Issue snapshot from a trusted message entry; never start DSH."""
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            actor_provenance = None
+            if delegation_id is not None:
+                from .collaboration import authorize_accept
+                actor_provenance = authorize_accept(self, identity, delegation_id, project_id, profile_id, message, issue, data)
+            elif self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'New work requires the verified owner.')
+            profile = data['profiles'].get(profile_id)
+            if project_id not in data['projects'] or not profile or profile['project_id'] != project_id or profile['capability'] != 'development':
+                raise ManagementError('invalid_change', 'An explicitly registered development project and responsible Profile are required.')
+            required = _message_anchor(message)
+            key = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
+            existing = next((r for r in data['requests'].values() if all(r['source_anchor'].get(k) == message[k] for k in required)), None)
+            if existing:
+                return {'status': 'accepted', 'duplicate': True, 'request': existing}
+            from .lifecycle import require_active
+            require_active(data, profile_id, project_id)
+            if not isinstance(issue, dict) or not re.fullmatch(r'https://github\.com/[\w.-]+/[\w.-]+/issues/[1-9]\d*', issue.get('url', '')) or any(not isinstance(issue.get(k), str) or not issue[k] for k in ('title', 'body', 'updated_at')):
+                raise ManagementError('invalid_change', 'A verified GitHub Issue snapshot and update time are required.')
+            _public_text(issue['title'], self._sensitive_values())
+            _public_text(issue['body'], self._sensitive_values())
+            from .delivery import delivery_requirements
+            record = {'id': key, 'project_id': project_id, 'profile_id': profile_id,
+                      'delivery_requirements': delivery_requirements(issue['body']),
+                      'accepted_scope': {k: issue[k] for k in ('url', 'title', 'body', 'updated_at')},
+                      'source_anchor': dict(message), 'task_start_anchor': None,
+                      'accepted_responsibility': {k: profile.get(k) for k in ('id', 'identity_ref', 'project_id', 'capability', 'role', 'parent_profile_id')},
+                      'executor_engine': 'dsh', 'accepted_dsh_ref': profile.get('connection_refs', {}).get('dsh'),
+                      'accepted_repository_fingerprint': hashlib.sha256(json.dumps(data['projects'][project_id]['repo'], sort_keys=True).encode()).hexdigest(),
+                      'accepted_actor': {'subject': identity.subject, 'source': identity.source},
+                      'acceptance': 'accepted', 'accepted_at': datetime.now(timezone.utc).isoformat(),
+                      'execution': 'waiting', 'unexecuted_reason': 'DSH execution is not enabled.',
+                      'delivery': 'pending', 'messages': [], 'outbox': []}
+            if actor_provenance is not None:
+                record['actor_provenance'] = actor_provenance
+            data['requests'][key] = record
+            from .queue import enroll
+            enroll(data, record, data['projects'][project_id]['repo'])
+            if delegation_id is None:
+                from .collaboration import synchronize_direct_request
+                synchronize_direct_request(self, identity, data, record, profile)
+            self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
+            return {'status': 'accepted', 'duplicate': False, 'request': record}
+
+    def _request(self, identity, request_id, data):
+        principal = self._principal(identity, data)
+        record = data['requests'].get(request_id)
+        if record is None:
+            raise ManagementError('invalid_change', 'Unknown request.')
+        if principal and principal['role'] != 'steward' and record['profile_id'] not in self._visible_profile_ids(principal, data):
+            raise ManagementError('forbidden', 'Request is outside this responsibility scope.')
+        return record
+
+    def global_validation(self, identity, action, details):
+        if action in {'start', 'prepare'}:
+            self.refresh_manual_sessions(identity)
+        from .global_validation import perform
+        result = perform(self, identity, action, details)
+        if action == 'rework':
+            from .notifications import on_rework
+            on_rework(self, result)
+        return result
+
+    def record_runtime_loss(self, reason):
+        from .maintenance import runtime_loss
+        runtime_loss(self, reason)
+
+    def maintenance(self, identity, action, details):
+        from .maintenance import operate
+        return operate(self, identity, action, details)
+
+    def lifecycle(self, identity, action, details):
+        from .lifecycle import operate
+        return operate(self, identity, action, details)
+
+    def migrate_profile(self, identity, action, details):
+        if action not in {'check', 'rollback'}:
+            with self._lock:
+                _, current = self._load()
+                if current.get('native_runtime_version_gate', {}).get('status') == 'unverified':
+                    raise ManagementError('unknown_version', 'Current native version is unknown; no migration is permitted.')
+        from .migration import operate
+        return operate(self, identity, action, details)
+
+    def take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id):
+        with self._lock:
+            _, data = self._load()
+            record = self._request(identity, request_id, data)
+            from .lifecycle import require_active
+            require_active(data, record['profile_id'], record['project_id'])
+            if record.get('archive_stop_intent'):
+                raise ManagementError('lifecycle_blocked', 'Archived unstarted work needs a new explicit request before any manual takeover.')
+            from .takeover import take_over_session
+            return take_over_session(self, identity, request_id, manual_session_id, grant_id, expected_turn_id)
+
+    def return_session_control(self, identity, request_id, grant_id):
+        from .takeover import return_session_control
+        return return_session_control(self, identity, request_id, grant_id)
+
+    def collaborate(self, identity, action, details):
+        from .collaboration import perform
+        return perform(self, identity, action, details)
+
+    def register_observation_source(self, identity, registration):
+        from .observation import register_source
+        return register_source(self, identity, registration)
+
+    def refresh_manual_sessions(self, identity, scope=None):
+        from .observation import refresh_manual_sessions
+        return refresh_manual_sessions(self, identity, scope)
+
+    def refresh_task_manual(self, identity, request_id):
+        with self._lock:
+            _, data = self._load()
+            from .execution import _responsible
+            record = _responsible(self, identity, request_id, data)
+            return self.refresh_manual_sessions(identity, record['project_id'])
+
+    def refresh_task_source(self, identity, request_id):
+        from .queue import refresh_task_source
+        return refresh_task_source(self, identity, request_id)
+
+    def dispatch_tasks(self):
+        from .queue import dispatch_tasks
+        return dispatch_tasks(self)
+
+    def prepare_task(self, identity, request_id, plan):
+        from .queue import prepare_task
+        return prepare_task(self, identity, request_id, plan)
+
+    def _refresh_observations_for_task(self, identity, request_id):
+        with self._lock:
+            _, data = self._load()
+            from .execution import _responsible
+            record = _responsible(self, identity, request_id, data)
+            logical = record.get('session', {}).get('logical_repository') or record['queue']['logical_repository']
+            if any(logical in s.get('logical_repositories', {}).values() for s in data.get('manual_sources', {}).values()):
+                self.refresh_manual_sessions(identity)
+
+    def start_task(self, identity, request_id):
+        self._refresh_observations_for_task(identity, request_id)
+        from .execution import start_task
+        return start_task(self, identity, request_id)
+
+    def reconcile_task(self, identity, request_id):
+        from .recovery import reconcile_task
+        return reconcile_task(self, identity, request_id)
+
+    def refresh_task(self, identity, request_id, *, sampling=False):
+        from .execution import refresh_task
+        return refresh_task(self, identity, request_id, sampling=sampling)
+
+    def control_task(self, identity, request_id, action, instruction_id, text=None, expected_turn_id=None):
+        if action in {'append', 'continue'}:
+            self._refresh_observations_for_task(identity, request_id)
+        from .control import control_task
+        try:
+            return control_task(self, identity, request_id, action, instruction_id, text, expected_turn_id)
+        except ManagementError as exc:
+            if exc.code in {'binding_conflict', 'capability_unverified', 'unavailable', 'outcome_unknown', 'service_rejected'}:
+                from .takeover import suspend_grant
+                suspend_grant(self, identity, request_id, str(exc))
+            raise
+
+    def associate_human_reply(self, identity, project_id, profile_id, message, text):
+        from .questions import associate_human_reply
+        return associate_human_reply(self, identity, project_id, profile_id, message, text)
+
+    def answer_human_request(self, identity, request_id, human_request_id, reply_id, response):
+        from .questions import answer_human_request
+        return answer_human_request(self, identity, request_id, human_request_id, reply_id, response)
+
+    def answer_from_knowledge(self, identity, request_id, human_request_id, query_id, material_ids):
+        from .memory import answer_from_knowledge
+        return answer_from_knowledge(self, identity, request_id, human_request_id, query_id, material_ids)
+
+    def curate_project_memory(self, identity, profile_id, entry_id, request_id, selection, supersedes=None):
+        from .memory import curate_project_memory
+        return curate_project_memory(self, identity, profile_id, entry_id, request_id, selection, supersedes)
+
+    def read_project_memory(self, identity, profile_id, include_superseded=False):
+        from .memory import read_project_memory
+        return read_project_memory(self, identity, profile_id, include_superseded)
+
+    def load_project_memory(self, identity, request_id, entry_ids):
+        from .memory import load_project_memory
+        return load_project_memory(self, identity, request_id, entry_ids)
+
+    def record_memory_preference(self, identity, profile_id, entry_id, statement, scope, supersedes=None):
+        from .memory import record_memory_preference
+        return record_memory_preference(self, identity, profile_id, entry_id, statement, scope, supersedes)
+
+    def supplement_project_memory(self, identity, request_id, entry_ids, expected_turn_id):
+        from .memory import supplement_project_memory
+        return supplement_project_memory(self, identity, request_id, entry_ids, expected_turn_id)
+
+    def manage_memory(self, identity, action, details):
+        from .memory import perform
+        return perform(self, identity, action, details)
+
+    def record_task_delivery(self, identity, request_id, report):
+        from .delivery import record_task_delivery
+        try:
+            result = record_task_delivery(self, identity, request_id, report)
+            from .notifications import on_delivery
+            on_delivery(self, result)
+            return result
+        except ManagementError as exc:
+            with self._lock, self._db:
+                version, data = self._load()
+                record = self._request(identity, request_id, data)
+                # Report only an authorized task operation; visibility is not authority.
+                from .execution import _responsible
+                _responsible(self, identity, request_id, data)
+                if record.get('session') and not record.get('repository_released'):
+                    record.update(handoff_reason=str(exc))
+                    self._save(version, data)
+            if record.get('session') and not record.get('repository_released'):
+                self.publish_request_message(identity, request_id, 'progress', '交付交接受阻；仓库占用保留：' + str(exc))
+            raise
+
+    def verify_task_execution(self, identity, request_id):
+        from .execution import verify_task_execution
+        return verify_task_execution(self, identity, request_id)
+
+    def register_knowledge_source(self, identity, expected_version, source):
+        from .knowledge import register_source
+        return register_source(self, identity, expected_version, source)
+
+    def query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id=None, channel_id=None, auto_supplement=False):
+        from .knowledge import query_knowledge
+        return query_knowledge(self, identity, source_id, query_id, question, scope_ids, request_id, channel_id, auto_supplement)
+
+    def claim_knowledge_delivery(self, identity, query_id):
+        from .knowledge import claim_delivery
+        return claim_delivery(self, identity, query_id)
+
+    def record_knowledge_delivery(self, identity, query_id, segment_id, receipt):
+        from .knowledge import record_delivery
+        return record_delivery(self, identity, query_id, segment_id, receipt)
+
+    def receive_wiki_query(self, identity, query_id, binding_id, anchor):
+        from .knowledge import receive_wiki_query
+        return receive_wiki_query(self, identity, query_id, binding_id, anchor)
+
+    def resolve_knowledge(self, identity, query_id):
+        from .knowledge import resolve_knowledge
+        return resolve_knowledge(self, identity, query_id)
+
+    def receive_wiki_result(self, identity, query_id, binding_id, anchor, result_version):
+        from .knowledge import receive_wiki_result
+        return receive_wiki_result(self, identity, query_id, binding_id, anchor, result_version)
+
+    def supplement_knowledge(self, identity, query_id, material_ids=None):
+        from .knowledge import supplement_knowledge
+        return supplement_knowledge(self, identity, query_id, material_ids)
+
+    def knowledge_bot_allowed(self, bot, app_id, chat_id, tenant_key, open_id, native_ids):
+        from .knowledge import registered_bot_allowed
+        return registered_bot_allowed(self, bot, app_id, chat_id, tenant_key, open_id, native_ids)
+
+    def next_knowledge_delivery_binding(self, identity, query_id):
+        from .knowledge import next_delivery_binding
+        return next_delivery_binding(self, identity, query_id)
+
+    def receive_direct_knowledge_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor):
+        from .knowledge import receive_direct_query
+        return receive_direct_query(self, identity, source_id, query_id, question, scope_ids, channel_id, anchor)
+
+    def backup_archive(self, identity, source_id, backup_id, kind='checkpoint'):
+        from .archive_backups import backup
+        if kind not in {'baseline', 'checkpoint'}:
+            raise ManagementError('invalid_change', 'Public backup requests select baseline or checkpoint; daily dates belong to the native scheduler.')
+        return backup(self, identity, source_id, backup_id, kind)
+
+    def restore_archive(self, identity, backup_id, restore_id):
+        from .archive_backups import restore
+        return restore(self, identity, backup_id, restore_id)
+
+    def protect_archive(self, identity, source_id, protection_id):
+        from .archive_backups import protect
+        return protect(self, identity, source_id, protection_id)
+
+    def run_archive_daily(self, day=None):
+        from .archive_backups import daily
+        return daily(self, day)
+
+    def register_archive_source(self, identity, registration):
+        from .archives import register_source
+        return register_source(self, identity, registration)
+
+    def query_archive(self, identity, source_id, query_id, question, scope_ids, complete=False, channel_id=None, anchor=None):
+        from .archives import query_archive
+        return query_archive(self, identity, source_id, query_id, question, scope_ids, complete, channel_id, anchor)
+
+    def record_intake_failure(self, identity, project_id, profile_id, message, code):
+        reasons = {'source_unavailable': 'Issue source could not be verified; no new work was accepted.',
+                   'association_unverified': 'Input could not be associated; quote the confirmed task start message.',
+                   'public_scope_unverified': 'Public scope could not be verified; inspect the original private interface before retrying.',
+                   'processing_unverified': 'Committed request processing needs reconciliation; inspect the authoritative record.',
+                   'admission_unverified': 'Native admission could not be verified; no new work was accepted.'}
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            if self._principal(identity, data) is not None or code not in reasons:
+                raise ManagementError('forbidden', 'A trusted owner intake failure code is required.')
+            required = _message_anchor(message)
+            profile = data['profiles'].get(profile_id)
+            if not profile or profile['project_id'] != project_id:
+                raise ManagementError('invalid_change', 'Unknown intake responsibility.')
+            key = hashlib.sha256(json.dumps([message[k] for k in required]).encode()).hexdigest()
+            existing = next((f for f in data['intake_failures'].values() if all(f['source_anchor'].get(k) == message[k] for k in required)), None)
+            if existing:
+                return {**existing, 'notification_claimed': False}
+            accepted = any(r['source_anchor'] == message for r in data['requests'].values())
+            record = {'id': key, 'project_id': project_id, 'profile_id': profile_id, 'source_anchor': dict(message),
+                      'acceptance': 'needs_reconciliation' if accepted else 'unaccepted', 'code': code, 'reason': reasons[code],
+                      'notification': {'uuid': str(uuid.uuid4()), 'status': 'unknown'}}
+            data['intake_failures'][key] = record
+            self._save(version, data)
+            return {**record, 'notification_claimed': True}
+
+    def read_intake_failure(self, identity, message):
+        with self._lock:
+            _, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'Only the verified owner entry checks original intake failures.')
+            required = _message_anchor(message)
+            return next((f for f in data['intake_failures'].values() if all(f['source_anchor'].get(k) == message[k] for k in required)), None)
+
+    def record_intake_conditions(self, identity, conditions):
+        allowed = {'enabled', 'runtime_route', 'compatibility', 'sdk_revision', 'lark_version',
+                   'allowed_users_policy', 'same_app_policy', 'real_connect', 'real_group_acceptance'}
+        with self._lock, self._db:
+            version, data = self._load()
+            if self._principal(identity, data) is not None or not isinstance(conditions, dict) or set(conditions) - allowed or conditions.get('enabled') is not False or any(not isinstance(v, str) or len(v) > 128 for k, v in conditions.items() if k != 'enabled'):
+                raise ManagementError('invalid_change', 'Only bounded owner capability conditions are accepted.')
+            if data.get('intake_conditions') != conditions:
+                data['intake_conditions'] = dict(conditions)
+                self._save(version, data)
+
+    def record_intake_failure_notification(self, identity, failure_id, receipt):
+        with self._lock, self._db:
+            version, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'Only the verified owner entry records failure notifications.')
+            if not isinstance(receipt, dict) or receipt.get('status') not in {'delivered', 'failed', 'unknown'} or set(receipt) - {'status', 'code', 'message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id'}:
+                raise ManagementError('invalid_change', 'A bounded native notification receipt is required.')
+            record = data['intake_failures'][failure_id]
+            record['notification'].update(receipt)
+            if receipt['status'] == 'delivered' and (not receipt.get('message_id') or receipt.get('chat_id') != record['source_anchor']['chat_id']):
+                record['notification']['status'] = 'unknown'
+            self._save(version, data)
+
+    def associate_message(self, identity, project_id, profile_id, message, text):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'Plain owner input requires the verified owner entry.')
+            _message_anchor(message)
+            _public_text(text, self._sensitive_values())
+            if re.fullmatch(r'(收到|谢谢|感谢|好的|ok|thanks)[。.!！\s]*', text.strip(), re.IGNORECASE):
+                return {'status': 'ignored'}
+            candidates = [r for r in data['requests'].values() if r['project_id'] == project_id and r['profile_id'] == profile_id
+                          and all(r['source_anchor'].get(k) == message[k] for k in _MESSAGE_NAMESPACE)]
+            parent = message.get('parent_id')
+            references = {message.get(k) for k in ('root_id', 'thread_id')} - {None, ''}
+            if parent:
+                candidates = [r for r in candidates if parent in {
+                    a.get('message_id') for a in [r['source_anchor'], r['task_start_anchor'] or {}]}]
+            elif references:
+                candidates = [r for r in candidates if references & {
+                    a.get(k) for a in [r['source_anchor'], r['task_start_anchor'] or {}]
+                    for k in ('message_id', 'root_id', 'thread_id')}]
+            key = hashlib.sha256(json.dumps(message, sort_keys=True).encode()).hexdigest()
+            if not candidates:
+                return {'status': 'unassociated'}
+            if len(candidates) > 1:
+                record = data['clarifications'].get(key)
+                if record is None:
+                    record = {'id': key, 'status': 'needs_clarification', 'project_id': project_id, 'profile_id': profile_id,
+                              'source_anchor': dict(message), 'candidate_ids': [r['id'] for r in candidates],
+                              'uuid': str(uuid.uuid4()), 'delivery': 'pending'}
+                    data['clarifications'][key] = record
+                    self._save(version, data)
+                return record
+            record = candidates[0]
+            existing = next((m for m in record['messages'] if m['id'] == key), None)
+            if existing:
+                return existing
+            kind = 'progress' if text.startswith('进度') else 'result' if text.startswith('结果') else 'input'
+            associated = {'id': key, 'status': 'associated', 'request_id': record['id'], 'kind': kind,
+                          'source_anchor': dict(message), 'text': text}
+            record['messages'].append(associated)
+            self._save(version, data)
+            return associated
+
+    def record_clarification_delivery(self, identity, clarification_id, receipt):
+        with self._lock, self._db:
+            version, data = self._load()
+            if self._principal(identity, data) is not None:
+                raise ManagementError('forbidden', 'Only the owner entry may record this clarification.')
+            clarification = data['clarifications'][clarification_id]
+            clarification['delivery'] = receipt.get('status', 'unknown')
+            clarification['receipt'] = receipt
+            self._save(version, data)
+
+    def _save(self, version, data):
+        self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
+
+    def publish_request_message(self, identity, request_id, kind, text):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            record = self._request(identity, request_id, data)
+            if kind not in {'confirmation', 'material', 'progress', 'result', 'clarification'} or not isinstance(text, str) or not text.strip():
+                raise ManagementError('invalid_change', 'An explicit message kind and public material are required.')
+            _public_text(text, self._sensitive_values())
+            key = hashlib.sha256((kind + ':' + text).encode()).hexdigest()
+            existing = next((p for p in record['outbox'] if p['id'] == key), None)
+            if existing:
+                return existing
+            publication = {'id': key, 'kind': kind, 'segments': [
+                {'number': index + 1, 'uuid': str(uuid.uuid4()), 'text': text[start:start + 1800],
+                 'status': 'pending', 'attempts': []}
+                for index, start in enumerate(range(0, len(text), 1800))]}
+            record['outbox'].append(publication)
+            record['delivery'] = _delivery_status(record)
+            self._save(version, data)
+            return publication
+
+    def claim_delivery(self, identity, request_id):
+        """Persist intent before the external send. An interrupted send requires reconciliation."""
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            record = self._request(identity, request_id, data)
+            for publication in record['outbox']:
+                for segment in publication['segments']:
+                    if segment['status'] == 'delivered':
+                        continue
+                    if segment['status'] == 'sending':
+                        return None
+                    if segment['status'] != 'pending':
+                        return None
+                    anchor = record['task_start_anchor'] or record['source_anchor']
+                    if publication['kind'] != 'confirmation' and record['task_start_anchor'] is None:
+                        return None
+                    segment['status'] = 'sending'
+                    self._inflight.add(segment['uuid'])
+                    segment['attempts'].append({'status': 'sending', 'path': 'reply',
+                                                'intended_chat_id': anchor['chat_id'],
+                                                'intended_reply_to': anchor['message_id'],
+                                                'intended_thread_id': anchor.get('thread_id')})
+                    record['delivery'] = _delivery_status(record)
+                    self._save(version, data)
+                    return {**segment, 'kind': publication['kind'], 'chat_id': anchor['chat_id'],
+                            'reply_to': anchor['message_id'], 'thread_id': anchor.get('thread_id'),
+                            'mention_open_id': record['source_anchor']['sender_open_id'] if publication['kind'] == 'confirmation' else None}
+            return None
+
+    def retry_delivery(self, identity, request_id):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            record = self._request(identity, request_id, data)
+            segments = [s for p in record['outbox'] for s in p['segments']]
+            if any(s['status'] in {'sending', 'unknown'} for s in segments):
+                raise ManagementError('version_conflict', 'Unknown delivery must be reconciled before retrying.')
+            failed = [s for s in segments if s['status'] == 'failed']
+            if not failed:
+                return {'status': 'completed', 'request': record}
+            for segment in failed:
+                segment['status'] = 'pending'
+            record['delivery'] = 'pending'
+            self._save(version, data)
+            return {'status': 'accepted', 'request': record}
+
+    def record_delivery(self, identity, request_id, segment_uuid, outcome):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            record = self._request(identity, request_id, data)
+            if not isinstance(outcome, dict) or outcome.get('status') not in {'delivered', 'failed', 'unknown'} or set(outcome) - {'status', 'code', 'message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id'}:
+                raise ManagementError('invalid_change', 'A scalar delivery receipt is required.')
+            found = next(((p, s) for p in record['outbox'] for s in p['segments'] if s['uuid'] == segment_uuid), None)
+            if not found or found[1]['status'] != 'sending':
+                raise ManagementError('version_conflict', 'There is no matching in-flight delivery.')
+            publication, segment = found
+            receipt = dict(outcome)
+            if receipt['status'] == 'delivered' and (not receipt.get('message_id') or receipt.get('chat_id') != record['source_anchor']['chat_id']):
+                receipt['status'] = 'unknown'
+            segment['status'] = receipt['status']
+            self._inflight.discard(segment['uuid'])
+            segment['attempts'][-1].update(receipt)
+            if receipt['status'] == 'delivered' and publication['kind'] == 'confirmation' and segment['number'] == 1 and record['task_start_anchor'] is None:
+                record['task_start_anchor'] = {k: receipt.get(k) for k in ('message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id')}
+            record['delivery'] = _delivery_status(record)
+            self._save(version, data)
+            return {'status': 'completed', 'request': record}
+
+    def _visible_profile_ids(self, principal, data):
+        from .snapshots import visible_profile_ids
+        return visible_profile_ids(principal, data)
+
+    def _authorize_change(self, principal, kind, candidate, data):
+        if principal is None:
+            return
+        old = data[kind + 's'].get(candidate['id'])
+        if old is None or principal['role'] in {'subproject_lead', 'independent'}:
+            raise ManagementError('forbidden', 'New identities and bindings require the verified owner.')
+        visible = self._visible_profile_ids(principal, data)
+        if kind == 'project':
+            project_ids = {p['project_id'] for p in data['profiles'].values() if p['id'] in visible}
+            if principal['role'] != 'steward' and candidate['id'] not in project_ids:
+                raise ManagementError('forbidden', 'Project is outside the registered responsibility scope.')
+            if candidate['repo'] != old['repo']:
+                raise ManagementError('forbidden', 'Repository boundary changes require the verified owner.')
+        else:
+            if principal['role'] != 'steward' or any(candidate.get(k) != old.get(k) for k in candidate if k != 'parent_profile_id'):
+                raise ManagementError('forbidden', 'Only the steward may transfer an existing Profile; identity decisions require the owner.')
+
+    def _validate_project(self, value):
+        if not isinstance(value, dict) or set(value) - {'id', 'name', 'repo_path', 'test_artifact_paths'}:
+            raise ManagementError('invalid_change', 'Unknown project fields.')
+        if any(not isinstance(value.get(k), str) or not value[k].strip() for k in ('id', 'name', 'repo_path')):
+            raise ManagementError('invalid_change', 'Project id, name and existing repository are required.')
+        if not isinstance(value.get('test_artifact_paths', []), list):
+            raise ManagementError('invalid_change', 'Test artifact paths must be explicit local paths.')
+
+    def _validate_profile(self, value, data):
+        allowed = {'id', 'native_profile', 'identity_ref', 'role', 'capability', 'project_id', 'parent_profile_id', 'connection_refs'}
+        if not isinstance(value, dict) or set(value) - allowed:
+            raise ManagementError('invalid_change', 'Unknown Profile fields; credentials must stay in native secret storage.')
+        if any(not isinstance(value.get(k), str) or not value[k].strip() for k in ('id', 'native_profile', 'identity_ref')):
+            raise ManagementError('invalid_change', 'Stable Profile, native Profile and verified identity references are required.')
+        if value.get('role') not in {'steward', 'project_lead', 'subproject_lead', 'independent'}:
+            raise ManagementError('invalid_change', 'Unknown responsibility role.')
+        if value.get('capability') not in {'development', 'non_development'}:
+            raise ManagementError('invalid_change', 'Unknown capability classification.')
+        if value['role'] in {'steward', 'independent'}:
+            if value.get('project_id') is not None or value.get('parent_profile_id') is not None:
+                raise ManagementError('invalid_change', 'Global and independent assistants remain outside the project tree.')
+        elif value.get('project_id') not in data['projects']:
+            raise ManagementError('invalid_change', 'Project Profile requires a registered project.')
+        parent = value.get('parent_profile_id')
+        if parent is not None:
+            if parent == value['id'] or parent not in data['profiles'] or data['profiles'][parent]['role'] != 'project_lead':
+                raise ManagementError('invalid_change', 'Parent must be a registered project lead.')
+        if value['role'] == 'subproject_lead' and parent is None:
+            raise ManagementError('invalid_change', 'Subproject lead requires its project lead.')
+        profiles = {**data['profiles'], value['id']: value}
+        for profile in profiles.values():
+            parent_id = profile.get('parent_profile_id')
+            if profile['role'] == 'subproject_lead':
+                lead = profiles.get(parent_id)
+                if lead is None or lead['role'] != 'project_lead' or lead.get('parent_profile_id') is not None:
+                    raise ManagementError('invalid_change', 'Subproject lead requires a root project lead; existing children must remain valid.')
+            elif parent_id is not None:
+                raise ManagementError('invalid_change', 'Only subproject leads have a parent; project leads cannot form cycles or extra responsibility layers.')
+        for profile in data['profiles'].values():
+            if profile['id'] != value['id'] and (profile['native_profile'] == value['native_profile'] or profile['identity_ref'] == value['identity_ref']):
+                raise ManagementError('binding_conflict', 'Native Profile and identity already belong to another Profile.')
+        if value['identity_ref'] == self.owner_identity_ref:
+            raise ManagementError('invalid_change', 'A bot identity cannot reuse the owner identity.')
+        refs = value.get('connection_refs', {})
+        if not isinstance(refs, dict) or set(refs) - {'bot', 'credential', 'dsh'}:
+            raise ManagementError('invalid_change', 'Use non-sensitive bot, native credential and local service references.')
+        if any(not isinstance(ref, str) or not re.fullmatch(r'(native|local|identity):[A-Za-z0-9_.:/-]+', ref) for ref in refs.values()):
+            raise ManagementError('invalid_change', 'Only native/local/identity references are accepted, never secret values.')
+        if 'credential' in refs and not refs['credential'].startswith('native:'):
+            raise ManagementError('invalid_change', 'Credential must reference native secret management.')
+        if 'dsh' in refs and not refs['dsh'].startswith('local:'):
+            raise ManagementError('invalid_change', 'Only local execution service references are supported.')
+
+    def apply_directory_change(self, identity, expected_version, change):
+        with self._lock, self._db:
+            self._db.execute('BEGIN IMMEDIATE')
+            version, data = self._load()
+            principal = self._principal(identity, data)
+            if version != expected_version:
+                raise ManagementError('version_conflict', 'Directory changed; read the current version first.')
+            if not isinstance(change, dict) or set(change) - {'project', 'profile', 'enable_profile'} or not change:
+                raise ManagementError('invalid_change', 'Expected project and/or profile changes.')
+            audit_changes = []
+            if 'project' in change:
+                value = change['project']
+                self._validate_project(value)
+                candidate = {'id': value['id'], 'name': value['name'], 'repo': _repository(value)}
+                if any(self.state_dir.is_relative_to(Path(candidate['repo'][key])) for key in ('worktree', 'git_dir', 'common_dir')):
+                    raise ManagementError('unsafe_state', 'Managed repositories cannot contain private runtime state.')
+                existing = data['projects'].get(value['id'], {})
+                candidate.update({k: existing[k] for k in ('lifecycle', 'archive_intent') if k in existing})
+                self._authorize_change(principal, 'project', candidate, data)
+                audit_changes.append({'kind': 'project', 'id': candidate['id'], 'before': data['projects'].get(candidate['id']), 'after': candidate})
+                data['projects'][value['id']] = candidate
+            if 'profile' in change:
+                self._validate_profile(change['profile'], data)
+                value = dict(change['profile'])
+                value.setdefault('project_id', None)
+                value.setdefault('parent_profile_id', None)
+                value.setdefault('connection_refs', {})
+                existing = data['profiles'].get(value['id'])
+                parent_id = value.get('parent_profile_id')
+                if parent_id and (existing is None or existing.get('parent_profile_id') != parent_id):
+                    from .lifecycle import require_active
+                    parent = data['profiles'][parent_id]
+                    require_active(data, parent_id, parent['project_id'], configuration=True)
+                if existing and existing['project_id'] != value['project_id']:
+                    raise ManagementError('binding_conflict', 'Profile has a long-term project binding; create a new Profile.')
+                value.update(lifecycle='configuring', can_execute=False,
+                             capabilities={'execution': {'enabled': False, 'reason': 'Not verified by an execution adapter.'}})
+                if existing:
+                    value.update({k: existing[k] for k in ('lifecycle', 'archive_intent', 'migration_gate', 'readiness') if k in existing})
+                self._authorize_change(principal, 'profile', value, data)
+                from .collaboration import _binding
+                audit_changes.append({'kind': 'profile', 'id': value['id'], 'before': _binding(existing) if existing else None, 'after': _binding(value)})
+                data['profiles'][value['id']] = value
+            if 'enable_profile' in change:
+                if principal is not None:
+                    raise ManagementError('forbidden', 'Profile enablement requires the verified Owner and current native receipts.')
+                profile = data['profiles'].get(change['enable_profile']) if isinstance(change['enable_profile'], str) else None
+                if not profile or profile.get('migration_gate') or profile.get('archive_intent') or profile.get('lifecycle') not in {'configuring', 'active'}:
+                    raise ManagementError('lifecycle_blocked', 'Only the exact configured Profile may be enabled; migration and archive decisions remain separate.')
+                from .readiness import enable_profile
+                enable_profile(self, profile)
+                audit_changes.append({'kind': 'profile_enablement', 'id': profile['id'], 'evidence_ref': profile['readiness']['evidence_ref']})
+            data['last_verified_at'] = datetime.now(timezone.utc).isoformat()
+            data.setdefault('directory_audit', []).append({'version': version + 1, 'at': data['last_verified_at'],
+                'actor': {'subject': identity.subject, 'source': identity.source, 'profile_id': principal['id'] if principal else None}, 'changes': audit_changes})
+            self._db.execute('UPDATE directory SET version=?, payload=? WHERE id=1', (version + 1, json.dumps(data)))
+            return {'status': 'completed', 'version': version + 1, 'last_verified_at': data['last_verified_at'],
+                    'needs_human': ['Verify native Profile, new bot identity, connections and execution capabilities.']}

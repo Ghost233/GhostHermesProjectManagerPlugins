@@ -1,0 +1,26 @@
+name: ghost-hermes-pm
+version: "0.1.0"
+description: Register existing projects and Profiles, inspect directory and unverified capability conditions.
+kind: standalone
+manifest_version: 2
+provides_tools:
+  - hermes_pm_loaded_version
+  - hermes_pm_snapshot
+  - hermes_pm_supervise
+  - hermes_pm_lifecycle
+  - hermes_pm_migration
+  - hermes_pm_observe
+  - hermes_pm_task
+  - hermes_pm_collaborate
+  - hermes_pm_global_validation
+  - hermes_pm_knowledge
+  - hermes_pm_archive
+  - hermes_pm_memory
+provides_hooks:
+  - pre_gateway_dispatch
+  - pre_api_request
+  - pre_tool_call
+python_dependencies:
+  - fastapi
+  - requests
+  - websockets>=15,<16
