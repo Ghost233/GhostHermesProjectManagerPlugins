@@ -84,7 +84,8 @@ def main():
                 raise ValueError('Installed Ruff differs from the pinned test dependency.')
             base = tempfile.mkdtemp(prefix='hc-', dir='/tmp')
             diff = ['git', 'diff', '--check'] + ([args.diff_base, 'HEAD'] if args.diff_base else [])
-            commands = [[args.python, '-m', 'ruff', 'check', '--no-cache', '--select', 'F821', 'ghost_hermes_pm', 'tests', 'tools', '__init__.py'],
+            commands = [[args.python, 'tools/check_sdk_test_seams.py'],
+                        [args.python, '-m', 'ruff', 'check', '--no-cache', '--select', 'F821', 'ghost_hermes_pm', 'tests', 'tools', '__init__.py'],
                         [args.python, '-m', 'pytest', '-q', '--basetemp=' + base],
                         [args.node, '--check', 'dashboard/dist/index.js'],
                         [args.node, '--check', 'ghost_hermes_pm/owned_native_host.mjs'], diff]

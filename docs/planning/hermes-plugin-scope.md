@@ -1,6 +1,14 @@
 # Hermes 分层协作与 DSH 监督插件：需求与范围记录
 
-状态：需求与决定已收敛为[已确认首版规格](../specs/hermes-plugin-v1.md)。2026-10-09 本人确认开发目标改为 DSH，停止 Codex 适配；具体接口、切换及证据要求见[DSH 修订](../specs/dsh-executor-transition.md)。本文件保留需求与边界，不是已实现功能清单。
+2026-10-10 起重新讨论首版。已确认内部派发与关键事件通知，首版先完成开发任务从受理到验收的流程，见[范围修订决定](../adr/0001-internal-handoffs-and-development-first.md)。下文保留旧方案的需求记录，供新范围取舍；其中的公开交接、自建 WebUI 和完整迁移档案功能不再作为首版默认要求。
+
+DSH 主持仓库内的 Matt 流程，Hermes 分派完整工作范围并监督。首版只管理专用 DSH 实例，Desktop 手动会话观察与接管留到后续，见[工作流分工决定](../adr/0002-dsh-led-repository-work.md)。
+
+原生 Kanban 负责唯一的外层派发，主插件补充 DSH 接入、仓库互斥、提问回送和验收，见[派发决定](../adr/0003-native-kanban-outer-dispatch.md)。普通问答和规划确认在飞书回复，执行审批到原生界面处理。一轮问题可分次回答，收齐后整轮回送，见[人工应答决定](../adr/0004-feishu-questions-and-native-approvals.md)。
+
+每个仓库的完整工作对应一个总 Issue 和一张外层任务卡。细任务 Issue 留在 GitHub，见[对应方式](../adr/0005-umbrella-issue-and-outer-card.md)。首版只开放实测受控的工具与任务，见[工具范围](../adr/0006-verified-tool-scope.md)。受限本机日志可保存非秘密绑定，见[记录保护](../adr/0007-private-local-runtime-logs.md)。完整讨论稿与待整体确认的验收见[简化方案](hermes-plugin-simplification.md)。
+
+旧方案状态：需求与决定已收敛为[已确认首版规格](../specs/hermes-plugin-v1.md)。2026-10-09 本人确认开发目标改为 DSH，停止 Codex 适配；具体接口、切换及证据要求见[DSH 修订](../specs/dsh-executor-transition.md)。本文件保留需求与边界，不是已实现功能清单。
 
 规范地图为 [原决策地图](../../../../issues/1)。决定写入各工单解决评论，地图只维护索引；实现契约及通过标准见首版规格。
 
