@@ -1,5 +1,5 @@
 include __init__.py plugin.yaml
 recursive-include dashboard *.json *.py *.js
-recursive-include ghost_hermes_pm *.mjs
+recursive-include ghost_hermes_pm *.mjs *.c
 recursive-include tests *.py *.mjs
 include docs/development/project-directory.md

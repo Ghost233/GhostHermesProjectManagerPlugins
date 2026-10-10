@@ -312,6 +312,11 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
             return False
 
     async def receive_payload(self, payload):
+        if payload.get('header', {}).get('event_type') == 'card.action.trigger':
+            callback = getattr(self, '_handle_card_action_payload', None)
+            if callable(callback):
+                await callback(payload)
+            return
         def namespace(value):
             if isinstance(value, dict):
                 return SimpleNamespace(**{k: namespace(v) for k, v in value.items()})
@@ -396,7 +401,7 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id):
         return {'type': 'group'}
 
-    def _base_admit(self, sender, message):
+    def _base_admit(self, sender, message, *, card_action=False):
         if getattr(getattr(sender, 'sender_id', None), 'open_id', None) == self._bot_open_id:
             return 'self_echo'
         if sender.sender_type in {'bot', 'app'} and self._allow_bots not in {'mentions', 'all'}:
@@ -427,7 +432,7 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
             require_mention = rule.get('require_mention', self._require_mention)
             require_mention = require_mention is True or require_mention in {'true', 1}
             text = getattr(message, 'content', '')
-            if (require_mention or is_bot) and not any(getattr(getattr(m, 'id', None), 'open_id', None) == self._bot_open_id
+            if not card_action and (require_mention or is_bot) and not any(getattr(getattr(m, 'id', None), 'open_id', None) == self._bot_open_id
                        and getattr(m, 'tenant_key', None) == binding.get('recipient_tenant_key')
                        and getattr(m, 'mentioned_type', None) == 'bot'
                        and isinstance(getattr(m, 'key', None), str) and m.key and m.key in text

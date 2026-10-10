@@ -20,11 +20,12 @@ export async function bootOwnedRuntime(config) {
   const {createLaunchEnvironmentSnapshot} = await import(pathToFileURL(path.join(config.runtime_package_root, '@deepseek-ai/dsh-launch-environment/lib/index.js')));
   const disabled = ['preset-standard', 'preset-minimal', 'preset-ptc', 'preset-cordis', 'terminal-controller', 'ui-sidebar-terminal',
     'cordis-host-runner', 'cordis-client-runner', 'cordis-inspect-providers', 'ui-cordis', 'ui-plugin-manager', 'tool-plugin-manager',
-    'schedule', 'ui-schedule', 'mcp-resources', 'session-title-llm', 'tool-working-directory', 'permission'];
+    'schedule', 'ui-schedule', 'mcp-resources', 'session-title-llm', 'tool-working-directory', 'permission', 'webserver', 'web-runtime'];
   const plugins = [
     {id: 'persona', name: '@deepseek-ai/dsh-persona', config: {prefix: 'Work in the bound repository. Follow its instructions and the installed Matt workflow. Report real tool results and ask the user about unresolved decisions.', complete: true, includeRuntimeContext: false}},
     {id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash', config: {enableRunInBackground: false, promoteOnTimeout: false}},
     {id: 'tool-jobs', name: '@deepseek-ai/dsh-tool-jobs', config: {completionDelivery: 'quiet'}},
+    {id: 'tool-ask-user', name: '@deepseek-ai/dsh-tool-ask-user', config: {mode: 'timed', timeout: 15}},
   ];
   const settings = config.runtime_configuration ?? {};
   if (settings.skill_directories?.length) plugins.push(
@@ -33,8 +34,6 @@ export async function bootOwnedRuntime(config) {
   );
   const overlay = [
     ...disabled.map(id => ({id, disabled: true})),
-    {id: 'web-runtime', config: {openBrowser: false, printUrl: false, surfaceContext: false, trustedHosts: []}},
-    {id: 'webserver', config: {host: '127.0.0.1', port: 0}},
     {id: 'tools', config: {mode: 'native'}},
     {id: 'sandbox-policy', config: {mode: 'workspace-write', workspaceRoot: config.workspace}},
     {id: 'agent-preset-registry', config: {default: 'hermes-owned', selectedDefault: 'hermes-owned'}},
@@ -51,18 +50,18 @@ export async function bootOwnedRuntime(config) {
   const patch = path.join(config.dsh_home, '.hermes-owned-overlay.json');
   fs.writeFileSync(patch, JSON.stringify(overlay), {mode: 0o600});
   const runtime = await runProfile({environment: createLaunchEnvironmentSnapshot([{source: 'process', values: {...process.env}}]),
-    profile: 'hermes-owned', patchFiles: [patch], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'],
+    profile: 'hermes-owned', patchFiles: [patch], args: ['--host', '127.0.0.1', '--port', '0'],
     ...(!fs.existsSync(path.join(config.dsh_home, 'profiles/hermes-owned/package.json')) ? {fromDefaultProfile: 'web'} : {}),
   });
   const inventory = await runtime.ctx.get('agentPresets').compositionInventory();
   if (inventory.length !== 1 || inventory[0].id !== 'hermes-owned' || inventory[0].broken
       || runtime.ctx.get('shell').sandboxMode !== 'workspace-write'
-      || ['terminalController', 'dynamicCordisRunner', 'cordisInspect'].some(name => runtime.ctx.get(name) !== undefined)) {
+      || ['terminalController', 'dynamicCordisRunner', 'cordisInspect', 'webServer', 'webRuntime'].some(name => runtime.ctx.get(name) !== undefined)) {
     await runtime.shutdown.shutdown(1);
     throw new Error('The original owned composition is unavailable.');
   }
   const release = runtime.ctx.get('tools').guard(exec => {
-    if (!['bash', 'job_kill', 'job_list', 'job_output', ...(settings.skill_directories?.length ? ['skill'] : [])].includes(exec.name)) return 'Unverified owned capability rejected.';
+    if (!['bash', 'job_kill', 'job_list', 'job_output', 'ask_user_question', ...(settings.skill_directories?.length ? ['skill'] : [])].includes(exec.name)) return 'Unverified owned capability rejected.';
     const session = exec.agent?.session;
     if (!session || session.id !== config.session_id || !session.header.cwd
         || fs.realpathSync(session.header.cwd) !== config.workspace) return 'Owned Session binding rejected.';
@@ -75,10 +74,17 @@ export async function bootOwnedRuntime(config) {
   runtime.ctx.on('tools/result', (exec, result) => {
     if (exec.agent?.session?.id !== config.session_id) return;
     const value = result.value;
+    const command = typeof exec.arguments?.command === 'string' ? exec.arguments.command : null;
+    const credential = settings.model?.configuration?.apiKeyEnv && process.env[settings.model.configuration.apiKeyEnv];
+    const sensitiveCommand = command && (credential && command.includes(credential)
+      || /(?:password|passwd|secret|token|api[_ -]?key|private[_ -]?key)\s*[:=]\s*\S+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,}|-----BEGIN[^\n]*PRIVATE KEY/i.test(command));
     const output = part => ({sha256: crypto.createHash('sha256').update(part.text).digest('hex'),
       byte_length: Buffer.byteLength(part.text), truncated: part.truncated});
     const row = {generation: config.generation, session_id: config.session_id, call_id: exec.callId,
       name: exec.name, is_error: result.isError,
+      ...(exec.name === 'bash' ? {cwd: exec.agent.session.header.cwd,
+        command_sha256: crypto.createHash('sha256').update(command ?? '').digest('hex'),
+        ...(!sensitiveCommand ? {command} : {command_omitted: 'sensitive'})} : {}),
       ...(value?.kind === 'foreground' ? {kind: value.kind, exit_code: value.exitCode,
         sandbox: value.sandbox, aborted: value.aborted, timed_out: value.timedOut,
         stdout: output(value.stdout), stderr: output(value.stderr)} : {}),
@@ -107,7 +113,8 @@ export async function bootOwnedRuntime(config) {
       if (agent.session.id !== config.session_id) throw new Error('Owned model Session differs.');
       if (state.started_at_ms === null) state.started_at_ms = Date.now();
       state.usage = readUsage(agent.session) ?? null;
-      const knownTokens = state.usage ? Object.values(state.usage).reduce((sum, value) => sum + (typeof value === 'number' ? value : 0), 0) : null;
+      const totals = state.usage?.totals;
+      const knownTokens = totals ? totals.uncachedInputTokens + totals.outputTokens + totals.cacheReadTokens + totals.cacheWriteTokens : null;
       if (state.requests >= budget.max_model_requests || knownTokens !== null && knownTokens >= budget.max_reported_tokens) {
         state.stop_reason = 'owned-budget-observed-limit'; save();
       }

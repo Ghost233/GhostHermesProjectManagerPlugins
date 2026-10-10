@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import sys
 import time
 import uuid
 
@@ -108,6 +109,179 @@ def original_jobs(carrier, session_id):
     return roster['jobs']
 
 
+def execution_event_references(events):
+    """Keep route facts and original log positions; question content stays native."""
+    references = []
+    for event in events:
+        row = {'seq': event['seq'], 'type': event['type']}
+        data = event.get('data', {})
+        if event['type'] == 'request/header':
+            header = data.get('header', {})
+            configuration = header.get('config', {})
+            row['data'] = {'header': {'config': {key: configuration[key] for key in ('provider', 'model', 'maxTokens')
+                                              if key in configuration},
+                                      'tools': [{'name': tool['name']} for tool in header.get('tools', [])]}}
+        elif event['type'] == 'request/context':
+            row['data'] = {key: data[key] for key in ('provider', 'model', 'contextWindow') if key in data}
+        references.append(row)
+    return references
+
+
+def acceptance_text(record):
+    acceptance = record['dsh_execution']['acceptance']
+    text = '交付已通过总 Issue 验收。' if acceptance['status'] == 'accepted' else '开发与测试结果待验收，尚未交付；总 Issue 验收未满足。'
+    text += '\n总 Issue：' + record['issue']['url']
+    if acceptance.get('source_commit'):
+        text += '\n交付版本：' + acceptance['source_commit']
+    pr = {'none': '未提供 PR', 'awaiting_review': '待审查', 'awaiting_merge': '待合并', 'merged': '已合并'}
+    review = {'not_provided': '未提供', 'pending': '待审查', 'changes_requested': '要求修改', 'approved': '审查通过'}
+    text += '\nPR 状态：' + pr.get(acceptance.get('pr_status'), '待核对')
+    text += '\n审查状态：' + review.get(acceptance.get('review_status'), '待核对')
+    if acceptance.get('unmet'):
+        text += '\n未满足项：' + '、'.join(acceptance['unmet'])
+    if isinstance(acceptance.get('leftovers'), list):
+        text += '\n遗留项：' + str(len(acceptance['leftovers'])) + ' 项'
+    return text
+
+
+async def notify_acceptance(intake, record, generation):
+    from .repository_questions import question_destination
+    execution = record['dsh_execution']
+    acceptance = execution.get('acceptance')
+    if not acceptance:
+        return
+    signature = hashlib.sha256(json.dumps({key: acceptance.get(key) for key in
+        ('status', 'source_commit', 'pr_status', 'review_status', 'unmet')}, sort_keys=True).encode()).hexdigest()
+    if execution.get('delivery_notification', {}).get('signature') == signature:
+        return
+    destination = question_destination(intake, record)
+    if destination is None:
+        return
+    transport, binding = destination
+    if await transport.verify_identity(binding) != {'app_id': binding['app_id'], 'open_id': binding['recipient_open_id']}:
+        raise ManagementError('binding_conflict', 'Original delivery recipient is unverified.')
+    intake.require_active(generation)
+    execution['delivery_notification'] = {'signature': signature, 'status': 'intent'}
+    intake._save_execution(record, fields=['delivery_notification'])
+    anchor = record['source_anchor']
+    result = await transport.send({'uuid': hashlib.sha256((record['id'] + ':acceptance:' + signature).encode()).hexdigest()[:32],
+        'text': acceptance_text(record), 'chat_id': binding['chat_id'], 'reply_to': anchor['message_id'],
+        'thread_id': anchor.get('thread_id')})
+    intake.require_active(generation)
+    execution['delivery_notification']['status'] = result.get('status', 'unknown')
+    intake._save_execution(record, fields=['delivery_notification'])
+
+
+def attach_existing_owned(intake, record):
+    """Attach a registered generation; absence never starts replacement work."""
+    from .dsh_owned_transport import PersistentOwnedTransport
+    execution = record['dsh_execution']
+    instance = intake.state_dir / 'owned-work' / record['id']
+    if (not execution.get('native_identity') or not (instance / 'native-configuration.json').is_file()
+        or not (instance / 'native-identity.json').is_file()):
+        raise ManagementError('outcome_unknown', 'Original owned execution is not registered.')
+    configuration, environment = execution_configuration(record['target'])
+    if configuration['reference_sha256'] != execution['reference_sha256']:
+        raise ManagementError('configuration_missing', 'Original admitted execution reference changed.')
+    configuration.update(dsh_home=str(instance / 'home'), workspace=record['target']['repo_path'],
+        instance_id=execution['instance_id'], generation=execution['generation'], session_id=execution['session_id'],
+        trusted_controllers=[record['gateway_controller']],
+        test_python=sys.executable,
+        test_runner_path=str(Path(__file__).with_name('repository_test_runner.py').resolve(strict=True)))
+    reference = execution.get('github_reference')
+    if reference:
+        environment.update(GH_CONFIG_DIR=reference['config_dir'], HERMES_OWNED_GITHUB_ACCOUNT=reference['account'],
+            HERMES_OWNED_GITHUB_REPOSITORY=reference['repository'], GH_TOKEN='', GITHUB_TOKEN='',
+            GH_ENTERPRISE_TOKEN='', GITHUB_ENTERPRISE_TOKEN='')
+    return PersistentOwnedTransport(instance_dir=str(instance), configuration=configuration,
+        node_bin=configuration.pop('node_bin'), timeout=15, environment=environment, attach_only=True)
+
+
+def _admit_resumed_worker(intake, record, carrier):
+    """Only the pinned gateway may admit a proven new claim of this same card."""
+    from .trusted_controller import controller_identity
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    if controller_identity() != record['gateway_controller']:
+        raise ManagementError('unauthorized', 'Original gateway controller identity changed.')
+    execution = record['dsh_execution']
+    previous = execution.get('supervisor_claim')
+    if not previous:
+        return
+    with connect_closing(board=intake.board) as connection:
+        card = kb.get_task(connection, record['card_id'])
+        old_run = kb.get_run(connection, previous['run_id'])
+        run = kb.get_run(connection, card.current_run_id) if card and card.current_run_id else None
+    if not card or card.status != 'running' or card.current_run_id == previous['run_id']:
+        return
+    replies = [*execution.get('questions', []), *execution.get('approvals', [])]
+    resumes = [reply['resume_unblock'] for reply in replies
+               if reply.get('reply_status') in {'accepted', 'settled'} and reply.get('admitted_seq')
+               and reply.get('resume_unblock', {}).get('status') == 'accepted'
+               and reply['resume_unblock'].get('previous_run_id') == previous['run_id']
+               and reply['resume_unblock'].get('generation') == execution['generation']
+               and reply['resume_unblock'].get('session_id') == execution['session_id']
+               and reply['resume_unblock'].get('card_id') == record['card_id']]
+    if (len(resumes) != 1 or old_run is None or old_run.status == 'running' or run is None
+        or card.assignee != record['target']['native_profile'] or card.workspace_kind != 'dir'
+        or Path(card.workspace_path).resolve(strict=True) != Path(record['target']['repo_path']).resolve(strict=True)
+        or card.title != record['issue']['title'] or card.body != intake._card_body(record)
+        or not card.claim_lock or card.claim_lock != run.claim_lock or card.worker_pid != run.worker_pid
+        or run.task_id != card.id or run.status != 'running' or card.claim_expires is None
+        or card.claim_expires <= time.time()):
+        raise ManagementError('binding_conflict', 'Original same-card claim resumption is unverified.')
+    old_identity = previous['identity']
+    if psutil.pid_exists(old_identity['pid']):
+        if controller_identity(old_identity['pid']) == old_identity:
+            return
+    identity = controller_identity(card.worker_pid)
+    carrier.admit_controller(identity)
+    execution['supervisor_claim'] = {'run_id': card.current_run_id, 'identity': identity}
+    intake._save_execution(record, fields=['supervisor_claim'])
+
+
+async def observe_human_requests(intake):
+    """Gateway observes existing work because claimed workers have no group transport."""
+    if os.environ.get('HERMES_KANBAN_RUN_ID'):
+        return
+    from .repository_questions import observe_questions
+    from .repository_approvals import observe_approvals
+    carriers = {}
+    try:
+        while not intake.closed:
+            if intake.transports:
+                for record in intake.snapshot()['work']:
+                    execution = record.get('dsh_execution', {})
+                    if execution.get('acceptance'):
+                        try:
+                            await notify_acceptance(intake, record, intake.generation)
+                        except ManagementError:
+                            pass
+                    if not execution.get('native_identity') or execution.get('state') == 'released':
+                        carrier = carriers.pop(record['id'], None)
+                        if carrier is not None:
+                            carrier.close()
+                        continue
+                    carrier = carriers.get(record['id'])
+                    try:
+                        if carrier is None:
+                            carrier = attach_existing_owned(intake, record)
+                            carriers[record['id']] = carrier
+                        await asyncio.to_thread(_admit_resumed_worker, intake, record, carrier)
+                        events, projections = await asyncio.to_thread(original_history, carrier,
+                            execution['session_id'], record['target']['repo_path'])
+                        await observe_questions(intake, record, carrier, events, projections, intake.generation)
+                        await observe_approvals(intake, record, carrier, events, projections, intake.generation)
+                    except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES):
+                        if carrier is not None:
+                            carrier.close()
+                        carriers.pop(record['id'], None)
+            await asyncio.sleep(.25)
+    finally:
+        for carrier in carriers.values():
+            carrier.close()
+
+
 def register_repository_supervision(ctx, intake):
     connections = set()
     def detach():
@@ -120,6 +294,18 @@ def register_repository_supervision(ctx, intake):
         card_id = owned_kanban_task()
         record = next((r for r in intake.snapshot()['work'] if r.get('card_id') == card_id), None) if card_id else None
         if record:
+            if tool_name == 'kanban_complete':
+                try:
+                    from .repository_acceptance import completion_ready
+                    intake.require_active(intake.generation)
+                    current_worker(ctx, intake, record)
+                    supplied = args or {}
+                    if (supplied.get('task_id', card_id) != card_id or supplied.get('board', intake.board) != intake.board
+                        or not completion_ready(intake, record)):
+                        raise ManagementError('unauthorized', 'Current original acceptance is unavailable.')
+                    return
+                except ManagementError:
+                    return {'action': 'block', 'message': 'Original acceptance, fixed source and current worker claim must be verified before completion; repository occupancy is retained. Call hermes_pm_supervise({}) now.'}
             if tool_name == 'kanban_block':
                 try:
                     intake.require_active(intake.generation)
@@ -135,14 +321,41 @@ def register_repository_supervision(ctx, intake):
             if tool_name not in {'kanban_show', 'kanban_heartbeat', 'kanban_comment', 'hermes_pm_supervise', 'hermes_pm_snapshot'}:
                 return {'action': 'block', 'message': 'This managed outer worker only supervises original DSH. Call hermes_pm_supervise({}) now; do not try alternative development tools or complete this card.'}
     ctx.register_hook('pre_tool_call', guard)
+
+    def completed(tool_name=None, args=None, status=None, **_):
+        if tool_name != 'kanban_complete' or status != 'ok':
+            return
+        from agent.delegation_context import owned_kanban_task
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
+        card_id = owned_kanban_task()
+        record = next((r for r in intake.snapshot()['work'] if r.get('card_id') == card_id), None)
+        if record is None or record.get('dsh_execution', {}).get('acceptance', {}).get('status') != 'accepted':
+            return
+        with connect_closing(board=intake.board) as connection:
+            card = kb.get_task(connection, card_id)
+        if card is not None and card.status == 'done':
+            record['dsh_execution']['state'] = 'released'
+            intake._save_execution(record, fields=['state'])
+            reference = record['dsh_execution'].get('github_reference')
+            if reference:
+                from .repository_github import cleanup_github_execution
+                try:
+                    record['dsh_execution']['github_cleanup'] = cleanup_github_execution(reference, record['dsh_execution']['generation'])
+                except ManagementError as error:
+                    record['dsh_execution']['github_cleanup'] = {'status': 'unconfirmed', 'code': error.code}
+                intake._save_execution(record, fields=['github_cleanup'])
+    ctx.register_hook('post_tool_call', completed)
     ctx.register_system_prompt_section('hermes-pm-supervision',
         'For a plugin-managed Kanban outer card, read kanban_show, then call hermes_pm_supervise with no arguments. '
-        'After supervision returns next_action=kanban_block, call kanban_block(kind="needs_input", reason="Dedicated execution awaits acceptance or reconciliation"), then end. '
+        'After supervision returns next_action=kanban_complete, call the original kanban_complete with the verified summary. '
+        'After next_action=kanban_block, call kanban_block(kind="needs_input", reason="Dedicated execution awaits acceptance or reconciliation"), then end. '
         'Do not develop directly, create/link cards, or declare delivery. DSH owns the detailed repository work; the plugin records its real status.')
 
     async def run_work(record, generation):
         from .dsh_owned_transport import PersistentOwnedTransport
-        current_worker(ctx, intake, record)
+        from .trusted_controller import controller_identity
+        run_id = current_worker(ctx, intake, record)
         admitted, environment = execution_configuration(record['target'])
         if record.get('dsh_execution', {}).get('reference_sha256') != admitted['reference_sha256']:
             raise ManagementError('configuration_missing', 'Original admitted execution reference changed.')
@@ -152,7 +365,7 @@ def register_repository_supervision(ctx, intake):
             intake.require_active(generation)
             record = next(r for r in intake.snapshot()['work'] if r['id'] == record['id'])
             execution = record['dsh_execution']
-            if execution['state'] in {'awaiting_acceptance', 'budget_stopped', 'execution_failed'}:
+            if execution['state'] in {'budget_stopped', 'execution_failed'}:
                 current_worker(ctx, intake, record)
                 return {'status': execution['state'], 'card_id': record['card_id'],
                         'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
@@ -164,9 +377,23 @@ def register_repository_supervision(ctx, intake):
                 execution.update(state='startup_intent', generation=str(uuid.uuid4()), instance_id=record['id'],
                     session_id='hermes-' + uuid.uuid4().hex, request_id='input-' + uuid.uuid4().hex)
                 intake._save_execution(record)
+            if not execution.get('supervisor_claim'):
+                execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity()}
+                intake._save_execution(record, fields=['supervisor_claim'])
             instance = intake.state_dir / 'owned-work' / record['id']
+            from .repository_github import prepare_github_execution
+            prepared_github = await asyncio.to_thread(prepare_github_execution, intake.github, record['target'],
+                instance, execution['generation'])
+            if execution.get('github_reference') and execution['github_reference'] != prepared_github['reference']:
+                raise ManagementError('binding_conflict', 'Original GitHub execution reference changed.')
+            execution['github_reference'] = prepared_github['reference']
+            intake._save_execution(record, fields=['github_reference'])
+            environment.update(prepared_github['environment'])
             configuration = dict(admitted, dsh_home=str(instance / 'home'), workspace=record['target']['repo_path'],
-                instance_id=execution['instance_id'], generation=execution['generation'], session_id=execution['session_id'])
+                instance_id=execution['instance_id'], generation=execution['generation'], session_id=execution['session_id'],
+                trusted_controllers=[record['gateway_controller']],
+                test_python=sys.executable,
+                test_runner_path=str(Path(__file__).with_name('repository_test_runner.py').resolve(strict=True)))
             node_bin = configuration.pop('node_bin')
             carrier = PersistentOwnedTransport(instance_dir=str(instance), configuration=configuration,
                 node_bin=node_bin, timeout=15, environment=environment)
@@ -187,21 +414,43 @@ def register_repository_supervision(ctx, intake):
                     {'sessionId': sid, 'cwd': configuration['workspace'], 'agentPreset': 'hermes-owned'})
                 if created.get('sessionId') != sid or created.get('agentPreset') != 'hermes-owned':
                     raise ManagementError('outcome_unknown', 'Original Session creation identity differs.')
-            elif len(existing) != 1 or existing[0].get('cwd') != configuration['workspace'] or existing[0].get('agentPreset') != 'hermes-owned':
+            elif len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']:
                 raise ManagementError('binding_conflict', 'Original visible Session binding differs.')
+            else:
+                _, original_projections = await asyncio.to_thread(original_history, carrier, sid, configuration['workspace'])
+                if original_projections.get('agentPreset') != 'hermes-owned':
+                    raise ManagementError('binding_conflict', 'Original Session preset projection differs.')
             execution['session_creation'] = 'registered'
             execution['native_identity'] = carrier.native_identity
             intake._save_execution(record)
+            if not execution.get('native_title'):
+                title = 'Hermes ' + record['id']
+                await asyncio.to_thread(owned_call, carrier, 'session/rename', {'sessionId': sid, 'title': title})
+                execution['native_title'] = title
+                intake._save_execution(record)
             if not execution.get('first_input'):
                 current_worker(ctx, intake, record)
                 intake.require_active(generation)
+                from .repository_acceptance import repository_source_state
+                try:
+                    execution['baseline'] = repository_source_state(record['target'])
+                except ManagementError:
+                    execution['baseline'] = None
                 execution.update(first_input='intent', state='input_intent')
                 intake._save_execution(record)
                 answer = await asyncio.to_thread(owned_call, carrier, 'session/prompt', {'sessionId': sid,
                     'requestId': execution['request_id'], 'mode': 'queue', 'content': [{'type': 'text',
                     'text': 'Work only in this bound repository. Use the installed Matt skills to host the detailed workflow.\n'
                             + 'Frozen Issue: ' + record['issue']['url'] + '\n' + record['issue']['title'] + '\n' + record['issue']['body']
-                            + '\nReport development and test results; do not claim outer delivery.'}]})
+                            + '\nReport development and test results; do not claim outer delivery. '
+                              'GitHub is limited to the bound repository in HERMES_OWNED_GITHUB_REPOSITORY. '
+                              'Before every GitHub business operation switch gh to HERMES_OWNED_GITHUB_ACCOUNT, '
+                              'read gh api user login and require an exact account match. Use the injected private GH_CONFIG_DIR; '
+                              'never print credentials or copy them into repository files, reports or questions. '
+                              'For acceptance finish with HERMES_REPOSITORY_DELIVERY_JSON followed by one JSON object with '
+                              'source_commit, issue_updated_at, criteria [{text,test_call_ids}], test_files, fine_issue_urls, '
+                              'pr_url (if any), sync_branches, and leftovers. Use original successful test tool call IDs. '
+                              'The supervisor independently verifies the actual tests and fixed source.'}]})
                 if answer.get('accepted') is not True:
                     raise ManagementError('outcome_unknown', 'Original first input acceptance is unconfirmed.')
                 execution.update(first_input='accepted', state='running')
@@ -220,7 +469,7 @@ def register_repository_supervision(ctx, intake):
                 item = next((row for row in items['items'] if row['sessionId'] == sid), None)
                 events, projections = await asyncio.to_thread(original_history, carrier, sid, configuration['workspace'])
                 execution.update(journal_cursor=events[-1]['seq'] if events else -1, usage=projections.get('tokenUsage'),
-                    observed_events=events)
+                    observed_events=execution_event_references(events))
                 intake._save_execution(record)
                 ends = [event for event in events if event['type'] == 'turn/end']
                 starts = [event for event in events if event['type'] == 'turn/start']
@@ -243,6 +492,9 @@ def register_repository_supervision(ctx, intake):
                     execution.update(state=state, terminal_reason=reason, jobs=[{'id': row['id'], 'status': row['status']} for row in jobs],
                         tool_receipts=tool_receipts)
                     intake._save_execution(record)
+                    if state == 'awaiting_acceptance':
+                        from .repository_acceptance import accept_repository_work
+                        return await accept_repository_work(intake, record, carrier, events, projections, generation)
                     return {'status': state, 'card_id': record['card_id'], 'session_id': sid,
                             'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
                 await asyncio.sleep(.25)
@@ -253,6 +505,12 @@ def register_repository_supervision(ctx, intake):
                 intake.require_active(generation)
                 current_worker(ctx, intake, record)
                 execution['state'] = 'outcome_unknown'
+                if isinstance(error, ManagementError):
+                    message = str(error)
+                    for secret in environment.values():
+                        if secret:
+                            message = message.replace(secret, '[REDACTED_CREDENTIAL]')
+                    execution['last_failure'] = {'code': error.code, 'message': message}
                 if isinstance(original, _TRANSPORT_FAILURES):
                     message = str(original)
                     for secret in environment.values():

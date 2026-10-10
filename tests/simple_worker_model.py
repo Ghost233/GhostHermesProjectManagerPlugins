@@ -18,6 +18,15 @@ class WorkerModelService:
         service = self
 
         class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{}' if self.path == '/models-dev' else b'{"data":[{"id":"fixture-model"}]}')
+
+            def do_CONNECT(self):
+                self.send_error(502, 'Only fixture local external services are available.')
+
             def do_POST(self):
                 payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 names = [tool['function']['name'] for tool in payload.get('tools', [])]
@@ -117,9 +126,11 @@ def execution_reference(scratch, base_url, sdk):
     receipt = scratch / 'tool-receipt.json'
     native_sources = ['@deepseek-ai/dsh/lib/profile-boot.js', '@deepseek-ai/dsh-sandbox-policy/lib/index.js',
         '@deepseek-ai/dsh-tool-bash/lib/index.js', '@deepseek-ai/dsh-tool-jobs/lib/index.js',
-        '@deepseek-ai/dsh-jobs-local/lib/index.js', '@deepseek-ai/dsh-agent-loop/lib/index.js']
+        '@deepseek-ai/dsh-jobs-local/lib/index.js', '@deepseek-ai/dsh-agent-loop/lib/index.js',
+        '@deepseek-ai/dsh-tool-ask-user/lib/index.js', '@deepseek-ai/dsh-tool-skill/lib/index.js',
+        '@deepseek-ai/dsh-skill-filesystem/lib/index.js']
     receipt.write_text(json.dumps({'status': 'passed', 'foreground_only': True,
-        'tool_catalog': ['bash', 'job_kill', 'job_list', 'job_output'],
+        'tool_catalog': ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'],
         'passed_cases': ['allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied', 'danger_denied', 'runtime_directory'],
         'composition_sha256': hashlib.sha256((root / 'ghost_hermes_pm/owned_runtime.mjs').read_bytes()).hexdigest(),
         'node_sha256': hashlib.sha256(node.read_bytes()).hexdigest(),

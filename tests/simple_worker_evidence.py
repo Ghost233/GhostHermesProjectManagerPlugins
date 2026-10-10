@@ -17,7 +17,7 @@ def verify_dsh_work(execution, configuration, *, skill_name):
         assert header['config']['provider'] == model['provider']
         assert header['config']['model'] == model['model']
         assert header['config']['maxTokens'] == budget['max_output_tokens_per_request']
-        assert {t['name'] for t in header['tools']} == {'bash', 'job_kill', 'job_list', 'job_output', 'skill'}, {
+        assert {t['name'] for t in header['tools']} == {'ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'}, {
             'original_catalogs': [[t['name'] for t in h['tools']] for h in headers]}
     assert any(c['provider'] == model['provider'] and c['model'] == model['model'] and
                c['contextWindow'] == model['configuration']['models'][0]['contextWindow'] for c in contexts)

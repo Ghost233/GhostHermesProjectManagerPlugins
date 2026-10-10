@@ -15,6 +15,11 @@ import uuid
 from .dsh_remote import FRAME_BOUND
 from .manager import ManagementError
 from .manager import _private_state_directory
+from .trusted_controller import controller_helper, controller_identity, validate_controller_helper
+
+
+class _ControllerNotAdmitted(OSError):
+    pass
 
 
 class NativeOwnedTransport:
@@ -142,7 +147,7 @@ class NativeOwnedTransport:
         finally:
             self._send_lock.release()
 
-    def _rpc(self, payload, *, identity=None):
+    def _rpc(self, payload, *, identity=None, timeout=None):
         identity = identity or str(uuid.uuid4())
         inbox = queue.Queue(maxsize=1)
         with self._lock:
@@ -151,7 +156,9 @@ class NativeOwnedTransport:
             self._replies[identity] = inbox
         try:
             self._send({**payload, 'id': identity})
-            response = inbox.get(timeout=self.timeout)
+            response = inbox.get(timeout=self.timeout if timeout is None else timeout)
+            if isinstance(response, dict) and response.get('reason') == 'controller_not_admitted':
+                raise _ControllerNotAdmitted('The socket peer is not an admitted original controller.')
             if not isinstance(response, dict) or response.get('ok') is not True:
                 raise OSError('Original owned native call was not confirmed.')
             return response.get('value')
@@ -282,7 +289,7 @@ class _OwnedStream:
 
 class PersistentOwnedTransport(NativeOwnedTransport):
     """A supervisor connection to one managed, independently owned generation."""
-    def __init__(self, *, instance_dir, configuration, node_bin=None, timeout=10, environment=None):
+    def __init__(self, *, instance_dir, configuration, node_bin=None, timeout=10, environment=None, attach_only=False):
         import hashlib
         self.instance_dir = _private_state_directory(instance_dir)
         required = {'dsh_home', 'workspace', 'runtime_package_root', 'instance_id', 'generation', 'session_id'}
@@ -291,16 +298,41 @@ class PersistentOwnedTransport(NativeOwnedTransport):
         super().__init__(dsh_home=configuration['dsh_home'], workspace=configuration['workspace'],
                          runtime_package_root=configuration['runtime_package_root'], node_bin=node_bin, timeout=timeout)
         self.config.update(configuration)
+        self.attach_only = attach_only
         self.environment = dict(environment or {})
         self.driver = Path(__file__).with_name('owned_persistent_host.mjs')
-        self._source_bindings.extend(self._path_binding(p) for p in (self.driver, self.driver.with_name('owned_runtime.mjs')))
+        self.configuration_path = self.instance_dir / 'native-configuration.json'
+        saved = None
+        if self.configuration_path.exists():
+            info = self.configuration_path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise ManagementError('outcome_unknown', 'Original controller configuration is not private.')
+            saved = json.loads(self.configuration_path.read_text())
+        controllers = self.config.get('trusted_controllers', [])
+        if not isinstance(controllers, list) or len(controllers) > 1:
+            raise ManagementError('binding_conflict', 'One original gateway controller may be admitted.')
+        if saved:
+            if saved.get('trusted_controllers') != controllers:
+                raise ManagementError('binding_conflict', 'Original initial gateway identity differs.')
+            helper = saved.get('controller_helper_path')
+            launcher = saved.get('launcher_controller')
+            if not helper or not launcher:
+                raise ManagementError('outcome_unknown', 'Original kernel controller binding is absent; no replacement was started.')
+        else:
+            helper, launcher = controller_helper(), controller_identity()
+        helper = validate_controller_helper(helper, self.workspace, self.config['dsh_home'])
+        self.config.update(controller_helper_path=helper, launcher_controller=launcher, trusted_controllers=controllers)
+        self._source_bindings.extend(self._path_binding(p) for p in (self.driver, self.driver.with_name('owned_runtime.mjs'),
+            self.driver.with_name('trusted_controller.mjs'), self.driver.with_name('trusted_controller.c'), Path(helper).parent, Path(helper)))
+        for name in ('test_python', 'test_runner_path'):
+            if self.config.get(name):
+                self._source_bindings.append(self._path_binding(Path(self.config[name])))
         digest = hashlib.sha256(str(self.instance_dir).encode()).hexdigest()[:20]
         socket_dir = _private_state_directory('/private/tmp/hpm-dsh-' + digest)
         self.socket_path = socket_dir / 'carrier.sock'
         self.identity_path = self.instance_dir / 'native-identity.json'
         self.birth_path = self.instance_dir / 'process-birth.json'
         self.exit_path = self.instance_dir / 'native-exit.json'
-        self.configuration_path = self.instance_dir / 'native-configuration.json'
         self.config.update(socket_path=str(self.socket_path), identity_path=str(self.identity_path), exit_path=str(self.exit_path))
         self.config['source_bindings'] = self._source_bindings
         self.config['configuration_sha256'] = hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest()
@@ -313,6 +345,35 @@ class PersistentOwnedTransport(NativeOwnedTransport):
             binding['sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
         return binding
 
+    def event_frames(self):
+        """Read the generation's retained original deliveries without retiring them."""
+        self._start()
+        value = self._rpc({'op': 'events'})
+        if (not isinstance(value, dict) or value.get('generation') != self.config['generation']
+                or value.get('session_id') != self.config['session_id'] or not isinstance(value.get('client_id'), str)
+                or not isinstance(value.get('frames'), list)):
+            raise ManagementError('binding_conflict', 'Original event observation changed execution binding.')
+        return value
+
+    def admit_controller(self, identity):
+        """The pinned gateway admits one exact worker after its original claim check."""
+        self._start()
+        value = self._rpc({'op': 'admit_controller', 'controller': identity})
+        if value != identity:
+            raise ManagementError('outcome_unknown', 'The original worker kernel admission was not confirmed.')
+        return value
+
+    def verify_repository_tests(self, test_files, test_python):
+        """Replay explicit tests through the original Shell under a read-only policy."""
+        if test_python != self.config.get('test_python'):
+            raise ManagementError('binding_conflict', 'The admitted verification Python runtime differs.')
+        self._start()
+        value = self._rpc({'op': 'verify_tests', 'test_files': test_files}, timeout=65)
+        if (not isinstance(value, dict) or value.get('generation') != self.config['generation']
+                or value.get('session_id') != self.config['session_id']):
+            raise ManagementError('binding_conflict', 'Original test verification execution binding differs.')
+        return value
+
     def _start_original(self):
         import fcntl
         with self._lock:
@@ -323,6 +384,8 @@ class PersistentOwnedTransport(NativeOwnedTransport):
         lock_fd = os.open(self.instance_dir / 'startup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
+            if self.attach_only and not self.configuration_path.exists():
+                raise ManagementError('outcome_unknown', 'Original owned execution configuration is absent; no replacement was started.')
             self._prepare_paths()
             if not self.configuration_path.exists():
                 data = json.dumps(self.config)
@@ -383,10 +446,22 @@ class PersistentOwnedTransport(NativeOwnedTransport):
             channel.settimeout(self.timeout)
             channel.connect(str(self.socket_path))
             channel.setblocking(False)
+            # Claim admission can arrive from the original gateway while this
+            # exact new worker waits; release the startup lock before attaching.
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
             self._socket, self._started = channel, True
             self._reader = threading.Thread(target=self._read, name='hermes-pm-persistent-carrier', daemon=True)
             self._reader.start()
-            actual = self._rpc({'op': 'attach'})
+            while True:
+                try:
+                    actual = self._rpc({'op': 'attach'})
+                    break
+                except _ControllerNotAdmitted:
+                    if time.monotonic() >= deadline:
+                        channel.close()
+                        self._started = False
+                        raise ManagementError('outcome_unknown', 'The exact worker remains unadmitted; no original execution was replaced.') from None
+                    time.sleep(0.05)
             if actual != identity or type(identity.get('pid')) is not int:
                 raise ManagementError('binding_conflict', 'The connected owned generation differs from its registered identity.')
             os.kill(identity['pid'], 0)
