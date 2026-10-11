@@ -462,3 +462,207 @@ def test_disappeared_original_owned_pid_retains_configuration_and_session():
                 carrier.socket_path.unlink()
                 carrier.socket_path.parent.rmdir()
     assert source_snapshot(sdk) == before
+
+
+@pytest.mark.parametrize('binding_change', ['match', 'digest', 'controller', 'work', 'runtime', 'home', 'source'])
+def test_attach_only_retains_original_profile_configuration(tmp_path, binding_change):
+    """Two installed plugin copies must attach to the same pinned native scope."""
+    import importlib
+    import shutil
+    import sys
+    import types
+    from ghost_hermes_pm.trusted_controller import controller_identity
+    sdk = Path(os.environ['DSH_TEST_SDK_ROOT']).resolve(strict=True)
+    root = Path(__file__).resolve().parents[1]
+    modules = []
+    for profile in ['child', 'manager']:
+        directory = tmp_path / profile / 'ghost_hermes_pm'
+        shutil.copytree(root / 'ghost_hermes_pm', directory, ignore=shutil.ignore_patterns('__pycache__'))
+        name = 'native_attach_' + profile
+        for key in list(sys.modules):
+            if key == name or key.startswith(name + '.'):
+                del sys.modules[key]
+        package = types.ModuleType(name)
+        package.__path__ = [str(directory)]
+        sys.modules[name] = package
+        modules.append(importlib.import_module(name + '.dsh_owned_transport'))
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    instance = tmp_path / 'instance'
+    instance.mkdir(mode=0o700)
+    home = instance / 'home'
+    home.mkdir(mode=0o700)
+    expected = {'dsh_home': str(home), 'workspace': str(repo), 'runtime_package_root': str(sdk),
+        'instance_id': 'fixture-cross-profile', 'generation': 'fixture-cross-generation', 'session_id': 'fixture-cross-session',
+        'trusted_controllers': [controller_identity()],
+        'runtime_configuration': {'budget': {'max_wall_seconds': 15}}}
+    original = modules[0].PersistentOwnedTransport(instance_dir=str(instance), configuration=expected,
+        node_bin='/opt/homebrew/bin/node')
+    # The original writer appends this actual Home identity after its digest is fixed.
+    saved = dict(original.config, home_identity={'device': str(home.stat().st_dev), 'inode': str(home.stat().st_ino)})
+    path = instance / 'native-configuration.json'
+    path.write_text(json.dumps(saved))
+    path.chmod(0o600)
+    before = path.read_bytes()
+    altered_source = None
+    original_source = None
+    old_home = None
+    if binding_change == 'digest':
+        corrupt = dict(saved, configuration_sha256='0'*64)
+        path.write_text(json.dumps(corrupt))
+        before = path.read_bytes()
+    elif binding_change == 'controller':
+        expected['trusted_controllers'] = [{**expected['trusted_controllers'][0], 'start_usec': '0'}]
+    elif binding_change == 'work':
+        expected['generation'] = 'different-original-generation'
+    elif binding_change == 'runtime':
+        expected['runtime_configuration'] = {'budget': {'max_wall_seconds': 16}}
+    elif binding_change == 'home':
+        old_home = instance / 'original-home'
+        home.rename(old_home)
+        home.mkdir(mode=0o700)
+    elif binding_change == 'source':
+        altered_source = Path(saved['source_bindings'][7]['path'])
+        original_source = altered_source.read_bytes()
+        altered_source.write_bytes(original_source + b'\n// synthetic source change\n')
+    attached = None
+    try:
+        if binding_change != 'match':
+            ManagementError = importlib.import_module(modules[1].__package__ + '.manager').ManagementError
+            with pytest.raises(ManagementError) as rejected:
+                modules[1].PersistentOwnedTransport(instance_dir=str(instance), configuration=expected,
+                    node_bin='/opt/homebrew/bin/node', attach_only=True)
+            assert rejected.value.code == 'binding_conflict'
+        else:
+            attached = modules[1].PersistentOwnedTransport(instance_dir=str(instance), configuration=expected,
+                node_bin='/opt/homebrew/bin/node', attach_only=True)
+            assert attached.config == saved, 'Attach-only must retain the validated original full configuration.'
+            assert attached.driver == Path(saved['source_bindings'][6]['path'])
+        assert path.read_bytes() == before, 'Attach cannot rewrite the persisted digest.'
+    finally:
+        if attached is not None:
+            attached.close()
+        if altered_source is not None:
+            altered_source.write_bytes(original_source)
+        if old_home is not None:
+            home.rmdir()
+            old_home.rename(home)
+        original.close()
+
+
+def test_original_sdk_attach_across_profile_sources(tmp_path):
+    import importlib
+    import shutil
+    import sys
+    import types
+    import psutil
+    from ghost_hermes_pm.trusted_controller import controller_identity
+    from simple_worker_model import execution_reference
+    from ghost_hermes_pm.repository_execution import execution_configuration
+    sdk = Path(os.environ['DSH_TEST_SDK_ROOT']).resolve(strict=True)
+    sdk_before = source_snapshot(sdk)
+    root = Path(__file__).resolve().parents[1]
+    modules = []
+    for profile in ['child', 'manager']:
+        directory = tmp_path / profile / 'ghost_hermes_pm'
+        shutil.copytree(root / 'ghost_hermes_pm', directory, ignore=shutil.ignore_patterns('__pycache__'))
+        name = 'native_live_attach_' + profile
+        package = types.ModuleType(name)
+        package.__path__ = [str(directory)]
+        sys.modules[name] = package
+        modules.append(importlib.import_module(name + '.dsh_owned_transport'))
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    state = tmp_path / 'state'
+    state.mkdir(mode=0o700)
+    work_id = 'work-' + 'a'*32
+    instance = state / 'owned-work' / work_id
+    model = WorkModel()
+    original = attached = None
+    try:
+        reference = execution_reference(tmp_path, model.base_url, sdk)
+        target = {'repo_path': str(repo), 'execution_ref': reference}
+        configuration, environment = execution_configuration(target)
+        node = configuration.pop('node_bin')
+        controller = controller_identity()
+        alias = tmp_path / 'child-python'
+        alias.symlink_to(sys.executable)
+        configuration.update(dsh_home=str(instance / 'home'), workspace=str(repo), instance_id=work_id,
+            generation='fixture-profile-generation', session_id='fixture-profile-session', trusted_controllers=[controller],
+            test_python=str(alias), test_runner_path=str(tmp_path / 'child/ghost_hermes_pm/repository_test_runner.py'))
+        original = modules[0].PersistentOwnedTransport(instance_dir=str(instance), configuration=configuration,
+            node_bin=node, timeout=15, environment=environment)
+        sid = configuration['session_id']
+        assert original.request('session/create', {'request': {'sessionId': sid, 'cwd': str(repo),
+            'agentPreset': 'hermes-owned'}}, 'fixture-profile-create')['result']['ok']
+        assert original.request('session/prompt', {'request': {'sessionId': sid, 'requestId': 'fixture-original-input',
+            'mode': 'queue', 'content': [{'type': 'text', 'text': 'Write the bounded synthetic delivery.'}]}},
+            'fixture-profile-prompt')['result']['value']['accepted'] is True
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            rows = original.request('session/list', {'_request': {}}, 'fixture-before-attach')['result']['value']['items']
+            if (repo / 'delivery.txt').exists() and any(row['sessionId'] == sid and row['running'] is False for row in rows):
+                break
+            time.sleep(.05)
+        assert (repo / 'delivery.txt').read_text() == 'bounded\n'
+        path = instance / 'native-configuration.json'
+        saved_bytes = path.read_bytes()
+        saved = json.loads(saved_bytes)
+        budget_bytes = (instance / 'home/.hermes-budget.json').read_bytes()
+        model_calls = len(model.requests)
+        record = {'id': work_id, 'target': target, 'gateway_controller': controller,
+            'dsh_execution': {'native_identity': dict(original.native_identity), 'reference_sha256': configuration['reference_sha256'],
+                'instance_id': work_id, 'generation': configuration['generation'], 'session_id': sid}}
+        supervision = importlib.import_module('native_live_attach_manager.repository_supervision')
+        ManagementError = importlib.import_module('native_live_attach_manager.manager').ManagementError
+        attached = supervision.attach_existing_owned(types.SimpleNamespace(state_dir=state), record)
+        observed = attached.request('session/list', {'_request': {}}, 'fixture-manager-attach')['result']['value']['items']
+        assert any(row['sessionId'] == sid and row['running'] is False for row in observed)
+        assert attached.native_identity == original.native_identity
+        waiting = supervision.attach_existing_owned(types.SimpleNamespace(state_dir=state), record)
+        corrupt = json.loads(saved_bytes)
+        corrupt['runtime_configuration']['budget']['max_wall_seconds'] += 1
+        path.write_text(json.dumps(corrupt))
+        try:
+            with pytest.raises(ManagementError) as rejected:
+                waiting.request('session/list', {'_request': {}}, 'fixture-changed-configuration')
+            assert rejected.value.code == 'binding_conflict'
+        finally:
+            path.write_bytes(saved_bytes)
+            waiting.close()
+        waiting = supervision.attach_existing_owned(types.SimpleNamespace(state_dir=state), record)
+        source = Path(saved['source_bindings'][7]['path'])
+        source_bytes = source.read_bytes()
+        source.write_bytes(source_bytes + b'\n// synthetic late source change\n')
+        try:
+            with pytest.raises(ManagementError) as rejected:
+                waiting.request('session/list', {'_request': {}}, 'fixture-changed-source')
+            assert rejected.value.code == 'invalid_change'
+        finally:
+            source.write_bytes(source_bytes)
+            waiting.close()
+        assert attached.config == saved and attached.driver == Path(saved['source_bindings'][6]['path'])
+        assert attached.config['test_python'] == str(alias)
+        assert attached.config['test_runner_path'] != str(tmp_path / 'manager/ghost_hermes_pm/repository_test_runner.py')
+        assert path.read_bytes() == saved_bytes and (instance / 'home/.hermes-budget.json').read_bytes() == budget_bytes
+        assert len(model.requests) == model_calls, 'Cross-profile observation cannot send replacement input.'
+        assert sorted(t['function']['name'] for t in model.requests[0]['tools']) == ['ask_user_question','bash','job_kill','job_list','job_output','skill']
+        attached.shutdown_owned()
+        assert attached.close_outcome['kind'] == 'original_exit' and attached.close_outcome['exit_code'] == 0
+        assert psutil.Process(original.native_identity['pid']).wait(timeout=5) == 0
+        evidence = Path(os.environ.get('HPM_ATTACH_EVIDENCE_DIR', '/private/tmp/hermes-cross-profile-attach-20261011/native-evidence'))
+        evidence.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (evidence/'original-cross-profile.json').write_text(json.dumps({'native_identity':original.native_identity,
+            'manager_close':attached.close_outcome,'original_configuration_sha256':saved['configuration_sha256'],
+            'source_bindings':saved['source_bindings'],'same_session':sid,'model_requests_before_after':[model_calls,len(model.requests)],
+            'budget_unchanged':True,'configuration_unchanged':True,'native_exit':json.loads((instance/'native-exit.json').read_text())}))
+    finally:
+        if attached is not None:
+            attached.close()
+        if original is not None:
+            if not (instance/'native-exit.json').exists():
+                original.shutdown_owned()
+                assert original.close_outcome['kind'] == 'original_exit'
+            original.close()
+        model.close()
+    assert source_snapshot(sdk) == sdk_before

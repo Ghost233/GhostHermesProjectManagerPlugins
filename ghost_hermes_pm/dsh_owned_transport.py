@@ -308,6 +308,9 @@ class PersistentOwnedTransport(NativeOwnedTransport):
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
                 raise ManagementError('outcome_unknown', 'Original controller configuration is not private.')
             saved = json.loads(self.configuration_path.read_text())
+        if attach_only:
+            self._restore_original_attachment(saved, configuration)
+            return
         controllers = self.config.get('trusted_controllers', [])
         if not isinstance(controllers, list) or len(controllers) > 1:
             raise ManagementError('binding_conflict', 'One original gateway controller may be admitted.')
@@ -336,6 +339,49 @@ class PersistentOwnedTransport(NativeOwnedTransport):
         self.config.update(socket_path=str(self.socket_path), identity_path=str(self.identity_path), exit_path=str(self.exit_path))
         self.config['source_bindings'] = self._source_bindings
         self.config['configuration_sha256'] = hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest()
+
+    def _restore_original_attachment(self, saved, expected):
+        """Validate the original pinned scope; another Profile cannot reconstruct it."""
+        import hashlib
+        try:
+            if not isinstance(saved, dict):
+                raise ValueError('Original configuration is absent.')
+            payload = {key: value for key, value in saved.items() if key not in {'configuration_sha256', 'home_identity'}}
+            if (hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest() != saved['configuration_sha256']
+                    or any(saved.get(key) != value for key, value in expected.items())):
+                raise ValueError('Original admitted configuration differs.')
+            controllers = saved['trusted_controllers']
+            if not isinstance(controllers, list) or len(controllers) > 1:
+                raise ValueError('Original controller scope is invalid.')
+            helper = validate_controller_helper(saved['controller_helper_path'], self.workspace, saved['dsh_home'])
+            if not saved.get('launcher_controller') or saved['home_identity'] != self._home_identity:
+                raise ValueError('Original controller or Home identity differs.')
+            sources = saved['source_bindings']
+            directory = Path(sources[6]['path']).parent
+            sdk = Path(saved['runtime_package_root'])
+            paths = [Path(self.workspace), sdk, Path(self.node_bin), directory / 'owned_native_host.mjs',
+                sdk / '@deepseek-ai/dsh/lib/profile-boot.js', sdk / '@deepseek-ai/dsh-launch-environment/lib/index.js',
+                directory / 'owned_persistent_host.mjs', directory / 'owned_runtime.mjs',
+                directory / 'trusted_controller.mjs', directory / 'trusted_controller.c', Path(helper).parent, Path(helper)]
+            paths.extend(Path(saved[key]) for key in ('test_python', 'test_runner_path') if saved.get(key))
+            bindings = [self._path_binding(path) for path in paths]
+            if bindings != sources:
+                raise ValueError('Original source identity differs.')
+            digest = hashlib.sha256(str(self.instance_dir).encode()).hexdigest()[:20]
+            socket_directory = Path('/private/tmp/hpm-dsh-' + digest)
+            self.socket_path = socket_directory / 'carrier.sock'
+            self.identity_path = self.instance_dir / 'native-identity.json'
+            self.birth_path = self.instance_dir / 'process-birth.json'
+            self.exit_path = self.instance_dir / 'native-exit.json'
+            if any(saved.get(key) != str(path) for key, path in [('socket_path', self.socket_path),
+                    ('identity_path', self.identity_path), ('exit_path', self.exit_path)]):
+                raise ValueError('Original instance paths differ.')
+            _private_state_directory(socket_directory)
+            self.driver = directory / 'owned_persistent_host.mjs'
+            self._source_bindings = bindings
+            self.config.update(saved)
+        except (OSError, KeyError, IndexError, TypeError, ValueError):
+            raise ManagementError('binding_conflict', 'Original persisted configuration, Home or source scope differs; no execution was replaced.') from None
 
     @staticmethod
     def _path_binding(path):
@@ -418,6 +464,8 @@ class PersistentOwnedTransport(NativeOwnedTransport):
                 if self.configuration_path.is_symlink():
                     raise ManagementError('outcome_unknown', 'The original owned configuration must be reconciled.')
                 saved = json.loads(self.configuration_path.read_text())
+                if self.attach_only:
+                    self._restore_original_attachment(saved, dict(self.config))
                 if saved.get('configuration_sha256') != self.config['configuration_sha256']:
                     raise ManagementError('binding_conflict', 'The admitted owned configuration changed.')
                 if saved.get('source_bindings') != self._source_bindings or saved.get('home_identity') != self._home_identity:

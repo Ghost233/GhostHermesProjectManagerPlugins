@@ -187,9 +187,7 @@ def attach_existing_owned(intake, record):
         raise ManagementError('configuration_missing', 'Original admitted execution reference changed.')
     configuration.update(dsh_home=str(instance / 'home'), workspace=record['target']['repo_path'],
         instance_id=execution['instance_id'], generation=execution['generation'], session_id=execution['session_id'],
-        trusted_controllers=[record['gateway_controller']],
-        test_python=sys.executable,
-        test_runner_path=str(Path(__file__).with_name('repository_test_runner.py').resolve(strict=True)))
+        trusted_controllers=[record['gateway_controller']])
     reference = execution.get('github_reference')
     if reference:
         environment.update(GH_CONFIG_DIR=reference['config_dir'], HERMES_OWNED_GITHUB_ACCOUNT=reference['account'],
