@@ -78,6 +78,11 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'})):
 
 
 def _carrier_end(intake, record):
+    if record['dsh_execution'].get('mode') == 'shared_native':
+        from .shared_repository import shared_range_proof
+        control = record['dsh_execution'].get('stop_control', {})
+        ended = record['dsh_execution'].get('lifecycle_end', {})
+        return shared_range_proof(intake, record, control.get('session_end', ended.get('session_end', {})))
     directory = owned_instance(intake, record)
     execution = record['dsh_execution']
     configuration = json.loads(private_file(directory / 'native-configuration.json').read_text())
@@ -104,6 +109,9 @@ def _carrier_end(intake, record):
 
 def _execution_coverage(intake, record, control):
     """Verify original job settlement and awaited native Mac managed-range cleanup."""
+    if record['dsh_execution'].get('mode') == 'shared_native':
+        from .shared_repository import shared_range_proof
+        return shared_range_proof(intake, record, control.get('session_end', {}))
     from collections import Counter
     directory = owned_instance(intake, record)
     execution = record['dsh_execution']
@@ -144,6 +152,9 @@ def _execution_coverage(intake, record, control):
 
 def native_range_proof(intake, record, session_end):
     """One original ended instance, independent of stop or delivery semantics."""
+    if record['dsh_execution'].get('mode') == 'shared_native':
+        from .shared_repository import shared_range_proof
+        return shared_range_proof(intake, record, session_end)
     return {'carrier': _carrier_end(intake, record),
             'coverage': _execution_coverage(intake, record, {'session_end': session_end})}
 
@@ -152,7 +163,8 @@ async def close_native_range(intake, record, carrier, session_end, generation):
     intake.require_active(generation)
     record['dsh_execution']['lifecycle_end'] = {'status': 'intent', 'session_end': session_end}
     intake._save_execution(record, fields=['lifecycle_end'])
-    await asyncio.to_thread(carrier.shutdown_owned)
+    if record['dsh_execution'].get('mode') != 'shared_native':
+        await asyncio.to_thread(carrier.shutdown_owned)
     proof = await asyncio.to_thread(native_range_proof, intake, record, session_end)
     intake.require_active(generation)
     record['dsh_execution']['lifecycle_end'].update(status='ended', proof=proof)
@@ -162,6 +174,9 @@ async def close_native_range(intake, record, carrier, session_end, generation):
 
 async def _stop(intake, record, generation):
     execution = record.get('dsh_execution')
+    if execution and execution.get('mode') == 'shared_native':
+        from .shared_repository import stop_shared_work
+        return await stop_shared_work(intake, record, generation)
     if not execution:
         raise ManagementError('configuration_missing', 'No dedicated execution is registered.')
     if execution['state'] == 'stopped':
@@ -316,6 +331,7 @@ async def _retry(intake, record, prepared, generation):
         history.append({'execution': execution, 'target': record['target'], 'gateway_controller': record['gateway_controller']})
         record.update(target=target, gateway_controller=controller_identity(), dsh_execution={
             'state': 'admitted', 'attempt': len(history) + 1, 'reference_sha256': admitted['reference_sha256'],
+            **({'mode': 'shared_native'} if admitted.get('mode') == 'shared_native' else {}),
             'control_message_ids': [prepared.envelope['message_id']],
             'admitted_budget': admitted['runtime_configuration']['budget'], 'retry_control': {
                 'message_id': prepared.envelope['message_id'], 'status': 'accepted', 'dispatch_status': 'intent', 'repository': source}})

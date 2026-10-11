@@ -1,9 +1,11 @@
 """Verify one original repository work; native card completion remains the worker's job."""
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 
 from .delivery import acceptance_criteria, delivery_requirements, source_state
 from .manager import ManagementError, _git
@@ -13,8 +15,22 @@ DELIVERY_MARKER = 'HERMES_REPOSITORY_DELIVERY_JSON'
 
 
 def repository_source_state(target):
-    value = source_state({'worktree': target['repo_path'], 'test_artifact_paths': []})
-    entries = iter(_git(target['repo_path'], 'status', '--porcelain=v1', '-z').split('\0'))
+    if target.get('execution_ref'):
+        from .repository_execution import private_file, execution_configuration
+        if json.loads(private_file(target['execution_ref']).read_text()).get('mode') == 'shared_native':
+            configuration, _ = execution_configuration(target)
+            source = configuration['source_snapshot']
+            result = subprocess.run([source['python'], '-I', source['reader'], target['repo_path'], '--repository-state'],
+                capture_output=True, text=True, timeout=15)
+            if result.returncode != 0:
+                raise ManagementError('outcome_unknown', 'The fixed read-only source snapshot failed.')
+            return json.loads(result.stdout)
+    return _repository_source_state(target)
+
+
+def _repository_source_state(target, *, git_read=_git):
+    value = source_state({'worktree': target['repo_path'], 'test_artifact_paths': []}, git_read=git_read)
+    entries = iter(git_read(target['repo_path'], 'status', '--porcelain=v1', '-z').split('\0'))
     preserved = {}
     for entry in entries:
         if not entry:
@@ -115,13 +131,23 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
                 arguments = json.loads(arguments)
             if (not receipt or not call or not settlement or receipt.get('generation') != execution['generation']
                 or receipt.get('session_id') != execution['session_id'] or receipt.get('name') != call.get('name')
-                or receipt.get('name') != 'bash' or receipt.get('command') != arguments.get('command')
+                or receipt.get('name') != 'bash'
+                or (receipt.get('command_sha256') != hashlib.sha256(arguments.get('command', '').encode()).hexdigest()
+                    if execution.get('mode') == 'shared_native' else receipt.get('command') != arguments.get('command'))
                 or receipt.get('cwd') != target['repo_path'] or receipt.get('is_error') is not False
                 or type(receipt.get('exit_code')) is not int or receipt['exit_code'] != 0
                 or receipt.get('timed_out') is not False or receipt.get('aborted') is not False
                 or settlement.get('isError') is not False):
                 unmet.append('test_evidence_missing')
             else:
+                if execution.get('mode') == 'shared_native':
+                    snapshots = [receipt.get('source_before'), receipt.get('source_after')]
+                    if (receipt.get('kind') != 'foreground' or receipt.get('execution_admission') != 'admitted'
+                        or receipt.get('sandbox', {}).get('mode') != 'workspace-write'
+                        or receipt.get('sandbox', {}).get('denied') is True or receipt.get('sandbox', {}).get('runnerFailed') is True
+                        or any(not isinstance(snapshot, dict) or set(snapshot) != {'head', 'source_digest', 'workspace_status'}
+                           for snapshot in snapshots)):
+                        unmet.append('test_source_unconfirmed')
                 test_ids.append(identifier)
     current = await asyncio.to_thread(repository_source_state, target)
     baseline = execution.get('baseline') or {}
@@ -133,9 +159,60 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
         unmet.append('workspace_handoff_unconfirmed')
     if any(current['file_digests'].get(p) != digest for p, digest in baseline.get('preserved_files', {}).items()):
         unmet.append('preserved_user_content_changed')
+    if execution.get('mode') == 'shared_native':
+        for identifier in set(test_ids):
+            snapshots = [receipts[identifier].get('source_before'), receipts[identifier].get('source_after')]
+            if any(not isinstance(snapshot, dict) or snapshot.get('source_digest') != current['source_digest']
+                   or not isinstance(snapshot.get('head'), str) or not re.fullmatch('[a-f0-9]{40}', snapshot['head'])
+                   for snapshot in snapshots):
+                unmet.append('test_source_unconfirmed')
+                continue
+            for snapshot in snapshots:
+                if snapshot['head'] != fixed:
+                    # A later commit may record exactly the tested bytes. Content
+                    # equality above is required in addition to Git ancestry.
+                    _git(target['repo_path'], 'merge-base', '--is-ancestor', snapshot['head'], fixed)
     test_files = report.get('test_files')
     if not carrier or not isinstance(test_files, list) or not test_files or not test_ids:
         unmet.append('test_evidence_missing')
+    elif not unmet and execution.get('mode') == 'shared_native':
+        from .shared_repository import verification_command
+        runner_receipts = []
+        for identifier in dict.fromkeys(test_ids):
+            receipt = receipts[identifier]
+            arguments = calls[identifier]['arguments']
+            arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+            if arguments['command'] != verification_command(getattr(carrier, 'config', {}), execution, target['repo_path'], test_files):
+                unmet.append('test_runner_unconfirmed')
+                continue
+            content = settled[identifier].get('content', [])
+            if len(content) != 1 or content[0].get('type') != 'text':
+                unmet.append('test_runner_unconfirmed')
+                continue
+            text = content[0].get('text', '')
+            output = receipt.get('stdout', {})
+            if (output.get('truncated') is not False or output.get('sha256') != hashlib.sha256(text.encode()).hexdigest()
+                or output.get('byte_length') != len(text.encode()) or receipt.get('stderr', {}).get('byte_length') != 0):
+                unmet.append('test_runner_unconfirmed')
+                continue
+            verified = json.loads(text)
+            if (verified.get('schema') != 1 or verified.get('runner') != 'node:test'
+                or verified.get('binding') != {'session_id': execution['session_id'], 'generation': execution['generation'],
+                    'nonce': execution['verification']['nonce']}
+                or verified.get('test_files') != test_files or verified.get('exit_code') != 0
+                or type(verified.get('exit_code')) is not int or type(verified.get('executed_tests')) is not int
+                or verified['executed_tests'] < 1 or verified.get('skipped_tests') != 0 or verified.get('failed_tests') != 0
+                or verified.get('before_source_digest') != current['source_digest']
+                or verified.get('after_source_digest') != current['source_digest']
+                or verified.get('artifact_roots') != [execution['verification']['artifact_root']]
+                or verified.get('source_access') != 'workspace-write' or verified.get('git_access') != 'workspace-write'):
+                unmet.append('test_runner_unconfirmed')
+                continue
+            runner_receipts.append(verified)
+        if not unmet:
+            result['test_evidence'] = {'original_call_ids': list(dict.fromkeys(test_ids)),
+                'runner': 'original_shared_dsh_bash', 'runner_receipts': runner_receipts,
+                'exit_code': 0, 'source_commit': fixed, 'source_digest': current['source_digest']}
     elif not unmet:
         receipt = await asyncio.to_thread(carrier.verify_repository_tests, test_files, carrier.config['test_python'])
         intake.require_active(generation)

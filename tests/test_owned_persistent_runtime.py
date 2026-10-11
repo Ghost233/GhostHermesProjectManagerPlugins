@@ -59,7 +59,7 @@ class WorkModel:
     (3, 20, True, 1, False), (3, 21, True, 2, False),
     (3, 1000, False, 2, True),
 ])
-def test_original_work_input_once_and_observed_budget(max_requests, token_limit, cached, expected_requests, npm_probe):
+def test_original_work_input_once_and_observed_budget(max_requests, token_limit, cached, expected_requests, npm_probe, tmp_path):
     configured = os.environ.get('DSH_TEST_SDK_ROOT')
     if not configured:
         pytest.skip('Original DSH SDK is absent.')
@@ -83,6 +83,8 @@ def test_original_work_input_once_and_observed_budget(max_requests, token_limit,
                                'max_output_tokens_per_request': 256}}}
             carrier = PersistentOwnedTransport(instance_dir=str(state), configuration=settings, timeout=15,
                                                 environment={'DSH_FIXTURE_MODEL_KEY': 'synthetic-key'})
+            diagnostics = None
+            diagnostic_path = tmp_path / 'native-work-failure.json'
             try:
                 sid = settings['session_id']
                 assert carrier.request('session/create', {'request': {'sessionId': sid, 'cwd': str(repo),
@@ -94,12 +96,39 @@ def test_original_work_input_once_and_observed_budget(max_requests, token_limit,
                 repeated = carrier.request('session/prompt', args, 'prompt-again')['result']
                 assert repeated == accepted, 'Repeated supervision must return the saved first-input receipt.'
                 deadline = time.monotonic() + 15
+                failed_journal = None
                 while time.monotonic() < deadline:
                     listing = carrier.request('session/list', {'_request': {}}, 'poll')['result']['value']['items']
                     item = next(row for row in listing if row['sessionId'] == sid)
                     if (repo / 'delivery.txt').exists() and not item['running']:
                         break
+                    if model.requests and not item['running'] and not (repo / 'delivery.txt').exists():
+                        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session', 'sessionId': sid}, 'maxMessages': 500}})
+                        try:
+                            journal = next(stream)
+                        finally:
+                            stream.close()
+                        if any(row['event']['type'] == 'tool/result'
+                               and row['event']['data'].get('error', {}).get('code') for row in journal['records']):
+                            failed_journal = journal
+                            break
                     time.sleep(.05)
+                if not (repo / 'delivery.txt').exists():
+                    diagnostics = {'model_requests': model.requests, 'native_session': item, 'receipts': {}}
+                    if failed_journal is not None:
+                        diagnostics['native_journal'] = failed_journal
+                    else:
+                        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session', 'sessionId': sid}, 'maxMessages': 500}})
+                        try:
+                            diagnostics['native_journal'] = next(stream)
+                        finally:
+                            stream.close()
+                    for name in ('.hermes-budget.json', '.hermes-tool-receipts.jsonl', '.hermes-native-jobs.jsonl'):
+                        receipt = state / 'home' / name
+                        diagnostics['receipts'][name] = receipt.read_text() if receipt.exists() else None
+                    diagnostic_path.write_text(json.dumps(diagnostics))
+                    diagnostic_path.chmod(0o600)
+                    print('Original work failure evidence:', diagnostic_path)
                 assert (repo / 'delivery.txt').read_text() == 'bounded\n'
                 if npm_probe:
                     assert (repo / 'cache-location.txt').read_text().strip() == str(repo / '.cache/npm'), 'Original npm must use the bound repository cache.'
@@ -140,6 +169,11 @@ def test_original_work_input_once_and_observed_budget(max_requests, token_limit,
                     assert budget['stop_reason'] == 'owned-budget-observed-limit' and budget['requests'] == 1
             finally:
                 carrier.shutdown_owned()
+                if diagnostics is not None:
+                    diagnostics['native_close_outcome'] = carrier.close_outcome
+                    diagnostics['sdk_bytes_unchanged'] = source_snapshot(sdk) == before
+                    diagnostic_path.write_text(json.dumps(diagnostics))
+                    diagnostic_path.chmod(0o600)
             assert carrier.close_outcome['kind'] == 'original_exit'
     finally:
         model.close()

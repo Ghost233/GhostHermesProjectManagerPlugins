@@ -1,0 +1,330 @@
+// Native in-process components; only the external model is a fixture.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import {pathToFileURL} from 'node:url';
+import {execFileSync} from 'node:child_process';
+
+const root = process.env.DSH_TEST_SDK_ROOT;
+const scratch = fs.realpathSync(process.argv[2]);
+const sdk = async name => import(pathToFileURL(path.join(root, `@deepseek-ai/${name}/lib/index.js`)));
+const {Context} = await sdk('cordis');
+const {Loader} = await sdk('cordis-plugin-loader');
+const {LlmAdapter, createUserMessage} = await sdk('dsh-llm');
+const {setSandboxMode} = await sdk('dsh-sandbox-policy');
+const ctx = new Context();
+await ctx.plugin(Loader, {baseUrl: pathToFileURL(root + '/').href});
+const loader = ctx.loader;
+const ledgerDir = path.join(scratch, 'ledger');
+const workspace = path.join(scratch, 'repository');
+fs.mkdirSync(ledgerDir, {mode: 0o700});
+fs.mkdirSync(workspace, {mode: 0o700});
+const config = {ledger_dir: ledgerDir, service_ref: 'fixture:shared-host',
+  host_lease: 'fixture-native-lease', agent_preset: 'fixture-managed'};
+const moduleURL = pathToFileURL(path.resolve('ghost_hermes_pm/shared_native_hook.mjs')).href;
+const calls = [];
+const toolRuns = [];
+let observerAgent;
+const diagnostics = [];
+ctx.logger.exporter({levels: {default: 3}, export: message => diagnostics.push(message.args.map(String).join(' '))});
+const scenario = process.argv[3] ?? 'basic';
+class Model extends LlmAdapter {
+  resolveModel(provider, model) {
+    return Promise.resolve({provider, id: model, name: model, context: {contextWindow: 16384}});
+  }
+  providerRetryPolicy() { return {mode: 'normal', maxRetries: 0, retryableCodes: [],
+    initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 0}; }
+  async *stream(options) {
+    calls.push(options);
+    if (options.model === 'fixture-wait') {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, 5000);
+        options.signal.addEventListener('abort', () => {clearTimeout(timer); reject(options.signal.reason);}, {once: true});
+      });
+    }
+    yield {type: 'block-start', index: 0, blockType: 'text'};
+    yield {type: 'text-delta', index: 0, text: 'Native result.'};
+    yield {type: 'block-end', index: 0, block: {type: 'text', text: 'Native result.'}};
+    if (options.model === 'fixture-observer-write') {
+      yield {type: 'block-start', index: 1, blockType: 'tool-call'};
+      yield {type: 'block-end', index: 1, block: {type: 'tool-call', id: 'fixture-should-not-run',
+        name: 'bash', arguments: '{}'}};
+      observerAgent.followup(createUserMessage({content: [{type: 'text', text: 'Queued native followup.'}],
+        source: {kind: 'user'}}));
+      fs.chmodSync(ledgerDir, 0o500);
+    }
+    if (options.model === 'fixture-recovery-unknown') fs.chmodSync(ledgerDir, 0o500);
+    if (!['fixture-unreported', 'fixture-observer-write', 'fixture-recovery-unknown'].includes(options.model)) {
+      yield {type: 'usage', usage: {inputTokens: 12, outputTokens: 8}};
+    }
+    yield {type: 'finish', reason: {kind: 'completed'}};
+  }
+}
+const names = ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'];
+try {
+  for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-token-meter',
+    'dsh-system-prompt', 'dsh-sandbox-policy', 'dsh-tools', 'dsh-jobs-local', 'dsh-llm', 'dsh-agent', 'dsh-agent-loop']) {
+    await loader.create({id: name, name: pathToFileURL(path.join(root, `@deepseek-ai/${name}/lib/index.js`)).href});
+  }
+  await loader.create({id: 'presets', name: pathToFileURL(path.join(root,
+    '@deepseek-ai/dsh-agent-preset-registry/lib/index.js')).href, config: {default: 'fixture-manual'}});
+  await loader.await();
+  assert.ok(ctx.get('agentLoop'), 'The original AgentLoop must load.');
+  ctx.llm.registerAdapter(['fixture-model'], new Model());
+  for (const name of names) ctx.tools.register({name, description: 'Fixture external capability boundary.',
+    parameters: {type: 'object', properties: {}}, execute: async () => {toolRuns.push(name); return 'unused';},
+    output: {schema: {type: 'string'}, render: value => [{type: 'text', text: value}]}});
+  const declaration = {id: 'fixture-managed', plugins: [{id: 'shared-hook', name: moduleURL, config},
+    {id: 'presentation', name: pathToFileURL(path.join(root,
+      '@deepseek-ai/dsh-agent-tool-presentation/lib/index.js')).href, config: {mode: 'native'}}]};
+  if (scenario === 'guard_deadline') {
+    execFileSync('git', ['init', '-q', workspace]);
+    const python = fs.realpathSync(process.env.HERMES_TEST_SESSION_PYTHON);
+    const reader = path.join(scratch, 'slow-source-reader.py');
+    fs.writeFileSync(reader, 'import runpy,time\ntime.sleep(1.2)\nrunpy.run_path('
+      + JSON.stringify(path.resolve('ghost_hermes_pm/shared_source_reader.py')) + ',run_name="__main__")\n');
+    config.source_snapshot = {python, reader, python_sha256: crypto.createHash('sha256').update(fs.readFileSync(python)).digest('hex'),
+      reader_sha256: crypto.createHash('sha256').update(fs.readFileSync(reader)).digest('hex')};
+  }
+  const removePreset = await ctx.agentPresets.register(declaration);
+  const roster = await ctx.agentPresets.list();
+  assert.equal(roster.find(row => row.id === declaration.id)?.broken, undefined,
+    'The original Loader must activate the main-plugin Hook.');
+  const create = async (id, preset = 'fixture-managed', restored) => {
+    const handle = await ctx.agents.create({sessionId: id,
+      meta: restored?.meta ?? {cwd: workspace, agentPreset: preset},
+      ...(restored ? {seed: restored.events} : {}),
+      agentOptions: {provider: 'fixture-model', model: 'fixture-default'},
+      setup: async agentCtx => {
+        if (preset === 'fixture-managed') await ctx.agentPresets.mount(agentCtx, preset);
+      }});
+    setSandboxMode(handle.agent.session, 'workspace-write');
+    return handle;
+  };
+  const ledgerPath = id => path.join(ledgerDir, crypto.createHash('sha256').update(id).digest('hex') + '.json');
+  const register = (agent, overrides = {}) => {
+    const row = {schema: 1, ...config, session_id: agent.session.id,
+      session_created_at: agent.session.header.createdAt, generation: 'fixture-work-' + agent.session.id,
+      workspace, provider: 'fixture-model', model: 'fixture-route',
+      budget: {max_wall_seconds: 1800, max_model_requests: 2, max_reported_tokens: 300000,
+        max_output_tokens_per_request: 8192},
+      state: {started_at_ms: null, requests: 0, reported_tokens: 0, admissions: [], stop_reason: null},
+      ...overrides};
+    fs.writeFileSync(ledgerPath(agent.session.id), JSON.stringify(row), {mode: 0o600});
+    return row;
+  };
+  const prompt = async agent => {
+    agent.followup(createUserMessage({content: [{type: 'text', text: 'One external model response.'}],
+      source: {kind: 'user'}}));
+    await agent.whenIdle();
+  };
+  if (scenario === 'integrity') {
+    const held = await create('fixture-state-binding');
+    const initial = register(held.agent);
+    await prompt(held.agent);
+    assert.equal(calls.length, 1);
+    fs.writeFileSync(ledgerPath(held.agent.session.id), JSON.stringify(initial), {mode: 0o600});
+    await prompt(held.agent);
+    assert.equal(calls.length, 1, 'An in-process count rollback must not admit another model request.');
+    await held.dispose();
+    const unsafe = await create('fixture-unsafe-policy');
+    register(unsafe.agent);
+    setSandboxMode(unsafe.agent.session, 'danger-full-access');
+    await prompt(unsafe.agent);
+    assert.equal(calls.length, 1, 'Ledger cwd does not replace the original sandbox policy.');
+    await unsafe.dispose();
+    const future = await create('fixture-future-clock');
+    register(future.agent, {state: {started_at_ms: Date.now() + 60000, requests: 0,
+      reported_tokens: 0, admissions: [], stop_reason: null}});
+    await prompt(future.agent);
+    assert.equal(calls.length, 1, 'A future start cannot extend a wall-clock budget.');
+    await future.dispose();
+    const invalidFile = await create('fixture-public-ledger');
+    register(invalidFile.agent);
+    fs.chmodSync(ledgerPath(invalidFile.agent.session.id), 0o644);
+    await prompt(invalidFile.agent);
+    assert.equal(calls.length, 1, 'A public ledger is not an ownership grant.');
+    await invalidFile.dispose();
+  } else if (scenario === 'guard_deadline') {
+    const owned = await create('fixture-guard-deadline');
+    const row = register(owned.agent);
+    row.budget.max_wall_seconds = 1;
+    fs.writeFileSync(ledgerPath(owned.agent.session.id), JSON.stringify(row));
+    await prompt(owned.agent);
+    const result = await ctx.tools.execute({agent: owned.agent, name: 'bash', callId: 'fixture-after-source-read',
+      arguments: {command: 'synthetic nonexecuted tool'}, signal: new AbortController().signal});
+    assert.equal(result.isError, true, 'A synchronous source read cannot grant a tool after the wall deadline.');
+    assert.equal(toolRuns.length, 0);
+    await owned.dispose();
+  } else if (scenario === 'inherited') {
+    ctx.tools.register({name: 'fixture-global-extra', description: 'Unrelated global capability.',
+      parameters: {type: 'object', properties: {}}, execute: async () => 'unused',
+      output: {schema: {type: 'string'}, render: value => [{type: 'text', text: value}]}});
+    const managed = await create('fixture-filtered-inheritance');
+    register(managed.agent);
+    await prompt(managed.agent);
+    assert.equal(calls.length, 1, 'Only inherited extra tools must be restricted for the admitted Agent.');
+    assert.deepEqual(ctx.tools.schemas(managed.agent).map(tool => tool.name).sort(), names);
+    assert.deepEqual(calls[0].tools.map(tool => tool.name).sort(), names,
+      'The first original Model call must receive only the restricted tool catalog.');
+    const manual = await create('fixture-inheritance-manual', 'fixture-manual');
+    assert.ok(ctx.tools.schemas(manual.agent).some(tool => tool.name === 'fixture-global-extra'));
+    await prompt(manual.agent);
+    assert.equal(calls.length, 2);
+    await managed.dispose();
+    await manual.dispose();
+  } else if (scenario === 'tool_guard') {
+    const owned = await create('fixture-guarded-tools');
+    register(owned.agent);
+    await prompt(owned.agent);
+    const result = await ctx.tools.execute({agent: owned.agent, name: 'bash', callId: 'fixture-danger',
+      arguments: {sandbox_permissions: 'danger-full-access'}, signal: new AbortController().signal});
+    assert.equal(result.isError, true, 'The native guard must reject danger privilege for the managed Agent.');
+    assert.equal(toolRuns.length, 0);
+    const file = path.join(ledgerDir, crypto.createHash('sha256').update(owned.agent.session.id).digest('hex') + '.tools.jsonl');
+    const receipts = fs.readFileSync(file, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(receipts[0].call_id, 'fixture-danger');
+    assert.equal(receipts[0].execution_admission, 'rejected');
+    assert.equal(receipts[0].is_error, true);
+    assert.equal(fs.statSync(file).mode & 0o077, 0);
+    const manual = await create('fixture-manual-tools', 'fixture-manual');
+    const allowed = await ctx.tools.execute({agent: manual.agent, name: 'bash', callId: 'fixture-manual-call',
+      arguments: {sandbox_permissions: 'danger-full-access'}, signal: new AbortController().signal});
+    assert.equal(allowed.isError, false, 'The managed preset guard must not change a manual Agent.');
+    assert.equal(toolRuns.length, 1);
+    await owned.dispose();
+    await manual.dispose();
+  } else if (scenario === 'lifecycle') {
+    const weak = await (async () => {
+      let owned = await create('fixture-disposed-object');
+      register(owned.agent);
+      await prompt(owned.agent);
+      const reference = new WeakRef(owned.agent);
+      await owned.dispose();
+      owned = null;
+      return reference;
+    })();
+    for (let index = 0; index < 40; index++) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      global.gc();
+      if (weak.deref() === undefined) break;
+    }
+    assert.ok(weak.deref() === undefined, 'The native disposal edge must release the exact admitted Agent.');
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath('fixture-disposed-object'))).state.requests, 1,
+      'Releasing an Agent does not erase its durable budget.');
+    const manual = await create('fixture-disposal-manual', 'fixture-manual');
+    await prompt(manual.agent);
+    assert.equal(calls.length, 2);
+    await manual.dispose();
+  } else if (scenario === 'recovery') {
+    const original = await create('fixture-recovered-unknown');
+    register(original.agent, {model: 'fixture-recovery-unknown'});
+    try {await prompt(original.agent);} finally {fs.chmodSync(ledgerDir, 0o700);}
+    assert.equal(calls.length, 1);
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(original.agent.session.id))).state.stop_reason, null,
+      'The actual permission failure left no durable unknown-usage stop marker.');
+    const restore = {meta: {...original.agent.session.header},
+      events: Array.from({length: original.agent.session.seq}, (_, index) => original.agent.session.eventAt(index))};
+    try {await prompt(original.agent);} finally {fs.chmodSync(ledgerDir, 0o700);}
+    assert.equal(calls.length, 1, 'An old unreported settlement cannot masquerade as a zero-usage completed request.');
+    await original.dispose();
+    const reattached = await create('fixture-recovered-unknown', 'fixture-managed', restore);
+    try {await prompt(reattached.agent);} finally {fs.chmodSync(ledgerDir, 0o700);}
+    assert.equal(calls.length, 1, 'Original native journal recovery must reject the missing usage proof.');
+    await reattached.dispose();
+  } else if (scenario === 'observer') {
+    const failing = await create('fixture-observer-write');
+    observerAgent = failing.agent;
+    register(failing.agent, {model: 'fixture-observer-write'});
+    try {await prompt(failing.agent);} finally {fs.chmodSync(ledgerDir, 0o700);}
+    assert.equal(calls.length, 1);
+    assert.equal(toolRuns.length, 0, 'A ledger write failure at settlement must cancel before tool dispatch.');
+    assert.ok(diagnostics.some(message => message.includes('EACCES')), 'Original filesystem failure remains in native diagnostics.');
+    await failing.dispose();
+    observerAgent = undefined;
+  } else if (scenario === 'unknown') {
+    const missing = await create('fixture-unknown-usage');
+    register(missing.agent, {model: 'fixture-unreported'});
+    await prompt(missing.agent);
+    await prompt(missing.agent);
+    assert.equal(calls.length, 1, 'A completed provider response without usage cannot be silently free.');
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(missing.agent.session.id))).state.stop_reason,
+      'shared-work-usage-unknown');
+    const blocked = await create('fixture-wall-wait');
+    const registration = register(blocked.agent, {model: 'fixture-wait'});
+    registration.budget.max_wall_seconds = 1;
+    fs.writeFileSync(ledgerPath(blocked.agent.session.id), JSON.stringify(registration));
+    await prompt(blocked.agent);
+    assert.equal(calls.length, 2);
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(blocked.agent.session.id))).state.stop_reason,
+      'shared-work-wall-budget');
+    const manual = await create('fixture-after-budget-stop', 'fixture-manual');
+    await prompt(manual.agent);
+    assert.equal(calls.length, 3, 'A work deadline does not stop its sibling manual Agent.');
+    await missing.dispose();
+    await blocked.dispose();
+    await manual.dispose();
+  } else if (scenario === 'limits') {
+    const tokens = await create('fixture-token-limit');
+    const row = register(tokens.agent);
+    row.budget.max_reported_tokens = 20;
+    fs.writeFileSync(ledgerPath(tokens.agent.session.id), JSON.stringify(row));
+    await prompt(tokens.agent);
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(tokens.agent.session.id))).state.stop_reason,
+      'shared-work-observed-budget', 'The final reported quota must stop owned execution immediately.');
+    await prompt(tokens.agent);
+    assert.equal(calls.length, 1, 'Reported tokens include input and output before the next call.');
+    const expired = await create('fixture-expired');
+    register(expired.agent, {state: {started_at_ms: Date.now() - 1800000, requests: 0,
+      reported_tokens: 0, admissions: [], stop_reason: null}});
+    await prompt(expired.agent);
+    assert.equal(calls.length, 1, 'Expired work cannot emit its first model call.');
+    await tokens.dispose();
+    await expired.dispose();
+  } else {
+  const managed = await create('fixture-owned');
+  register(managed.agent);
+  await prompt(managed.agent);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, 'fixture-route');
+  assert.equal(calls[0].maxTokens, 8192);
+  assert.equal(JSON.parse(fs.readFileSync(ledgerPath('fixture-owned'))).state.requests, 1);
+  assert.equal(JSON.parse(fs.readFileSync(ledgerPath('fixture-owned'))).state.model_context_window, 16384,
+    'The admitted model route must record original prepared context metadata.');
+  await prompt(managed.agent);
+  await prompt(managed.agent);
+  assert.equal(calls.length, 2, 'The third model request must not reach the external model.');
+  assert.equal(JSON.parse(fs.readFileSync(ledgerPath('fixture-owned'))).state.reported_tokens, 40);
+  const manual = await create('fixture-manual-session', 'fixture-manual');
+  await prompt(manual.agent);
+  assert.equal(calls.length, 3, 'A sibling manual Session remains usable.');
+  assert.equal(calls.at(-1).model, 'fixture-default');
+  const absent = await create('fixture-no-ledger');
+  await prompt(absent.agent);
+  assert.equal(calls.length, 3, 'The managed preset cannot run unregistered Sessions.');
+  const wrong = await create('fixture-wrong-owner');
+  register(wrong.agent, {host_lease: 'foreign-lease'});
+  await prompt(wrong.agent);
+  assert.equal(calls.length, 3, 'A foreign host lease must fail before model dispatch.');
+  await managed.dispose();
+  await absent.dispose();
+  await wrong.dispose();
+  await removePreset();
+  const reload = await ctx.agentPresets.register(declaration);
+  const restored = await create('fixture-restored');
+  register(restored.agent, {state: {started_at_ms: Date.now(), requests: 2,
+    reported_tokens: 40, admissions: ['old-a', 'old-b'], stop_reason: null}});
+  await prompt(restored.agent);
+  assert.equal(calls.length, 3, 'Reload must honor durable admission count.');
+  await restored.dispose();
+  await reload();
+  await prompt(manual.agent);
+  assert.equal(calls.length, 4, 'Managed unloading does not disable the manual Agent.');
+  await manual.dispose();
+  }
+  await removePreset();
+  process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: calls.length}));
+} finally {
+  await ctx.fiber.dispose();
+}

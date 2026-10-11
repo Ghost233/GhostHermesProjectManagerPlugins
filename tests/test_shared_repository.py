@@ -1,0 +1,381 @@
+"""Shared Desktop public HTTP seam; no new runtime or authenticated URL export."""
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+import threading
+from pathlib import Path
+import subprocess
+import sys
+import shutil
+import asyncio
+import hashlib
+import time
+
+from sdk_source_integrity import source_snapshot
+from test_repository_github import github_source  # noqa: F401
+
+import pytest
+
+from ghost_hermes_pm.manager import ManagementError
+
+
+@contextmanager
+def desktop_service(tmp_path):
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            calls.append(('GET', self.path))
+            assert self.path == '/?token=synthetic-only'
+            self.send_response(303)
+            self.send_header('Set-Cookie', 'fixture-session=value; HttpOnly; Path=/')
+            self.send_header('Location', './')
+            self.end_headers()
+
+        def do_POST(self):
+            assert self.headers['Cookie'] == 'fixture-session=value'
+            packet = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            calls.append(packet)
+            value = {'items': []} if packet['method'] == 'session/list' else {'accepted': True}
+            body = json.dumps({'type': 'server-response', 'rpcId': packet['rpcId'],
+                               'result': {'ok': True, 'value': value}}).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    path = tmp_path / 'desktop-host.json'
+    path.write_text(json.dumps({'schema': 1, 'lease': 'synthetic-lease', 'pid': os.getpid(),
+        'url': 'http://127.0.0.1:' + str(server.server_port) + '/?token=synthetic-only',
+        'runtimeVersion': 'fixture', 'permissionMode': 'workspace-write'}))
+    path.chmod(0o600)
+    try:
+        yield path, calls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_shared_desktop_consumes_native_receipt_and_never_exports_auth(tmp_path):
+    from ghost_hermes_pm.shared_desktop import SharedDesktopTransport
+    with desktop_service(tmp_path) as (path, calls):
+        carrier = SharedDesktopTransport({'desktop_receipt': str(path), 'host_lease': 'synthetic-lease',
+            'service_ref': 'fixture-service', 'session_id': 'fixture-owned', 'generation': 'fixture-generation',
+            'workspace': str(tmp_path)}, timeout=1)
+        try:
+            result = carrier.request('session/list', {'_request': {}}, 'fixture-list')
+            assert result['result']['value'] == {'items': []}
+            assert carrier.native_identity['kind'] == 'shared_native'
+            assert carrier.native_identity['pid'] == os.getpid()
+            assert set(tmp_path.iterdir()) == {path}
+            with pytest.raises(ManagementError, match='owned'):
+                carrier.request('session/cancel', {'request': {'sessionId': 'manual-foreign'}}, 'foreign')
+            assert len(calls) == 2
+        finally:
+            carrier.close()
+
+
+@pytest.mark.parametrize('change', ['lease', 'mode', 'hardlink'])
+def test_shared_desktop_revalidates_receipt_before_mutation(tmp_path, change):
+    from ghost_hermes_pm.shared_desktop import SharedDesktopTransport
+    with desktop_service(tmp_path) as (path, calls):
+        carrier = SharedDesktopTransport({'desktop_receipt': str(path), 'host_lease': 'synthetic-lease',
+            'service_ref': 'fixture-service', 'session_id': 'fixture-owned', 'generation': 'fixture-generation',
+            'workspace': str(tmp_path)}, timeout=1)
+        try:
+            carrier.request('session/list', {'_request': {}}, 'first')
+            if change == 'lease':
+                row = json.loads(path.read_text())
+                row['lease'] = 'new-lease'
+                path.write_text(json.dumps(row))
+            elif change == 'mode':
+                path.chmod(0o644)
+            else:
+                os.link(path, tmp_path / 'receipt-alias')
+            with pytest.raises(ManagementError):
+                carrier.request('session/cancel', {'request': {'sessionId': 'fixture-owned'}}, 'stop')
+            assert len(calls) == 2
+        finally:
+            carrier.close()
+
+
+@contextmanager
+def shared_remote_peer(tmp_path, behavior):
+    # This is only the external protocol boundary fixture, never an SDK patch.
+    path = Path(__file__).with_name('dsh_fixture_server.py')
+    source = path.read_text().replace("assert self.path == '/api/remote.mux'", """if self.path == '/?token=fixture-launch':
+                self.send_response(303)
+                self.send_header('Set-Cookie', 'synthetic-auth=value; HttpOnly; Path=/')
+                self.send_header('Location', './')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            assert self.path == '/api/remote.mux'""")
+    namespace = {}
+    exec(compile(source, str(path), 'exec'), namespace)
+    with namespace['remote_peer'](behavior=behavior) as (url, peer):
+        receipt = tmp_path / 'desktop-host.json'
+        receipt.write_text(json.dumps({'schema': 1, 'lease': 'fixture-lease', 'pid': os.getpid(),
+            'url': url + '/?token=fixture-launch', 'runtimeVersion': 'fixture', 'permissionMode': 'workspace-write'}))
+        receipt.chmod(0o600)
+        from ghost_hermes_pm.shared_desktop import SharedDesktopTransport
+        carrier = SharedDesktopTransport({'desktop_receipt': str(receipt), 'host_lease': 'fixture-lease',
+            'service_ref': 'fixture-service', 'session_id': 'session-fixture', 'generation': 'fixture-generation',
+            'workspace': str(tmp_path)}, timeout=1)
+        try:
+            yield carrier, peer
+        finally:
+            carrier.close()
+
+
+def test_shared_original_waterfalls_ignore_manual_tasks_and_accept_only_one_owned_choice(tmp_path):
+    frames = [{'type': 'waterfall', 'event': 'approval/request', 'eventId': 'manual-request',
+        'agentId': 'manual-session', 'request': {'toolName': 'bash', 'callId': 'manual-call'}},
+        {'type': 'waterfall', 'event': 'approval/request', 'eventId': 'owned-request',
+        'agentId': 'session-fixture', 'request': {'toolName': 'bash', 'callId': 'owned-call'}}]
+    with shared_remote_peer(tmp_path, {'remote_events': frames}) as (carrier, peer):
+        carrier.start_events()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            packet = carrier.event_frames()
+            if packet['frames']:
+                break
+            time.sleep(.01)
+        assert [frame['eventId'] for frame in packet['frames']] == ['owned-request']
+        rejected = {'clientId': packet['client_id'], 'eventId': 'owned-request',
+            'outcome': {'kind': 'result', 'value': 'allowed-always'}}
+        with pytest.raises(ManagementError):
+            carrier.request('$events/result', rejected, 'unapproved-persistence')
+        approved = dict(rejected, outcome={'kind': 'result', 'value': 'allowed-once'})
+        assert carrier.request('$events/result', approved, 'single-choice')['result']['ok'] is True
+        with pytest.raises(ManagementError):
+            carrier.request('$events/result', approved, 'repeat')
+        results = [call['payload']['args'] for call in peer['calls'] if call['method'] == '$events/result']
+        assert results == [{'clientId': packet['client_id'], 'eventId': 'manual-request', 'outcome': {'kind': 'next'}}, approved]
+
+
+def test_shared_stop_never_adopts_visible_unowned_jobs(tmp_path):
+    jobs = [{'id': 'unowned', 'owner': None, 'status': 'running'},
+            {'id': 'owned', 'owner': 'session-fixture', 'status': 'running'}]
+    with shared_remote_peer(tmp_path, {'jobs': jobs}) as (carrier, peer):
+        assert carrier.owned_jobs() == [jobs[1]]
+        with pytest.raises(ManagementError):
+            carrier.request('job/kill', {'request': {'sessionId': 'session-fixture', 'jobId': 'unowned'}}, 'unsafe')
+        assert peer['calls'] == []
+
+
+@pytest.mark.parametrize('entry', ['reader', 'runner'])
+def test_privileged_source_reads_do_not_execute_repository_fsmonitor(tmp_path, entry):
+    root = Path(__file__).resolve().parents[1]
+    repository = tmp_path / 'repository'
+    repository.mkdir()
+    subprocess.run(['git', 'init', '-q', str(repository)], check=True)
+    marker = tmp_path / 'outside-marker'
+    extension = tmp_path / 'fsmonitor'
+    extension.write_text('#!/bin/sh\nprintf touched > ' + str(marker) + '\nprintf "fixture-token\\0"\n')
+    extension.chmod(0o700)
+    subprocess.run(['git', '-C', str(repository), 'config', 'core.fsmonitor', str(extension)], check=True)
+    arguments = ([str(root / 'ghost_hermes_pm/shared_source_reader.py'), str(repository)] if entry == 'reader'
+        else [str(root / 'ghost_hermes_pm/repository_test_runner.py'), str(repository), '--state'])
+    result = subprocess.run([sys.executable, '-I', *arguments], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists(), 'A privileged fingerprint must not execute a repository Git extension.'
+
+
+def test_privileged_source_reads_disable_clean_filter_without_changing_user_git(tmp_path):
+    repository = tmp_path / 'repository'
+    repository.mkdir()
+    subprocess.run(['git', 'init', '-q', str(repository)], check=True)
+    marker = tmp_path / 'outside-filter-marker'
+    extension = tmp_path / 'clean-filter'
+    extension.write_text('#!/bin/sh\nprintf touched > ' + str(marker) + '\ncat\n')
+    extension.chmod(0o700)
+    (repository / '.gitattributes').write_text('*.txt filter=fixture\n')
+    (repository / 'feature.txt').write_text('original\n')
+    subprocess.run(['git', '-C', str(repository), 'config', 'filter.fixture.clean', str(extension)], check=True)
+    subprocess.run(['git', '-C', str(repository), 'add', '.'], check=True)
+    (repository / 'feature.txt').write_text('changed\n')
+    subprocess.run(['git', '-C', str(repository), 'status', '--porcelain=v1'], capture_output=True, check=True)
+    assert marker.exists(), 'The external-marker control must demonstrate the executable extension.'
+    marker.unlink()
+    config_before = (repository / '.git/config').read_bytes()
+    reader = Path(__file__).resolve().parents[1] / 'ghost_hermes_pm/shared_source_reader.py'
+    result = subprocess.run([sys.executable, '-I', str(reader), str(repository)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists() and (repository / '.git/config').read_bytes() == config_before
+
+
+@pytest.mark.parametrize('unknown_file', [False, True])
+def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environment(github_source, unknown_file):
+    from types import SimpleNamespace
+    from ghost_hermes_pm.shared_repository import prepare_shared_github, cleanup_shared_github, _prompt
+    source, original = github_source
+    before, environment = original.read_bytes(), dict(os.environ)
+    saved = []
+    intake = SimpleNamespace(github=source, _save_execution=lambda record, fields=None: saved.append(fields))
+    record = {'id': 'fixture-work', 'target': {'repository': 'fixture-user/fixture'},
+        'issue': {'url': 'https://github.com/fixture-user/fixture/issues/7', 'title': 'Fixture', 'body': 'Fixture scope'},
+        'dsh_execution': {'generation': 'fixture-generation'}}
+    reference = prepare_shared_github(intake, record)
+    directory = Path(reference['config_dir'])
+    try:
+        assert directory.resolve().is_relative_to(Path('/tmp').resolve())
+        assert directory.stat().st_mode & 0o077 == 0 and (directory / 'hosts.yml').stat().st_mode & 0o077 == 0
+        prompt = _prompt(intake, record)
+        assert str(directory) in prompt and str(original.parent) not in prompt
+        assert 'synthetic-configured-account-token' not in prompt
+        assert original.read_bytes() == before and dict(os.environ) == environment
+        assert 'DSH_HOME' not in prompt
+        record['dsh_execution']['generation'] = 'different-generation'
+        with pytest.raises(ManagementError):
+            cleanup_shared_github(intake, record)
+        assert directory.exists() and original.read_bytes() == before
+        record['dsh_execution']['generation'] = 'fixture-generation'
+        if unknown_file:
+            note = directory / 'owner-note.txt'
+            note.write_text('Synthetic owner content must remain.\n')
+            note.chmod(0o600)
+            with pytest.raises(ManagementError):
+                cleanup_shared_github(intake, record)
+            assert note.read_text() == 'Synthetic owner content must remain.\n'
+            assert record['dsh_execution']['github_cleanup']['status'] == 'unconfirmed'
+            assert directory.exists() and (directory / 'hosts.yml').exists()
+            note.unlink()  # Remove only this test's own deliberately injected fixture.
+        assert cleanup_shared_github(intake, record) == {'status': 'removed'}
+        assert not directory.exists() and original.read_bytes() == before
+        assert dict(os.environ) == environment
+    finally:
+        from ghost_hermes_pm.repository_github import cleanup_github_execution
+        if directory.exists():
+            cleanup_github_execution(reference, 'fixture-generation')
+
+
+@pytest.mark.parametrize('scenario', ['terminal', 'stop'])
+def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
+    root = Path(__file__).resolve().parents[1]
+    sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])
+    sdk_before = source_snapshot(sdk)
+    home = tmp_path / 'home'
+    plugin = home / 'plugins/ghost-hermes-pm'
+    plugin.mkdir(parents=True)
+    home.chmod(0o700)
+    for name in ('__init__.py', 'plugin.yaml', 'ghost_hermes_pm'):
+        if (root / name).is_dir():
+            shutil.copytree(root / name, plugin / name, ignore=shutil.ignore_patterns('__pycache__'))
+        else:
+            shutil.copy2(root / name, plugin / name)
+    env = {**os.environ, 'HERMES_HOME': str(home), 'HERMES_KANBAN_HOME': str(home),
+        'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'), 'PYTHONPATH': str(sdk),
+        'PYTHONDONTWRITEBYTECODE': '1'}
+    result = subprocess.run([sys.executable, str(Path(__file__).with_name('shared_repository_runner.py')),
+        str(tmp_path), scenario], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=100)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert source_snapshot(sdk) == sdk_before
+    assert json.loads((tmp_path / 'shared-worker-result.json').read_text())['status'] == 'passed'
+
+
+@pytest.mark.parametrize('change', ['none', 'source_changed', 'failed_test', 'wrong_command', 'non_test', 'true', 'missing_test', 'failing', 'zero_tests'])
+def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_path, monkeypatch, change):
+    from ghost_hermes_pm.simple_development import RepositoryIntake
+    from ghost_hermes_pm.repository_acceptance import accept_repository_work, repository_source_state
+    repo = tmp_path / 'repository'
+    repo.mkdir()
+    subprocess.run(['git', 'init', '-q', '-b', 'fixture-delivery', str(repo)], check=True)
+    test_file = 'feature.test.mjs'
+    (repo / test_file).write_text("console.log('900 passed');\n" if change == 'zero_tests' else
+        "import test from 'node:test'; import assert from 'node:assert/strict';\n"
+        "test('real assertion',()=>{assert.equal(40+2," + ('41' if change in {'non_test', 'failing'} else '42') + ")});\n")
+    subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+    subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+        'commit', '-qm', 'Synthetic fixed test source'], check=True)
+    source = repository_source_state({'repo_path': str(repo)})
+    from ghost_hermes_pm.shared_repository import verification_command
+    from types import SimpleNamespace
+    root = Path(__file__).resolve().parents[1]
+    artifacts = tmp_path / 'artifacts'
+    artifacts.mkdir(mode=0o700)
+    verification = {'python': str(Path(sys.executable).resolve()), 'runner': str(root / 'ghost_hermes_pm/repository_test_runner.py'),
+        'node': str(Path(shutil.which('node')).resolve())}
+    verification.update({name + '_sha256': hashlib.sha256(Path(path).read_bytes()).hexdigest() for name, path in list(verification.items())})
+    carrier = SimpleNamespace(config={'verification': verification})
+    execution = {'session_id': 'fixture-session', 'generation': 'fixture-generation',
+        'verification': {'artifact_root': str(artifacts), 'nonce': 'fixture-nonce'}}
+    test_files = [test_file]
+    command = verification_command(carrier.config, execution, str(repo), test_files)
+    if change == 'non_test':
+        command = '/usr/bin/printf "900 passed\\n"'
+    elif change == 'true':
+        command = '/usr/bin/true'
+    elif change == 'missing_test':
+        command = command.replace(test_file, 'nonexistent.test.mjs')
+        test_files = ['nonexistent.test.mjs']
+    actual_test = subprocess.run(['/bin/bash', '-c', command], cwd=repo,
+        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True)
+    assert actual_test.returncode == (1 if change in {'failing', 'missing_test'} else 0), actual_test.stderr
+    issue = {'url': 'https://github.com/fixture-user/fixture/issues/7', 'title': 'Verify synthetic feature',
+        'body': '- [ ] Verify the fixture feature.', 'updated_at': '2026-10-10T00:00:00Z'}
+    state = tmp_path / 'github.json'
+    state.write_text(json.dumps({'url': issue['url'], 'title': issue['title'], 'body': issue['body'],
+        'updatedAt': issue['updated_at'], 'state': 'OPEN'}))
+    gh = tmp_path / 'gh'
+    gh.write_text('#!' + sys.executable + '\nimport json,os,sys\nfrom pathlib import Path\n'
+        'a=sys.argv[1:]\n'
+        'if a[:2]==["auth","switch"]: pass\n'
+        'elif a[:2]==["api","user"]: print("fixture-user")\n'
+        'elif a[:2]==["issue","view"]: print(Path(os.environ["SHARED_FIXTURE_GH"]).read_text())\n'
+        'elif "/sub_issues" in a[1]: print("[]")\n'
+        'else: sys.exit(2)\n')
+    gh.chmod(0o700)
+    monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setenv('SHARED_FIXTURE_GH', str(state))
+    gh_config = tmp_path / 'gh-config'
+    gh_config.mkdir(mode=0o700)
+    intake = RepositoryIntake('fixture:owner', {}, {'github_account': 'fixture-user',
+        'github_config_dir': str(gh_config)}, str(tmp_path / 'private'))
+    snapshot = {key: source[key] for key in ('head', 'source_digest', 'workspace_status')}
+    receipt = {'name': 'bash', 'kind': 'foreground', 'execution_admission': 'admitted',
+        'generation': 'fixture-generation', 'session_id': 'fixture-session', 'call_id': 'fixture-test',
+        'is_error': actual_test.returncode != 0, 'exit_code': actual_test.returncode, 'timed_out': False, 'aborted': False,
+        'command_sha256': hashlib.sha256(command.encode()).hexdigest(), 'cwd': str(repo),
+        'sandbox': {'mode': 'workspace-write'}, 'source_before': snapshot, 'source_after': snapshot,
+        'stdout': {'sha256': hashlib.sha256(actual_test.stdout.encode()).hexdigest(), 'byte_length': len(actual_test.stdout.encode()), 'truncated': False},
+        'stderr': {'sha256': hashlib.sha256(actual_test.stderr.encode()).hexdigest(), 'byte_length': len(actual_test.stderr.encode()), 'truncated': False}}
+    if change == 'source_changed':
+        receipt['source_before'] = dict(snapshot, source_digest='unknown-source')
+    elif change == 'failed_test':
+        receipt['exit_code'] = 1
+    elif change == 'wrong_command':
+        receipt['command_sha256'] = hashlib.sha256(b'echo ignored').hexdigest()
+    report = {'issue_updated_at': issue['updated_at'], 'source_commit': source['head'],
+        'criteria': [{'text': 'Verify the fixture feature.', 'test_call_ids': ['fixture-test']}],
+        'fine_issue_urls': [], 'sync_branches': [], 'leftovers': [], 'test_files': test_files}
+    events = [{'seq': 0, 'type': 'turn/start', 'data': {'turn': 1}},
+        {'seq': 1, 'type': 'tool/call', 'data': {'callId': 'fixture-test', 'name': 'bash', 'arguments': {'command': command}}},
+        {'seq': 2, 'type': 'tool/result', 'data': {'message': {'toolCallId': 'fixture-test', 'isError': actual_test.returncode != 0,
+            'content': [{'type': 'text', 'text': actual_test.stdout}]}}},
+        {'seq': 3, 'type': 'assistant/message', 'data': {'turn': 1, 'message': {'content': [{'type': 'text',
+            'text': 'HERMES_REPOSITORY_DELIVERY_JSON ' + json.dumps(report)}]}}},
+        {'seq': 4, 'type': 'turn/end', 'data': {'turn': 1, 'reason': {'kind': 'completed'}}}]
+    record = {'id': 'fixture-work', 'card_id': 'fixture-card', 'issue': issue,
+        'target': {'repo_path': str(repo), 'repository': 'fixture-user/fixture'},
+        'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance', 'generation': 'fixture-generation',
+            'session_id': 'fixture-session', 'baseline': source, 'tool_receipts': [receipt], 'jobs': [],
+            'verification': execution['verification']}}
+    intake._save(record)
+    result = asyncio.run(accept_repository_work(intake, record, carrier, events,
+        {'inbox': {'next-turn': [], 'next-step': []}}, intake.generation))
+    assert (result['status'] == 'accepted') == (change == 'none'), json.dumps(result)
+    if change == 'source_changed':
+        assert 'test_source_unconfirmed' in result['unmet']
+    elif change in {'non_test', 'true', 'zero_tests'}:
+        assert 'test_runner_unconfirmed' in result['unmet']
+    elif change != 'none':
+        assert 'test_evidence_missing' in result['unmet']

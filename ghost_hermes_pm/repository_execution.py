@@ -26,6 +26,9 @@ def execution_configuration(target):
     try:
         reference = private_file(target['execution_ref'])
         configuration = json.loads(reference.read_text())
+        if configuration.get('mode') == 'shared_native':
+            from .shared_repository import shared_configuration
+            return shared_configuration(reference, configuration), {}
         if (set(configuration) != {'schema', 'approved', 'runtime_package_root', 'node_bin', 'model', 'budget', 'skill_directories', 'tool_receipt_ref'}
             or configuration.get('schema') != 1 or configuration.get('approved') is not True):
             raise ValueError('Unapproved execution reference.')

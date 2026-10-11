@@ -31,8 +31,9 @@ def activate_work(intake, record, generation):
         raise ManagementError('binding_conflict', 'Original outer work needs reconciliation.')
     with intake.lifecycle_lock:
         intake.require_active(generation)
-        record['dsh_execution'] = {'state': 'admitted', 'reference_sha256': configuration['reference_sha256']}
-        record['execution'] = 'owned_dsh'
+        record['dsh_execution'] = {'state': 'admitted', 'reference_sha256': configuration['reference_sha256'],
+            **({'mode': 'shared_native'} if configuration.get('mode') == 'shared_native' else {})}
+        record['execution'] = 'shared_dsh' if configuration.get('mode') == 'shared_native' else 'owned_dsh'
         intake._save(record)
         intake._kanban('kanban_unblock', {'task_id': record['card_id']})
 
@@ -78,7 +79,7 @@ def owned_call(carrier, method, request):
     if (envelope.get('type') != 'server-response' or envelope.get('rpcId') != rpc_id
         or envelope.get('result', {}).get('ok') is not True):
         raise ManagementError('outcome_unknown', 'Original owned execution response is unconfirmed.')
-    return envelope['result']['value']
+    return envelope['result'].get('value') if method == '$events/result' else envelope['result']['value']
 
 
 def original_history(carrier, session_id, workspace):
@@ -97,6 +98,10 @@ def original_history(carrier, session_id, workspace):
 
 
 def original_jobs(carrier, session_id):
+    if carrier.config.get('mode') == 'shared_native':
+        if carrier.config['session_id'] != session_id:
+            raise ManagementError('binding_conflict', 'The original shared job owner differs.')
+        return carrier.owned_jobs()
     stream = carrier.stream('job/list', {'request': {'sessionId': session_id}})
     try:
         roster = next(stream)
@@ -176,6 +181,9 @@ async def notify_acceptance(intake, record, generation):
 
 def attach_existing_owned(intake, record):
     """Attach a registered generation; absence never starts replacement work."""
+    if record['dsh_execution'].get('mode') == 'shared_native':
+        from .shared_repository import shared_attach
+        return shared_attach(intake, record)
     from .dsh_owned_transport import PersistentOwnedTransport
     execution = record['dsh_execution']
     instance = owned_instance(intake, record)
@@ -305,6 +313,9 @@ async def observe_human_requests(intake):
                         carrier = carriers.pop(record['id'], None)
                         if carrier is not None:
                             carrier.close()
+                        if execution.get('mode') == 'shared_native':
+                            from .shared_repository import retire_shared
+                            retire_shared(intake, record['id'])
                         continue
                     carrier = carriers.get(record['id'])
                     try:
@@ -319,11 +330,19 @@ async def observe_human_requests(intake):
                     except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES):
                         if carrier is not None:
                             carrier.close()
+                        if execution.get('mode') == 'shared_native':
+                            from .shared_repository import retire_shared
+                            retire_shared(intake, record['id'])
+                            execution['shared_event_observer'] = {'status': 'unavailable',
+                                'session_id': execution['session_id'], 'generation': execution['generation']}
+                            intake._save_execution(record, fields=['shared_event_observer'])
                         carriers.pop(record['id'], None)
             await asyncio.sleep(.25)
     finally:
         for carrier in carriers.values():
             carrier.close()
+        from .shared_repository import dispose_shared
+        dispose_shared(intake)
 
 
 def register_repository_supervision(ctx, intake):
@@ -331,6 +350,8 @@ def register_repository_supervision(ctx, intake):
     def detach():
         for carrier in tuple(connections):
             carrier.close()
+        from .shared_repository import dispose_shared
+        dispose_shared(intake)
     ctx.on_unload(detach)
 
     def guard(tool_name=None, args=None, **_):
@@ -392,6 +413,9 @@ def register_repository_supervision(ctx, intake):
         'Do not develop directly, create/link cards, or declare delivery. DSH owns the detailed repository work; the plugin records its real status.')
 
     async def run_work(record, generation):
+        if record['dsh_execution'].get('mode') == 'shared_native':
+            from .shared_repository import run_shared_work
+            return await run_shared_work(ctx, intake, record, generation)
         from .dsh_owned_transport import PersistentOwnedTransport
         from .trusted_controller import controller_identity
         run_id = current_worker(ctx, intake, record)

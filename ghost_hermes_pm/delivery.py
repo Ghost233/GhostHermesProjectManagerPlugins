@@ -9,11 +9,17 @@ import shlex
 from .manager import ManagementError, _git, _public_text
 
 
-def source_state(repository):
+def source_state(repository, *, git_read=_git):
     root = Path(repository['worktree'])
-    result = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True)
-    head = result.stdout.strip() if result.returncode == 0 else None
-    files = _git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z').split('\0')
+    if git_read is _git:
+        result = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True)
+        head = result.stdout.strip() if result.returncode == 0 else None
+    else:
+        try:
+            head = git_read(root, 'rev-parse', 'HEAD').strip()
+        except ManagementError:
+            head = None
+    files = git_read(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z').split('\0')
     digest = hashlib.sha256()
     file_digests = {}
     artifacts = [Path(p) for p in repository['test_artifact_paths']]
@@ -32,7 +38,7 @@ def source_state(repository):
             continue
         digest.update(raw if raw is not None else b'<deleted>')
         file_digests[name] = hashlib.sha256(raw).hexdigest() if raw is not None else None
-    return {'head': head, 'source_digest': digest.hexdigest(), 'file_digests': file_digests, 'workspace_status': _git(root, 'status', '--porcelain=v1')}
+    return {'head': head, 'source_digest': digest.hexdigest(), 'file_digests': file_digests, 'workspace_status': git_read(root, 'status', '--porcelain=v1')}
 
 
 
