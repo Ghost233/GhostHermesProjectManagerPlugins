@@ -127,7 +127,7 @@ def _execution_coverage(intake, record, control):
                 start = True
             elif token in {'>', '>>', '<'} and not start and not redirect:
                 redirect = True
-            elif token in {'&', '||', '(', ')', '<<', '>&', '<&'} or start and token not in {'printf', '/bin/cat', '/usr/bin/cmp'}:
+            elif re.fullmatch(r'[;&|<>()]+', token) or start and token not in {'printf', '/bin/cat', '/usr/bin/cmp'}:
                 raise ManagementError('coverage_unverified', 'This command has no verified finite file-operation stop proof.')
             else:
                 start, redirect = False, False
@@ -274,6 +274,7 @@ async def _retry(intake, record, prepared, generation):
         history.append({'execution': execution, 'target': record['target'], 'gateway_controller': record['gateway_controller']})
         record.update(target=target, gateway_controller=controller_identity(), dsh_execution={
             'state': 'admitted', 'attempt': len(history) + 1, 'reference_sha256': admitted['reference_sha256'],
+            'control_message_ids': [prepared.envelope['message_id']],
             'admitted_budget': admitted['runtime_configuration']['budget'], 'retry_control': {
                 'message_id': prepared.envelope['message_id'], 'status': 'accepted', 'dispatch_status': 'intent', 'repository': source}})
         intake._save(record)
@@ -308,10 +309,23 @@ async def process_control(intake, prepared, generation):
             intake.require_active(generation)
             record = _record(intake, prepared.work_id)
             execution = record['dsh_execution']
-            historical = any(prepared.envelope['message_id'] == previous['execution'].get(field, {}).get('message_id')
-                for previous in record.get('execution_attempts', []) for field in ('stop_control', 'retry_control'))
+            message_id = prepared.envelope['message_id']
+            historical = any(message_id in previous['execution'].get('control_message_ids', [])
+                or any(message_id == previous['execution'].get(field, {}).get('message_id') for field in ('stop_control', 'retry_control'))
+                for previous in record.get('execution_attempts', []))
+            duplicate = message_id in execution.get('control_message_ids', [])
+            if not historical and not duplicate:
+                execution.setdefault('control_message_ids', []).append(message_id)
+                intake._save_execution(record, fields=['control_message_ids'])
             if historical:
-                text, result = '这是前轮已受理的控制消息；本轮执行没有改变。', {'status': 'duplicate', 'work_id': record['id']}
+                text, result = '这是前轮已登记的控制消息；本轮执行没有改变。原操作结果仍按原记录核对。', {'status': 'duplicate', 'work_id': record['id']}
+            elif duplicate and (prepared.command.startswith('重试 ') or execution.get('state') == 'stopped'):
+                saved = execution.get('retry_control' if prepared.command.startswith('重试 ') else 'stop_control', {})
+                text = '这条控制消息已登记；不会重送操作或新增预算。原结果仍按记录核对，未受理或未知时请用新的消息明确请求。'
+                result = {'status': 'duplicate', 'work_id': record['id'],
+                    'original_status': saved.get('status', 'unverified') if saved.get('message_id') == message_id else 'unverified'}
+                if saved.get('message_id') == message_id and 'dispatch_status' in saved:
+                    result['dispatch_status'] = saved['dispatch_status']
             elif prepared.command.startswith('重试 '):
                 record = await _retry(intake, record, prepared, generation)
                 text = '已受理独立新一轮执行；沿用原总 Issue 和外层卡，旧会话、预算与失败记录完整保留，等待原生派发。'

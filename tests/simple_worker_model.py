@@ -7,12 +7,13 @@ import time
 
 
 class WorkerModelService:
-    def __init__(self, query_lock=None, refuse=False, hold_dsh=False, budget_stop=False, hold_after_write=False, uncovered_shell=False, static_commands=False, question_after_write=False):
+    def __init__(self, query_lock=None, refuse=False, hold_dsh=False, budget_stop=False, hold_after_write=False, uncovered_shell=False, static_commands=False, question_after_write=False, nested_background_duration=None):
         self.requests = []
         self.worker_steps = 0
         self.dsh_steps = 0
         self.budget_stop = budget_stop
         self.fail_worker_after = None
+        self.nested_background_duration = nested_background_duration
         self.foreign_task_id = None
         self.query_ready = threading.Event()
         self.dsh_ready = threading.Event()
@@ -84,6 +85,9 @@ class WorkerModelService:
                     if uncovered_shell and service.dsh_steps == 2:
                         call = ('bash', {'description': 'Demonstrate a foreground receipt with an unregistered finite descendant.',
                             'command': "sleep 20 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > pending-child.pid; printf 'native-worker\\n' > native-delivery.txt"})
+                    if nested_background_duration is not None and service.dsh_steps == 2:
+                        call = ('bash', {'description': 'Demonstrate combined punctuation with an exact finite background descendant.',
+                            'command': "printf 'native-worker\\n' > native-delivery.txt;(/bin/sleep " + nested_background_duration + " >/dev/null 2>/dev/null&);printf 'bounded-parent\\n'"})
                     if hold_dsh and service.dsh_steps == 1 or hold_after_write and service.dsh_steps == 3:
                         service.dsh_ready.set()
                         if not service.dsh_release.wait(timeout=45):

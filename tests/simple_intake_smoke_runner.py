@@ -29,7 +29,7 @@ def audit(event, args):
             raise RuntimeError('Smoke refuses existing personal runtime state.')
     if event == 'socket.connect' and isinstance(args[1], tuple) and args[1][:2] != model_address:
         raise RuntimeError('Smoke refuses external network access.')
-    if event == 'import' and args[0] == 'hermes_cli.main' and scenario not in {'worker_dispatch', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
+    if event == 'import' and args[0] == 'hermes_cli.main' and scenario not in {'worker_dispatch', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_stop_nested', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
         raise RuntimeError('Intake cannot launch native workers.')
 
 
@@ -52,10 +52,10 @@ from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, ReplyMessageResponse  # no
 from tools.registry import registry  # noqa: E402
 
 home = scratch / 'home'
-if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
+if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_stop_nested', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
     from simple_worker_model import WorkerModelService, execution_reference
     model = WorkerModelService(scratch / 'state/repository-intake.lock' if scenario == 'worker_query_race' else None,
-                               refuse=os.environ.get('HPM_SYNTHETIC_WORKER_REFUSE') == '1', hold_dsh=scenario == 'worker_transport_timeout', budget_stop=scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_stop_unknown', 'worker_retry_failed'}, hold_after_write=scenario == 'worker_stop_running', uncovered_shell=scenario == 'worker_stop_uncovered', question_after_write=scenario == 'worker_stop_question', static_commands=scenario in {'worker_stop_terminal', 'worker_stop_running', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'})
+                               refuse=os.environ.get('HPM_SYNTHETIC_WORKER_REFUSE') == '1', hold_dsh=scenario == 'worker_transport_timeout', budget_stop=scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_unknown', 'worker_retry_failed'}, hold_after_write=scenario == 'worker_stop_running', uncovered_shell=scenario == 'worker_stop_uncovered', nested_background_duration=('20.' + str(int(hashlib.sha256(str(scratch).encode()).hexdigest()[:8], 16) % 1000000).zfill(6)) if scenario == 'worker_stop_nested' else None, question_after_write=scenario == 'worker_stop_question', static_commands=scenario in {'worker_stop_terminal', 'worker_stop_running', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'})
 else:
     model = OrdinaryModelService()
 model_address = ('127.0.0.1', model.server.server_port)
@@ -130,9 +130,9 @@ settings = {'state_dir': str(state), 'owner_identity_ref': 'fixture:owner',
                                    'github_config_dir': str(gh_config)},
             'feishu_intake': {'enabled': True, 'verification_ref': 'fixture:controlled-smoke',
                               'bindings': [binding]}}
-if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
+if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_stop_nested', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
     binding['execution_ref'] = os.environ.get('HPM_NATIVE_EXECUTION_REFERENCE') or execution_reference(scratch, model.base_url, Path(os.environ['DSH_TEST_SDK_ROOT']))
-    if scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_stop_unknown', 'worker_retry_failed'}:
+    if scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_unknown', 'worker_retry_failed'}:
         reference = Path(binding['execution_ref'])
         configuration = json.loads(reference.read_text())
         configuration['budget']['max_reported_tokens'] = 50
@@ -166,7 +166,7 @@ if scenario == 'responsibility_conflict':
     settings['simple_development']['work_profiles'] = [dict(binding, profile_id='other-lead', native_profile='other-worker')]
 if scenario == 'configuration_repository':
     binding['repo_path'] = str(scratch / 'missing-repository')
-(home / 'config.yaml').write_text(yaml.safe_dump({'kanban': {'auto_decompose': scenario == 'configuration_auto_decompose'}, 'toolsets': ['kanban', 'hermes_pm'] if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} else ['kanban'],
+(home / 'config.yaml').write_text(yaml.safe_dump({'kanban': {'auto_decompose': scenario == 'configuration_auto_decompose'}, 'toolsets': ['kanban', 'hermes_pm'] if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_stop_nested', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} else ['kanban'],
     'platform_toolsets': {'cli': ['hermes_pm_supervision']},
     'known_plugin_toolsets': {'cli': ['hermes_pm', 'hermes_pm_supervision']},
     'tools': {'tool_search': {'enabled': 'off'}},
@@ -177,7 +177,7 @@ if scenario == 'configuration_repository':
               'context_length': real_model['context_window'] if real_model else 131072},
     'agent': {'max_turns': 8},
     'plugins': {'enabled': ['ghost-hermes-pm'], 'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
-if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} and not real_model:
+if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_stop_nested', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} and not real_model:
     from hermes_cli.auth import PROVIDER_REGISTRY
     from hermes_cli.providers import HERMES_OVERLAYS
     from agent.models_dev import PROVIDER_TO_MODELS_DEV
@@ -417,10 +417,10 @@ async def main():
         await receive(adapter, raw('om_bot_retry', '@_user_1 重试 ' + record['id'], sender=bot))
         assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == controlled
         assert not any('独立新一轮' in message.request_body.content or '停止已核实' in message.request_body.content for message in sent), 'Bot control is rejected by native authorization or the owner-only plugin entry.'
-    expected_body = 'Create native-delivery.txt' if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} else 'Verify the bounded acceptance.' if scenario == 'create_unknown' else 'Verify [binding:' if scenario in {'private_issue', 'private_all_bindings'} else 'Implement the requested feature and verify it.'
+    expected_body = 'Create native-delivery.txt' if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_stop_nested', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} else 'Verify the bounded acceptance.' if scenario == 'create_unknown' else 'Verify [binding:' if scenario in {'private_issue', 'private_all_bindings'} else 'Implement the requested feature and verify it.'
     assert expected_body in record['issue']['body']
     assert record['superior_profile_id'] == ('pm' if scenario == 'private_all_bindings' else 'steward')
-    if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
+    if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_stop_nested', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
         from simple_worker_evidence import verify_dsh_work, verify_hermes_worker, remember_worker
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli.kanban_db_dispatch import dispatch_once
@@ -628,10 +628,10 @@ async def main():
                 except psutil.NoSuchProcess:
                     break
             await asyncio.sleep(.1)
-        assert current['dsh_execution']['state'] == ('budget_stopped' if scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_stop_unknown', 'worker_retry_failed'} else 'awaiting_acceptance'), current
+        assert current['dsh_execution']['state'] == ('budget_stopped' if scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_unknown', 'worker_retry_failed'} else 'awaiting_acceptance'), current
         assert (repo / 'native-delivery.txt').read_text() == 'native-worker\n'
         await receive(adapter, raw('om_status', text='@_user_1 核对 ' + record['id']))
-        assert sent[-1].message_id == 'om_status' and ('预算已触发停止' if scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_stop_unknown', 'worker_retry_failed'} else '开发与测试结果待验收，尚未交付') in sent[-1].request_body.content
+        assert sent[-1].message_id == 'om_status' and ('预算已触发停止' if scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_unknown', 'worker_retry_failed'} else '开发与测试结果待验收，尚未交付') in sent[-1].request_body.content
         assert record['issue']['url'] in sent[-1].request_body.content
         tasks = json.loads(registry.dispatch('kanban_list', {'limit': 200}))['tasks']
         assert sum(record['issue']['url'] in row.get('body', '') or row['id'] == record['card_id'] for row in tasks) == 1, 'Worker cannot create a second outer queue.'
@@ -676,8 +676,13 @@ async def main():
             (scratch / 'simple-smoke-result').write_text('passed')
             return
 
-        if scenario == 'worker_stop_uncovered':
-            child = psutil.Process(int((repo / 'pending-child.pid').read_text().strip()))
+        if scenario in {'worker_stop_uncovered', 'worker_stop_nested'}:
+            if scenario == 'worker_stop_nested':
+                children = [process for process in psutil.process_iter(['pid', 'cmdline', 'create_time']) if process.info['cmdline'] == ['/bin/sleep', model.nested_background_duration]]
+                assert len(children) == 1, 'The exact finite synthetic background child must be uniquely identified.'
+                child = children[0]
+            else:
+                child = psutil.Process(int((repo / 'pending-child.pid').read_text().strip()))
             child_birth = child.create_time()
             assert 'sleep' in child.name() and child.is_running(), 'Original Bash has an unregistered still-live descendant.'
             assert current['dsh_execution']['jobs'] == [], 'Original DSH job roster alone cannot prove absence of an escaped shell child.'
@@ -698,7 +703,7 @@ async def main():
             (scratch / 'simple-smoke-result').write_text('passed')
             return
 
-        if scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_stop_unknown', 'worker_retry_failed'}:
+        if scenario in {'worker_stop_terminal', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_unknown', 'worker_retry_failed'}:
             original_execution = current['dsh_execution']
             directory = state / 'owned-work' / record['id']
             budget_before = (directory / 'home/.hermes-budget.json').read_bytes()
@@ -739,11 +744,15 @@ async def main():
             model_calls = len(model.requests)
             await receive(adapter, raw('om_stop', text='@_user_1 停止 ' + record['id']))
             await receive(adapter, raw('om_late_dispatch'))
-            assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'] == stopped['dsh_execution']
+            assert {key: value for key, value in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
             assert len(model.requests) == model_calls
             card = json.loads(registry.dispatch('kanban_show', {'task_id': record['card_id']}))['task']
             assert card['status'] == 'blocked'
-            if scenario in {'worker_retry_terminal', 'worker_retry_failed', 'worker_retry_observer'}:
+            if scenario == 'worker_retry_message_history':
+                await receive(adapter, raw('om_stop_additional', text='@_user_1 停止 ' + record['id']))
+                assert '停止已核实' in sent[-1].request_body.content
+                assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution']['state'] == 'stopped'
+            if scenario in {'worker_retry_terminal', 'worker_retry_message_history', 'worker_retry_failed', 'worker_retry_observer'}:
                 original_files = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
                 reference = Path(binding['execution_ref'])
                 configured = json.loads(reference.read_text())
@@ -754,26 +763,35 @@ async def main():
                 model.worker_steps, model.dsh_steps = 0, 0
                 (scratch / 'issue-body-override').write_text(record['issue']['body'] + '\nChanged outside the accepted scope.')
                 await receive(adapter, raw('om_retry_changed', text='@_user_1 重试 ' + record['id']))
-                assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'] == stopped['dsh_execution']
+                assert {key: value for key, value in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
                 (scratch / 'issue-body-override').write_text(record['issue']['body'])
                 assert json.loads(registry.dispatch('kanban_unblock', {'task_id': foreign_card}))['ok'] is True
                 await receive(adapter, raw('om_retry_queued', text='@_user_1 重试 ' + record['id']))
-                assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'] == stopped['dsh_execution']
+                assert {key: value for key, value in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
                 assert json.loads(registry.dispatch('kanban_block', {'task_id': foreign_card, 'kind': 'needs_input', 'reason': 'Synthetic queue probe completed without dispatch.'}))['ok'] is True
                 configured['approved'] = False
                 reference.write_text(json.dumps(configured))
                 await receive(adapter, raw('om_retry_unapproved', text='@_user_1 重试 ' + record['id']))
-                assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'] == stopped['dsh_execution']
+                assert {key: value for key, value in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
                 configured['approved'] = True
                 reference.write_text(json.dumps(configured))
                 await receive(adapter, raw('om_retry',  text='@_user_1 重试 ' + record['id']))
                 retried = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
                 assert retried['dsh_execution']['state'] == 'admitted', {'work': retried, 'reply': sent[-1].request_body.content}
-                assert retried['execution_attempts'][0]['execution'] == stopped['dsh_execution']
+                assert {key: value for key, value in retried['execution_attempts'][0]['execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
+                assert {'om_stop', 'om_retry_changed', 'om_retry_queued', 'om_retry_unapproved', 'om_retry'} <= set(retried['execution_attempts'][0]['execution']['control_message_ids'])
+                if scenario == 'worker_retry_message_history':
+                    assert 'om_stop_additional' in retried['execution_attempts'][0]['execution']['control_message_ids']
                 assert retried['card_id'] == record['card_id'] and retried['source_anchor'] == record['source_anchor']
                 assert '独立新一轮' in sent[-1].request_body.content
                 await receive(adapter, raw('om_retry', text='@_user_1 重试 ' + record['id']))
                 assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0] == retried
+                if scenario == 'worker_retry_message_history':
+                    await receive(adapter, raw('om_retry_additional', text='@_user_1 重试 ' + record['id']))
+                    retried = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                    assert retried['dsh_execution']['state'] == 'admitted' and retried['dsh_execution']['attempt'] == 2
+                    assert 'om_retry_additional' in retried['dsh_execution']['control_message_ids']
+
                 if scenario == 'worker_retry_failed':
                     model.fail_worker_after = 3
                 with connect_closing() as db:
@@ -819,6 +837,9 @@ async def main():
                 assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['card_id'] == record['card_id']
                 assert len(list((state / 'owned-work').rglob('native-configuration.json'))) == 2
                 assert len([w for w in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work']]) == 1
+                if scenario == 'worker_retry_message_history':
+                    for index in range(2050):
+                        await receive(adapter, raw('om_cache_eviction_' + str(index), text='@_user_1 停止 work-ffffffffffffffffffffffffffffffff'))
                 assert plugins.unload('ghost-hermes-pm')
                 plugins.discover_and_load(force=True)
                 replacement = runner._create_adapter(platform, adapter.config)
@@ -828,8 +849,16 @@ async def main():
                 adapter = replacement
                 before_duplicate = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
                 new_budget_bytes = (new_directory / 'home/.hermes-budget.json').read_bytes()
-                await receive(adapter, raw('om_stop', text='@_user_1 停止 ' + record['id']))
+                await receive(adapter, raw('om_stop_additional' if scenario == 'worker_retry_message_history' else 'om_stop', text='@_user_1 停止 ' + record['id']))
+                if scenario == 'worker_retry_message_history':
+                    assert any(request.message_id == 'om_stop_additional' and ('前轮' in request.request_body.content or '停止已核实' in request.request_body.content) for request in sent[-2:]), 'Old m2 must reach the control consumer after native cache eviction/reload.'
                 after_duplicate = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                if scenario == 'worker_retry_message_history':
+                    (scratch / 'control-message-replay-evidence.json').write_text(json.dumps({'before': {key: before_duplicate['dsh_execution'].get(key) for key in ('state', 'generation', 'session_id', 'request_id', 'stop_requested')},
+                        'after': {key: after_duplicate['dsh_execution'].get(key) for key in ('state', 'generation', 'session_id', 'request_id', 'stop_requested')},
+                        'message_id': 'om_stop_additional', 'consumer_replies': [{'anchor': request.message_id, 'content': request.request_body.content} for request in sent[-2:]],
+                        'history_message_ids': after_duplicate['execution_attempts'][0]['execution'].get('control_message_ids', [])}))
+                    (scratch / 'control-message-replay-evidence.json').chmod(0o600)
                 assert all(after_duplicate['dsh_execution'][key] == before_duplicate['dsh_execution'][key] for key in ('state', 'generation', 'session_id', 'request_id'))
                 assert not after_duplicate['dsh_execution'].get('stop_requested') and not (new_directory / 'native-exit.json').exists()
                 assert after_duplicate['execution_attempts'] == before_duplicate['execution_attempts']
@@ -840,6 +869,20 @@ async def main():
                 assert stopped_second['dsh_execution']['state'] == 'stopped', stopped_second
                 assert stopped_second['dsh_execution']['generation'] == latest['dsh_execution']['generation']
                 assert (new_directory / 'home/.hermes-budget.json').read_bytes() == new_budget_bytes
+                if scenario == 'worker_retry_message_history':
+                    for index in range(2050):
+                        await receive(adapter, raw('om_retry_cache_eviction_' + str(index), text='@_user_1 停止 work-ffffffffffffffffffffffffffffffff'))
+                    assert plugins.unload('ghost-hermes-pm')
+                    plugins.discover_and_load(force=True)
+                    replacement = runner._create_adapter(platform, adapter.config)
+                    runner.adapters[platform] = replacement
+                    runner._wire_adapter_handlers(replacement)
+                    await connect_service(replacement, native)
+                    adapter = replacement
+                    await receive(adapter, raw('om_retry_additional', text='@_user_1 重试 ' + record['id']))
+                    replayed_retry = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                    assert replayed_retry['dsh_execution']['state'] == 'stopped' and replayed_retry['dsh_execution']['attempt'] == 2
+                    assert '原结果仍按记录核对' in sent[-1].request_body.content and sent[-1].message_id == 'om_retry_additional'
                 await receive(adapter, raw('om_retry_third', text='@_user_1 重试 ' + record['id']))
                 third = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
                 assert third['dsh_execution']['state'] == 'admitted' and third['dsh_execution']['attempt'] == 3, third
@@ -942,7 +985,7 @@ async def with_cleanup():
             model.dsh_release.set()
         cleanup_errors = []
         worker_exits, carrier_exits = [], []
-        if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
+        if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_stop_nested', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
             import importlib
             from simple_worker_evidence import cleanup_worker, carrier_exit_evidence
             for worker in known_workers:

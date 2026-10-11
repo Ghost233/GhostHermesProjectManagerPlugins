@@ -72,7 +72,7 @@ class RepositoryIntake(FeishuEntry):
         # Each observer owns its fields; a stale worker cannot replace replies.
         execution = record['dsh_execution']
         keys = list(fields) if fields is not None else [key for key in execution
-            if key not in {'questions', 'approvals', 'acceptance', 'delivery_notification', 'stop_requested', 'stop_control'}]
+            if key not in {'questions', 'approvals', 'acceptance', 'delivery_notification', 'stop_requested', 'stop_control', 'control_message_ids'}]
         if not keys:
             return
         arguments = []
