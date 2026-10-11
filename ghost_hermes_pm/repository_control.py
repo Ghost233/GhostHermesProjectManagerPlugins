@@ -1,0 +1,348 @@
+"""Owner requests end original execution before releasing its repository."""
+import asyncio
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import time
+
+import psutil
+
+from .manager import ManagementError
+from .repository_execution import execution_configuration, private_file
+from .repository_supervision import attach_existing_owned, original_history, original_jobs, owned_call, owned_instance
+
+
+def _record(intake, work_id):
+    return next(r for r in intake.snapshot()['work'] if r['id'] == work_id)
+
+
+def _card(intake, record):
+    path = Path(record['target']['repo_path']).resolve(strict=True)
+    if intake._verified_card(record, path, record['card_id']) != record['card_id']:
+        raise ManagementError('binding_conflict', 'The original outer card changed; repository remains occupied.')
+    return intake._kanban('kanban_show', {'task_id': record['card_id']})['task']
+
+
+def _worker_end(intake, record):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from .trusted_controller import controller_identity
+    with connect_closing(board=intake.board) as connection:
+        card = kb.get_task(connection, record['card_id'])
+        run = kb.latest_run(connection, record['card_id'])
+        runs = kb.list_runs(connection, record['card_id'])
+    if not card or card.status not in {'blocked', 'triage'} or card.current_run_id is not None or card.worker_pid is not None:
+        raise ManagementError('outcome_unknown', 'The original Kanban worker has not ended.')
+    claim = record['dsh_execution'].get('supervisor_claim')
+    if claim is None:
+        if run is not None:
+            prior = record.get('execution_attempts', [])
+            previous = prior[-1]['execution'].get('supervisor_claim') if prior else None
+            if not previous or run.id != previous['run_id'] or run.status == 'running' or run.ended_at is None:
+                raise ManagementError('outcome_unknown', 'An unregistered original worker requires reconciliation.')
+        return {'run_id': None, 'exit_code': None, 'not_started': True}
+    identity = claim['identity']
+    if not run or run.id != claim['run_id'] or run.task_id != card.id or run.worker_pid != identity['pid'] or run.status == 'running' or run.ended_at is None:
+        raise ManagementError('outcome_unknown', 'The original claimed run has not ended.')
+    if psutil.pid_exists(identity['pid']):
+        process = psutil.Process(identity['pid'])
+        birth = float(identity['start_sec']) + float(identity['start_usec']) / 1000000
+        if abs(process.create_time() - birth) < .000001:
+            if process.status() != psutil.STATUS_ZOMBIE and controller_identity(identity['pid']) != identity:
+                raise ManagementError('outcome_unknown', 'The original worker kernel binding differs.')
+            try:
+                process.wait(timeout=.05)
+            except psutil.TimeoutExpired:
+                raise ManagementError('outcome_unknown', 'The original worker process still exists.') from None
+    offset = claim.get('exit_log_offset')
+    path = kb.worker_log_path(card.id, board=intake.board)
+    size = path.stat().st_size
+    if offset is None:
+        if len(runs) != 1:
+            raise ManagementError('outcome_unknown', 'Original worker exit has no unambiguous run log boundary.')
+        offset = 0
+    if type(offset) is not int or offset < 0 or offset > size:
+        raise ManagementError('outcome_unknown', 'Original worker log boundary changed.')
+    text = kb.read_worker_log(card.id, tail_bytes=min(4000, size - offset), board=intake.board)
+    if not isinstance(text, str):
+        raise ManagementError('outcome_unknown', 'The original worker log is unavailable.')
+    codes = re.findall(r'^\[kanban-worker-exit\] rc=(-?\d+)\s*$', text, re.MULTILINE)
+    if not codes or codes[-1] != '0':
+        raise ManagementError('outcome_unknown', 'The original worker has no successful native exit receipt.')
+    return {'run_id': run.id, 'identity': identity, 'exit_code': 0}
+
+
+def _carrier_end(intake, record):
+    directory = owned_instance(intake, record)
+    execution = record['dsh_execution']
+    configuration = json.loads(private_file(directory / 'native-configuration.json').read_text())
+    identity = json.loads(private_file(directory / 'native-identity.json').read_text())
+    birth = json.loads(private_file(directory / 'process-birth.json').read_text())
+    receipt = json.loads(private_file(directory / 'native-exit.json').read_text())
+    if (identity != execution['native_identity'] or configuration['generation'] != execution['generation']
+        or configuration['session_id'] != execution['session_id'] or birth['generation'] != execution['generation']
+        or birth['pid'] != identity['pid'] or receipt.get('exit_code') != 0 or receipt.get('shutdown_requested') is not True
+        or any(receipt.get(k) != identity[k] for k in ('pid', 'generation', 'created_at_ms', 'configuration_sha256'))
+        or Path(configuration['socket_path']).exists()):
+        raise ManagementError('outcome_unknown', 'The original carrier has no verified normal exit.')
+    try:
+        process = psutil.Process(birth['pid'])
+        if process.create_time() == birth['created_at']:
+            try:
+                process.wait(timeout=2)
+            except psutil.TimeoutExpired:
+                raise ManagementError('outcome_unknown', 'The original carrier generation still exists.') from None
+    except psutil.NoSuchProcess:
+        pass
+    return receipt
+
+
+def _execution_coverage(intake, record, control):
+    """Release proof covers finite static file commands, never arbitrary Bash."""
+    directory = owned_instance(intake, record)
+    path = directory / 'home/.hermes-tool-receipts.jsonl'
+    receipts = [json.loads(line) for line in private_file(path).read_text().splitlines()] if path.exists() else []
+    calls = control.get('session_end', {}).get('tool_calls', [])
+    if sorted((row['call_id'], row['name']) for row in receipts) != sorted((row['id'], row['name']) for row in calls):
+        raise ManagementError('coverage_unverified', 'Original tool settlement coverage is incomplete.')
+    for receipt in receipts:
+        if receipt.get('generation') != record['dsh_execution']['generation'] or receipt.get('session_id') != record['dsh_execution']['session_id']:
+            raise ManagementError('coverage_unverified', 'Original tool settlement belongs to another execution.')
+        if receipt['name'] in {'skill', 'ask_user_question', 'job_list', 'job_output', 'job_kill'}:
+            continue
+        command = receipt.get('command', '')
+        if (receipt['name'] != 'bash' or receipt.get('kind') != 'foreground' or receipt.get('exit_code') != 0
+            or receipt.get('is_error') is not False or receipt.get('aborted') is not False or receipt.get('timed_out') is not False
+            or receipt.get('sandbox') != {'mode': 'workspace-write', 'denied': False, 'enforcement': 'full'}
+            or not command or any(value in command for value in ('$','`','\n'))):
+            raise ManagementError('coverage_unverified', 'This execution exceeds the verified foreground stop scope.')
+        tokens = list(shlex.shlex(command, posix=True, punctuation_chars=';&|<>()'))
+        start, redirect = True, False
+        for token in tokens:
+            if token in {'&&', ';', '|'} and not start and not redirect:
+                start = True
+            elif token in {'>', '>>', '<'} and not start and not redirect:
+                redirect = True
+            elif token in {'&', '||', '(', ')', '<<', '>&', '<&'} or start and token not in {'printf', '/bin/cat', '/usr/bin/cmp'}:
+                raise ManagementError('coverage_unverified', 'This command has no verified finite file-operation stop proof.')
+            else:
+                start, redirect = False, False
+        if start or redirect:
+            raise ManagementError('coverage_unverified', 'Original command coverage is incomplete.')
+    return {'scope': 'static_foreground_file_operations', 'settled_call_ids': [row['call_id'] for row in receipts]}
+
+
+async def _stop(intake, record, generation):
+    execution = record.get('dsh_execution')
+    if not execution:
+        raise ManagementError('configuration_missing', 'No dedicated execution is registered.')
+    if execution['state'] == 'stopped':
+        return record
+    control = execution.get('stop_control', {})
+    carrier = None
+    try:
+        card = _card(intake, record)
+        if card['status'] == 'ready':
+            intake._kanban('kanban_block', {'task_id': record['card_id'], 'kind': 'needs_input',
+                'reason': 'Owner requested termination; original execution cleanup must be verified.'})
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            intake.require_active(generation)
+            record = _record(intake, record['id'])
+            execution = record['dsh_execution']
+            if execution.get('native_identity') or not execution.get('generation'):
+                break
+            await asyncio.sleep(.05)
+        if execution.get('native_identity'):
+            directory = owned_instance(intake, record)
+            if not (directory / 'native-exit.json').exists():
+                carrier = attach_existing_owned(intake, record)
+                while time.monotonic() < deadline:
+                    intake.require_active(generation)
+                    sessions = await asyncio.to_thread(owned_call, carrier, 'session/list', {})
+                    rows = [row for row in sessions['items'] if row['sessionId'] == execution['session_id']]
+                    if len(rows) != 1 or rows[0].get('cwd') != record['target']['repo_path'] or rows[0].get('agentAvailable') is not True:
+                        raise ManagementError('outcome_unknown', 'The original session identity is unavailable.')
+                    if rows[0].get('running') is True and not control.get('cancel_status'):
+                        control['cancel_status'] = 'intent'
+                        execution['stop_control'] = control
+                        intake._save_execution(record, fields=['stop_control'])
+                        answer = await asyncio.to_thread(owned_call, carrier, 'session/cancel', {'sessionId': execution['session_id']})
+                        if answer.get('accepted') is not True:
+                            raise ManagementError('outcome_unknown', 'Original cancel admission remains unknown.')
+                        control['cancel_status'] = 'accepted'
+                        intake._save_execution(record, fields=['stop_control'])
+                    events, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], record['target']['repo_path'])
+                    starts = [event for event in events if event['type'] == 'turn/start']
+                    ends = [event for event in events if event['type'] == 'turn/end']
+                    inbox = projections.get('inbox')
+                    jobs = await asyncio.to_thread(original_jobs, carrier, execution['session_id'])
+                    if (rows[0].get('running') is False and (not starts or ends and ends[-1]['seq'] > starts[-1]['seq'])
+                        and isinstance(inbox, dict) and set(inbox) == {'next-turn', 'next-step'} and not any(inbox.values())
+                        and not any(job['status'] in {'running', 'stopping'} for job in jobs)):
+                        control['session_end'] = {'session_id': execution['session_id'], 'generation': execution['generation'],
+                            'journal_cursor': events[-1]['seq'] if events else -1,
+                            'tool_calls': [{'id': event['data']['callId'], 'name': event['data']['name']}
+                                for event in events if event['type'] == 'tool/call'],
+                            'jobs': [{'id': job['id'], 'status': job['status']} for job in jobs]}
+                        execution['stop_control'] = control
+                        intake._save_execution(record, fields=['stop_control'])
+                        await asyncio.to_thread(carrier.shutdown_owned)
+                        break
+                    await asyncio.sleep(.05)
+                else:
+                    raise ManagementError('outcome_unknown', 'Original execution or background jobs remain unconfirmed.')
+            if not control.get('session_end'):
+                raise ManagementError('outcome_unknown', 'No original session and background-task end proof exists.')
+            exit_receipt = await asyncio.to_thread(_carrier_end, intake, record)
+        elif execution.get('generation'):
+            raise ManagementError('outcome_unknown', 'Original native startup remains unconfirmed.')
+        else:
+            exit_receipt = {'not_started': True}
+        coverage = _execution_coverage(intake, record, control) if execution.get('native_identity') else {'scope': 'not_started'}
+        while time.monotonic() < deadline:
+            intake.require_active(generation)
+            try:
+                worker = _worker_end(intake, _record(intake, record['id']))
+                break
+            except ManagementError as error:
+                if error.code != 'outcome_unknown':
+                    raise
+            await asyncio.sleep(.05)
+        else:
+            raise ManagementError('outcome_unknown', 'Original outer worker exit remains unconfirmed.')
+        from .repository_acceptance import repository_source_state
+        source = await asyncio.to_thread(repository_source_state, record['target'])
+        intake.require_active(generation)
+        record = _record(intake, record['id'])
+        execution = record['dsh_execution']
+        control.update(status='stopped', proof={'carrier': exit_receipt, 'worker': worker, 'repository': source, 'coverage': coverage})
+        execution.update(state='stopped', stop_control=control)
+        intake._save_execution(record, fields=['state', 'stop_control'])
+        return record
+    finally:
+        if carrier is not None:
+            carrier.close()
+
+
+async def _retry(intake, record, prepared, generation):
+    execution = record['dsh_execution']
+    if execution.get('retry_control', {}).get('message_id') == prepared.envelope['message_id']:
+        return record
+    if execution.get('state') != 'stopped' or execution.get('stop_control', {}).get('status') != 'stopped':
+        raise ManagementError('outcome_unknown', 'Explicit retry requires confirmed original execution cleanup.')
+    card = _card(intake, record)
+    _worker_end(intake, record)
+    if execution.get('native_identity'):
+        _carrier_end(intake, record)
+        _execution_coverage(intake, record, execution['stop_control'])
+    from .manager import _git
+    def repository_key(path):
+        path = Path(path).resolve(strict=True)
+        common = Path(_git(path, 'rev-parse', '--git-common-dir'))
+        return (path / common).resolve(strict=True) if not common.is_absolute() else common.resolve(strict=True)
+    key = repository_key(record['target']['repo_path'])
+    for other in intake.snapshot()['work']:
+        if other['id'] != record['id'] and repository_key(other['target']['repo_path']) == key and other.get('dsh_execution', {}).get('state') not in {'stopped', 'released'}:
+            raise ManagementError('repository_busy', 'Earlier repository work must be reconciled before retry.')
+    listing = intake._kanban('kanban_list', {'include_archived': True, 'limit': 200})
+    if listing.get('truncated') is not False:
+        raise ManagementError('outcome_unknown', 'Native repository queue coverage is incomplete.')
+    for queued in listing.get('tasks', []):
+        if queued['id'] != record['card_id'] and queued.get('status') in {'ready', 'running', 'todo', 'scheduled'} and queued.get('workspace_kind') == 'dir':
+            if repository_key(queued['workspace_path']) == key:
+                raise ManagementError('repository_busy', 'Native repository work is already queued; retry cannot bypass it.')
+    target, _ = intake._target(prepared.binding, '派发 ' + record['profile_id'] + ' ' + record['issue']['url'])
+    if target is None or any(target.get(field) != record['target'].get(field) for field in ('profile_id', 'native_profile', 'repository')) or repository_key(target['repo_path']) != key:
+        raise ManagementError('binding_conflict', 'Current registered responsibility differs from the original work.')
+    target = dict(record['target'], execution_ref=target.get('execution_ref'))
+    admitted, _ = execution_configuration(target)
+    issue = await asyncio.to_thread(intake.github.read_issue, record['issue']['url'])
+    intake.require_active(generation)
+    if any(issue.get(field) != record['issue'].get(field) for field in ('url', 'title', 'body', 'updated_at')):
+        raise ManagementError('binding_conflict', 'The original frozen Issue changed; accept a new scope explicitly.')
+    from .repository_acceptance import repository_source_state
+    from .trusted_controller import controller_identity
+    source = repository_source_state(target)
+    with intake.lifecycle_lock:
+        intake.require_active(generation)
+        history = record.setdefault('execution_attempts', [])
+        history.append({'execution': execution, 'target': record['target'], 'gateway_controller': record['gateway_controller']})
+        record.update(target=target, gateway_controller=controller_identity(), dsh_execution={
+            'state': 'admitted', 'attempt': len(history) + 1, 'reference_sha256': admitted['reference_sha256'],
+            'admitted_budget': admitted['runtime_configuration']['budget'], 'retry_control': {
+                'message_id': prepared.envelope['message_id'], 'status': 'accepted', 'dispatch_status': 'intent', 'repository': source}})
+        intake._save(record)
+        if card['status'] == 'triage':
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                    raise ManagementError('outcome_unknown', 'Original native triage respecification remains unconfirmed.')
+                if kb.get_task(connection, record['card_id']).status not in {'todo', 'ready'}:
+                    raise ManagementError('outcome_unknown', 'Original native parent-gated retry phase remains unconfirmed.')
+        else:
+            intake._kanban('kanban_unblock', {'task_id': record['card_id']})
+        current = _record(intake, record['id'])
+        current['dsh_execution']['retry_control']['dispatch_status'] = 'accepted'
+        intake._save_execution(current, fields=['retry_control'])
+        record = current
+    return record
+
+
+async def process_control(intake, prepared, generation):
+    async with intake.lock:
+        descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            while True:
+                intake.require_active(generation)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(.02)
+            intake.require_active(generation)
+            record = _record(intake, prepared.work_id)
+            execution = record['dsh_execution']
+            historical = any(prepared.envelope['message_id'] == previous['execution'].get(field, {}).get('message_id')
+                for previous in record.get('execution_attempts', []) for field in ('stop_control', 'retry_control'))
+            if historical:
+                text, result = '这是前轮已受理的控制消息；本轮执行没有改变。', {'status': 'duplicate', 'work_id': record['id']}
+            elif prepared.command.startswith('重试 '):
+                record = await _retry(intake, record, prepared, generation)
+                text = '已受理独立新一轮执行；沿用原总 Issue 和外层卡，旧会话、预算与失败记录完整保留，等待原生派发。'
+                result = {'status': record['dsh_execution']['state'], 'work_id': record['id']}
+            else:
+                if not execution.get('stop_requested'):
+                    _card(intake, record)
+                    execution.update(stop_requested=True, stop_control={'message_id': prepared.envelope['message_id'],
+                        'prior_state': execution['state'], 'status': 'intent'})
+                    intake._save_execution(record, fields=['stop_requested', 'stop_control'])
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                record = await _stop(intake, record, generation)
+                text = '停止已核实；改动、原会话、预算与失败记录保留。原外层卡保持待处理，可安排后续仓库工作。'
+                result = {'status': 'stopped', 'work_id': record['id']}
+        except (ManagementError, ValueError, KeyError, OSError, TimeoutError, psutil.NoSuchProcess, psutil.AccessDenied) as error:
+            intake.require_active(generation)
+            record = _record(intake, prepared.work_id)
+            execution = record.get('dsh_execution', {})
+            if prepared.command.startswith('停止 ') and execution.get('stop_control'):
+                execution['stop_control'].update(status='unverified',
+                    last_failure={'code': error.code if isinstance(error, ManagementError) else 'outcome_unknown',
+                        'type': type(error).__name__, 'message': str(error) if isinstance(error, ManagementError) else 'Original cleanup remains unconfirmed.'})
+                intake._save_execution(record, fields=['stop_control'])
+            text = ('重试未受理；原工作与记录保留，先核对停止、当前配置、Issue 和仓库队列。' if prepared.command.startswith('重试 ')
+                else '停止尚未核实；保留仓库占用，不启动重试或后续工作。原记录与改动保留。')
+            result = {'status': 'unverified', 'code': error.code if isinstance(error, ManagementError) else 'outcome_unknown',
+                'repository_retained': True}
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        await prepared.transport.send({'uuid': hashlib.sha256(('work-control:' + prepared.envelope['message_id']).encode()).hexdigest()[:32],
+            'text': text, 'chat_id': prepared.envelope['chat_id'], 'reply_to': prepared.envelope['message_id']})
+        intake.require_active(generation)
+        return result

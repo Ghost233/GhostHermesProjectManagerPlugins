@@ -7,10 +7,12 @@ import time
 
 
 class WorkerModelService:
-    def __init__(self, query_lock=None, refuse=False, hold_dsh=False):
+    def __init__(self, query_lock=None, refuse=False, hold_dsh=False, budget_stop=False, hold_after_write=False, uncovered_shell=False, static_commands=False, question_after_write=False):
         self.requests = []
         self.worker_steps = 0
         self.dsh_steps = 0
+        self.budget_stop = budget_stop
+        self.fail_worker_after = None
         self.foreign_task_id = None
         self.query_ready = threading.Event()
         self.dsh_ready = threading.Event()
@@ -34,6 +36,8 @@ class WorkerModelService:
                 expected_key = 'synthetic-model-only-key' if worker else 'synthetic-only-key'
                 authenticated = self.headers.get('Authorization') == 'Bearer ' + expected_key
                 service.requests.append({'worker': worker, 'tool_names': names,
+                    'ordinary_canary': any('请回复普通会话测试' in str(message.get('content', '')) for message in payload.get('messages', [])),
+                    'historical_question_reply': any('colour：Blue' in str(message.get('content', '')) for message in payload.get('messages', [])),
                     'authentication_accepted': authenticated,
                     'outer_instructions_present': any('Managed outer card:' in str(m.get('content', '')) for m in payload.get('messages', [])),
                     'skill_catalog': any('fixture-matt' in str(m.get('content', '')) for m in payload.get('messages', []))})
@@ -43,6 +47,12 @@ class WorkerModelService:
                     self.end_headers()
                     self.wfile.write(json.dumps({'error': {'message': 'Synthetic model authentication failed.',
                         'type': 'authentication_error'}}).encode())
+                    return
+                if worker and service.fail_worker_after is not None and service.worker_steps + 1 >= service.fail_worker_after:
+                    self.send_response(401)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":{"message":"The finite synthetic worker provider is unavailable.","type":"authentication_error"}}')
                     return
                 if worker:
                     service.worker_steps += 1
@@ -65,8 +75,16 @@ class WorkerModelService:
                     service.dsh_steps += 1
                     call = (('skill', {'name': 'fixture-matt'}) if service.dsh_steps == 1 else
                         ('bash', {'description': 'Write and verify one bounded synthetic work result.',
-                                 'command': "printf 'native-worker\\n' > native-delivery.txt && cat native-delivery.txt"}) if service.dsh_steps == 2 else None)
-                    if hold_dsh and service.dsh_steps == 1:
+                                 'command': "printf 'native-worker\\n' > native-delivery.txt && cat native-delivery.txt"}) if service.dsh_steps == 2 else ('skill', {'name': 'fixture-matt'}) if service.budget_stop else None)
+                    if static_commands and service.dsh_steps == 2:
+                        call = ('bash', {'description': 'Write and verify one bounded static file result.',
+                            'command': "printf 'native-worker\\n' > native-delivery.txt && /bin/cat native-delivery.txt"})
+                    if question_after_write and service.dsh_steps == 3:
+                        call = ('ask_user_question', {'timeout': -1, 'questions': [{'id': 'colour', 'question': 'Which colour?', 'options': [{'label': 'Blue'}, {'label': 'Green'}]}]})
+                    if uncovered_shell and service.dsh_steps == 2:
+                        call = ('bash', {'description': 'Demonstrate a foreground receipt with an unregistered finite descendant.',
+                            'command': "sleep 20 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > pending-child.pid; printf 'native-worker\\n' > native-delivery.txt"})
+                    if hold_dsh and service.dsh_steps == 1 or hold_after_write and service.dsh_steps == 3:
                         service.dsh_ready.set()
                         if not service.dsh_release.wait(timeout=45):
                             raise AssertionError('Bounded external DSH response was not released.')

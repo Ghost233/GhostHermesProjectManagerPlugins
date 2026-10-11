@@ -72,7 +72,7 @@ class RepositoryIntake(FeishuEntry):
         # Each observer owns its fields; a stale worker cannot replace replies.
         execution = record['dsh_execution']
         keys = list(fields) if fields is not None else [key for key in execution
-            if key not in {'questions', 'approvals', 'acceptance', 'delivery_notification'}]
+            if key not in {'questions', 'approvals', 'acceptance', 'delivery_notification', 'stop_requested', 'stop_control'}]
         if not keys:
             return
         arguments = []
@@ -83,8 +83,10 @@ class RepositoryIntake(FeishuEntry):
         changes = ','.join('?, json(?)' for _ in keys)
         with sqlite3.connect(self.database) as db:
             changed = db.execute("UPDATE work SET data=json_set(data, '$.dsh_execution', "
-                "json_set(json_extract(data, '$.dsh_execution'), " + changes + ")) WHERE id=?",
-                (*arguments, record['id'])).rowcount
+                "json_set(json_extract(data, '$.dsh_execution'), " + changes + ")) WHERE id=? AND "
+                "(json_extract(data, '$.dsh_execution.generation') IS NULL OR json_extract(data, '$.dsh_execution.generation')=?) "
+                "AND COALESCE(json_extract(data, '$.dsh_execution.attempt'), 1)=?",
+                (*arguments, record['id'], execution.get('generation'), execution.get('attempt', 1))).rowcount
         if changed != 1:
             raise ManagementError('outcome_unknown', 'The original outer work must be reconciled before saving execution.')
 
@@ -159,11 +161,19 @@ class RepositoryIntake(FeishuEntry):
             except ManagementError:
                 if human_reply is not None:
                     return replace(human_reply, command='', rejected='sensitive')
-                if command.startswith(('派发 ', '工作 ', '核对 ')):
+                if command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '重试 ')):
                     return WorkMessage(event, adapter, transport, binding, envelope, {}, '', None, rejected='sensitive')
                 return None
-            if human_reply is not None:
+            if human_reply is not None and not re.fullmatch(r'(停止|重试) work-[a-f0-9]{32}', command):
                 return human_reply
+            control = re.fullmatch(r'(停止|重试) (work-[a-f0-9]{32})', command)
+            if control:
+                record = next((r for r in self.snapshot()['work'] if r['id'] == control.group(2)), None)
+                if sender.sender_type != 'user' or record is None or record['profile_id'] not in authorized_profiles:
+                    return WorkMessage(event, adapter, transport, binding, envelope, {}, command, None,
+                        rejected='scope', action='control')
+                return WorkMessage(event, adapter, transport, binding, envelope, record['target'], command, None,
+                    record['id'], action='control')
             if re.fullmatch(r'核对 work-[a-f0-9]{32}', command):
                 record = next((r for r in self.snapshot()['work'] if r['id'] == command.split()[1]), None)
                 if record and record['profile_id'] in authorized_profiles:
@@ -228,7 +238,7 @@ class RepositoryIntake(FeishuEntry):
         except (TypeError, KeyError, OSError):
             return None
         target = record['target']
-        statuses = {'blocked', 'ready', 'running'} if record.get('dsh_execution') else {'blocked'}
+        statuses = {'blocked', 'ready', 'running', 'triage'} if record.get('dsh_execution') else {'blocked'}
         if record.get('dsh_execution', {}).get('acceptance', {}).get('status') == 'accepted':
             statuses.add('done')
         if (card.get('assignee') != target['native_profile'] or card.get('workspace_kind') != 'dir'
@@ -367,6 +377,7 @@ class RepositoryIntake(FeishuEntry):
         if prepared.action != 'work' and prepared.rejected:
             text = ('敏感答复请在原生私有界面处理；本轮没有通过群消息回送。' if prepared.rejected == 'sensitive'
                     else '本次决定未匹配唯一具体审批；请引用当前审批通知或明确审批 ID。原权限和审批结果没有改变。' if prepared.action == 'approval'
+                    else '停止和重试仅接受本人对已登记工作的明确请求；未改变执行或预算。' if prepared.action == 'control'
                     else '无法唯一关联本次答复与当前原问题。请引用正确轮次的提问消息，并通过平台选择器真实 @ 发问机器人。')
             await prepared.transport.send({'uuid': hashlib.sha256(('private-answer:' + prepared.envelope['message_id']).encode()).hexdigest()[:32],
                 'text': text,
@@ -379,6 +390,9 @@ class RepositoryIntake(FeishuEntry):
         if prepared.action == 'question':
             from .repository_questions import process_reply
             return await process_reply(self, prepared, generation)
+        if prepared.action == 'control':
+            from .repository_control import process_control
+            return await process_control(self, prepared, generation)
         async with self.lock:
             self.require_active(generation)
             if prepared.rejected:
@@ -426,6 +440,7 @@ class RepositoryIntake(FeishuEntry):
                         'input_intent': '首次输入受理待核对', 'running': '专用 DSH 正在执行',
                         'awaiting_acceptance': '开发与测试结果待验收，尚未交付', 'budget_stopped': '预算已触发停止，等待明确处理',
                         'execution_failed': '原执行异常，等待处理', 'outcome_unknown': '原执行结果未知，保留仓库占用'}
+                    labels.update(stop_requested='停止正在核对，保留仓库占用', stopped='停止已核实，改动与历史保留')
                     if prepared.work_id:
                         text = '原工作状态：' + labels.get(record['dsh_execution']['state'], '原执行状态待核对') + '\n' + record['issue']['url']
                         acceptance = record['dsh_execution'].get('acceptance')

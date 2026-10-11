@@ -81,6 +81,8 @@ def _approval_card(record, notice):
         status = '原审批：' + {'allowed-once': '已允许本次操作', 'rejected': '已拒绝操作',
             'cancelled': '已取消', 'unavailable': '不可用，操作未获许可'}[notice['outcome']]
         status += '\n原工具：' + {'pending': '尚未结束', 'failed': '失败', 'settled': '已结束'}[notice['operation_state']]
+    elif execution.get('stop_requested'):
+        status = '原工作已收到停止指令；审批已失效，不接受新的决定。'
     elif execution['state'] in _TERMINAL:
         status = '原工作已结束；审批已失效，不能再决定。'
     elif notice.get('reply_status') == 'outcome_unknown':
@@ -91,7 +93,7 @@ def _approval_card(record, notice):
         status = '等待本人决定；仅允许上述本次操作，不改变常驻权限。文字审批 ID 答复仍可使用。'
     elements.append({'tag': 'div', 'text': {'tag': 'plain_text', 'content': status}})
     if (notice['answerable'] and notice['state'] == 'pending' and not notice.get('reply_status')
-            and execution['state'] not in _TERMINAL):
+            and execution['state'] not in _TERMINAL and not execution.get('stop_requested')):
         values = {'kind': 'hermes-operation-approval', 'approval_id': notice['approval_id'],
                   'binding_sha256': _approval_binding_digest(notice)}
         elements.append({'tag': 'action', 'actions': [
@@ -130,7 +132,7 @@ def prepare_card_action(intake, payload, adapter):
             and notice.get('request_message_id') == context['open_message_id'] and notice['approval_id'] == value['approval_id']
             and all(notice.get('delivery', {}).get(key) == binding[key] for key in _NAMESPACE)
             and notice['answerable'] and notice['state'] == 'pending' and not notice.get('reply_status')
-            and record['dsh_execution']['state'] not in _TERMINAL
+            and record['dsh_execution']['state'] not in _TERMINAL and not record['dsh_execution'].get('stop_requested')
             and notice['generation'] == record['dsh_execution']['generation']
             and notice['session_id'] == record['dsh_execution']['session_id']
             and notice['work_id'] == record['id'] and notice['card_id'] == record['card_id']
@@ -194,9 +196,10 @@ async def refresh_released_approval_cards(intake, record, generation):
             intake.require_active(generation)
             fresh = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])
             execution = fresh['dsh_execution']
-            if execution['state'] != 'released':
+            stopping = execution.get('stop_requested')
+            if execution['state'] != 'released' and not stopping:
                 return
-            notices = [notice for notice in execution.get('approvals', [])
+            notices = execution.get('approvals', []) if stopping else [notice for notice in execution.get('approvals', [])
                        if notice['state'] == 'resolved' and notice['operation_state'] != 'pending'
                        and notice.get('card_updates', {}).get(hashlib.sha256(json.dumps(
                            _approval_card(fresh, notice), sort_keys=True, ensure_ascii=False).encode()).hexdigest()) == 'failed']
@@ -271,6 +274,9 @@ async def observe_approvals(intake, record, carrier, events, projections, genera
 async def _observe_approvals(intake, record, carrier, events, generation):
     intake.require_active(generation)
     execution = record['dsh_execution']
+    current = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])['dsh_execution']
+    if current.get('stop_requested') or current.get('generation') != execution.get('generation'):
+        return
     frames = await asyncio.to_thread(carrier.event_frames)
     if frames.get('generation') != execution['generation'] or frames.get('session_id') != execution['session_id']:
         raise ManagementError('binding_conflict', 'Original approval observer identity differs.')
@@ -400,7 +406,7 @@ async def process_approval_reply(intake, prepared, generation):
             notice = matches[0]
             if (not notice['answerable'] or notice['generation'] != execution['generation']
                 or notice['session_id'] != execution['session_id'] or notice['work_id'] != record['id']
-                or notice['card_id'] != record['card_id'] or execution['state'] in _TERMINAL
+                or notice['card_id'] != record['card_id'] or execution['state'] in _TERMINAL or execution.get('stop_requested')
                 or any(notice['delivery'].get(key) != prepared.envelope.get(key) for key in _NAMESPACE)):
                 raise ManagementError('binding_conflict', 'Original approval reply binding is no longer current.')
             if (prepared.action == 'approval_card'

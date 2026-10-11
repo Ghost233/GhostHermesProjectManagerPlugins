@@ -176,7 +176,7 @@ def attach_existing_owned(intake, record):
     """Attach a registered generation; absence never starts replacement work."""
     from .dsh_owned_transport import PersistentOwnedTransport
     execution = record['dsh_execution']
-    instance = intake.state_dir / 'owned-work' / record['id']
+    instance = owned_instance(intake, record)
     if (not execution.get('native_identity') or not (instance / 'native-configuration.json').is_file()
         or not (instance / 'native-identity.json').is_file()):
         raise ManagementError('outcome_unknown', 'Original owned execution is not registered.')
@@ -195,6 +195,14 @@ def attach_existing_owned(intake, record):
             GH_ENTERPRISE_TOKEN='', GITHUB_ENTERPRISE_TOKEN='')
     return PersistentOwnedTransport(instance_dir=str(instance), configuration=configuration,
         node_bin=configuration.pop('node_bin'), timeout=15, environment=environment, attach_only=True)
+
+
+def owned_instance(intake, record):
+    attempt = record.get('dsh_execution', {}).get('attempt', 1)
+    if type(attempt) is not int or attempt < 1:
+        raise ManagementError('binding_conflict', 'Original execution attempt identity differs.')
+    directory = intake.state_dir / 'owned-work' / record['id']
+    return directory if attempt == 1 else directory / ('attempt-' + str(attempt))
 
 
 def _admit_resumed_worker(intake, record, carrier):
@@ -237,6 +245,7 @@ def _admit_resumed_worker(intake, record, carrier):
     identity = controller_identity(card.worker_pid)
     carrier.admit_controller(identity)
     execution['supervisor_claim'] = {'run_id': card.current_run_id, 'identity': identity}
+    execution['supervisor_claim']['exit_log_offset'] = kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size
     intake._save_execution(record, fields=['supervisor_claim'])
 
 
@@ -257,12 +266,12 @@ async def observe_human_requests(intake):
                             await notify_acceptance(intake, record, intake.generation)
                         except ManagementError:
                             pass
-                    if execution.get('state') == 'released':
+                    if execution.get('state') == 'released' or execution.get('stop_requested'):
                         try:
                             await refresh_released_approval_cards(intake, record, intake.generation)
                         except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES):
                             pass
-                    if not execution.get('native_identity') or execution.get('state') == 'released':
+                    if not execution.get('native_identity') or execution.get('state') in {'released', 'stopped'} or execution.get('stop_requested'):
                         carrier = carriers.pop(record['id'], None)
                         if carrier is not None:
                             carrier.close()
@@ -318,7 +327,8 @@ def register_repository_supervision(ctx, intake):
                     supplied = args or {}
                     if (supplied.get('task_id', card_id) != card_id or supplied.get('board', intake.board) != intake.board
                         or supplied.get('kind') != 'needs_input'
-                        or record.get('dsh_execution', {}).get('state') not in {'awaiting_acceptance', 'budget_stopped', 'execution_failed', 'outcome_unknown'}):
+                        or record.get('dsh_execution', {}).get('state') not in {'awaiting_acceptance', 'budget_stopped', 'execution_failed', 'outcome_unknown', 'stop_requested'}
+                        and not record.get('dsh_execution', {}).get('stop_requested')):
                         raise ManagementError('unauthorized', 'Original supervision handoff is unverified.')
                     return
                 except ManagementError:
@@ -370,22 +380,29 @@ def register_repository_supervision(ctx, intake):
             intake.require_active(generation)
             record = next(r for r in intake.snapshot()['work'] if r['id'] == record['id'])
             execution = record['dsh_execution']
+            if not execution.get('supervisor_claim'):
+                from hermes_cli import kanban_db as kb
+                execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
+                    'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
+                intake._save_execution(record, fields=['supervisor_claim'])
+            if execution.get('stop_requested'):
+                return {'status': 'stop_requested', 'card_id': record['card_id'], 'next_action': 'kanban_block',
+                        'block_kind': 'needs_input', 'delivered': False}
+            if execution.get('retry_control', {}).get('status', 'accepted') != 'accepted':
+                raise ManagementError('outcome_unknown', 'Explicit retry dispatch admission remains unconfirmed.')
             if execution['state'] in {'budget_stopped', 'execution_failed'}:
                 current_worker(ctx, intake, record)
                 return {'status': execution['state'], 'card_id': record['card_id'],
                         'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
             occupied = [r for r in intake.snapshot()['work'] if r['id'] != record['id'] and r['target'].get('repo_path') == record['target']['repo_path']
-                and r.get('dsh_execution', {}).get('state') not in {None, 'admitted', 'released'}]
+                and r.get('dsh_execution', {}).get('state') not in {None, 'admitted', 'released', 'stopped'}]
             if occupied:
                 raise ManagementError('repository_busy', 'Earlier original work still retains this repository.')
             if 'generation' not in execution:
                 execution.update(state='startup_intent', generation=str(uuid.uuid4()), instance_id=record['id'],
                     session_id='hermes-' + uuid.uuid4().hex, request_id='input-' + uuid.uuid4().hex)
                 intake._save_execution(record)
-            if not execution.get('supervisor_claim'):
-                execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity()}
-                intake._save_execution(record, fields=['supervisor_claim'])
-            instance = intake.state_dir / 'owned-work' / record['id']
+            instance = owned_instance(intake, record)
             from .repository_github import prepare_github_execution
             prepared_github = await asyncio.to_thread(prepare_github_execution, intake.github, record['target'],
                 instance, execution['generation'])
@@ -467,6 +484,9 @@ def register_repository_supervision(ctx, intake):
             while time.monotonic() < deadline:
                 intake.require_active(generation)
                 current_worker(ctx, intake, record)
+                if next(r for r in intake.snapshot()['work'] if r['id'] == record['id'])['dsh_execution'].get('stop_requested'):
+                    return {'status': 'stop_requested', 'card_id': record['card_id'], 'next_action': 'kanban_block',
+                            'block_kind': 'needs_input', 'delivered': False}
                 if time.monotonic() - heartbeat_at >= 30:
                     native_call(ctx, 'kanban_heartbeat', {'task_id': record['card_id'], 'board': intake.board})
                     heartbeat_at = time.monotonic()

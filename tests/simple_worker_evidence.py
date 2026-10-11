@@ -111,7 +111,11 @@ def cleanup_worker(worker, home):
             code = process.wait(timeout=15)
             return {**worker, 'exit_code': code, 'cleanup': 'native_scope_cleanup'}
     except psutil.NoSuchProcess:
-        text = (home / 'kanban/logs' / (worker['task_id'] + '.log')).read_text()
+        payload = (home / 'kanban/logs' / (worker['task_id'] + '.log')).read_bytes()
+        if worker.get('exit_log_bytes') is not None:
+            assert len(payload) >= worker['exit_log_bytes'], 'The captured original run log was truncated.'
+            payload = payload[:worker['exit_log_bytes']]
+        text = payload.decode()
         codes = re.findall(r'\[kanban-worker-exit\] rc=(-?\d+)', text)
         return {**worker, 'exit_code': int(codes[-1]) if codes else None, 'cleanup': 'already_exited'}
 

@@ -185,6 +185,22 @@ async def main():
                     'union_id': 'on_owner', 'tenant_key': binding['sender_tenant_key']},
                     'context': {'open_message_id': notice['request_message_id'], 'open_chat_id': binding['chat_id']},
                     'action': {'tag': 'button', 'value': value}}}
+        if reply_mode == 'stopping':
+            action = next(button for element in request_card['elements'] for button in element.get('actions', [])
+                          if button['value']['outcome'] == outcome)
+            await receive(adapter, raw('om_stop_approval', '@_user_1 停止 ' + original['id']))
+            stopped = record()
+            assert stopped['dsh_execution']['stop_requested'] is True
+            assert not (repo / 'approval-result.txt').exists()
+            await receive(adapter, raw('om_late_approval', '@_user_1 批准一次 审批 ' + notice['approval_id']))
+            await adapter.receive_payload(card_payload('event-card-late-stop', action['value']))
+            assert not (repo / 'approval-result.txt').exists()
+            assert not record()['dsh_execution']['approvals'][0].get('reply_message_id')
+            await wait_for(lambda: updated and all(element.get('tag') != 'action' for element in json.loads(updated[-1].request_body.content)['elements']))
+            carrier.close()
+            carrier = None
+            passed = True
+            return
         if reply_mode == 'card':
             action = next(button for element in request_card['elements'] for button in element.get('actions', [])
                           if button['value']['outcome'] == outcome)
@@ -235,13 +251,18 @@ async def main():
     finally:
         plugins.unload('ghost-hermes-pm')
         await runner.stop()
-        if carrier is None and adapter.intake.snapshot()['work'][0].get('dsh_execution', {}).get('native_identity'):
+        if carrier is None and adapter.intake.snapshot()['work'][0].get('dsh_execution', {}).get('native_identity') and not (instance / 'native-exit.json').exists():
             import importlib
             supervision = importlib.import_module(type(adapter.intake).__module__.rsplit('.', 1)[0] + '.repository_supervision')
             carrier = supervision.attach_existing_owned(adapter.intake, adapter.intake.snapshot()['work'][0])
         if carrier is not None:
-            await asyncio.to_thread(carrier.shutdown_owned)
-            assert carrier.close_outcome['kind'] == 'original_exit'
+            if not (instance / 'native-exit.json').exists():
+                await asyncio.to_thread(carrier.shutdown_owned)
+                assert carrier.close_outcome['kind'] == 'original_exit'
+            else:
+                carrier.close()
+                from simple_worker_evidence import carrier_exit_evidence
+                carrier_exit_evidence(instance / 'native-configuration.json')
         if worker is not None:
             import time
             deadline = time.monotonic() + 20

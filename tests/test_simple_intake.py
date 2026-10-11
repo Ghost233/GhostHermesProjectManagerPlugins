@@ -17,11 +17,12 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize('scenario', ['existing', 'create_unknown', 'private_issue', 'concurrent', 'delegation', 'authority',
     'wrong_card_assignee', 'wrong_card_path', 'wrong_card_body', 'wrong_card_duplicate', 'changed_card',
     'issue_unavailable', 'issue_unavailable_unload', 'private_all_bindings',
-    'configuration_auto_decompose', 'configuration_repository', 'queued_rejection_unload', 'responsibility_conflict', 'worker_required', 'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'])
+    'configuration_auto_decompose', 'configuration_repository', 'queued_rejection_unload', 'responsibility_conflict', 'worker_required', 'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'])
 def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
     flags = ('HPM_NATIVE_REAL_MODEL_REFERENCE', 'HPM_NATIVE_EXECUTION_REFERENCE')
-    if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'}:
+    if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
         assert bool(os.environ.get(flags[0])) == bool(os.environ.get(flags[1])), 'Real model acceptance requires both approved references.'
+    native_real = scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'} and bool(os.environ.get(flags[0]))
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     if not configured:
         if os.environ.get('HERMES_REQUIRE_SDK_SMOKE') == '1':
@@ -29,7 +30,7 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
         pytest.skip('Set HERMES_TEST_SDK_ROOT; a skip does not establish native intake.')
     sdk = Path(configured).resolve(strict=True)
     before = source_snapshot(sdk)
-    dsh_before = source_snapshot(os.environ['DSH_TEST_SDK_ROOT']) if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'} else None
+    dsh_before = source_snapshot(os.environ['DSH_TEST_SDK_ROOT']) if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} else None
     scratch = Path(tempfile.mkdtemp(prefix='hpm-simple-', dir='/tmp')).resolve()
     cleaned = False
     passed = False
@@ -48,17 +49,17 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
                'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'),
                'HERMES_KANBAN_HOME': str(home), 'PYTHONDONTWRITEBYTECODE': '1',
                'PYTHONPATH': str(sdk), 'HERMES_TEST_SDK_ROOT': str(sdk)}
-        if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'}:
+        if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
             env['DSH_TEST_SDK_ROOT'] = os.environ['DSH_TEST_SDK_ROOT']
             for name in ('HPM_NATIVE_REAL_MODEL_REFERENCE', 'HPM_NATIVE_EXECUTION_REFERENCE'):
-                if name in os.environ:
+                if native_real and name in os.environ:
                     env[name] = os.environ[name]
             if os.environ.get('HPM_SYNTHETIC_WORKER_REFUSE'):
                 env['HPM_SYNTHETIC_WORKER_REFUSE'] = os.environ['HPM_SYNTHETIC_WORKER_REFUSE']
         process = subprocess.Popen([sys.executable, str(ROOT / 'tests/simple_intake_smoke_runner.py'), str(scratch), scenario],
             cwd=scratch, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            stdout, stderr = process.communicate(timeout=210 if os.environ.get('HPM_NATIVE_REAL_MODEL_REFERENCE') else 100)
+            stdout, stderr = process.communicate(timeout=210 if native_real else 100)
         except subprocess.TimeoutExpired:
             process.terminate()
             try:
@@ -68,7 +69,7 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
                 process.communicate()
             pytest.fail('Fixture timed out; external execution cleanup is unknown. Private runtime retained: ' + str(scratch))
         result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-        if os.environ.get('HPM_NATIVE_REAL_MODEL_REFERENCE'):
+        if native_real:
             model = json.loads(Path(os.environ['HPM_NATIVE_REAL_MODEL_REFERENCE']).read_text())
             key = next(line.split('=', 1)[1].strip().strip('\"\'') for line in Path(model['env_file']).read_text().splitlines()
                        if line.startswith(model['api_key_env'] + '='))
@@ -81,7 +82,7 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
         assert source_snapshot(sdk) == before, 'Plugin intake cannot mutate original SDK source.'
         if dsh_before is not None:
             assert source_snapshot(os.environ['DSH_TEST_SDK_ROOT']) == dsh_before, 'Native worker cannot mutate original DSH SDK source.'
-        if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout'} and os.environ.get('HPM_NATIVE_EVIDENCE_DIR'):
+        if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} and os.environ.get('HPM_NATIVE_EVIDENCE_DIR'):
             destination = Path(os.environ['HPM_NATIVE_EVIDENCE_DIR']).resolve(strict=True)
             import stat
             assert destination.is_dir() and destination.stat().st_uid == os.getuid() and stat.S_IMODE(destination.stat().st_mode) & 0o077 == 0
@@ -89,7 +90,7 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
                 if not (scratch / name).exists():
                     continue
                 payload = (scratch / name).read_bytes()
-                if os.environ.get('HPM_NATIVE_REAL_MODEL_REFERENCE'):
+                if native_real:
                     assert key.encode() not in payload, 'Credential appeared in evidence.'
                 descriptor = os.open(destination / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 with os.fdopen(descriptor, 'wb') as target:

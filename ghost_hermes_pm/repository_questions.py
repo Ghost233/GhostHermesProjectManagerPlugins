@@ -133,6 +133,9 @@ async def observe_questions(intake, record, carrier, events, projections, genera
 async def _observe_questions(intake, record, carrier, events, projections, generation):
     intake.require_active(generation)
     execution = record['dsh_execution']
+    current = next(r for r in intake.snapshot()['work'] if r['id'] == record['id'])['dsh_execution']
+    if current.get('stop_requested') or current.get('generation') != execution.get('generation'):
+        return
     packet = await asyncio.to_thread(carrier.event_frames)
     if packet['generation'] != execution['generation'] or packet['session_id'] != execution['session_id']:
         raise ManagementError('binding_conflict', 'Original question observation belongs to another execution.')
@@ -252,10 +255,15 @@ def prepare_reply(intake, event, adapter, binding, envelope, command, authorized
                if question.get('delivery', {}).get('message_id') == envelope['parent_id']
                and all(question['delivery'].get(key) == envelope.get(key) for key in _NAMESPACE)]
     if len(matches) != 1:
+        historical = any(question.get('delivery', {}).get('message_id') == envelope['parent_id']
+            and all(question.get('delivery', {}).get(key) == envelope.get(key) for key in _NAMESPACE)
+            for record in intake.snapshot()['work'] if record['profile_id'] in authorized_profiles
+            for previous in record.get('execution_attempts', [])
+            for question in previous['execution'].get('questions', []))
         candidates = [record for record in intake.snapshot()['work'] if record['profile_id'] in authorized_profiles
             and any(all(q.get('delivery', {}).get(key) == envelope.get(key) for key in _NAMESPACE)
                     for q in record.get('dsh_execution', {}).get('questions', []))]
-        if not candidates:
+        if not candidates and not historical:
             return None
         from .simple_development import WorkMessage
         transport = next((t for a, t in intake.transports if a is adapter), None)
@@ -328,7 +336,7 @@ async def process_reply(intake, prepared, generation):
             execution = record['dsh_execution']
             question = next(q for q in execution.get('questions', [])
                             if q.get('delivery', {}).get('message_id') == prepared.envelope['parent_id'])
-            if not question['answerable'] or execution['state'] in {'released', 'stopped', 'budget_stopped', 'execution_failed', 'outcome_unknown'}:
+            if not question['answerable'] or execution.get('stop_requested') or execution['state'] in {'released', 'stopped', 'budget_stopped', 'execution_failed', 'outcome_unknown'}:
                 raise ManagementError('binding_conflict', 'This original work no longer accepts public answers.')
             if question.get('reply_status') or prepared.envelope['message_id'] in question['reply_messages']:
                 return {'status': question.get('reply_status', 'partial'), 'duplicate': True}
