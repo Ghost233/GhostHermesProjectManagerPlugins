@@ -45,7 +45,9 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'})):
                 raise ManagementError('outcome_unknown', 'An unregistered original worker requires reconciliation.')
         return {'run_id': None, 'exit_code': None, 'not_started': True}
     identity = claim['identity']
-    if not run or run.id != claim['run_id'] or run.task_id != card.id or run.worker_pid != identity['pid'] or run.status == 'running' or run.ended_at is None:
+    if (not run or run.id != claim['run_id'] or run.task_id != card.id
+        or type(identity.get('pid')) is not int or identity['pid'] <= 0
+        or run.worker_pid not in {None, identity['pid']} or run.status == 'running' or run.ended_at is None):
         raise ManagementError('outcome_unknown', 'The original claimed run has not ended.')
     if psutil.pid_exists(identity['pid']):
         process = psutil.Process(identity['pid'])

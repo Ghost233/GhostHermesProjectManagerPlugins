@@ -420,7 +420,9 @@ def register_repository_supervision(ctx, intake):
                     with connect_closing(board=intake.board) as db:
                         old = kb.get_run(db, previous['run_id'])
                     identity = previous['identity']
-                    if not old or old.task_id != record['card_id'] or old.worker_pid != identity['pid'] or old.status == 'running' or old.ended_at is None:
+                    if (not old or old.id != previous['run_id'] or old.task_id != record['card_id']
+                        or type(identity.get('pid')) is not int or identity['pid'] <= 0
+                        or old.worker_pid not in {None, identity['pid']} or old.status == 'running' or old.ended_at is None):
                         raise ManagementError('outcome_unknown', 'Original preceding worker outcome is unconfirmed.')
                     if psutil.pid_exists(identity['pid']):
                         process = psutil.Process(identity['pid'])

@@ -15,7 +15,7 @@ from sdk_source_integrity import source_snapshot
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('scenario', ['pending_review', 'fake_test_success', 'merge_required', 'completion_scope', 'completion_repeat', 'completion_unknown', 'completion_reload', 'completion_proof_changed', 'completion_rearranged'])
+@pytest.mark.parametrize('scenario', ['pending_review', 'fake_test_success', 'merge_required', 'completion_scope', 'completion_repeat', 'completion_unknown', 'completion_reload', 'completion_proof_changed', 'completion_rearranged', 'completion_rearranged_reaped'])
 def test_repository_acceptance_through_original_native_entries(scenario):
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     if not configured or not os.environ.get('DSH_TEST_SDK_ROOT'):
@@ -44,7 +44,7 @@ def test_repository_acceptance_through_original_native_entries(scenario):
         process = subprocess.Popen([sys.executable, str(ROOT / 'tests/repository_acceptance_smoke_runner.py'), str(scratch), scenario],
             cwd=scratch, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            stdout, stderr = process.communicate(timeout=100)
+            stdout, stderr = process.communicate(timeout=240 if scenario == 'completion_rearranged_reaped' else 100)
         except subprocess.TimeoutExpired:
             process.terminate()
             try:

@@ -20,6 +20,7 @@ import yaml
 
 scratch = Path(sys.argv[1]).resolve()
 scenario = sys.argv[2]
+rearranged = scenario in {'completion_rearranged', 'completion_rearranged_reaped'}
 home, state, repo = scratch / 'home', scratch / 'state', scratch / 'repository'
 home.chmod(0o700)
 repo.mkdir()
@@ -86,7 +87,7 @@ class ModelService:
                         proof=json.loads(files[0].read_text())
                         proof['generation']='foreign-generation'
                         files[0].write_text(json.dumps(proof))
-                    if scenario == 'completion_rearranged' and step == 3 and not service.rearranged:
+                    if rearranged and step == 3 and not service.rearranged:
                         call = ('fixture-handoff-rearrange', 'kanban_block', {'kind': 'needs_input', 'reason': 'Original accepted work waits for the next native worker.'})
                     if scenario in {'completion_repeat', 'completion_proof_changed'} and step == 3:
                         call = ('fixture-repeat-supervise', 'hermes_pm_supervise', {})
@@ -326,7 +327,7 @@ async def main():
         if card.status == 'blocked' or card.status == 'done' and current['dsh_execution']['state'] == 'released':
             break
         await asyncio.sleep(.05)
-    if scenario == 'completion_rearranged':
+    if rearranged:
         assert card.status == 'blocked' and current['dsh_execution']['acceptance']['status'] == 'accepted', current
         first_generation = current['dsh_execution']['generation']
         first_session = current['dsh_execution']['session_id']
@@ -335,6 +336,20 @@ async def main():
         await asyncio.to_thread(psutil.Process(worker['pid']).wait, timeout=20)
         workers[0]['exit_log_bytes'] = (home / 'kanban/logs' / (record['card_id'] + '.log')).stat().st_size
         assert '[kanban-worker-exit] rc=0' in (home / 'kanban/logs' / (record['card_id'] + '.log')).read_text()
+        if scenario == 'completion_rearranged_reaped':
+            from hermes_cli.kanban_db_dispatch import reap_terminal_workers
+            deadline = time.monotonic() + 140
+            while time.monotonic() < deadline:
+                with connect_closing() as db:
+                    reap_terminal_workers(db)
+                    original_run = kb.get_run(db, workers[0]['run_id'])
+                if original_run.worker_pid is None:
+                    break
+                await asyncio.sleep(.5)
+            assert original_run.worker_pid is None and original_run.ended_at is not None
+            original_reaper = {'run_id': original_run.id, 'worker_pid': original_run.worker_pid,
+                'claim_pid': workers[0]['pid'], 'ended_at': original_run.ended_at}
+            (scratch / 'original-reaper-proof.json').write_text(json.dumps(original_reaper))
         model.rearranged = True
         model.steps['worker'] = 0
         assert json.loads(registry.dispatch('kanban_unblock', {'task_id': record['card_id']}))['ok'] is True
@@ -373,7 +388,7 @@ async def main():
         assert acceptance['status']=='accepted' and acceptance['delivered'] is True, current
         assert current['dsh_execution']['state']=='outcome_unknown' and card.status=='blocked', current
         assert not (state/'owned-work'/record['id']/'native-exit.json').exists()
-    elif scenario in {'pending_review', 'completion_scope', 'completion_reload', 'completion_repeat', 'completion_rearranged'}:
+    elif scenario in {'pending_review', 'completion_scope', 'completion_reload', 'completion_repeat', 'completion_rearranged', 'completion_rearranged_reaped'}:
         assert acceptance['status'] == 'accepted' and acceptance['delivered'] is True, acceptance
         assert card.status == 'done', card
         assert current['dsh_execution']['state'] == 'released'
@@ -391,7 +406,7 @@ async def main():
     reply_text = sent[-1].request_body.content
     assert record['issue']['url'] in reply_text and fixed in reply_text, reply_text
     assert '待审查' in reply_text, reply_text
-    assert ('保留仓库占用' in reply_text if scenario in {'completion_unknown', 'completion_proof_changed'} else '交付' in reply_text if scenario in {'pending_review', 'completion_scope', 'completion_reload', 'completion_repeat', 'completion_rearranged'} else '未交付' in reply_text), reply_text
+    assert ('保留仓库占用' in reply_text if scenario in {'completion_unknown', 'completion_proof_changed'} else '交付' in reply_text if scenario in {'pending_review', 'completion_scope', 'completion_reload', 'completion_repeat', 'completion_rearranged', 'completion_rearranged_reaped'} else '未交付' in reply_text), reply_text
     listing = json.loads(registry.dispatch('kanban_list', {'limit': 200}))
     assert len(listing['tasks']) == 1, 'Fine GitHub Issues never create outer native cards.'
     from hermes_state import SessionDB
@@ -400,19 +415,20 @@ async def main():
     while time.monotonic() < deadline and '[kanban-worker-exit] rc=0' not in log_path.read_text():
         await asyncio.sleep(.05)
     transcript_ids = re.findall(r'^Session: *([^\s]+)', log_path.read_text(), re.MULTILINE)
-    assert len(transcript_ids) == (2 if scenario == 'completion_rearranged' else 1) and '[kanban-worker-exit] rc=0' in log_path.read_text()
+    assert len(transcript_ids) == (2 if rearranged else 1) and '[kanban-worker-exit] rc=0' in log_path.read_text()
     ledger = SessionDB(db_path=home / 'state.db', read_only=True)
     try:
         messages = ledger.get_messages(transcript_ids[-1])
     finally:
         ledger.close()
-    terminal_name = 'kanban_complete' if scenario in {'pending_review', 'completion_scope', 'completion_reload', 'completion_repeat', 'completion_rearranged'} else 'kanban_block'
+    terminal_name = 'kanban_complete' if scenario in {'pending_review', 'completion_scope', 'completion_reload', 'completion_repeat', 'completion_rearranged', 'completion_rearranged_reaped'} else 'kanban_block'
     terminal = [json.loads(m.get('content') or '{}') for m in messages
                 if m['role'] == 'tool' and m.get('tool_name') == terminal_name]
     assert any(v.get('ok') is True and v.get('task_id') == record['card_id'] for v in terminal), terminal
     evidence = {'scenario': scenario, 'card_status': card.status, 'acceptance': acceptance,
         'execution_state': current['dsh_execution']['state'], 'lifecycle_end': current['dsh_execution'].get('lifecycle_end'),
         'supervisor_claim': current['dsh_execution'].get('supervisor_claim'),
+        'original_terminal_reaper': locals().get('original_reaper'),
         'native_instance_count': len(list((state / 'owned-work').rglob('native-configuration.json'))),
         'before_worker_exit': locals().get('facts'),
         'headless': {'webserver_disabled': True, 'web_runtime_disabled': True, 'os_opener_calls': 0},
