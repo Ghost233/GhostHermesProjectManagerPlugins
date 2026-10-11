@@ -68,13 +68,17 @@ def execution_configuration(target):
         sdk_sources = {'@deepseek-ai/dsh/lib/profile-boot.js', '@deepseek-ai/dsh-sandbox-policy/lib/index.js',
                        '@deepseek-ai/dsh-tool-bash/lib/index.js', '@deepseek-ai/dsh-tool-jobs/lib/index.js',
                        '@deepseek-ai/dsh-jobs-local/lib/index.js', '@deepseek-ai/dsh-agent-loop/lib/index.js',
-                       '@deepseek-ai/dsh-tool-ask-user/lib/index.js'}
+                       '@deepseek-ai/dsh-tool-ask-user/lib/index.js', '@deepseek-ai/dsh-subprocess-local/lib/index.js',
+                       '@deepseek-ai/dsh-subprocess/lib/index.js', '@deepseek-ai/dsh-bash-local/lib/index.js',
+                       '@deepseek-ai/dsh-api-job-controller/lib/index.js'}
         if skills:
             sdk_sources.update({'@deepseek-ai/dsh-tool-skill/lib/index.js', '@deepseek-ai/dsh-skill-filesystem/lib/index.js'})
-        if (receipt.get('status') != 'passed' or receipt.get('foreground_only') is not True
+        if (receipt.get('status') != 'passed' or receipt.get('managed_jobs') != {'foreground': True, 'background': True, 'scope': 'darwin_process_group'}
             or sorted(receipt.get('tool_catalog', [])) != catalog
-            or not {'allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied', 'danger_denied', 'runtime_directory'} <= set(receipt.get('passed_cases', []))
+            or not {'allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied', 'danger_denied', 'runtime_directory', 'foreground_job_registered', 'managed_background_stopped', 'foreground_cancelled', 'foreground_promoted',
+                    'foreign_job_kill_denied', 'background_write_boundary'} <= set(receipt.get('passed_cases', []))
             or receipt.get('composition_sha256') != hashlib.sha256(source.read_bytes()).hexdigest()
+            or receipt.get('owned_host_sha256') != hashlib.sha256(source.with_name('owned_persistent_host.mjs').read_bytes()).hexdigest()
             or receipt.get('node_sha256') != hashlib.sha256(node.read_bytes()).hexdigest()
             or not sdk_sources <= set(receipt.get('sdk_sources', {}))):
             raise ValueError('Exact original tool composition has not been verified.')

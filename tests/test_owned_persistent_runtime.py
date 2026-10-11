@@ -13,7 +13,7 @@ from sdk_source_integrity import source_snapshot
 
 class WorkModel:
     """A finite external model stream; original DSH handles every tool call."""
-    def __init__(self, command="printf 'bounded\\n' > delivery.txt", dangerous=False, cached=False):
+    def __init__(self, command="printf 'bounded\\n' > delivery.txt", dangerous=False, cached=False, background=False):
         self.requests = []
         owner = self
 
@@ -27,7 +27,7 @@ class WorkModel:
                 tool = len(owner.requests) == 1
                 delta = {'tool_calls': [{'index': 0, 'id': 'fixture-write', 'type': 'function',
                     'function': {'name': 'bash', 'arguments': json.dumps({'command': command,
-                        'description': 'Run one bounded synthetic tool.', **({'sandbox_permissions': 'danger-full-access',
+                        'description': 'Run one bounded synthetic tool.', **({'run_in_background': True} if background else {}), **({'sandbox_permissions': 'danger-full-access',
                             'justification': 'Synthetic rejected capability.'} if dangerous else {})})}}]} if tool else {'content': 'Awaiting acceptance.'}
                 for part, reason in (({'role': 'assistant'}, None), (delta, None), ({}, 'tool_calls' if tool else 'stop')):
                     data = {'id': 'fixture-response', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'fixture-model',
@@ -53,19 +53,20 @@ class WorkModel:
         assert not self.thread.is_alive()
 
 
-@pytest.mark.parametrize('max_requests,token_limit,cached,expected_requests', [
-    (1, 1000, False, 1), (3, 1000, False, 2),
-    (3, 20, False, 1), (3, 21, False, 2),
-    (3, 20, True, 1), (3, 21, True, 2),
+@pytest.mark.parametrize('max_requests,token_limit,cached,expected_requests,npm_probe', [
+    (1, 1000, False, 1, False), (3, 1000, False, 2, False),
+    (3, 20, False, 1, False), (3, 21, False, 2, False),
+    (3, 20, True, 1, False), (3, 21, True, 2, False),
+    (3, 1000, False, 2, True),
 ])
-def test_original_work_input_once_and_observed_budget(max_requests, token_limit, cached, expected_requests):
+def test_original_work_input_once_and_observed_budget(max_requests, token_limit, cached, expected_requests, npm_probe):
     configured = os.environ.get('DSH_TEST_SDK_ROOT')
     if not configured:
         pytest.skip('Original DSH SDK is absent.')
     sdk = Path(configured).resolve(strict=True)
     before = source_snapshot(sdk)
     from ghost_hermes_pm.dsh_owned_transport import PersistentOwnedTransport
-    model = WorkModel(cached=cached)
+    model = WorkModel("npm config get cache > cache-location.txt && printf 'bounded\\n' > delivery.txt", cached=cached) if npm_probe else WorkModel(cached=cached)
     try:
         with tempfile.TemporaryDirectory(prefix='hpm-work-', dir='/tmp') as temporary:
             root = Path(temporary).resolve()
@@ -100,6 +101,8 @@ def test_original_work_input_once_and_observed_budget(max_requests, token_limit,
                         break
                     time.sleep(.05)
                 assert (repo / 'delivery.txt').read_text() == 'bounded\n'
+                if npm_probe:
+                    assert (repo / 'cache-location.txt').read_text().strip() == str(repo / '.cache/npm'), 'Original npm must use the bound repository cache.'
                 assert item['running'] is False
                 budget = json.loads((state / 'home/.hermes-budget.json').read_text())
                 assert budget['usage']['totals'] == {
@@ -143,8 +146,9 @@ def test_original_work_input_once_and_observed_budget(max_requests, token_limit,
     assert source_snapshot(sdk) == before
 
 
-@pytest.mark.parametrize('boundary', ['outside', 'symlink', 'hardlink', 'danger', 'temporary'])
-def test_original_bash_write_boundary_and_aliases(boundary):
+@pytest.mark.parametrize('background', [False, True])
+@pytest.mark.parametrize('boundary', ['outside', 'symlink', 'hardlink', 'danger', 'temporary', 'runtime'])
+def test_original_bash_write_boundary_and_aliases(boundary, background):
     configured = os.environ.get('DSH_TEST_SDK_ROOT')
     if not configured:
         pytest.skip('Original DSH SDK is absent.')
@@ -158,7 +162,7 @@ def test_original_bash_write_boundary_and_aliases(boundary):
         root = Path(temporary).resolve()
         repo = root / 'repo'
         repo.mkdir()
-        state = root / 'instance'
+        state = Path(external) / 'instance'
         state.mkdir(mode=0o700)
         sentinel = Path(external) / 'sentinel'
         sentinel.write_text('unchanged\n')
@@ -168,7 +172,11 @@ def test_original_bash_write_boundary_and_aliases(boundary):
             command = ('ln -s ' if boundary == 'symlink' else 'ln ') + quoted + " alias.txt && printf 'changed\\n' > alias.txt"
         elif boundary == 'temporary':
             command = "printf 'temporary\\n' > \"$TMPDIR/temporary.txt\""
-        model = WorkModel(command, dangerous=boundary == 'danger')
+        if boundary == 'runtime':
+            sentinel = state / 'protected-runtime.txt'
+            sentinel.write_text('unchanged\n')
+            command = "printf 'changed\\n' > " + __import__('shlex').quote(str(sentinel))
+        model = WorkModel(command, dangerous=boundary == 'danger', background=background)
         settings = {'dsh_home': str(state / 'home'), 'workspace': str(repo), 'runtime_package_root': str(sdk),
             'instance_id': 'fixture-boundary', 'generation': 'fixture-generation', 'session_id': 'session-fixture-boundary',
             'runtime_configuration': {'model': {'provider': 'fixture-provider', 'model': 'fixture-model', 'configuration': {
@@ -187,14 +195,33 @@ def test_original_bash_write_boundary_and_aliases(boundary):
                 time.sleep(.05)
             assert receipt_path.exists(), 'Original tool settlement was not observed.'
             receipt = json.loads(receipt_path.read_text().splitlines()[0])
+            job = None
+            if background and boundary != 'danger':
+                assert receipt['kind'] == 'background'
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    stream = carrier.stream('job/list', {'request': {'sessionId': sid}})
+                    try:
+                        roster = next(stream)
+                    finally:
+                        stream.close()
+                    job = next(row for row in roster['jobs'] if row['id'] == receipt['job_id'])
+                    if job['status'] in {'completed', 'killed', 'failed'}:
+                        break
+                    time.sleep(.025)
+                assert job['owner'] == sid and job['status'] == 'completed', job
             assert receipt['generation'] == settings['generation'] and receipt['session_id'] == sid
             assert sentinel.read_text() == 'unchanged\n', {'boundary': boundary, 'receipt': receipt}
             if boundary == 'danger':
-                assert receipt['is_error'] is True and 'exit_code' not in receipt
+                assert receipt['is_error'] is True and receipt['execution_admission'] == 'rejected' and 'exit_code' not in receipt
             elif boundary == 'temporary':
-                assert receipt['exit_code'] == 0 and (state / 'home/tmp/temporary.txt').read_text() == 'temporary\n'
+                assert (job and job['detail'] == 'exit code: 0') if background else receipt['exit_code'] == 0
+                assert (state / 'home/tmp/temporary.txt').read_text() == 'temporary\n'
             else:
-                assert receipt['exit_code'] != 0 and receipt['sandbox']['denied'] is True, receipt
+                if background:
+                    assert '[sandbox:' in job['detail'] and 'exit code: 0;' not in job['detail'], job
+                else:
+                    assert receipt['exit_code'] != 0 and receipt['sandbox']['denied'] is True, receipt
         finally:
             carrier.shutdown_owned()
             model.close()
@@ -237,6 +264,78 @@ def test_reconnect_uses_same_original_owned_instance_and_session():
         finally:
             second.shutdown_owned()
         assert second.close_outcome['kind'] == 'original_exit' and second.close_outcome['exit_code'] == 0
+    assert source_snapshot(sdk) == before
+
+
+def test_original_managed_job_rejects_foreign_session_cancel_and_keeps_six_tools():
+    configured = os.environ.get('DSH_TEST_SDK_ROOT')
+    if not configured:
+        pytest.skip('Original DSH SDK is absent.')
+    sdk = Path(configured).resolve(strict=True)
+    before = source_snapshot(sdk)
+    from ghost_hermes_pm.dsh_owned_transport import PersistentOwnedTransport
+    command = "node -e \"require('fs').writeFileSync('managed.pid',String(process.pid)); setTimeout(()=>{},25000)\""
+    model = WorkModel(command, background=True)
+    with tempfile.TemporaryDirectory(prefix='hpm-job-owner-', dir='/tmp') as temporary:
+        root = Path(temporary).resolve()
+        repo, state, skills = root / 'repo', root / 'instance', root / 'skills'
+        repo.mkdir()
+        state.mkdir(mode=0o700)
+        (skills / 'fixture-workflow').mkdir(parents=True)
+        (skills / 'fixture-workflow/SKILL.md').write_text('---\nname: fixture-workflow\ndescription: Synthetic workflow.\n---\nReport actual results.\n')
+        sid = 'fixture-managed-job-session'
+        configuration = {'dsh_home': str(state / 'home'), 'workspace': str(repo), 'runtime_package_root': str(sdk),
+            'instance_id': 'fixture-managed-job', 'generation': 'fixture-managed-generation', 'session_id': sid,
+            'runtime_configuration': {'skill_directories': [str(skills)], 'model': {
+                'provider': 'fixture-provider', 'model': 'fixture-model', 'configuration': {
+                    'api': 'openai-completions', 'baseURL': model.base_url, 'apiKeyEnv': 'DSH_FIXTURE_MODEL_KEY',
+                    'models': [{'id': 'fixture-model', 'contextWindow': 16384, 'maxTokens': 256, 'input': ['text']}]}}}}
+        carrier = PersistentOwnedTransport(instance_dir=str(state), configuration=configuration, timeout=15,
+                                            environment={'DSH_FIXTURE_MODEL_KEY': 'synthetic-key'})
+        try:
+            assert carrier.request('session/create', {'request': {'sessionId': sid, 'cwd': str(repo),
+                'agentPreset': 'hermes-owned'}}, 'create')['result']['ok']
+            assert carrier.request('session/prompt', {'request': {'sessionId': sid, 'requestId': 'managed-input', 'mode': 'queue',
+                'content': [{'type': 'text', 'text': 'Start the single bounded original managed job.'}]}}, 'prompt')['result']['value']['accepted']
+            deadline = time.monotonic() + 15
+            receipt_path = state / 'home/.hermes-tool-receipts.jsonl'
+            while (not (repo / 'managed.pid').exists() or not receipt_path.exists()) and time.monotonic() < deadline:
+                time.sleep(.025)
+            assert (repo / 'managed.pid').exists() and receipt_path.exists()
+            receipt = json.loads(receipt_path.read_text().splitlines()[0])
+            assert receipt['kind'] == 'background' and receipt['session_id'] == sid
+            import psutil
+            child = psutil.Process(int((repo / 'managed.pid').read_text()))
+            birth = child.create_time()
+            for index, request in enumerate(({'sessionId': 'foreign-session', 'jobId': receipt['job_id']},
+                    {'sessionId': sid, 'jobId': 'absent-job'}, {'jobId': receipt['job_id']})):
+                with pytest.raises(OSError):
+                    carrier.request('job/kill', {'request': request}, 'rejected-' + str(index))
+                assert child.is_running() and child.create_time() == birth
+            result = carrier.request('job/kill', {'request': {'sessionId': sid, 'jobId': receipt['job_id']}}, 'owned-cancel')
+            assert result['result']['ok'] and result['result']['value']['outcome'] == 'requested'
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                stream = carrier.stream('job/list', {'request': {'sessionId': sid}})
+                try:
+                    row = next(stream)['jobs'][0]
+                finally:
+                    stream.close()
+                if row['status'] == 'killed':
+                    break
+                time.sleep(.025)
+            assert row['owner'] == sid and row['status'] == 'killed'
+            if psutil.pid_exists(child.pid):
+                assert psutil.Process(child.pid).create_time() == birth
+                child.wait(timeout=5)
+            assert all(sorted(tool['function']['name'] for tool in request['tools']) ==
+                ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'] for request in model.requests)
+        finally:
+            carrier.shutdown_owned()
+            model.close()
+        assert carrier.close_outcome['kind'] == 'original_exit'
+        cleanup = json.loads((state / 'home/.hermes-native-cleanup.json').read_text())
+        assert cleanup['status'] == 'completed' and cleanup['session_id'] == sid
     assert source_snapshot(sdk) == before
 
 

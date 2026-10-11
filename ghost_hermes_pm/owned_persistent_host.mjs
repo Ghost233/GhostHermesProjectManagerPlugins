@@ -12,7 +12,7 @@ const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 let runtime, gateway, controllerGuard, ending = false;
 const channels = new Set();
 const empty = async function* () {};
-const methods = new Set(['session/list', 'session/projections', 'session/page', 'session/create', 'session/prompt', 'session/cancel', 'session/rename', '$events/result', 'userQuestions/answer']);
+const methods = new Set(['session/list', 'session/projections', 'session/page', 'session/create', 'session/prompt', 'session/cancel', 'session/rename', 'job/kill', '$events/result', 'userQuestions/answer']);
 const endpoints = new Set(['$events', 'session/control', 'session/follow', 'job/list', 'job/follow']);
 const bound = 16 * 1024 * 1024;
 const eventFrames = [], deliveries = new Map();
@@ -142,7 +142,26 @@ async function shutdown() {
   eventControl.abort();
   for (const channel of channels) channel.destroy();
   server.close();
-  if (runtime) await runtime.shutdown.shutdown(0);
+  if (runtime) {
+    const receiptPath = path.join(config.dsh_home, '.hermes-native-cleanup.json');
+    const receipt = {...identity, schema: 1, session_id: config.session_id,
+      scope: 'darwin_process_group', provider: '@deepseek-ai/dsh-subprocess-local', escaped_descendants: 'unverified', status: 'intent'};
+    fs.writeFileSync(receiptPath, JSON.stringify(receipt), {mode: 0o600});
+    try {
+      if (process.platform !== 'darwin') throw new Error('Native lifecycle scope has not been verified on this host.');
+      const subprocess = runtime.ctx.get('subprocess');
+      await subprocess.disposeManagedProcesses();
+      await runtime.ctx.fiber.dispose();
+      receipt.scope_disposal = 'returned';
+      await subprocess.disposeManagedProcesses();
+      fs.writeFileSync(receiptPath, JSON.stringify({...receipt, status: 'completed', completed_at_ms: Date.now()}), {mode: 0o600});
+    } catch {
+      fs.writeFileSync(receiptPath, JSON.stringify({...receipt, status: 'unknown'}), {mode: 0o600});
+      await runtime.shutdown.shutdown(1);
+      return;
+    }
+    await runtime.shutdown.shutdown(0);
+  }
 }
 
 const server = net.createServer(channel => {
@@ -174,6 +193,12 @@ const server = net.createServer(channel => {
         if (namespace === 'session' && ['create', 'prompt', 'cancel', 'rename'].includes(method)
             && request?.sessionId !== config.session_id) throw new Error('Owned Session target differs.');
         if (method === 'create' && (request.cwd !== config.workspace || request.agentPreset !== 'hermes-owned')) throw new Error('Owned repository or preset differs.');
+        if (namespace === 'job') {
+          if (request?.sessionId !== config.session_id || typeof request.jobId !== 'string'
+              || runtime.ctx.get('jobs').get(request.jobId, config.session_id).owner !== config.session_id) {
+            throw new Error('Original owned job target differs.');
+          }
+        }
         if (namespace === '$events') {
           const args = message.args?.request ?? message.args, delivery = deliveries.get(args?.eventId);
           if (args?.clientId !== eventClientId || delivery?.agentId !== config.session_id
@@ -267,6 +292,7 @@ const server = net.createServer(channel => {
       }
       if (message.op === 'open') {
         if (!endpoints.has(message.endpoint) || streams.has(message.id)) throw new Error('Stream not admitted.');
+        if (message.endpoint.startsWith('job/') && message.args?.request?.sessionId !== config.session_id) throw new Error('Original job Session differs.');
         const control = new AbortController();
         streams.set(message.id, control);
         const source = await gateway.wireStream.open(message.endpoint, {args: message.args}, empty(), undefined, control.signal);

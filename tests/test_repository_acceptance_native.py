@@ -15,7 +15,7 @@ from sdk_source_integrity import source_snapshot
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('scenario', ['pending_review', 'fake_test_success', 'merge_required'])
+@pytest.mark.parametrize('scenario', ['pending_review', 'fake_test_success', 'merge_required', 'completion_scope', 'completion_repeat', 'completion_unknown', 'completion_reload', 'completion_proof_changed', 'completion_rearranged'])
 def test_repository_acceptance_through_original_native_entries(scenario):
     configured = os.environ.get('HERMES_TEST_SDK_ROOT')
     if not configured or not os.environ.get('DSH_TEST_SDK_ROOT'):

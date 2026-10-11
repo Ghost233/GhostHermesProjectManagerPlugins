@@ -7,13 +7,13 @@ import time
 
 
 class WorkerModelService:
-    def __init__(self, query_lock=None, refuse=False, hold_dsh=False, budget_stop=False, hold_after_write=False, uncovered_shell=False, static_commands=False, question_after_write=False, nested_background_duration=None):
+    def __init__(self, query_lock=None, refuse=False, hold_dsh=False, budget_stop=False, hold_after_write=False, uncovered_shell=False, question_after_write=False, native_foreground=False, native_service=None):
         self.requests = []
         self.worker_steps = 0
         self.dsh_steps = 0
         self.budget_stop = budget_stop
+        self.native_service = native_service
         self.fail_worker_after = None
-        self.nested_background_duration = nested_background_duration
         self.foreign_task_id = None
         self.query_ready = threading.Event()
         self.dsh_ready = threading.Event()
@@ -77,17 +77,19 @@ class WorkerModelService:
                     call = (('skill', {'name': 'fixture-matt'}) if service.dsh_steps == 1 else
                         ('bash', {'description': 'Write and verify one bounded synthetic work result.',
                                  'command': "printf 'native-worker\\n' > native-delivery.txt && cat native-delivery.txt"}) if service.dsh_steps == 2 else ('skill', {'name': 'fixture-matt'}) if service.budget_stop else None)
-                    if static_commands and service.dsh_steps == 2:
-                        call = ('bash', {'description': 'Write and verify one bounded static file result.',
-                            'command': "printf 'native-worker\\n' > native-delivery.txt && /bin/cat native-delivery.txt"})
+                    if native_foreground and service.dsh_steps == 2:
+                        call = ('bash', {'description': 'Run real Node development through the original foreground tool.',
+                            'command': "node -e \"require('fs').writeFileSync('native-delivery.txt','native-worker\\n')\""})
+                    if service.native_service and service.dsh_steps == 3:
+                        call = ('bash', {'description': 'Start one original job-owned finite Node development server.',
+                            'command': "node -e \"const fs=require('fs'); const server=require('http').createServer((q,r)=>r.end('native-service')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync('native-service.json',JSON.stringify({pid:process.pid,port:server.address().port}))); setTimeout(()=>server.close(),25000)\"",
+                            'run_in_background': service.native_service == 'background',
+                            'timeoutMs': 100 if service.native_service == 'promoted' else 30000})
                     if question_after_write and service.dsh_steps == 3:
                         call = ('ask_user_question', {'timeout': -1, 'questions': [{'id': 'colour', 'question': 'Which colour?', 'options': [{'label': 'Blue'}, {'label': 'Green'}]}]})
                     if uncovered_shell and service.dsh_steps == 2:
                         call = ('bash', {'description': 'Demonstrate a foreground receipt with an unregistered finite descendant.',
                             'command': "sleep 20 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > pending-child.pid; printf 'native-worker\\n' > native-delivery.txt"})
-                    if nested_background_duration is not None and service.dsh_steps == 2:
-                        call = ('bash', {'description': 'Demonstrate combined punctuation with an exact finite background descendant.',
-                            'command': "printf 'native-worker\\n' > native-delivery.txt;(/bin/sleep " + nested_background_duration + " >/dev/null 2>/dev/null&);printf 'bounded-parent\\n'"})
                     if hold_dsh and service.dsh_steps == 1 or hold_after_write and service.dsh_steps == 3:
                         service.dsh_ready.set()
                         if not service.dsh_release.wait(timeout=45):
@@ -150,11 +152,15 @@ def execution_reference(scratch, base_url, sdk):
         '@deepseek-ai/dsh-tool-bash/lib/index.js', '@deepseek-ai/dsh-tool-jobs/lib/index.js',
         '@deepseek-ai/dsh-jobs-local/lib/index.js', '@deepseek-ai/dsh-agent-loop/lib/index.js',
         '@deepseek-ai/dsh-tool-ask-user/lib/index.js', '@deepseek-ai/dsh-tool-skill/lib/index.js',
-        '@deepseek-ai/dsh-skill-filesystem/lib/index.js']
-    receipt.write_text(json.dumps({'status': 'passed', 'foreground_only': True,
+        '@deepseek-ai/dsh-skill-filesystem/lib/index.js', '@deepseek-ai/dsh-subprocess-local/lib/index.js',
+        '@deepseek-ai/dsh-subprocess/lib/index.js', '@deepseek-ai/dsh-bash-local/lib/index.js',
+        '@deepseek-ai/dsh-api-job-controller/lib/index.js']
+    receipt.write_text(json.dumps({'status': 'passed', 'managed_jobs': {'foreground': True, 'background': True, 'scope': 'darwin_process_group'},
         'tool_catalog': ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'],
-        'passed_cases': ['allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied', 'danger_denied', 'runtime_directory'],
+        'passed_cases': ['allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied', 'danger_denied', 'runtime_directory',
+            'foreground_job_registered', 'managed_background_stopped', 'foreground_cancelled', 'foreground_promoted', 'foreign_job_kill_denied', 'background_write_boundary'],
         'composition_sha256': hashlib.sha256((root / 'ghost_hermes_pm/owned_runtime.mjs').read_bytes()).hexdigest(),
+        'owned_host_sha256': hashlib.sha256((root / 'ghost_hermes_pm/owned_persistent_host.mjs').read_bytes()).hexdigest(),
         'node_sha256': hashlib.sha256(node.read_bytes()).hexdigest(),
         'sdk_sources': {p: hashlib.sha256((sdk / p).read_bytes()).hexdigest() for p in native_sources}}))
     receipt.chmod(0o600)

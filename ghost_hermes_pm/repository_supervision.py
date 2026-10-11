@@ -129,7 +129,8 @@ def execution_event_references(events):
 
 def acceptance_text(record):
     acceptance = record['dsh_execution']['acceptance']
-    text = '交付已通过总 Issue 验收。' if acceptance['status'] == 'accepted' else '开发与测试结果待验收，尚未交付；总 Issue 验收未满足。'
+    text = ('交付已通过总 Issue 验收。' if record['dsh_execution']['state'] == 'released'
+        else '总 Issue 验收已通过；交付收尾尚未核实，保留仓库占用。') if acceptance['status'] == 'accepted' else '开发与测试结果待验收，尚未交付；总 Issue 验收未满足。'
     text += '\n总 Issue：' + record['issue']['url']
     if acceptance.get('source_commit'):
         text += '\n交付版本：' + acceptance['source_commit']
@@ -151,7 +152,8 @@ async def notify_acceptance(intake, record, generation):
     if not acceptance:
         return
     signature = hashlib.sha256(json.dumps({key: acceptance.get(key) for key in
-        ('status', 'source_commit', 'pr_status', 'review_status', 'unmet')}, sort_keys=True).encode()).hexdigest()
+        ('status', 'source_commit', 'pr_status', 'review_status', 'unmet')}
+        | {'released': execution.get('state') == 'released'}, sort_keys=True).encode()).hexdigest()
     if execution.get('delivery_notification', {}).get('signature') == signature:
         return
     destination = question_destination(intake, record)
@@ -249,6 +251,29 @@ def _admit_resumed_worker(intake, record, carrier):
     intake._save_execution(record, fields=['supervisor_claim'])
 
 
+async def reconcile_completed_delivery(intake, record, generation):
+    from .repository_acceptance import completion_ready
+    from .repository_control import _card, _worker_end
+    execution = record['dsh_execution']
+    if not completion_ready(intake, record) or _card(intake, record)['status'] != 'done':
+        return
+    worker = await asyncio.to_thread(_worker_end, intake, record, frozenset({'done'}))
+    intake.require_active(generation)
+    latest = next(r for r in intake.snapshot()['work'] if r['id'] == record['id'])
+    if latest['dsh_execution'].get('stop_requested') or not completion_ready(intake, latest):
+        return
+    latest['dsh_execution']['lifecycle_end']['worker'] = worker
+    reference = latest['dsh_execution'].get('github_reference')
+    if reference:
+        from .repository_github import cleanup_github_execution
+        try:
+            latest['dsh_execution']['github_cleanup'] = cleanup_github_execution(reference, execution['generation'])
+        except ManagementError as error:
+            latest['dsh_execution']['github_cleanup'] = {'status': 'unconfirmed', 'code': error.code}
+    latest['dsh_execution']['state'] = 'released'
+    intake._save_execution(latest, fields=['state', 'lifecycle_end', 'github_cleanup'])
+
+
 async def observe_human_requests(intake):
     """Gateway observes existing work because claimed workers have no group transport."""
     if os.environ.get('HERMES_KANBAN_RUN_ID'):
@@ -261,6 +286,13 @@ async def observe_human_requests(intake):
             if intake.transports:
                 for record in intake.snapshot()['work']:
                     execution = record.get('dsh_execution', {})
+                    if execution.get('lifecycle_end', {}).get('status') == 'ended' and not execution.get('stop_requested') and execution.get('state') != 'released':
+                        try:
+                            await reconcile_completed_delivery(intake, record, intake.generation)
+                        except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES):
+                            pass
+                        record = next(r for r in intake.snapshot()['work'] if r['id'] == record['id'])
+                        execution = record['dsh_execution']
                     if execution.get('acceptance'):
                         try:
                             await notify_acceptance(intake, record, intake.generation)
@@ -271,7 +303,7 @@ async def observe_human_requests(intake):
                             await refresh_released_approval_cards(intake, record, intake.generation)
                         except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES):
                             pass
-                    if not execution.get('native_identity') or execution.get('state') in {'released', 'stopped'} or execution.get('stop_requested'):
+                    if not execution.get('native_identity') or execution.get('state') in {'released', 'stopped'} or execution.get('stop_requested') or execution.get('lifecycle_end'):
                         carrier = carriers.pop(record['id'], None)
                         if carrier is not None:
                             carrier.close()
@@ -312,9 +344,11 @@ def register_repository_supervision(ctx, intake):
                 try:
                     from .repository_acceptance import completion_ready
                     intake.require_active(intake.generation)
-                    current_worker(ctx, intake, record)
+                    run_id = current_worker(ctx, intake, record)
                     supplied = args or {}
+                    claim = record.get('dsh_execution', {}).get('supervisor_claim', {})
                     if (supplied.get('task_id', card_id) != card_id or supplied.get('board', intake.board) != intake.board
+                        or claim.get('run_id') != run_id or claim.get('identity', {}).get('pid') != os.getpid()
                         or not completion_ready(intake, record)):
                         raise ManagementError('unauthorized', 'Current original acceptance is unavailable.')
                     return
@@ -349,17 +383,9 @@ def register_repository_supervision(ctx, intake):
             return
         with connect_closing(board=intake.board) as connection:
             card = kb.get_task(connection, card_id)
-        if card is not None and card.status == 'done':
-            record['dsh_execution']['state'] = 'released'
-            intake._save_execution(record, fields=['state'])
-            reference = record['dsh_execution'].get('github_reference')
-            if reference:
-                from .repository_github import cleanup_github_execution
-                try:
-                    record['dsh_execution']['github_cleanup'] = cleanup_github_execution(reference, record['dsh_execution']['generation'])
-                except ManagementError as error:
-                    record['dsh_execution']['github_cleanup'] = {'status': 'unconfirmed', 'code': error.code}
-                intake._save_execution(record, fields=['github_cleanup'])
+        if card is not None and card.status == 'done' and record['dsh_execution'].get('lifecycle_end', {}).get('status') == 'ended':
+            record['dsh_execution']['lifecycle_end']['card_completed'] = True
+            intake._save_execution(record, fields=['lifecycle_end'])
     ctx.register_hook('post_tool_call', completed)
     ctx.register_system_prompt_section('hermes-pm-supervision',
         'For a plugin-managed Kanban outer card, read kanban_show, then call hermes_pm_supervise with no arguments. '
@@ -380,6 +406,42 @@ def register_repository_supervision(ctx, intake):
             intake.require_active(generation)
             record = next(r for r in intake.snapshot()['work'] if r['id'] == record['id'])
             execution = record['dsh_execution']
+            if execution.get('lifecycle_end', {}).get('status') == 'ended' and execution.get('acceptance', {}).get('status') == 'accepted':
+                from .repository_acceptance import completion_ready
+                from .repository_control import native_range_proof
+                proof = native_range_proof(intake, record, execution['lifecycle_end'].get('session_end', {}))
+                if proof != execution['lifecycle_end'].get('proof'):
+                    raise ManagementError('outcome_unknown', 'Original ended-range proof changed.')
+                issue = await asyncio.to_thread(intake.github.read_issue, record['issue']['url'])
+                if any(issue.get(key) != record['issue'][key] for key in ('url', 'title', 'body', 'updated_at')):
+                    raise ManagementError('outcome_unknown', 'Original accepted Issue changed.')
+                previous = execution.get('supervisor_claim')
+                if previous and previous['run_id'] != run_id:
+                    from hermes_cli import kanban_db as kb
+                    from hermes_cli.kanban_db_connect import connect_closing
+                    with connect_closing(board=intake.board) as db:
+                        old = kb.get_run(db, previous['run_id'])
+                    identity = previous['identity']
+                    if not old or old.task_id != record['card_id'] or old.worker_pid != identity['pid'] or old.status == 'running' or old.ended_at is None:
+                        raise ManagementError('outcome_unknown', 'Original preceding worker outcome is unconfirmed.')
+                    if psutil.pid_exists(identity['pid']):
+                        process = psutil.Process(identity['pid'])
+                        birth = float(identity['start_sec']) + float(identity['start_usec']) / 1000000
+                        if abs(process.create_time() - birth) < .000001:
+                            try:
+                                process.wait(timeout=.05)
+                            except psutil.TimeoutExpired:
+                                raise ManagementError('outcome_unknown', 'Original preceding worker is still alive.') from None
+                execution['state'] = 'awaiting_acceptance'
+                if not completion_ready(intake, record):
+                    raise ManagementError('outcome_unknown', 'Original accepted source is unconfirmed.')
+                current_worker(ctx, intake, record)
+                if not previous or previous['run_id'] != run_id:
+                    from hermes_cli import kanban_db as kb
+                    execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
+                        'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
+                intake._save_execution(record, fields=['state', 'supervisor_claim'])
+                return execution['acceptance']
             if not execution.get('supervisor_claim'):
                 from hermes_cli import kanban_db as kb
                 execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
@@ -518,8 +580,11 @@ def register_repository_supervision(ctx, intake):
                         tool_receipts=tool_receipts)
                     intake._save_execution(record)
                     if state == 'awaiting_acceptance':
-                        from .repository_acceptance import accept_repository_work
-                        return await accept_repository_work(intake, record, carrier, events, projections, generation)
+                        from .repository_acceptance import accept_repository_work, finish_delivery_range
+                        result = await accept_repository_work(intake, record, carrier, events, projections, generation)
+                        if result.get('status') == 'accepted':
+                            await finish_delivery_range(intake, record, carrier, generation)
+                        return result
                     return {'status': state, 'card_id': record['card_id'], 'session_id': sid,
                             'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
                 await asyncio.sleep(.25)

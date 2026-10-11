@@ -23,7 +23,7 @@ export async function bootOwnedRuntime(config) {
     'schedule', 'ui-schedule', 'mcp-resources', 'session-title-llm', 'tool-working-directory', 'permission', 'webserver', 'web-runtime'];
   const plugins = [
     {id: 'persona', name: '@deepseek-ai/dsh-persona', config: {prefix: 'Work in the bound repository. Follow its instructions and the installed Matt workflow. Report real tool results and ask the user about unresolved decisions.', complete: true, includeRuntimeContext: false}},
-    {id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash', config: {enableRunInBackground: false, promoteOnTimeout: false}},
+    {id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash', config: {enableRunInBackground: true, promoteOnTimeout: true}},
     {id: 'tool-jobs', name: '@deepseek-ai/dsh-tool-jobs', config: {completionDelivery: 'quiet'}},
     {id: 'tool-ask-user', name: '@deepseek-ai/dsh-tool-ask-user', config: {mode: 'timed', timeout: 15}},
   ];
@@ -60,17 +60,37 @@ export async function bootOwnedRuntime(config) {
     await runtime.shutdown.shutdown(1);
     throw new Error('The original owned composition is unavailable.');
   }
+  const rejectedCalls = new Set();
   const release = runtime.ctx.get('tools').guard(exec => {
-    if (!['bash', 'job_kill', 'job_list', 'job_output', 'ask_user_question', ...(settings.skill_directories?.length ? ['skill'] : [])].includes(exec.name)) return 'Unverified owned capability rejected.';
+    const reject = reason => {rejectedCalls.add(exec.callId); return reason;};
+    if (!['bash', 'job_kill', 'job_list', 'job_output', 'ask_user_question', ...(settings.skill_directories?.length ? ['skill'] : [])].includes(exec.name)) return reject('Unverified owned capability rejected.');
     const session = exec.agent?.session;
     if (!session || session.id !== config.session_id || !session.header.cwd
-        || fs.realpathSync(session.header.cwd) !== config.workspace) return 'Owned Session binding rejected.';
+        || fs.realpathSync(session.header.cwd) !== config.workspace) return reject('Owned Session binding rejected.');
     const policy = runtime.ctx.get('sandboxPolicy').resolve({session});
-    if (!['read-only', 'workspace-write'].includes(policy.mode)) return 'Unsupported sandbox rejected.';
-    if (exec.arguments?.sandbox_permissions === 'danger-full-access') return 'Danger permission rejected.';
-    if (exec.arguments?.run_in_background === true) return 'Unverified background start rejected.';
+    if (!['read-only', 'workspace-write'].includes(policy.mode)) return reject('Unsupported sandbox rejected.');
+    if (exec.arguments?.sandbox_permissions === 'danger-full-access') return reject('Danger permission rejected.');
+    if (['job_kill', 'job_output'].includes(exec.name)) {
+      try {
+        if (runtime.ctx.get('jobs').get(exec.arguments?.job_id, config.session_id).owner !== config.session_id) return reject('Unowned job rejected.');
+      } catch {return reject('Foreign or absent job rejected.');}
+    }
   });
   runtime.ctx.effect(() => release);
+  const jobs = runtime.ctx.get('jobs');
+  if (!jobs?.events?.subscribe || typeof runtime.ctx.get('subprocess')?.disposeManagedProcesses !== 'function') {
+    await runtime.shutdown.shutdown(1);
+    throw new Error('Original managed lifecycle is unavailable.');
+  }
+  jobs.events.subscribe({owner: config.session_id}, event => {
+    if (!['registered', 'settled', 'removed'].includes(event.type) || event.job?.owner !== config.session_id) return;
+    const row = {generation: config.generation, session_id: config.session_id, type: event.type,
+      job_id: event.job.id, owner: event.job.owner, kind: event.job.kind, status: event.job.status,
+      command_sha256: crypto.createHash('sha256').update(event.job.label).digest('hex'),
+      started_at_ms: event.job.startedAt, finished_at_ms: event.job.finishedAt,
+      ...(event.type === 'settled' ? {cause: event.cause} : {})};
+    fs.appendFileSync(path.join(config.dsh_home, '.hermes-native-jobs.jsonl'), JSON.stringify(row) + '\n', {mode: 0o600});
+  });
   runtime.ctx.on('tools/result', (exec, result) => {
     if (exec.agent?.session?.id !== config.session_id) return;
     const value = result.value;
@@ -81,10 +101,11 @@ export async function bootOwnedRuntime(config) {
     const output = part => ({sha256: crypto.createHash('sha256').update(part.text).digest('hex'),
       byte_length: Buffer.byteLength(part.text), truncated: part.truncated});
     const row = {generation: config.generation, session_id: config.session_id, call_id: exec.callId,
-      name: exec.name, is_error: result.isError,
+      name: exec.name, is_error: result.isError, execution_admission: rejectedCalls.has(exec.callId) ? 'rejected' : 'admitted',
       ...(exec.name === 'bash' ? {cwd: exec.agent.session.header.cwd,
         command_sha256: crypto.createHash('sha256').update(command ?? '').digest('hex'),
         ...(!sensitiveCommand ? {command} : {command_omitted: 'sensitive'})} : {}),
+      ...(['background', 'promoted'].includes(value?.kind) ? {kind: value.kind, job_id: value.jobId} : {}),
       ...(value?.kind === 'foreground' ? {kind: value.kind, exit_code: value.exitCode,
         sandbox: value.sandbox, aborted: value.aborted, timed_out: value.timedOut,
         stdout: output(value.stdout), stderr: output(value.stderr)} : {}),

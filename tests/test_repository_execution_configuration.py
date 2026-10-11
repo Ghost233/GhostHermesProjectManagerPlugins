@@ -54,3 +54,19 @@ def test_mismatched_or_unverified_tool_catalog_stays_unadmitted(workflow_referen
     with pytest.raises(ManagementError) as error:
         execution_configuration({'execution_ref': str(workflow_reference)})
     assert error.value.code == 'configuration_missing'
+
+
+@pytest.mark.parametrize('changed', ['legacy_foreground', 'owned_host'])
+def test_old_or_changed_owned_lifecycle_proof_stays_unadmitted(workflow_reference, changed):
+    configuration = json.loads(workflow_reference.read_text())
+    receipt = Path(configuration['tool_receipt_ref'])
+    proof = json.loads(receipt.read_text())
+    if changed == 'legacy_foreground':
+        proof.pop('managed_jobs')
+        proof['foreground_only'] = True
+    else:
+        proof['owned_host_sha256'] = '0' * 64
+    receipt.write_text(json.dumps(proof))
+    with pytest.raises(ManagementError) as error:
+        execution_configuration({'execution_ref': str(workflow_reference)})
+    assert error.value.code == 'configuration_missing'

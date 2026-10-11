@@ -226,6 +226,36 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
         unmet.append('delivery_source_changed')
 
 
+async def finish_delivery_range(intake, record, carrier, generation):
+    """Business acceptance does not establish original execution quiescence."""
+    from .repository_control import close_native_range
+    from .repository_supervision import owned_call, original_history, original_jobs
+    execution = record['dsh_execution']
+    sid = execution['session_id']
+    listing = await asyncio.to_thread(owned_call, carrier, 'session/list', {})
+    rows = [row for row in listing['items'] if row['sessionId'] == sid]
+    events, projections = await asyncio.to_thread(original_history, carrier, sid, record['target']['repo_path'])
+    jobs = await asyncio.to_thread(original_jobs, carrier, sid)
+    starts = [event for event in events if event['type'] == 'turn/start']
+    ends = [event for event in events if event['type'] == 'turn/end']
+    current = next(r for r in intake.snapshot()['work'] if r['id'] == record['id'])
+    if (len(rows) != 1 or rows[0].get('cwd') != record['target']['repo_path']
+        or rows[0].get('agentAvailable') is not True or rows[0].get('running') is not False
+        or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
+        or projections.get('inbox') != {'next-turn': [], 'next-step': []}
+        or any(job.get('owner') != sid or job['status'] in {'running', 'stopping'} for job in jobs)
+        or current['dsh_execution'].get('stop_requested') or _human_pending(current['dsh_execution'])):
+        raise ManagementError('outcome_unknown', 'Original accepted execution is not idle for handoff.')
+    session_end = {'session_id': sid, 'generation': execution['generation'],
+        'journal_cursor': events[-1]['seq'],
+        'tool_calls': [{'id': event['data']['callId'], 'name': event['data']['name']}
+            for event in events if event['type'] == 'tool/call'],
+        'jobs': [{'id': job['id'], 'status': job['status']} for job in jobs]}
+    await close_native_range(intake, record, carrier, session_end, generation)
+    if not completion_ready(intake, record):
+        raise ManagementError('outcome_unknown', 'Original accepted source or native range changed before completion.')
+
+
 def completion_ready(intake, record):
     """The native Hook uses this after validating the current original worker claim."""
     execution = record.get('dsh_execution', {})
@@ -236,6 +266,10 @@ def completion_ready(intake, record):
         or execution.get('stop_requested') or any(j.get('status') in {'running', 'stopping'} for j in execution.get('jobs', []))):
         return False
     try:
+        from .repository_control import native_range_proof
+        ended = execution.get('lifecycle_end', {})
+        if ended.get('status') != 'ended' or native_range_proof(intake, record, ended.get('session_end', {})) != ended.get('proof'):
+            return False
         current = repository_source_state(record['target'])
         return (current['head'] == acceptance.get('source_commit')
                 and current['source_digest'] == acceptance.get('source_digest')

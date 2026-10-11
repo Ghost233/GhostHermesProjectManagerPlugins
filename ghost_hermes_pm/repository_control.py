@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import time
 
 import psutil
@@ -27,7 +26,7 @@ def _card(intake, record):
     return intake._kanban('kanban_show', {'task_id': record['card_id']})['task']
 
 
-def _worker_end(intake, record):
+def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'})):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
     from .trusted_controller import controller_identity
@@ -35,7 +34,7 @@ def _worker_end(intake, record):
         card = kb.get_task(connection, record['card_id'])
         run = kb.latest_run(connection, record['card_id'])
         runs = kb.list_runs(connection, record['card_id'])
-    if not card or card.status not in {'blocked', 'triage'} or card.current_run_id is not None or card.worker_pid is not None:
+    if not card or card.status not in statuses or card.current_run_id is not None or card.worker_pid is not None:
         raise ManagementError('outcome_unknown', 'The original Kanban worker has not ended.')
     claim = record['dsh_execution'].get('supervisor_claim')
     if claim is None:
@@ -102,38 +101,61 @@ def _carrier_end(intake, record):
 
 
 def _execution_coverage(intake, record, control):
-    """Release proof covers finite static file commands, never arbitrary Bash."""
+    """Verify original job settlement and awaited native Mac managed-range cleanup."""
+    from collections import Counter
     directory = owned_instance(intake, record)
+    execution = record['dsh_execution']
     path = directory / 'home/.hermes-tool-receipts.jsonl'
     receipts = [json.loads(line) for line in private_file(path).read_text().splitlines()] if path.exists() else []
     calls = control.get('session_end', {}).get('tool_calls', [])
+    if (control.get('session_end', {}).get('session_id') != execution['session_id']
+        or control.get('session_end', {}).get('generation') != execution['generation']):
+        raise ManagementError('coverage_unverified', 'Original session end belongs to another execution.')
     if sorted((row['call_id'], row['name']) for row in receipts) != sorted((row['id'], row['name']) for row in calls):
         raise ManagementError('coverage_unverified', 'Original tool settlement coverage is incomplete.')
-    for receipt in receipts:
-        if receipt.get('generation') != record['dsh_execution']['generation'] or receipt.get('session_id') != record['dsh_execution']['session_id']:
-            raise ManagementError('coverage_unverified', 'Original tool settlement belongs to another execution.')
-        if receipt['name'] in {'skill', 'ask_user_question', 'job_list', 'job_output', 'job_kill'}:
-            continue
-        command = receipt.get('command', '')
-        if (receipt['name'] != 'bash' or receipt.get('kind') != 'foreground' or receipt.get('exit_code') != 0
-            or receipt.get('is_error') is not False or receipt.get('aborted') is not False or receipt.get('timed_out') is not False
-            or receipt.get('sandbox') != {'mode': 'workspace-write', 'denied': False, 'enforcement': 'full'}
-            or not command or any(value in command for value in ('$','`','\n'))):
-            raise ManagementError('coverage_unverified', 'This execution exceeds the verified foreground stop scope.')
-        tokens = list(shlex.shlex(command, posix=True, punctuation_chars=';&|<>()'))
-        start, redirect = True, False
-        for token in tokens:
-            if token in {'&&', ';', '|'} and not start and not redirect:
-                start = True
-            elif token in {'>', '>>', '<'} and not start and not redirect:
-                redirect = True
-            elif re.fullmatch(r'[;&|<>()]+', token) or start and token not in {'printf', '/bin/cat', '/usr/bin/cmp'}:
-                raise ManagementError('coverage_unverified', 'This command has no verified finite file-operation stop proof.')
-            else:
-                start, redirect = False, False
-        if start or redirect:
-            raise ManagementError('coverage_unverified', 'Original command coverage is incomplete.')
-    return {'scope': 'static_foreground_file_operations', 'settled_call_ids': [row['call_id'] for row in receipts]}
+    path = directory / 'home/.hermes-native-jobs.jsonl'
+    events = [json.loads(line) for line in private_file(path).read_text().splitlines()] if path.exists() else []
+    for row in receipts + events:
+        if row.get('generation') != execution['generation'] or row.get('session_id') != execution['session_id']:
+            raise ManagementError('coverage_unverified', 'Original managed lifecycle belongs to another execution.')
+    registered = [row for row in events if row['type'] == 'registered']
+    settled = [row for row in events if row['type'] == 'settled']
+    if (any(row.get('owner') != execution['session_id'] or row.get('kind') != 'bash' for row in events)
+        or Counter(row['command_sha256'] for row in receipts if row['name'] == 'bash' and row.get('execution_admission') != 'rejected')
+            != Counter(row['command_sha256'] for row in registered)
+        or Counter(row['job_id'] for row in registered) != Counter(row['job_id'] for row in settled)
+        or any(row.get('status') not in {'completed', 'killed', 'failed'} or row.get('cause') == 'teardown' for row in settled)
+        or any(row.get('execution_admission') == 'rejected' and row.get('is_error') is not True for row in receipts)):
+        raise ManagementError('coverage_unverified', 'Original registered job settlement is incomplete or unknown.')
+    cleanup = json.loads(private_file(directory / 'home/.hermes-native-cleanup.json').read_text())
+    identity = execution['native_identity']
+    if (cleanup.get('schema') != 1 or cleanup.get('status') != 'completed'
+        or cleanup.get('scope') != 'darwin_process_group' or cleanup.get('provider') != '@deepseek-ai/dsh-subprocess-local'
+        or cleanup.get('scope_disposal') != 'returned' or cleanup.get('escaped_descendants') != 'unverified'
+        or cleanup.get('session_id') != execution['session_id']
+        or any(cleanup.get(key) != identity[key] for key in ('pid', 'generation', 'instance_id', 'created_at_ms', 'configuration_sha256'))):
+        raise ManagementError('coverage_unverified', 'Original native managed-range cleanup is unconfirmed.')
+    return {'scope': 'darwin_process_group', 'escaped_descendants': 'unverified',
+            'settled_call_ids': [row['call_id'] for row in receipts],
+            'settled_job_ids': [row['job_id'] for row in settled], 'runtime_cleanup': cleanup}
+
+
+def native_range_proof(intake, record, session_end):
+    """One original ended instance, independent of stop or delivery semantics."""
+    return {'carrier': _carrier_end(intake, record),
+            'coverage': _execution_coverage(intake, record, {'session_end': session_end})}
+
+
+async def close_native_range(intake, record, carrier, session_end, generation):
+    intake.require_active(generation)
+    record['dsh_execution']['lifecycle_end'] = {'status': 'intent', 'session_end': session_end}
+    intake._save_execution(record, fields=['lifecycle_end'])
+    await asyncio.to_thread(carrier.shutdown_owned)
+    proof = await asyncio.to_thread(native_range_proof, intake, record, session_end)
+    intake.require_active(generation)
+    record['dsh_execution']['lifecycle_end'].update(status='ended', proof=proof)
+    intake._save_execution(record, fields=['lifecycle_end'])
+    return proof
 
 
 async def _stop(intake, record, generation):
@@ -181,6 +203,24 @@ async def _stop(intake, record, generation):
                     ends = [event for event in events if event['type'] == 'turn/end']
                     inbox = projections.get('inbox')
                     jobs = await asyncio.to_thread(original_jobs, carrier, execution['session_id'])
+                    for job in jobs:
+                        if job.get('owner') != execution['session_id']:
+                            raise ManagementError('coverage_unverified', 'Unowned background work requires reconciliation.')
+                        if job['status'] not in {'running', 'stopping'}:
+                            continue
+                        cancelled = control.setdefault('job_cancel', {})
+                        if cancelled.get(job['id']) == 'intent':
+                            raise ManagementError('outcome_unknown', 'Original job cancel admission remains unknown.')
+                        if job['id'] not in cancelled:
+                            cancelled[job['id']] = 'intent'
+                            execution['stop_control'] = control
+                            intake._save_execution(record, fields=['stop_control'])
+                            answer = await asyncio.to_thread(owned_call, carrier, 'job/kill',
+                                {'sessionId': execution['session_id'], 'jobId': job['id']})
+                            if answer.get('outcome') not in {'requested', 'already-finished'}:
+                                raise ManagementError('outcome_unknown', 'Original job cancel admission remains unknown.')
+                            cancelled[job['id']] = 'accepted'
+                            intake._save_execution(record, fields=['stop_control'])
                     if (rows[0].get('running') is False and (not starts or ends and ends[-1]['seq'] > starts[-1]['seq'])
                         and isinstance(inbox, dict) and set(inbox) == {'next-turn', 'next-step'} and not any(inbox.values())
                         and not any(job['status'] in {'running', 'stopping'} for job in jobs)):
@@ -191,7 +231,7 @@ async def _stop(intake, record, generation):
                             'jobs': [{'id': job['id'], 'status': job['status']} for job in jobs]}
                         execution['stop_control'] = control
                         intake._save_execution(record, fields=['stop_control'])
-                        await asyncio.to_thread(carrier.shutdown_owned)
+                        await close_native_range(intake, record, carrier, control['session_end'], generation)
                         break
                     await asyncio.sleep(.05)
                 else:

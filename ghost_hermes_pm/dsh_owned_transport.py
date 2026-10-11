@@ -399,6 +399,7 @@ class PersistentOwnedTransport(NativeOwnedTransport):
                 temporary.mkdir(mode=0o700, exist_ok=True)
                 environment = {k: v for k, v in os.environ.items() if k in {'PATH', 'LANG', 'LC_ALL', 'TZ'}}
                 environment.update(HOME=str(home), DSH_HOME=str(home), DSH_TELEMETRY_DISABLED='1', TMPDIR=str(temporary), **self.environment)
+                environment['NPM_CONFIG_CACHE'] = str(Path(self.workspace) / '.cache/npm')
                 with self._lock:
                     if self._closed:
                         raise OSError('The supervisor detached before native startup.')
