@@ -583,6 +583,7 @@ def _verified_source_chain(execution, baseline, receipts, current):
     if previous is None or current is None:
         return False
     found = False
+    previous_seq = 0
     for receipt in receipts:
         before, after = receipt.get('source_before'), receipt.get('source_after')
         if before is None and after is None:
@@ -590,13 +591,16 @@ def _verified_source_chain(execution, baseline, receipts, current):
         if (receipt.get('generation') != execution['generation'] or receipt.get('session_id') != execution['session_id']
                 or receipt.get('name') != 'bash' or receipt.get('kind') != 'foreground'
                 or receipt.get('execution_admission') != 'admitted' or receipt.get('is_error') is not False
-                or receipt.get('exit_code') != 0 or receipt.get('timed_out') is not False
+                or type(receipt.get('exit_code')) is not int or receipt.get('timed_out') is not False
                 or receipt.get('aborted') is not False):
+            return False
+        sequence = receipt.get('native_session_seq')
+        if type(sequence) is not int or sequence <= previous_seq:
             return False
         before, after = _source_core(before), _source_core(after)
         if before is None or after is None or before != previous:
             return False
-        previous, found = after, True
+        previous, previous_seq, found = after, sequence, True
     return found and previous == current
 
 
