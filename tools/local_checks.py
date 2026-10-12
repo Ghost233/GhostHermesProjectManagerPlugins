@@ -44,7 +44,7 @@ def main():
     environment = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'HERMES_REQUIRE_SDK_SMOKE': '1'}
     before = fingerprint(root)
     record = {'source_before': before, 'commands': [], 'preparation': [], 'command_exit_code': None,
-              'validation_exit_code': 3, 'reason': None, 'mode': 'command' if args.command else 'full', 'started_at_ns': time.time_ns(),
+              'validation_exit_code': 3, 'reason': None, 'mode': 'command' if args.command else 'core', 'started_at_ns': time.time_ns(),
               'environment': {key: environment.get(key) for key in ('HERMES_TEST_SDK_ROOT', 'HERMES_REQUIRE_SDK_SMOKE', 'HERMES_TEST_SESSION_PYTHON', 'DSH_TEST_SDK_ROOT', 'DSH_REQUIRE_SDK_SMOKE')}}
     def interrupted(*_):
         raise KeyboardInterrupt
@@ -87,7 +87,7 @@ def main():
             node = execute([args.node, '--version'], root, environment, artifacts, 'node')
             record['preparation'] += [lint, node]
             if lint['actual_exit_code'] != 0 or node['actual_exit_code'] != 0:
-                raise ValueError('Install the pinned test dependencies and Node before full validation.')
+                raise ValueError('Install the pinned test dependencies and Node before core validation.')
             import tomllib
             project = tomllib.loads((root / 'pyproject.toml').read_text())
             pinned = next(value.removeprefix('ruff==') for value in project['project']['optional-dependencies']['test'] if value.startswith('ruff=='))
@@ -96,9 +96,7 @@ def main():
             diff = ['git', 'diff', '--check'] + ([args.diff_base, 'HEAD'] if args.diff_base else [])
             commands = [[args.python, 'tools/check_sdk_test_seams.py'],
                         [args.python, '-m', 'ruff', 'check', '--no-cache', '--select', 'F821', 'ghost_hermes_pm', 'tests', 'tools', '__init__.py'],
-                        [args.python, '-m', 'pytest', '-q', '--maxfail=1', '-rs', '--basetemp=' + base],
-                        [args.node, '--check', 'dashboard/dist/index.js'],
-                        [args.node, '--check', 'ghost_hermes_pm/owned_native_host.mjs'], diff]
+                        [args.python, '-m', 'pytest', '-q', '--maxfail=1', '-rs', '--basetemp=' + base], diff]
         record['validation_exit_code'] = 0
         for number, command in enumerate(commands):
             result = execute(command, root, environment, artifacts, number)

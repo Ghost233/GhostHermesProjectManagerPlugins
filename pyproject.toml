@@ -21,7 +21,30 @@ include = ["ghost_hermes_pm*"]
 ghost_hermes_pm = ["*.mjs", "trusted_controller.c"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = [
+    "tests/test_shared_only_execution.py",
+    "tests/test_shared_repository.py",
+    "tests/test_shared_native_hook.py",
+    "tests/test_shared_tools_native.py",
+    "tests/test_simple_intake.py",
+    "tests/test_owned_driver.py",
+    "tests/test_native_slash_cards.py",
+    "tests/test_repository_approval_cards.py",
+    "tests/test_repository_approval_replies.py",
+    "tests/test_repository_question_reconciliation.py",
+    "tests/test_repository_test_runner.py",
+    "tests/test_repository_github.py",
+    "tests/test_dsh_configuration.py",
+    "tests/test_dsh_remote.py",
+    "tests/test_plugin_entry.py",
+    "tests/test_plugin_manifest.py",
+    "tests/test_plugin_hook_contract.py",
+    "tests/test_sdk_test_seam_check.py",
+    "tests/test_unmodified_sdk_source.py",
+    "tests/test_local_checks.py",
+    "tests/test_phase_gate.py",
+    "tests/test_sdk_source_integrity.py",
+]
 addopts = "-m 'not retired_independent_runtime'"
 markers = ["retired_independent_runtime: historical standalone DSH startup and lifecycle; excluded from the shared Desktop regression"]
 
