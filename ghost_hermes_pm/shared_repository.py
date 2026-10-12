@@ -775,10 +775,14 @@ def _require_expired_window_budget(configuration, row):
     window, state = row.get('renewWindow', {}), row.get('state', {})
     original = window.get('original_state', {})
     started = window.get('started_at_ms')
-    used = state.get('requests', -1) - window.get('request_base', -1)
+    requests, request_base = state.get('requests'), window.get('request_base')
+    used = requests - request_base if type(requests) is int and type(request_base) is int else -1
     if (window.get('stop_reason') not in {None, 'shared-work-wall-budget'} or type(started) is not int or started <= 0
             or time.time() * 1000 < started + configuration['budget']['max_wall_seconds'] * 1000
             or not 0 <= used < configuration['budget']['max_model_requests']
+            or type(state.get('reported_tokens')) is not int or state['reported_tokens'] < 0
+            or not isinstance(state.get('admissions'), list) or len(state['admissions']) != requests
+            or any(not isinstance(value, str) or not value for value in state['admissions'])
             or state.get('started_at_ms') != original.get('started_at_ms')
             or state.get('stop_reason') != original.get('stop_reason')
             or state.get('reported_tokens', -1) < original.get('reported_tokens', 0)
@@ -808,8 +812,7 @@ def prepare_shared_window_renewal(intake, record, message_id):
     raw = private_file(budget_file).read_bytes()
     row = read_ledger(configuration, execution)
     if (row.get('renewWindow', {}).get('host_lease') != configuration['host_lease']
-            or row['renewWindow'].get('hook_marker') != 'same-sid-window-v1'
-            or row['state'].get('requests') != 17 or row['state'].get('reported_tokens') != 555422):
+            or row['renewWindow'].get('hook_marker') != 'same-sid-window-v1'):
         raise ManagementError('outcome_unknown', 'The current window is not the authorized expired window.')
     _require_expired_window_budget(configuration, row)
     source = repository_source_state(record['target'])
@@ -843,7 +846,7 @@ def prepare_shared_window_renewal(intake, record, message_id):
                 or len(sessions) != 1 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
                 or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
                 or ends[-1]['data'].get('reason') != execution['terminal_reason']
-                or len(settlements) != 17 or delivery or not _rejected_bash_window_evidence(events, receipts)
+                or len(settlements) != row['state']['requests'] or delivery or not _rejected_bash_window_evidence(events, receipts)
                 or any(job['status'] in {'running', 'stopping'} for job in carrier.owned_jobs())
                 or private_file(budget_file).read_bytes() != raw):
             raise ManagementError('outcome_unknown', 'The expired window has unverified delivery, tool, job or budget activity.')
@@ -865,7 +868,8 @@ def prepare_shared_window_renewal(intake, record, message_id):
             'ledger_sha256': hashlib.sha256(raw).hexdigest(), 'cursor': snapshot['cursor'],
             'snapshot_sha256': hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
             'workspace': {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']},
-            'receipts': proofs, 'source': source, 'previous_renew_window': deepcopy(row['renewWindow'])}
+            'receipts': proofs, 'source': source, 'previous_state': deepcopy(row['state']),
+            'previous_renew_window': deepcopy(row['renewWindow'])}
         intake._save_execution(record, fields=['renewal_window_checkpoint'])
         return record
     finally:
@@ -906,7 +910,7 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
             or private_file(checkpoint['ledger_backup']).read_bytes() != raw):
         raise ManagementError('binding_conflict', 'The prepared expired window bytes changed.')
     row = read_ledger(dict(configuration, host_lease=old['lease']), execution)
-    if (row['state'].get('requests') != 17 or row['state'].get('reported_tokens') != 555422
+    if (row.get('state') != checkpoint['previous_state']
             or row.get('renewWindow') != checkpoint['previous_renew_window']):
         raise ManagementError('binding_conflict', 'The original expired window state changed.')
     _require_expired_window_budget(configuration, row)

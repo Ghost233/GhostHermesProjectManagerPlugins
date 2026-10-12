@@ -296,13 +296,13 @@ async def main():
                 budget_file = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
                 budget_row = json.loads(budget_file.read_text())
                 started = int(time.time() * 1000) - (61000 if renew_window_again else 1000)
-                base_requests = 9 if renew_window_again else 3
-                total_requests = 17 if renew_window_again else 9
+                base_requests = 4 if renew_window_again else 3
+                total_requests = 11 if renew_window_again else 9
                 original_state = {'started_at_ms': started, 'requests': base_requests,
-                                  'reported_tokens': 555000 if renew_window_again else 30,
+                                  'reported_tokens': 700 if renew_window_again else 30,
                                   'admissions': ['fixture-old-' + str(index) for index in range(base_requests)], 'stop_reason': None}
                 budget_row['state'] = {**original_state, 'requests': total_requests,
-                    'reported_tokens': 555422 if renew_window_again else 90,
+                    'reported_tokens': 911 if renew_window_again else 90,
                     'admissions': [*original_state['admissions'],
                         *['fixture-current-' + str(index) for index in range(total_requests - base_requests)]]}
                 budget_row['renewWindow'] = {'id': 'window-fixture', 'message_id': 'om-prior-window',
@@ -444,7 +444,7 @@ async def main():
                 assert control['kind'] == 'renew_window' and control['status'] == 'admitted', latest['dsh_execution']
                 granted = json.loads(budget_file.read_text())
                 old = json.loads(budget_before)
-                assert granted['renewWindow']['request_base'] == 17
+                assert granted['renewWindow']['request_base'] == old['state']['requests']
                 assert granted['renewWindow']['original_state'] == old['state']
                 assert granted['renewWindow']['started_at_ms'] is None
                 assert granted['renewWindow']['host_lease'] == granted['host_lease'] == updated['lease']
@@ -462,8 +462,10 @@ async def main():
             if renew_window_again and renewal_admitted and len(peer['prompts']) == 2 and not renewal_ended:
                 latest = record()
                 budget = json.loads(budget_file.read_text())
-                assert budget['renewWindow']['started_at_ms'] is not None and budget['renewWindow']['request_base'] == 17
-                assert budget['state']['requests'] == 18 and budget['renewWindow']['hook_marker'] == 'same-sid-window-v1'
+                assert budget['renewWindow']['started_at_ms'] is not None
+                assert budget['renewWindow']['request_base'] == old['state']['requests']
+                assert budget['state']['requests'] == old['state']['requests'] + 1
+                assert budget['renewWindow']['hook_marker'] == 'same-sid-window-v1'
                 sid = latest['dsh_execution']['session_id']
                 rows = peer['journals'][sid]
                 rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 6,
