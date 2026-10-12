@@ -161,12 +161,12 @@ class RepositoryIntake(FeishuEntry):
             except ManagementError:
                 if human_reply is not None:
                     return replace(human_reply, command='', rejected='sensitive')
-                if command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '重试 ')):
+                if command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '重试 ', '继续 ')):
                     return WorkMessage(event, adapter, transport, binding, envelope, {}, '', None, rejected='sensitive')
                 return None
-            if human_reply is not None and not re.fullmatch(r'(停止|重试) work-[a-f0-9]{32}', command):
+            if human_reply is not None and not re.fullmatch(r'(停止|重试|继续) work-[a-f0-9]{32}', command):
                 return human_reply
-            control = re.fullmatch(r'(停止|重试) (work-[a-f0-9]{32})', command)
+            control = re.fullmatch(r'(停止|重试|继续) (work-[a-f0-9]{32})', command)
             if control:
                 record = next((r for r in self.snapshot()['work'] if r['id'] == control.group(2)), None)
                 if sender.sender_type != 'user' or record is None or record['profile_id'] not in authorized_profiles:

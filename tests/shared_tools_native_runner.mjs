@@ -35,6 +35,7 @@ fs.writeFileSync(path.join(skills, 'fixture-matt', 'SKILL.md'),
   '---\nname: fixture-matt\ndescription: Synthetic public workflow.\n---\nCheck actual tool results.\n');
 const config = {ledger_dir: ledgerDir, service_ref: 'fixture:shared-host',
   host_lease: 'fixture-native-lease', agent_preset: 'fixture-managed-tools'};
+ctx.provide('workflowHostInstance', {instanceId: config.host_lease});
 const reader = path.resolve('ghost_hermes_pm/shared_source_reader.py');
 const python = fs.realpathSync(process.env.HERMES_TEST_SESSION_PYTHON);
 config.source_snapshot = {python, reader, python_sha256: crypto.createHash('sha256').update(fs.readFileSync(python)).digest('hex'),

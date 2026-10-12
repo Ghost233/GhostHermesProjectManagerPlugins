@@ -29,6 +29,8 @@ let observerAgent;
 const diagnostics = [];
 ctx.logger.exporter({levels: {default: 3}, export: message => diagnostics.push(message.args.map(String).join(' '))});
 const scenario = process.argv[3] ?? 'basic';
+const currentHostLease = scenario === 'host_restart' ? 'fixture-restarted-lease' : config.host_lease;
+ctx.provide('workflowHostInstance', {instanceId: currentHostLease});
 class Model extends LlmAdapter {
   resolveModel(provider, model) {
     return Promise.resolve({provider, id: model, name: model, context: {contextWindow: 16384}});
@@ -152,7 +154,23 @@ try {
       source: {kind: 'user'}}));
     await agent.whenIdle();
   };
-  if (scenario === 'team') {
+  if (scenario === 'host_restart') {
+    const managed = await create('fixture-restarted');
+    register(managed.agent, {host_lease: currentHostLease});
+    await prompt(managed.agent);
+    assert.equal(calls.length, 1, 'The original public Host lease admits its re-bound Session after restart.');
+    const stale = await create('fixture-stale-lease');
+    register(stale.agent);
+    await prompt(stale.agent);
+    assert.equal(calls.length, 1, 'The preset configuration lease cannot admit a stale ledger on the new Host.');
+    const manual = await create('fixture-manual-session', 'fixture-manual');
+    await prompt(manual.agent);
+    assert.equal(calls.length, 2, 'A sibling manual Session remains usable after the Host restart.');
+    assert.equal(calls.at(-1).model, 'fixture-default');
+    await managed.dispose();
+    await stale.dispose();
+    await manual.dispose();
+  } else if (scenario === 'team') {
     const managed = await create('fixture-managed-with-native-team');
     register(managed.agent);
     const rawBefore = ctx.tools.schemas(managed.agent).map(tool => tool.name).sort();

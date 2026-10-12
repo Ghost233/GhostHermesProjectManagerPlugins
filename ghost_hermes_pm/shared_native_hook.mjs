@@ -53,6 +53,8 @@ export default function sharedNativeHook(ctx, config) {
     throw new Error('Shared work Hook requires an exact native preset binding.');
   }
   privateDirectory(config.ledger_dir);
+  const hostLease = ctx.get('workflowHostInstance')?.instanceId;
+  if (!text(hostLease)) throw new Error('Shared work original public Host identity is unavailable.');
   const admitted = new Map();
   const cleanups = new Set();
   const projection = ctx.get('sessionProjections');
@@ -91,7 +93,8 @@ export default function sharedNativeHook(ctx, config) {
     const record = readPrivate(file);
     const {row} = record;
     if (row.schema !== 1 || row.session_id !== session.id || row.session_created_at !== session.header.createdAt
-        || !['service_ref', 'host_lease', 'agent_preset'].every(key => row[key] === config[key])
+        || row.host_lease !== hostLease
+        || !['service_ref', 'agent_preset'].every(key => row[key] === config[key])
         || !text(row.generation) || !text(row.workspace) || !path.isAbsolute(row.workspace)
         || fs.realpathSync(row.workspace) !== row.workspace || fs.realpathSync(session.header.cwd) !== row.workspace
         || !text(row.provider) || !text(row.model)

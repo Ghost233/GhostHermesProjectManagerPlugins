@@ -460,7 +460,7 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent'])
+@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])

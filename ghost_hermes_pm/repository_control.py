@@ -377,8 +377,10 @@ async def process_control(intake, prepared, generation):
                 intake._save_execution(record, fields=['control_message_ids'])
             if historical:
                 text, result = '这是前轮已登记的控制消息；本轮执行没有改变。原操作结果仍按原记录核对。', {'status': 'duplicate', 'work_id': record['id']}
-            elif duplicate and (prepared.command.startswith('重试 ') or execution.get('state') == 'stopped'):
-                saved = execution.get('retry_control' if prepared.command.startswith('重试 ') else 'stop_control', {})
+            elif duplicate and (prepared.command.startswith(('重试 ', '继续 ')) or execution.get('state') == 'stopped'):
+                field = ('continuation_control' if execution.get('continuation_control', {}).get('message_id') == message_id
+                    else 'maintenance_checkpoint') if prepared.command.startswith('继续 ') else 'retry_control' if prepared.command.startswith('重试 ') else 'stop_control'
+                saved = execution.get(field, {})
                 text = '这条控制消息已登记；不会重送操作或新增预算。原结果仍按记录核对，未受理或未知时请用新的消息明确请求。'
                 result = {'status': 'duplicate', 'work_id': record['id'],
                     'original_status': saved.get('status', 'unverified') if saved.get('message_id') == message_id else 'unverified'}
@@ -388,6 +390,17 @@ async def process_control(intake, prepared, generation):
                 record = await _retry(intake, record, prepared, generation)
                 text = '已受理独立新一轮执行；沿用原总 Issue 和外层卡，旧会话、预算与失败记录完整保留，等待原生派发。'
                 result = {'status': record['dsh_execution']['state'], 'work_id': record['id']}
+            elif prepared.command.startswith('继续 '):
+                if execution.get('maintenance_checkpoint'):
+                    from .shared_repository import admit_shared_continuation
+                    record = await asyncio.to_thread(admit_shared_continuation, intake, record, message_id, generation)
+                    text = '原会话维护后续接已受理；原 SID、任务与预算保持，原外层卡等待原生派发，随后向原会话发送明确续接。'
+                    result = {'status': 'admitted', 'work_id': record['id']}
+                else:
+                    from .shared_repository import prepare_shared_continuation
+                    record = await asyncio.to_thread(prepare_shared_continuation, intake, record, message_id)
+                    text = '原会话续接准备已保存；原 SID、历史、任务与预算保持，尚未派发或重送输入。维护重载后须再次明确继续。'
+                    result = {'status': 'prepared', 'work_id': record['id']}
             else:
                 if not execution.get('stop_requested'):
                     _card(intake, record)
@@ -407,7 +420,8 @@ async def process_control(intake, prepared, generation):
                     last_failure={'code': error.code if isinstance(error, ManagementError) else 'outcome_unknown',
                         'type': type(error).__name__, 'message': str(error) if isinstance(error, ManagementError) else 'Original cleanup remains unconfirmed.'})
                 intake._save_execution(record, fields=['stop_control'])
-            text = ('重试未受理；原工作与记录保留，先核对停止、当前配置、Issue 和仓库队列。' if prepared.command.startswith('重试 ')
+            text = ('继续未受理；原 SID、历史与预算保留，先核对原失败、维护重载及连接身份。' if prepared.command.startswith('继续 ')
+                else '重试未受理；原工作与记录保留，先核对停止、当前配置、Issue 和仓库队列。' if prepared.command.startswith('重试 ')
                 else '停止尚未核实；保留仓库占用，不启动重试或后续工作。原记录与改动保留。')
             result = {'status': 'unverified', 'code': error.code if isinstance(error, ManagementError) else 'outcome_unknown',
                 'repository_retained': True}
