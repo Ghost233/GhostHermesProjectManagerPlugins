@@ -379,6 +379,7 @@ async def process_control(intake, prepared, generation):
                 text, result = '这是前轮已登记的控制消息；本轮执行没有改变。原操作结果仍按原记录核对。', {'status': 'duplicate', 'work_id': record['id']}
             elif duplicate and (prepared.command.startswith(('重试 ', '继续 ', '续预算 ')) or execution.get('state') == 'stopped'):
                 field = ('continuation_control' if execution.get('continuation_control', {}).get('message_id') == message_id
+                    else 'window_resume_checkpoint' if execution.get('window_resume_checkpoint', {}).get('message_id') == message_id
                     else 'renew_window_checkpoint' if prepared.command.startswith('续预算 ') else 'maintenance_checkpoint') if prepared.command.startswith(('继续 ', '续预算 ')) else 'retry_control' if prepared.command.startswith('重试 ') else 'stop_control'
                 saved = execution.get(field, {})
                 text = '这条控制消息已登记；不会重送操作或新增预算。原结果仍按记录核对，未受理或未知时请用新的消息明确请求。'
@@ -406,6 +407,17 @@ async def process_control(intake, prepared, generation):
                     record = await asyncio.to_thread(admit_shared_max_tokens, intake, record, message_id, generation)
                     text = '原任务截断后续接已受理；原 SID、任务、已用量与预算窗口保持，原外层卡等待原生派发。'
                     result = {'status': 'admitted', 'work_id': record['id']}
+                elif execution.get('window_resume_checkpoint'):
+                    from .shared_repository import admit_shared_window_resume
+                    record = await asyncio.to_thread(admit_shared_window_resume, intake, record, message_id, generation)
+                    text = '原会话维护后在原有限窗口内继续已受理；原 SID、窗口起点、累计用量与剩余额度保持，原外层卡等待原生派发。'
+                    result = {'status': 'admitted', 'work_id': record['id']}
+                elif (execution.get('state') == 'awaiting_acceptance'
+                        and execution.get('terminal_reason', {}).get('kind') == 'completed'):
+                    from .shared_repository import prepare_shared_window_resume
+                    record = await asyncio.to_thread(prepare_shared_window_resume, intake, record, message_id)
+                    text = '原有限窗口维护续接准备已保存；未新增输入、预算或期限。正常维护后须再次明确继续，原 SID 与窗口完整保留。'
+                    result = {'status': 'prepared', 'work_id': record['id']}
                 elif execution.get('maintenance_checkpoint'):
                     from .shared_repository import admit_shared_continuation
                     record = await asyncio.to_thread(admit_shared_continuation, intake, record, message_id, generation)

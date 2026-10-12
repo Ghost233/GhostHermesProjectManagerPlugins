@@ -542,6 +542,235 @@ def _require_window_budget(configuration, row):
     return remaining
 
 
+def _rejected_bash_window_evidence(events, receipts):
+    calls = [event['data'] for event in events if event['type'] == 'tool/call' and event['data'].get('name') == 'bash']
+    results = {event['data'].get('message', {}).get('toolCallId'): event['data'].get('message', {})
+               for event in events if event['type'] == 'tool/result'}
+    call_ids = [call.get('callId') for call in calls]
+    if (len(calls) != 6 or any(not isinstance(call_id, str) or not call_id for call_id in call_ids)
+            or len(set(call_ids)) != len(call_ids)):
+        return False
+    receipt_by_id = {row.get('call_id'): row for row in receipts if row.get('name') == 'bash'}
+    for call_id in call_ids:
+        result, receipt = results.get(call_id), receipt_by_id.get(call_id)
+        texts = [block.get('text') for block in result.get('content', []) if isinstance(block, dict)
+                 and block.get('type') == 'text'] if isinstance(result, dict) else []
+        if (not isinstance(result, dict) or result.get('isError') is not True
+                or not any(text == 'Shared work tool ownership is unknown' for text in texts)
+                or not isinstance(receipt, dict) or receipt.get('is_error') is not True
+                or receipt.get('execution_admission') != 'rejected'):
+            return False
+    return True
+
+
+def prepare_shared_window_resume(intake, record, message_id):
+    """Freeze one explicitly rejected, undelivered active window before normal maintenance."""
+    from .repository_acceptance import DELIVERY_MARKER, repository_source_state
+    from .repository_control import _card, _worker_end
+    from .repository_supervision import owned_call
+    execution = record['dsh_execution']
+    acceptance = execution.get('acceptance', {})
+    if (execution.get('mode') != 'shared_native' or execution.get('state') != 'awaiting_acceptance'
+            or execution.get('terminal_reason') != {'kind': 'completed'} or execution.get('first_input') != 'accepted'
+            or execution.get('stop_requested') or execution.get('lifecycle_end')
+            or execution.get('window_resume_checkpoint')
+            or acceptance.get('status') != 'unmet' or acceptance.get('delivered') is not False
+            or 'delivery_report_missing' not in acceptance.get('unmet', [])):
+        raise ManagementError('outcome_unknown', 'Only the original undelivered completed renewed window may prepare maintenance continuation.')
+    _card(intake, record)
+    worker = _worker_end(intake, record)
+    scope = json.loads(private_file(record['target']['execution_ref']).read_text())
+    configuration = shared_configuration(Path(record['target']['execution_ref']), scope, workspace=record['target']['repo_path'])
+    configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'], generation=execution['generation'])
+    budget_file = ledger_path(configuration, execution['session_id'])
+    raw = private_file(budget_file).read_bytes()
+    row = read_ledger(configuration, execution)
+    if ('renewWindow' not in row or row['renewWindow'].get('host_lease') != configuration['host_lease']
+            or row['renewWindow'].get('hook_marker') != 'same-sid-window-v1'):
+        raise ManagementError('outcome_unknown', 'The original active renewed window is unavailable.')
+    _require_window_budget(configuration, row)
+    source = repository_source_state(record['target'])
+    if source != execution.get('baseline'):
+        raise ManagementError('binding_conflict', 'The original repository source changed before maintenance continuation.')
+    carrier = SharedDesktopTransport(configuration)
+    try:
+        if carrier.native_identity != execution['native_identity']:
+            raise ManagementError('binding_conflict', 'Prepare the active window before its normal Host maintenance.')
+        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session', 'sessionId': execution['session_id']}, 'maxMessages': 500}})
+        try:
+            snapshot = next(stream)
+        finally:
+            stream.close()
+        events = [item['event'] for item in snapshot['records']]
+        header, values = snapshot.get('header', {}), snapshot.get('projections', {}).get('values', {})
+        starts = [event for event in events if event['type'] == 'turn/start']
+        ends = [event for event in events if event['type'] == 'turn/end']
+        settlements = [event for event in events if event['type'] in {'assistant/message', 'assistant/attempt'}]
+        sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
+        workspace = resolve_shared_workspace(intake, record, carrier)
+        receipts = shared_receipts(configuration, execution, '.tools.jsonl')
+        delivery = any(DELIVERY_MARKER in block.get('text', '') for event in events if event['type'] == 'assistant/message'
+                       for block in event['data'].get('message', {}).get('content', []) if isinstance(block, dict)
+                       and block.get('type') == 'text')
+        if (snapshot.get('hasMore') is not False or header.get('id') != execution['session_id']
+                or header.get('createdAt') != execution['session_created_at'] or header.get('cwd') != configuration['workspace']
+                or values.get('agentPreset') != configuration['agent_preset']
+                or values.get('permissions') != {'currentValue': 'workspace-write'}
+                or values.get('inbox') != {'next-turn': [], 'next-step': []}
+                or len(sessions) != 1 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
+                or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
+                or ends[-1]['data'].get('reason') != execution['terminal_reason']
+                or row['state'].get('requests') != len(settlements) or delivery
+                or not _rejected_bash_window_evidence(events, receipts)
+                or any(job['status'] in {'running', 'stopping'} for job in carrier.owned_jobs())
+                or private_file(budget_file).read_bytes() != raw):
+            raise ManagementError('outcome_unknown', 'The completed active window has unverified delivery, tool, job or budget activity.')
+        backup = budget_file.with_name(budget_file.name + '.resume-window-' + hashlib.sha256(raw).hexdigest())
+        if not backup.exists():
+            with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as output:
+                output.write(raw)
+                output.flush()
+                os.fsync(output.fileno())
+        if private_file(backup).read_bytes() != raw:
+            raise ManagementError('binding_conflict', 'Original active window backup bytes differ.')
+        receipt_proofs = {}
+        for suffix in ('.tools.jsonl', '.jobs.jsonl'):
+            path = ledger_path(configuration, execution['session_id'], suffix)
+            content = private_file(path).read_bytes() if path.exists() else b''
+            receipt_proofs[suffix] = {'size': len(content), 'sha256': hashlib.sha256(content).hexdigest()}
+        execution['window_resume_checkpoint'] = {'status': 'prepared', 'message_id': message_id, 'scope': scope,
+            'native_identity': execution['native_identity'], 'worker': worker, 'ledger_backup': str(backup),
+            'ledger_sha256': hashlib.sha256(raw).hexdigest(), 'cursor': snapshot['cursor'],
+            'snapshot_sha256': hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
+            'workspace': {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']},
+            'receipts': receipt_proofs, 'source': source}
+        intake._save_execution(record, fields=['window_resume_checkpoint'])
+        return record
+    finally:
+        carrier.close()
+
+
+def admit_shared_window_resume(intake, record, message_id, generation):
+    """Re-adopt one checkpointed active window without resetting its deadline or usage."""
+    import psutil
+    from .repository_control import _card, _worker_end
+    from .repository_execution import execution_configuration
+    from .repository_supervision import owned_call
+    execution = record['dsh_execution']
+    checkpoint = execution.get('window_resume_checkpoint', {})
+    if (checkpoint.get('status') != 'prepared' or execution.get('mode') != 'shared_native'
+            or execution.get('state') != 'awaiting_acceptance' or execution.get('terminal_reason') != {'kind': 'completed'}
+            or execution.get('stop_requested') or _worker_end(intake, record) != checkpoint.get('worker')
+            or execution.get('native_identity') != checkpoint.get('native_identity')):
+        raise ManagementError('outcome_unknown', 'Only the prepared active window may continue after normal maintenance.')
+    configuration, _ = execution_configuration(record['target'])
+    scope = json.loads(private_file(record['target']['execution_ref']).read_text())
+    expected = json.loads(json.dumps(checkpoint['scope']))
+    expected['host_lease'] = scope.get('host_lease')
+    if scope != expected:
+        raise ManagementError('binding_conflict', 'The prepared active window scope changed beyond its Host lease.')
+    old = checkpoint['native_identity']
+    if psutil.pid_exists(old['pid']):
+        try:
+            if psutil.Process(old['pid']).create_time() == old['created_at']:
+                raise ManagementError('outcome_unknown', 'The original Host has not completed normal maintenance.')
+        except psutil.NoSuchProcess:
+            pass
+    configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
+        generation=execution['generation'], workspace_id=execution['workspace_id'])
+    budget_file = ledger_path(configuration, execution['session_id'])
+    raw = private_file(budget_file).read_bytes()
+    if (hashlib.sha256(raw).hexdigest() != checkpoint['ledger_sha256']
+            or private_file(checkpoint['ledger_backup']).read_bytes() != raw):
+        raise ManagementError('binding_conflict', 'The prepared active window bytes changed.')
+    row = read_ledger(dict(configuration, host_lease=old['lease']), execution)
+    if (row.get('renewWindow', {}).get('host_lease') != old['lease']
+            or row['renewWindow'].get('original_host_lease') == configuration['host_lease']):
+        raise ManagementError('binding_conflict', 'The active renewed window Host binding changed.')
+    _require_window_budget(configuration, row)
+    carrier = SharedDesktopTransport(configuration)
+    try:
+        new = carrier.native_identity
+        if any(new[key] == old[key] for key in ('lease', 'pid', 'created_at')):
+            raise ManagementError('binding_conflict', 'Normal Launcher maintenance is unverified.')
+        workspace = resolve_shared_workspace(intake, record, carrier)
+        if {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']} != checkpoint['workspace']:
+            raise ManagementError('binding_conflict', 'The original Workspace account changed.')
+        if execution.get('window_resume_adoption') == 'intent':
+            raise ManagementError('outcome_unknown', 'Original active window adoption is unknown; no replay.')
+        if execution.get('window_resume_adoption') != 'accepted':
+            execution['window_resume_adoption'] = 'intent'
+            intake._save_execution(record, fields=['window_resume_adoption'])
+            created = owned_call(carrier, 'session/create', {'sessionId': execution['session_id'],
+                'workspaceId': workspace['workspaceId'], 'agentPreset': configuration['agent_preset']})
+            if created != {'sessionId': execution['session_id'], 'agentPreset': configuration['agent_preset']}:
+                raise ManagementError('outcome_unknown', 'Original active window adoption was not confirmed.')
+            execution['window_resume_adoption'] = 'accepted'
+            intake._save_execution(record, fields=['window_resume_adoption'])
+        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session', 'sessionId': execution['session_id']}, 'maxMessages': 500}})
+        try:
+            snapshot = next(stream)
+        finally:
+            stream.close()
+        sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
+        if (not _maintenance_snapshot_matches(snapshot, checkpoint) or len(sessions) != 1
+                or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
+                or any(job['status'] in {'running', 'stopping'} for job in carrier.owned_jobs())
+                or private_file(budget_file).read_bytes() != raw):
+            raise ManagementError('binding_conflict', 'The restored active window, history or jobs differ.')
+        for suffix, proof in checkpoint['receipts'].items():
+            path = ledger_path(configuration, execution['session_id'], suffix)
+            content = private_file(path).read_bytes() if path.exists() else b''
+            if len(content) != proof['size'] or hashlib.sha256(content).hexdigest() != proof['sha256']:
+                raise ManagementError('binding_conflict', 'The prepared active receipt bytes changed.')
+        from .repository_acceptance import repository_source_state
+        if repository_source_state(record['target']) != checkpoint['source']:
+            raise ManagementError('binding_conflict', 'The original repository source changed during maintenance.')
+        intake.require_active(generation)
+        previous = execution.get('continuation_control')
+        execution.setdefault('continuation_history', [])
+        if previous:
+            execution['continuation_history'].append(previous)
+        execution['continuation_request_id'] = 'continue-' + uuid.uuid4().hex
+        execution['continuation_control'] = {'kind': 'resume_window', 'message_id': message_id, 'status': 'rebind_intent',
+            'dispatch_status': 'intent', 'previous_claim': execution['supervisor_claim'], 'worker': checkpoint['worker'],
+            'cursor': snapshot['cursor'], 'workspace': checkpoint['workspace'],
+            'snapshot_sha256': hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
+            'original_failure': {key: execution[key] for key in ('state', 'terminal_reason', 'last_failure') if key in execution}}
+        intake._save_execution(record, fields=['continuation_history', 'continuation_request_id', 'continuation_control'])
+        row['host_lease'] = new['lease']
+        row['renewWindow']['host_lease'] = new['lease']
+        row['state']['binding_sha256'] = _window_fingerprint(row)
+        temporary = budget_file.with_name(budget_file.name + '.' + uuid.uuid4().hex)
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'w') as output:
+            json.dump(row, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, budget_file)
+        retire_shared(intake, record['id'])
+        execution.update(native_identity=new, reference_sha256=configuration['reference_sha256'], state='continuation_pending')
+        execution['continuation_control'].update(status='admitted', ledger_sha256=hashlib.sha256(private_file(budget_file).read_bytes()).hexdigest())
+        execution['shared_event_observer'] = {'status': 'unavailable', 'session_id': execution['session_id'],
+            'generation': execution['generation']}
+        checkpoint['status'] = 'admitted'
+        intake._save_execution(record, fields=['native_identity', 'reference_sha256', 'state', 'continuation_control',
+            'shared_event_observer', 'window_resume_checkpoint'])
+        card = _card(intake, record)
+        if card['status'] == 'triage':
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                    raise ManagementError('outcome_unknown', 'Original triage dispatch is unconfirmed.')
+        else:
+            intake._kanban('kanban_unblock', {'task_id': record['card_id']})
+        execution['continuation_control']['dispatch_status'] = 'accepted'
+        intake._save_execution(record, fields=['continuation_control'])
+        return record
+    finally:
+        carrier.close()
+
+
 def prepare_shared_window(intake, record, message_id):
     """Freeze one expired original window; neither adopt nor send input."""
     from .repository_control import _card, _worker_end
@@ -910,16 +1139,19 @@ def shared_receipts(configuration, execution, suffix):
     expected = {'schema': 1, 'generation': execution['generation'], 'session_id': execution['session_id'],
         'session_created_at': execution['session_created_at'], 'service_ref': configuration['service_ref'],
         'host_lease': configuration['host_lease']}
-    checkpoint = execution.get('renew_window_checkpoint', {})
-    proof = checkpoint.get('receipts', {}).get(suffix)
-    old_count = 0
-    if proof:
+    prefixes = []
+    for checkpoint in (execution.get('renew_window_checkpoint', {}), execution.get('window_resume_checkpoint', {})):
+        proof = checkpoint.get('receipts', {}).get(suffix)
+        if not proof:
+            continue
         prefix = content[:proof['size']]
         if hashlib.sha256(prefix).hexdigest() != proof['sha256']:
             raise ManagementError('coverage_unverified', 'Original window receipt prefix changed.')
-        old_count = len(prefix.splitlines())
-    if any(any(row.get(key) != (checkpoint['native_identity']['lease'] if key == 'host_lease' and index < old_count else value)
-               for key, value in expected.items()) for index, row in enumerate(rows)):
+        prefixes.append((len(prefix.splitlines()), checkpoint['native_identity']['lease']))
+    if any(prefixes[index][0] >= prefixes[index + 1][0] for index in range(len(prefixes) - 1)):
+        raise ManagementError('coverage_unverified', 'Original window receipt checkpoints are unordered.')
+    if any(any(row.get(key) != (next((lease for count, lease in prefixes if index < count), value)
+               if key == 'host_lease' else value) for key, value in expected.items()) for index, row in enumerate(rows)):
         raise ManagementError('coverage_unverified', 'A shared native receipt belongs to another Session.')
     return rows
 
@@ -1122,7 +1354,7 @@ async def run_shared_work(ctx, intake, record, generation):
         elif pending_continuation and execution['supervisor_claim']['run_id'] != run_id:
             from hermes_cli.kanban_db_connect import connect_closing
             previous = continuation['previous_claim']
-            checkpoint = continuation if continuation.get('kind') in {'max_tokens', 'renew_window'} else execution['maintenance_checkpoint']
+            checkpoint = continuation if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'} else execution['maintenance_checkpoint']
             if (execution['supervisor_claim'] != previous or checkpoint['worker']['run_id'] != previous['run_id']
                     or checkpoint['worker']['identity'] != previous['identity'] or checkpoint['worker']['exit_code'] != 0):
                 raise ManagementError('binding_conflict', 'The checkpointed continuation worker claim differs.')
@@ -1137,7 +1369,7 @@ async def run_shared_work(ctx, intake, record, generation):
         if existing and (len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']):
             raise ManagementError('binding_conflict', 'Shared Session registration differs.')
         workspace = await asyncio.to_thread(resolve_shared_workspace, intake, record, carrier)
-        proof = continuation if continuation.get('kind') in {'max_tokens', 'renew_window'} else execution.get('maintenance_checkpoint', {})
+        proof = continuation if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'} else execution.get('maintenance_checkpoint', {})
         if pending_continuation and {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']} != proof['workspace']:
             raise ManagementError('binding_conflict', 'The admitted original Workspace account changed before dispatch.')
         if not existing:
@@ -1167,19 +1399,19 @@ async def run_shared_work(ctx, intake, record, generation):
         if pending_continuation:
             budget = read_ledger(configuration, execution)
             snapshot_matches = (hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == continuation['snapshot_sha256']
-                if continuation.get('kind') in {'max_tokens', 'renew_window'} else _maintenance_snapshot_matches(snapshot, execution['maintenance_checkpoint']))
+                if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'} else _maintenance_snapshot_matches(snapshot, execution['maintenance_checkpoint']))
             if continuation.get('kind') == 'max_tokens':
                 _require_max_tokens_budget(configuration, budget['state'], budget.get('renewWindow'))
-            elif continuation.get('kind') == 'renew_window':
+            elif continuation.get('kind') in {'renew_window', 'resume_window'}:
                 _require_window_budget(configuration, budget)
             jobs = carrier.owned_jobs()
             if (not snapshot_matches
                     or hashlib.sha256(private_file(ledger_path(configuration, execution['session_id'])).read_bytes()).hexdigest()
                     != continuation['ledger_sha256']
-                    or continuation.get('kind') not in {'max_tokens', 'renew_window'} and budget['state'] != {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0,
+                    or continuation.get('kind') not in {'max_tokens', 'renew_window', 'resume_window'} and budget['state'] != {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0,
                                            'admissions': [], 'stop_reason': None}
                     or (any(job['status'] in {'running', 'stopping'} for job in jobs)
-                        if continuation.get('kind') in {'max_tokens', 'renew_window'} else bool(jobs))):
+                        if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'} else bool(jobs))):
                 raise ManagementError('binding_conflict', 'The admitted pre-model continuation changed before dispatch.')
         if not execution.get('first_input') and any(row.get('event', {}).get('type') in
                 {'turn/start', 'user/message', 'assistant/message', 'tool/call'} for row in snapshot.get('records', [])):
@@ -1242,7 +1474,7 @@ async def run_shared_work(ctx, intake, record, generation):
         os.close(descriptor)
     try:
         window_start = None
-        if continuation.get('kind') == 'renew_window':
+        if continuation.get('kind') in {'renew_window', 'resume_window'}:
             budget = read_ledger(configuration, execution)
             deadline = time.monotonic() + _require_window_budget(configuration, budget) + 15
             window_start = budget['renewWindow']['started_at_ms']
@@ -1267,7 +1499,7 @@ async def run_shared_work(ctx, intake, record, generation):
                 if continuation.get('kind') == 'max_tokens':
                     budget = read_ledger(configuration, execution)
                     _require_max_tokens_budget(configuration, budget['state'], budget.get('renewWindow'))
-                elif continuation.get('kind') == 'renew_window':
+                elif continuation.get('kind') in {'renew_window', 'resume_window'}:
                     _require_window_budget(configuration, read_ledger(configuration, execution))
                 continuation['status'] = 'input_intent'
                 intake._save_execution(record, fields=['continuation_control'])
@@ -1276,7 +1508,11 @@ async def run_shared_work(ctx, intake, record, generation):
                     else 'its pre-model failure and verified maintenance restart')
                 prompt = ('Continue the original accepted task in this Session after ' + reason + '. Keep the original scope, frozen Issue, rules and remaining '
                     'budget. Resume that task in this original Session.\n\n' + _prompt(intake, record))
-                if read_ledger(configuration, execution).get('renewWindow'):
+                if continuation.get('kind') == 'resume_window':
+                    prompt = ('Continue the original accepted task in this same Session after verified normal maintenance. '
+                        'The original finite execution window is still active: preserve its existing start time, request base, '
+                        'cumulative usage and remaining allowance. Do not create or extend any budget window.\n\n' + _prompt(intake, record))
+                elif read_ledger(configuration, execution).get('renewWindow'):
                     prompt = ('The owner explicitly authorized one new finite execution window in this same Session. '
                         'Its wall limit is ' + str(configuration['budget']['max_wall_seconds']) + ' seconds and its request limit is '
                         + str(configuration['budget']['max_model_requests']) + '. It starts at the first actual native request. '
@@ -1302,7 +1538,7 @@ async def run_shared_work(ctx, intake, record, generation):
         elif execution['first_input'] != 'accepted' or (continuation and continuation.get('status') != 'accepted'):
             raise ManagementError('outcome_unknown', 'Original shared input needs reconciliation; no replay.')
         heartbeat_at = 0
-        if continuation.get('kind') not in {'max_tokens', 'renew_window'}:
+        if continuation.get('kind') not in {'max_tokens', 'renew_window', 'resume_window'}:
             deadline = time.monotonic() + configuration['budget']['max_wall_seconds'] + 15
         while time.monotonic() < deadline:
             intake.require_active(generation)
@@ -1317,13 +1553,13 @@ async def run_shared_work(ctx, intake, record, generation):
             row = next((row for row in listing['items'] if row['sessionId'] == execution['session_id']), None)
             events, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], configuration['workspace'])
             budget = read_ledger(configuration, execution)
-            if continuation.get('kind') == 'renew_window' and window_start is None and budget['renewWindow']['started_at_ms'] is not None:
+            if continuation.get('kind') in {'renew_window', 'resume_window'} and window_start is None and budget['renewWindow']['started_at_ms'] is not None:
                 window_start = budget['renewWindow']['started_at_ms']
                 deadline = time.monotonic() + (window_start + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
             execution.update(journal_cursor=events[-1]['seq'] if events else -1, usage=projections.get('tokenUsage'),
                 observed_events=execution_event_references(events), shared_budget=budget['state'])
             intake._save_execution(record)
-            cursor = (continuation['cursor'] if continuation.get('kind') in {'max_tokens', 'renew_window'}
+            cursor = (continuation['cursor'] if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'}
                 else execution['maintenance_checkpoint']['cursor']) if continuation else -1
             starts = [event for event in events if event['type'] == 'turn/start' and event['seq'] > cursor]
             ends = [event for event in events if event['type'] == 'turn/end' and event['seq'] > cursor]
