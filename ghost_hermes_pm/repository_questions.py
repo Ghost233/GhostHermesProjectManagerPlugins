@@ -56,8 +56,10 @@ def _natural_question(events):
 def _readable_material(intake, record, text):
     """Show small referenced plans as content in the same question message."""
     repository = Path(record['target']['repo_path']).resolve(strict=True)
-    for value in dict.fromkeys(re.findall(r'/(?:[^\s`"<>]+)\.md', text)):
+    for value in dict.fromkeys(re.findall(r'(?<![^\s`"<>()\[\]])[^\s`"<>()\[\]]+\.md(?=$|[\s`"<>()\[\]，。！？,;:])', text)):
         path = Path(value)
+        if not path.is_absolute():
+            path = repository / path
         try:
             resolved = path.resolve(strict=True)
             if not resolved.is_relative_to(repository) or not resolved.is_file() or resolved.stat().st_size > 16000:

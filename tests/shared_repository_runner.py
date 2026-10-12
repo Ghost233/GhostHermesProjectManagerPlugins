@@ -176,6 +176,29 @@ async def main():
     service.im.v1.message.reply = reply
     worker = None
     try:
+        material_cases = []
+        material_observations = []
+        material_pending = None
+        if shared_scenario == 'question_material':
+            docs = repo / 'docs'
+            docs.mkdir()
+            plan = 'A bounded synthetic plan with two implementation steps.\n'
+            (docs / 'spec.md').write_text(plan)
+            (repo / 'README.md').write_text(plan)
+            outside = scratch / 'outside-plan.md'
+            outside.write_text('Outside fixture material must stay private.\n')
+            (docs / 'linked.md').symlink_to(outside)
+            (docs / 'hidden.md').write_text('password: fixture-sensitive-value\n')
+            (docs / 'large.md').write_text('L' * 16001)
+            (docs / 'long-message.md').write_text('M' * 7500)
+            material_cases = [('relative', '`docs/spec.md`', True),
+                ('link', '[方案](docs/spec.md)', True), ('bare', '`README.md`', True),
+                ('absolute', '`' + str(docs / 'spec.md') + '`', True),
+                ('inside_parent', '`docs/../README.md`', True),
+                ('missing', '`docs/missing.md`', False), ('parent_escape', '`../outside-plan.md`', False),
+                ('absolute_escape', '`' + str(outside) + '`', False), ('symlink_escape', '`docs/linked.md`', False),
+                ('sensitive', '`docs/hidden.md`', False), ('file_limit', '`docs/large.md`', False),
+                ('message_limit', '`docs/long-message.md`', False)]
         if shared_scenario in continuation_scenarios:
             host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
@@ -215,11 +238,44 @@ async def main():
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
             latest = record()
+            if shared_scenario == 'question_material' and peer['prompts']:
+                sid = peer['prompts'][0]['sessionId']
+                rows = peer['journals'][sid]
+                if material_pending is not None:
+                    question = next((question for question in latest['dsh_execution'].get('questions', [])
+                        if question['id'] == 'message-' + str(material_pending)), None)
+                    if question and question.get('notification') == 'delivered':
+                        delivered = next(message for index, message in enumerate(sent, 1)
+                            if 'om_sent_' + str(index) == question['delivery']['message_id'])
+                        material_observations.append((question, delivered.request_body.content))
+                        material_pending = None
+                if material_pending is None and len(material_observations) < len(material_cases):
+                    label, reference_text, _ = material_cases[len(material_observations)]
+                    material_pending = len(rows)
+                    rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows),
+                        'time': 5 + len(material_observations), 'data': {'turn': 1, 'step': len(material_observations),
+                            'message': {'id': 'fixture-plan-' + label, 'role': 'assistant',
+                                'content': [{'type': 'text', 'text': '请确认方案 ' + reference_text + '？'}]}}}})
+                elif material_pending is None and not ended:
+                    rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 20,
+                        'data': {'turn': 1, 'reason': {'kind': 'error', 'error': {'code': 'UNKNOWN', 'message': 'Synthetic material round ended.'}}}}})
+                    next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
+                    ended = True
             if shared_scenario == 'stop' and latest['dsh_execution'].get('first_input') == 'accepted' and not stop_sent:
                 stop_sent = True
                 await receive(adapter, raw('om_stop', '@_user_1 停止 ' + latest['id']))
                 latest = record()
             card = json.loads(registry.dispatch('kanban_show', {'task_id': initial['card_id']}))['task']
+            if shared_scenario == 'question_material' and ended and card['status'] in {'blocked', 'triage'}:
+                for (label, _, answerable), (question, notification) in zip(material_cases, material_observations, strict=True):
+                    assert question['answerable'] is answerable, {'case': label, 'answerable': question['answerable'], 'notification': notification}
+                    if answerable:
+                        assert plan.strip() in notification, {'case': label, 'notification': notification}
+                    else:
+                        assert '原生 DSH 私有界面' in notification
+                    assert 'fixture-sensitive-value' not in notification and 'Outside fixture material' not in notification
+                assert len(peer['prompts']) == 1, 'Question material notifications do not submit new DSH input.'
+                break
             if shared_scenario in {'prepare_continue', *continuation_scenarios} and not continued and card['status'] in {'blocked', 'triage'}:
                 assert latest['dsh_execution']['state'] == 'execution_failed'
                 while True:
