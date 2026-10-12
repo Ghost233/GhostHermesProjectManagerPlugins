@@ -5,8 +5,8 @@ import crypto from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 
 const tools = ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'];
-const caps = {max_wall_seconds: 1800, max_model_requests: 80,
-  max_reported_tokens: 300000, max_output_tokens_per_request: 8192};
+const caps = {max_wall_seconds: 1800, max_model_requests: 80};
+const budgetKeys = [...Object.keys(caps), 'max_reported_tokens', 'max_output_tokens_per_request'];
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 const text = value => typeof value === 'string' && value.length > 0;
@@ -44,7 +44,7 @@ function binding(row) {
   return JSON.stringify({schema: row.schema, service_ref: row.service_ref, host_lease: row.host_lease,
     agent_preset: row.agent_preset, session_id: row.session_id, session_created_at: row.session_created_at,
     generation: row.generation, workspace: row.workspace, provider: row.provider, model: row.model,
-    budget: Object.fromEntries(Object.keys(caps).map(key => [key, row.budget?.[key]]))});
+    budget: Object.fromEntries(budgetKeys.filter(key => Object.hasOwn(row.budget ?? {}, key)).map(key => [key, row.budget[key]]))});
 }
 
 export default function sharedNativeHook(ctx, config) {
@@ -98,6 +98,8 @@ export default function sharedNativeHook(ctx, config) {
         || !text(row.generation) || !text(row.workspace) || !path.isAbsolute(row.workspace)
         || fs.realpathSync(row.workspace) !== row.workspace || fs.realpathSync(session.header.cwd) !== row.workspace
         || !text(row.provider) || !text(row.model)
+        || !row.budget || ![2, 4].includes(Object.keys(row.budget).length)
+        || !Object.keys(row.budget).every(key => budgetKeys.includes(key) && integer(row.budget[key]) && row.budget[key] > 0)
         || !Object.entries(caps).every(([key, maximum]) => integer(row.budget?.[key])
           && row.budget[key] > 0 && row.budget[key] <= maximum)) {
       throw new Error('Shared work ledger binding rejected.');
@@ -256,8 +258,7 @@ export default function sharedNativeHook(ctx, config) {
     if (!agent || owned?.agent !== agent) return reject('Shared work tool has no admitted owner.');
     try {
       const record = ledgerFor(agent);
-      if (record.row.state.stop_reason || expired(record)
-          || record.row.state.reported_tokens >= record.row.budget.max_reported_tokens) {
+      if (record.row.state.stop_reason || expired(record)) {
         stop(agent, record, expired(record) ? 'shared-work-wall-budget' : 'shared-work-observed-budget');
         return reject('Shared work tool budget stopped.');
       }
@@ -351,25 +352,21 @@ export default function sharedNativeHook(ctx, config) {
     validateSettlements(agent.session);
     usage(agent, record);
     if (state.stop_reason || expired(record)) throw stop(agent, record, 'shared-work-wall-budget');
-    if (state.requests >= record.row.budget.max_model_requests
-        || state.reported_tokens >= record.row.budget.max_reported_tokens) {
+    if (state.requests >= record.row.budget.max_model_requests) {
       throw stop(agent, record, 'shared-work-observed-budget');
     }
     const catalog = ctx.get('tools').schemas(agent).map(schema => schema.name).filter(name => tools.includes(name)).sort();
     if (JSON.stringify(catalog) !== JSON.stringify(tools)) throw new Error('Shared work native tool catalog changed.');
     const retry = ctx.get('llm').providerRetryPolicy(record.row.provider);
     if (retry?.mode !== 'normal' || retry.maxRetries !== 0) throw new Error('Shared work requires the native no-retry provider policy.');
-    const maxTokens = Math.min(record.row.budget.max_output_tokens_per_request,
-      record.row.budget.max_reported_tokens - state.reported_tokens);
     const prepared = await ctx.get('llm').prepareCall({provider: record.row.provider,
-      model: record.row.model, maxTokens}, signal);
+      model: record.row.model}, signal);
     const window = prepared.context?.contextWindow;
-    if (!integer(window) || window <= 0 || prepared.config.maxTokens !== maxTokens || maxTokens > window
+    if (!integer(window) || window <= 0
         || state.model_context_window !== undefined && state.model_context_window !== window) {
       throw new Error('Shared work prepared model bounds changed or are unknown.');
     }
     state.model_context_window = window; // Catalog metadata, not a provider-enforced input-token proof.
-    state.effective_max_output_tokens = maxTokens;
     if (!integer(turn) || !integer(step)) throw new Error('Shared work request identity is unavailable.');
     const key = `${turn}:${step}:${agent.session.seq}`;
     if (state.admissions.includes(key)) throw new Error('Shared work request reservation is already consumed.');
@@ -384,8 +381,7 @@ export default function sharedNativeHook(ctx, config) {
     const current = ledgerFor(agent);
     signal.throwIfAborted();
     if (current.row.state.stop_reason || expired(current)) throw stop(agent, current, 'shared-work-wall-budget');
-    return {...request, provider: current.row.provider, model: current.row.model,
-      maxTokens: current.row.state.effective_max_output_tokens};
+    return {...request, provider: current.row.provider, model: current.row.model};
   });
   ctx.on('session/event', (session, event) => {
     const owned = admitted.get(session.id);
@@ -397,8 +393,6 @@ export default function sharedNativeHook(ctx, config) {
           && (!event.data.usage && !event.data.stream?.some(record => record.type === 'chunk' && record.chunk?.type === 'usage')
             || value.last?.turn !== event.data.turn || value.last?.step !== event.data.step)) {
         stop(owned.agent, record, 'shared-work-usage-unknown');
-      } else if (record.row.state.reported_tokens >= record.row.budget.max_reported_tokens) {
-        stop(owned.agent, record, 'shared-work-observed-budget');
       } else save(record);
     } catch (error) {
       cancel(owned.agent, 'shared-work-observer-failed');

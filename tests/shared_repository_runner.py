@@ -16,9 +16,10 @@ shared_scenario = sys.argv[2]
 triage_continuation = shared_scenario == 'continue_triage'
 concurrent_claim = shared_scenario == 'continue_claim_race'
 native_restore = shared_scenario == 'continue_native_restore'
-max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot'}
+max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'continue_tokens_uncapped'}
 max_tokens_unknown = shared_scenario == 'continue_max_tokens_unknown'
 max_tokens_last_slot = shared_scenario == 'continue_max_tokens_last_slot'
+tokens_uncapped = shared_scenario == 'continue_tokens_uncapped'
 if triage_continuation or concurrent_claim or native_restore or max_tokens_continuation:
     shared_scenario = 'continue_restart'
 continuation_scenarios = {'continue_restart', 'continue_unknown'}
@@ -139,8 +140,7 @@ reference.write_text(json.dumps({'schema': 1, 'approved': True, 'mode': 'shared_
     'desktop_receipt': str(receipt), 'host_lease': 'fixture-shared-lease', 'service_ref': 'fixture-native',
     'runtime_package_root': str(sdk), 'node_bin': str(Path(shutil.which('node')).resolve()),
     'agent_preset': 'fixture-shared', 'ledger_dir': str(ledger), 'provider': 'fixture', 'model': 'fixture',
-    'budget': {'max_wall_seconds': 60, 'max_model_requests': 9 if max_tokens_last_slot else 80, 'max_reported_tokens': 300000,
-        'max_output_tokens_per_request': 8192}, 'tool_receipt_ref': str(proof),
+    'budget': {'max_wall_seconds': 60, 'max_model_requests': 9 if max_tokens_last_slot else 80}, 'tool_receipt_ref': str(proof),
     'composition_sha256': 'synthetic-composition', 'source_snapshot': {
         'python': str(Path(sys.executable).resolve()),
         'reader': str(ROOT / 'ghost_hermes_pm/shared_source_reader.py'),
@@ -359,6 +359,10 @@ async def main():
                     reference.write_text(json.dumps(wrong))
                     await rejected('om_continue_changed_caps')
                     reference.write_text(json.dumps(approved))
+                    for key, value in [('max_reported_tokens', 300000), ('max_output_tokens_per_request', 8192)]:
+                        reference.write_text(json.dumps({**approved, 'budget': {**approved['budget'], key: value}}))
+                        await rejected('om_continue_removed_' + key)
+                        reference.write_text(json.dumps(approved))
                     for name, state in (
                         ('started', {'started_at_ms': 1, 'requests': 1, 'reported_tokens': 0, 'admissions': ['fixture-start'], 'stop_reason': None}),
                         ('uncertain', {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0, 'admissions': [], 'stop_reason': 'usage-unknown'}),
@@ -499,8 +503,11 @@ async def main():
                                             'stream': [{'type': 'chunk', 'chunk': {'type': 'finish', 'reason': {
                                                 'kind': 'max-tokens' if step == 7 else 'completed'}}}]}}})
                                 budget_row = json.loads(budget_file.read_text())
+                                if tokens_uncapped:
+                                    budget_row['budget'].update(max_reported_tokens=300000, max_output_tokens_per_request=8192)
                                 budget_row['state'] = {'started_at_ms': int(time.time() * 1000), 'requests': 8,
-                                    'reported_tokens': 145200, 'admissions': ['fixture-request-' + str(step) for step in range(8)],
+                                    'reported_tokens': 345200 if tokens_uncapped else 145200,
+                                    'admissions': ['fixture-request-' + str(step) for step in range(8)],
                                     'stop_reason': None}
                                 budget_file.write_text(json.dumps(budget_row))
                                 reason = {'kind': 'max-tokens'}
@@ -547,7 +554,7 @@ async def main():
                         await max_rejected('om_continue_ordinary_error')
                         rows[-1]['event']['data']['reason'] = {'kind': 'max-tokens'}
                         for key, value in [('started_at_ms', int(time.time() * 1000) - 61000),
-                                           ('requests', 80), ('reported_tokens', 300000), ('stop_reason', 'shared-work-wall-budget')]:
+                                           ('requests', 80), ('stop_reason', 'shared-work-wall-budget')]:
                             changed = json.loads(max_budget_before)
                             changed['state'][key] = value
                             budget_file.write_text(json.dumps(changed))
@@ -623,6 +630,8 @@ async def main():
                         assert latest['dsh_execution']['terminal_reason'] == {'kind': 'completed'}
                     else:
                         assert budget_file.read_bytes() == max_budget_before
+                    if tokens_uncapped:
+                        assert json.loads(budget_file.read_bytes())['state']['reported_tokens'] == 345200
                     await receive(adapter, raw('om_continue_max_tokens', '@_user_1 继续 ' + latest['id']))
                     await receive(adapter, raw('om_stop_max_tokens', '@_user_1 停止 ' + latest['id']))
                     latest = record()

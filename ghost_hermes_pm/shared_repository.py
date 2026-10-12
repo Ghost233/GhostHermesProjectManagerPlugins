@@ -21,8 +21,7 @@ TOOLS = ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'ski
 CASES = {'allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied',
          'danger_denied', 'foreground_job_registered', 'managed_background_stopped',
          'foreground_cancelled', 'foreign_job_kill_denied', 'background_write_boundary'}
-CAPS = {'max_wall_seconds': 1800, 'max_model_requests': 80, 'max_reported_tokens': 300000,
-        'max_output_tokens_per_request': 8192}
+CAPS = {'max_wall_seconds': 1800, 'max_model_requests': 80}
 
 
 def shared_configuration(reference, configuration):
@@ -80,8 +79,13 @@ def read_ledger(configuration, execution):
     row = json.loads(private_file(ledger_path(configuration, execution['session_id'])).read_text())
     expected = {'schema': 1, 'session_id': execution['session_id'], 'generation': execution['generation'],
                 'session_created_at': execution['session_created_at'], 'workspace': configuration['workspace']}
-    expected.update({key: configuration[key] for key in ('host_lease', 'service_ref', 'agent_preset', 'provider', 'model', 'budget')})
-    if any(row.get(key) != value for key, value in expected.items()):
+    expected.update({key: configuration[key] for key in ('host_lease', 'service_ref', 'agent_preset', 'provider', 'model')})
+    budget = row.get('budget')
+    legacy_tokens = {'max_reported_tokens', 'max_output_tokens_per_request'}
+    if (any(row.get(key) != value for key, value in expected.items())
+            or not isinstance(budget, dict) or set(budget) not in (set(CAPS), set(CAPS) | legacy_tokens)
+            or any(type(budget[key]) is not int or budget[key] != configuration['budget'][key] for key in CAPS)
+            or any(type(budget[key]) is not int or budget[key] <= 0 for key in legacy_tokens & set(budget))):
         raise ManagementError('binding_conflict', 'The original shared Session ledger changed.')
     return row
 
@@ -422,7 +426,7 @@ def _require_max_tokens_budget(configuration, state):
             or now >= state['started_at_ms'] + configuration['budget']['max_wall_seconds'] * 1000
             or type(state.get('requests')) is not int or not 0 < state['requests'] < configuration['budget']['max_model_requests']
             or type(state.get('reported_tokens')) is not int
-            or not 0 <= state['reported_tokens'] < configuration['budget']['max_reported_tokens']
+            or state['reported_tokens'] < 0
             or not isinstance(state.get('admissions'), list) or len(state['admissions']) != state['requests']
             or any(not isinstance(value, str) or not value for value in state['admissions'])
             or len(set(state['admissions'])) != state['requests']):

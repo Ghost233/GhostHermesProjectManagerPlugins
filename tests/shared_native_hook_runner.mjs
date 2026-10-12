@@ -33,7 +33,7 @@ const currentHostLease = scenario === 'host_restart' ? 'fixture-restarted-lease'
 if (scenario !== 'late_host') ctx.provide('workflowHostInstance', {instanceId: currentHostLease});
 class Model extends LlmAdapter {
   resolveModel(provider, model) {
-    return Promise.resolve({provider, id: model, name: model, context: {contextWindow: 16384}});
+    return Promise.resolve({provider, id: model, name: model, defaultMaxTokens: 12288, context: {contextWindow: 16384}});
   }
   providerRetryPolicy() { return {mode: 'normal', maxRetries: 0, retryableCodes: [],
     initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 0}; }
@@ -58,7 +58,7 @@ class Model extends LlmAdapter {
     }
     if (options.model === 'fixture-recovery-unknown') fs.chmodSync(ledgerDir, 0o500);
     if (!['fixture-unreported', 'fixture-observer-write', 'fixture-recovery-unknown'].includes(options.model)) {
-      yield {type: 'usage', usage: {inputTokens: 12, outputTokens: 8}};
+      yield {type: 'usage', usage: {inputTokens: 12, outputTokens: options.model === 'fixture-large-usage' ? 300008 : 8}};
     }
     yield {type: 'finish', reason: {kind: 'completed'}};
   }
@@ -163,7 +163,8 @@ try {
     const handle = await ctx.agents.create({sessionId: id,
       meta: restored?.meta ?? {cwd: workspace, agentPreset: preset},
       ...(restored ? {seed: restored.events} : {}),
-      agentOptions: {provider: 'fixture-model', model: 'fixture-default'},
+      agentOptions: {provider: 'fixture-model', model: 'fixture-default',
+        ...(id === 'fixture-native-control' ? {maxTokens: 10000} : {})},
       setup: async agentCtx => {
         if (preset === 'fixture-managed' || scenario === 'team') await ctx.agentPresets.mount(agentCtx, preset);
       }});
@@ -175,8 +176,7 @@ try {
     const row = {schema: 1, ...config, session_id: agent.session.id,
       session_created_at: agent.session.header.createdAt, generation: 'fixture-work-' + agent.session.id,
       workspace, provider: 'fixture-model', model: 'fixture-route',
-      budget: {max_wall_seconds: 1800, max_model_requests: 2, max_reported_tokens: 300000,
-        max_output_tokens_per_request: 8192},
+      budget: {max_wall_seconds: 1800, max_model_requests: 2},
       state: {started_at_ms: null, requests: 0, reported_tokens: 0, admissions: [], stop_reason: null},
       ...overrides};
     fs.writeFileSync(ledgerPath(agent.session.id), JSON.stringify(row), {mode: 0o600});
@@ -418,20 +418,46 @@ try {
     await manual.dispose();
   } else if (scenario === 'limits') {
     const tokens = await create('fixture-token-limit');
-    const row = register(tokens.agent);
-    row.budget.max_reported_tokens = 20;
+    const row = register(tokens.agent, {model: 'fixture-large-usage'});
+    row.budget.max_reported_tokens = 300000;
+    row.budget.max_output_tokens_per_request = 8192;
+    row.state.effective_max_output_tokens = 8192;
+    row.state.binding_sha256 = crypto.createHash('sha256').update(JSON.stringify(Object.fromEntries(
+      ['schema', 'service_ref', 'host_lease', 'agent_preset', 'session_id', 'session_created_at',
+        'generation', 'workspace', 'provider', 'model', 'budget'].map(key => [key, row[key]])))).digest('hex');
     fs.writeFileSync(ledgerPath(tokens.agent.session.id), JSON.stringify(row));
     await prompt(tokens.agent);
-    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(tokens.agent.session.id))).state.stop_reason,
-      'shared-work-observed-budget', 'The final reported quota must stop owned execution immediately.');
+    assert.equal(calls[0].maxTokens, 12288, 'The original adapter default must not be capped at 8192.');
+    const first = JSON.parse(fs.readFileSync(ledgerPath(tokens.agent.session.id)));
+    assert.equal(first.state.reported_tokens, 300020);
+    assert.equal(first.state.stop_reason, null, 'Reported usage above the historical token cap is accounting only.');
+    assert.deepEqual(first.budget, row.budget, 'Historical token cap fields remain unmodified metadata.');
+    assert.equal(first.state.binding_sha256, row.state.binding_sha256, 'The original four-field ledger binding is preserved.');
+    assert.equal(first.state.effective_max_output_tokens, 8192, 'The historical output cap is neither enforced nor rewritten.');
+    const tool = await ctx.tools.execute({agent: tokens.agent, name: 'job_list', callId: 'fixture-above-token-cap',
+      arguments: {}, signal: new AbortController().signal});
+    assert.equal(tool.isError, false, 'Accounted tokens cannot deny an owned allowed tool.');
     await prompt(tokens.agent);
-    assert.equal(calls.length, 1, 'Reported tokens include input and output before the next call.');
+    const second = JSON.parse(fs.readFileSync(ledgerPath(tokens.agent.session.id)));
+    assert.equal(calls.length, 2, 'Token usage cannot deny an otherwise admitted second request.');
+    assert.equal(second.state.reported_tokens, 600040);
+    assert.equal(second.state.started_at_ms, first.state.started_at_ms);
+    await prompt(tokens.agent);
+    assert.equal(calls.length, 2, 'The request count still stops a third request.');
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(tokens.agent.session.id))).state.stop_reason,
+      'shared-work-observed-budget');
+    const upstream = await create('fixture-native-control');
+    register(upstream.agent);
+    await prompt(upstream.agent);
+    assert.equal(calls.length, 3);
+    assert.equal(calls.at(-1).maxTokens, 10000, 'An upstream native request control remains unchanged.');
     const expired = await create('fixture-expired');
     register(expired.agent, {state: {started_at_ms: Date.now() - 1800000, requests: 0,
       reported_tokens: 0, admissions: [], stop_reason: null}});
     await prompt(expired.agent);
-    assert.equal(calls.length, 1, 'Expired work cannot emit its first model call.');
+    assert.equal(calls.length, 3, 'Expired work cannot emit its first model call.');
     await tokens.dispose();
+    await upstream.dispose();
     await expired.dispose();
   } else {
   const managed = await create('fixture-owned');
@@ -439,7 +465,7 @@ try {
   await prompt(managed.agent);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].model, 'fixture-route');
-  assert.equal(calls[0].maxTokens, 8192);
+  assert.equal(calls[0].maxTokens, 12288);
   assert.equal(JSON.parse(fs.readFileSync(ledgerPath('fixture-owned'))).state.requests, 1);
   assert.equal(JSON.parse(fs.readFileSync(ledgerPath('fixture-owned'))).state.model_context_window, 16384,
     'The admitted model route must record original prepared context metadata.');
