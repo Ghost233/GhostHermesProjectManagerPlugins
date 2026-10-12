@@ -327,11 +327,13 @@ async def main():
                                 'content': [{'type': 'text', 'text': 'Synthetic bounded work.'}]}, 'stream': []}}})
                 for index in range(6):
                     call_id = 'fixture-rejected-bash-' + str(index)
+                    rejection_text = ('Error: Shared work tool ownership is unknown.' if renew_window_again
+                                      else 'Shared work tool ownership is unknown')
                     rows.append({'type': 'event', 'event': {'type': 'tool/call', 'seq': len(rows), 'time': 4,
                         'data': {'turn': 1, 'step': index, 'callId': call_id, 'name': 'bash', 'arguments': {'command': 'printf fixture'}}}})
                     rows.append({'type': 'event', 'event': {'type': 'tool/result', 'seq': len(rows), 'time': 4,
                         'data': {'turn': 1, 'step': index, 'message': {'toolCallId': call_id, 'isError': True,
-                            'content': [{'type': 'text', 'text': 'Shared work tool ownership is unknown'}]}}}})
+                            'content': [{'type': 'text', 'text': rejection_text}]}}}})
                 source = {'head': None, 'workspace_status': '', 'source_digest': hashlib.sha256(b'').hexdigest()}
                 receipt_rows = [{'schema': 1, 'generation': budget_row['generation'], 'session_id': sid,
                     'session_created_at': budget_row['session_created_at'], 'service_ref': 'fixture-native',
@@ -469,6 +471,22 @@ async def main():
                 assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
                 drift.unlink()
                 receipts = [json.loads(row) for row in receipt_path.read_text().splitlines()]
+                journal = peer['journals'][latest['dsh_execution']['session_id']]
+                rejected_result = next(row['event']['data']['message'] for row in journal
+                    if row['event']['type'] == 'tool/result' and row['event']['data']['message'].get('toolCallId') == 'fixture-rejected-bash-0')
+                original_text = rejected_result['content'][0]['text']
+                for label, text in [('missing_period', 'Error: Shared work tool ownership is unknown'),
+                                    ('other_error', 'Error: Shared work ownership failed.')]:
+                    rejected_result['content'][0]['text'] = text
+                    await receive(adapter, raw('om_window_again_' + label, '@_user_1 续预算 ' + latest['id']))
+                    assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                rejected_result['content'][0]['text'] = original_text
+                rejected_call = next(row['event']['data'] for row in journal
+                    if row['event']['type'] == 'tool/call' and row['event']['data'].get('callId') == 'fixture-rejected-bash-0')
+                rejected_call['name'] = 'skill'
+                await receive(adapter, raw('om_window_again_wrong_tool', '@_user_1 续预算 ' + latest['id']))
+                assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                rejected_call['name'] = 'bash'
                 receipts[3]['execution_admission'] = 'admitted'
                 receipt_path.write_text(''.join(json.dumps(row) + '\n' for row in receipts))
                 receipt_path.chmod(0o600)

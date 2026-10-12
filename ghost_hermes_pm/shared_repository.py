@@ -559,7 +559,8 @@ def _rejected_bash_window_evidence(events, receipts):
         texts = [block.get('text') for block in result.get('content', []) if isinstance(block, dict)
                  and block.get('type') == 'text'] if isinstance(result, dict) else []
         if (not isinstance(result, dict) or result.get('isError') is not True
-                or not any(text == 'Shared work tool ownership is unknown' for text in texts)
+                or not any(text in {'Shared work tool ownership is unknown', 'Error: Shared work tool ownership is unknown.'}
+                           for text in texts)
                 or not isinstance(receipt, dict) or receipt.get('is_error') is not True
                 or receipt.get('execution_admission') != 'rejected'):
             return False
