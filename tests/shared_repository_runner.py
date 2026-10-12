@@ -198,6 +198,7 @@ service_client, connect_service, receive, raw, ReplyMessageResponse = (namespace
 
 
 async def main():
+    from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
     from hermes_cli.kanban_db_dispatch import dispatch_once
     from simple_worker_evidence import remember_worker
@@ -392,6 +393,27 @@ async def main():
                         break
                     await asyncio.sleep(.05)
                 worker = None
+                claim_run_id = latest['dsh_execution']['supervisor_claim']['run_id']
+                assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
+                with connect_closing() as db:
+                    assert dispatch_once(db, max_spawn=1).spawned
+                    later_worker = remember_worker(db, initial['card_id'])
+                await receive(adapter, raw('om_window_again_later_active', '@_user_1 续预算 ' + latest['id']))
+                assert 'renewal_window_checkpoint' not in record()['dsh_execution'] and len(peer['prompts']) == 1
+                assert 'error' not in json.loads(registry.dispatch('kanban_block', {
+                    'task_id': initial['card_id'], 'kind': 'needs_input', 'reason': 'Synthetic second worker terminal outcome.'}))
+                while True:
+                    waited, status = os.waitpid(later_worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        break
+                    await asyncio.sleep(.05)
+                with connect_closing() as db:
+                    later_run = kb.latest_run(db, initial['card_id'])
+                    later_card = kb.get_task(db, initial['card_id'])
+                assert later_run.id != claim_run_id and later_run.status in {'done', 'blocked', 'crashed', 'timed_out', 'failed', 'released'} and later_run.ended_at is not None
+                assert later_card.status in {'blocked', 'triage'} and later_card.current_run_id is None and later_card.worker_pid is None
+                latest = record()
                 budget_file = ledger / (hashlib.sha256(latest['dsh_execution']['session_id'].encode()).hexdigest() + '.json')
                 budget_before = budget_file.read_bytes()
                 await receive(adapter, raw('om_window_again_continue_expired', '@_user_1 继续 ' + latest['id']))

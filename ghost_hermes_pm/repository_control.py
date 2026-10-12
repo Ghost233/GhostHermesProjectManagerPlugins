@@ -26,29 +26,34 @@ def _card(intake, record):
     return intake._kanban('kanban_show', {'task_id': record['card_id']})['task']
 
 
-def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'})):
+def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, allow_later_terminal=False):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
     from .trusted_controller import controller_identity
     with connect_closing(board=intake.board) as connection:
         card = kb.get_task(connection, record['card_id'])
-        run = kb.latest_run(connection, record['card_id'])
+        latest = kb.latest_run(connection, record['card_id'])
         runs = kb.list_runs(connection, record['card_id'])
     if not card or card.status not in statuses or card.current_run_id is not None or card.worker_pid is not None:
         raise ManagementError('outcome_unknown', 'The original Kanban worker has not ended.')
     claim = record['dsh_execution'].get('supervisor_claim')
     if claim is None:
-        if run is not None:
+        if latest is not None:
             prior = record.get('execution_attempts', [])
             previous = prior[-1]['execution'].get('supervisor_claim') if prior else None
-            if not previous or run.id != previous['run_id'] or run.status == 'running' or run.ended_at is None:
+            if not previous or latest.id != previous['run_id'] or latest.status == 'running' or latest.ended_at is None:
                 raise ManagementError('outcome_unknown', 'An unregistered original worker requires reconciliation.')
         return {'run_id': None, 'exit_code': None, 'not_started': True}
+    run = next((candidate for candidate in runs if candidate.id == claim['run_id']), None) if allow_later_terminal else latest
     identity = claim['identity']
     if (not run or run.id != claim['run_id'] or run.task_id != card.id
         or type(identity.get('pid')) is not int or identity['pid'] <= 0
         or run.worker_pid not in {None, identity['pid']} or run.status == 'running' or run.ended_at is None):
         raise ManagementError('outcome_unknown', 'The original claimed run has not ended.')
+    terminal_statuses = {'done', 'blocked', 'crashed', 'timed_out', 'failed', 'released'}
+    if allow_later_terminal and any(candidate.task_id != card.id or candidate.status not in terminal_statuses
+                                    or candidate.ended_at is None for candidate in runs if candidate.id > run.id):
+        raise ManagementError('outcome_unknown', 'A later original worker remains active or unknown.')
     if psutil.pid_exists(identity['pid']):
         process = psutil.Process(identity['pid'])
         birth = float(identity['start_sec']) + float(identity['start_usec']) / 1000000
@@ -63,7 +68,7 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'})):
     path = kb.worker_log_path(card.id, board=intake.board)
     size = path.stat().st_size
     if offset is None:
-        if len(runs) != 1:
+        if len(runs) != 1 or allow_later_terminal:
             raise ManagementError('outcome_unknown', 'Original worker exit has no unambiguous run log boundary.')
         offset = 0
     if type(offset) is not int or offset < 0 or offset > size:
@@ -72,7 +77,7 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'})):
     if not isinstance(text, str):
         raise ManagementError('outcome_unknown', 'The original worker log is unavailable.')
     codes = re.findall(r'^\[kanban-worker-exit\] rc=(-?\d+)\s*$', text, re.MULTILINE)
-    if not codes or codes[-1] != '0':
+    if not codes or (codes[0] if allow_later_terminal else codes[-1]) != '0':
         raise ManagementError('outcome_unknown', 'The original worker has no successful native exit receipt.')
     return {'run_id': run.id, 'identity': identity, 'exit_code': 0}
 

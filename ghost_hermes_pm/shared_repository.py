@@ -804,7 +804,7 @@ def prepare_shared_window_renewal(intake, record, message_id):
             or acceptance.get('delivered') is not False or 'delivery_report_missing' not in acceptance.get('unmet', [])):
         raise ManagementError('outcome_unknown', 'Only the original undelivered completed window may prepare its one renewal.')
     _card(intake, record)
-    worker = _worker_end(intake, record)
+    worker = _worker_end(intake, record, allow_later_terminal=True)
     scope = json.loads(private_file(record['target']['execution_ref']).read_text())
     configuration = shared_configuration(Path(record['target']['execution_ref']), scope, workspace=record['target']['repo_path'])
     configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'], generation=execution['generation'])
@@ -886,7 +886,7 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
     checkpoint = execution.get('renewal_window_checkpoint', {})
     if (checkpoint.get('status') != 'prepared' or execution.get('mode') != 'shared_native'
             or execution.get('state') != 'awaiting_acceptance' or execution.get('terminal_reason') != {'kind': 'completed'}
-            or execution.get('stop_requested') or _worker_end(intake, record) != checkpoint.get('worker')
+            or execution.get('stop_requested') or _worker_end(intake, record, allow_later_terminal=True) != checkpoint.get('worker')
             or execution.get('native_identity') != checkpoint.get('native_identity')):
         raise ManagementError('outcome_unknown', 'Only the prepared expired window may enter its authorized renewal.')
     configuration, _ = execution_configuration(record['target'])
