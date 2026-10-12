@@ -332,7 +332,13 @@ async def main():
                     rows.append({'type': 'event', 'event': {'type': 'tool/result', 'seq': len(rows), 'time': 4,
                         'data': {'turn': 1, 'step': index, 'message': {'toolCallId': call_id, 'isError': True,
                             'content': [{'type': 'text', 'text': 'Shared work tool ownership is unknown'}]}}}})
+                source = {'head': None, 'workspace_status': '', 'source_digest': hashlib.sha256(b'').hexdigest()}
                 receipt_rows = [{'schema': 1, 'generation': budget_row['generation'], 'session_id': sid,
+                    'session_created_at': budget_row['session_created_at'], 'service_ref': 'fixture-native',
+                    'host_lease': 'fixture-shared-lease', 'call_id': 'fixture-source-' + str(index), 'name': 'bash',
+                    'kind': 'foreground', 'execution_admission': 'admitted', 'is_error': False, 'exit_code': 0,
+                    'timed_out': False, 'aborted': False, 'native_session_seq': index, 'source_before': source,
+                    'source_after': source} for index in range(3)] + [{'schema': 1, 'generation': budget_row['generation'], 'session_id': sid,
                     'session_created_at': budget_row['session_created_at'], 'service_ref': 'fixture-native',
                     'host_lease': 'fixture-shared-lease', 'call_id': 'fixture-rejected-bash-' + str(index), 'name': 'bash',
                     'is_error': True, 'execution_admission': 'rejected'} for index in range(6)]
@@ -426,13 +432,25 @@ async def main():
                 budget_file.write_bytes(budget_before)
                 receipt_path = ledger / (hashlib.sha256(latest['dsh_execution']['session_id'].encode()).hexdigest() + '.tools.jsonl')
                 receipts = [json.loads(row) for row in receipt_path.read_text().splitlines()]
-                receipts[0]['execution_admission'] = 'admitted'
+                receipts_before = receipt_path.read_bytes()
+                receipts[1]['source_before'] = {**receipts[1]['source_before'], 'source_digest': 'f' * 64}
+                receipt_path.write_text(''.join(json.dumps(row) + '\n' for row in receipts))
+                receipt_path.chmod(0o600)
+                await receive(adapter, raw('om_window_again_broken_chain', '@_user_1 续预算 ' + latest['id']))
+                assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                receipt_path.write_bytes(receipts_before)
+                drift = repo / 'synthetic-source-drift'
+                drift.write_text('Synthetic source drift.\n')
+                await receive(adapter, raw('om_window_again_current_drift', '@_user_1 续预算 ' + latest['id']))
+                assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                drift.unlink()
+                receipts = [json.loads(row) for row in receipt_path.read_text().splitlines()]
+                receipts[3]['execution_admission'] = 'admitted'
                 receipt_path.write_text(''.join(json.dumps(row) + '\n' for row in receipts))
                 receipt_path.chmod(0o600)
                 await receive(adapter, raw('om_window_again_admitted_bash', '@_user_1 续预算 ' + latest['id']))
                 assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
-                receipt_path.write_text(''.join(json.dumps(row) + '\n' for row in record()['dsh_execution']['tool_receipts']))
-                receipt_path.chmod(0o600)
+                receipt_path.write_bytes(receipts_before)
                 fixture_behavior['jobs'] = [{'id': 'fixture-running-job', 'owner': latest['dsh_execution']['session_id'], 'status': 'running'}]
                 await receive(adapter, raw('om_window_again_active_job', '@_user_1 续预算 ' + latest['id']))
                 assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1

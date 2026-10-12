@@ -547,12 +547,15 @@ def _rejected_bash_window_evidence(events, receipts):
     results = {event['data'].get('message', {}).get('toolCallId'): event['data'].get('message', {})
                for event in events if event['type'] == 'tool/result'}
     call_ids = [call.get('callId') for call in calls]
-    if (len(calls) != 6 or any(not isinstance(call_id, str) or not call_id for call_id in call_ids)
+    if (any(not isinstance(call_id, str) or not call_id for call_id in call_ids)
             or len(set(call_ids)) != len(call_ids)):
         return False
     receipt_by_id = {row.get('call_id'): row for row in receipts if row.get('name') == 'bash'}
+    rejected = []
     for call_id in call_ids:
         result, receipt = results.get(call_id), receipt_by_id.get(call_id)
+        if isinstance(result, dict) and result.get('isError') is not True:
+            continue
         texts = [block.get('text') for block in result.get('content', []) if isinstance(block, dict)
                  and block.get('type') == 'text'] if isinstance(result, dict) else []
         if (not isinstance(result, dict) or result.get('isError') is not True
@@ -560,7 +563,41 @@ def _rejected_bash_window_evidence(events, receipts):
                 or not isinstance(receipt, dict) or receipt.get('is_error') is not True
                 or receipt.get('execution_admission') != 'rejected'):
             return False
-    return True
+        rejected.append(call_id)
+    return len(rejected) == 6
+
+
+def _source_core(value):
+    if not isinstance(value, dict):
+        return None
+    core = {key: value.get(key) for key in ('head', 'workspace_status', 'source_digest')}
+    if (not isinstance(core['workspace_status'], str) or not isinstance(core['source_digest'], str)
+            or core['head'] is not None and not isinstance(core['head'], str)):
+        return None
+    return core
+
+
+def _verified_source_chain(execution, baseline, receipts, current):
+    previous = _source_core(baseline)
+    current = _source_core(current)
+    if previous is None or current is None:
+        return False
+    found = False
+    for receipt in receipts:
+        before, after = receipt.get('source_before'), receipt.get('source_after')
+        if before is None and after is None:
+            continue
+        if (receipt.get('generation') != execution['generation'] or receipt.get('session_id') != execution['session_id']
+                or receipt.get('name') != 'bash' or receipt.get('kind') != 'foreground'
+                or receipt.get('execution_admission') != 'admitted' or receipt.get('is_error') is not False
+                or receipt.get('exit_code') != 0 or receipt.get('timed_out') is not False
+                or receipt.get('aborted') is not False):
+            return False
+        before, after = _source_core(before), _source_core(after)
+        if before is None or after is None or before != previous:
+            return False
+        previous, found = after, True
+    return found and previous == current
 
 
 def prepare_shared_window_resume(intake, record, message_id):
@@ -816,8 +853,6 @@ def prepare_shared_window_renewal(intake, record, message_id):
         raise ManagementError('outcome_unknown', 'The current window is not the authorized expired window.')
     _require_expired_window_budget(configuration, row)
     source = repository_source_state(record['target'])
-    if source != execution.get('baseline'):
-        raise ManagementError('binding_conflict', 'The original repository source changed before renewal.')
     carrier = SharedDesktopTransport(configuration)
     try:
         if carrier.native_identity != execution['native_identity']:
@@ -835,6 +870,8 @@ def prepare_shared_window_renewal(intake, record, message_id):
         sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
         workspace = resolve_shared_workspace(intake, record, carrier)
         receipts = shared_receipts(configuration, execution, '.tools.jsonl')
+        if not _verified_source_chain(execution, execution.get('baseline'), receipts, source):
+            raise ManagementError('binding_conflict', 'The original shared source receipt chain changed before renewal.')
         delivery = any(DELIVERY_MARKER in block.get('text', '') for event in events if event['type'] == 'assistant/message'
                        for block in event['data'].get('message', {}).get('content', []) if isinstance(block, dict)
                        and block.get('type') == 'text')
