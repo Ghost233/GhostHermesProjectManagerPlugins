@@ -174,6 +174,59 @@ def require_permission_initializer_end(previous, old_run, card_id):
         raise ManagementError('outcome_unknown', 'The original permission-initialization worker is still alive.')
 
 
+def resolve_shared_workspace(intake, record, carrier):
+    from .repository_supervision import owned_call
+    execution = record['dsh_execution']
+    workspace = owned_call(carrier, 'workspace/create', {'path': record['target']['repo_path']})['workspace']
+    if execution.get('workspace_id', workspace['workspaceId']) != workspace['workspaceId']:
+        raise ManagementError('binding_conflict', 'The registered original Workspace identity changed.')
+    execution['workspace_id'] = workspace['workspaceId']
+    intake._save_execution(record, fields=['workspace_id'])
+    return workspace
+
+
+def bind_shared_workspace(intake, record, carrier):
+    """Account only this existing Session, without resending work or changing its journal."""
+    from .repository_supervision import owned_call
+    execution = record['dsh_execution']
+    if (execution.get('mode') != 'shared_native' or carrier.config['session_id'] != execution['session_id']
+            or carrier.config['generation'] != execution['generation'] or carrier.native_identity != execution['native_identity']):
+        raise ManagementError('binding_conflict', 'Only the registered shared Session may gain its Workspace account.')
+    def snapshot():
+        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
+            'sessionId': execution['session_id']}, 'maxMessages': 500}})
+        try:
+            value = next(stream)
+        finally:
+            stream.close()
+        header = value.get('header', {})
+        if (header.get('id') != execution['session_id'] or header.get('cwd') != record['target']['repo_path']
+                or header.get('createdAt') != execution['session_created_at'] or value.get('hasMore') is not False
+                or value.get('projections', {}).get('values', {}).get('agentPreset') != carrier.config['agent_preset']):
+            raise ManagementError('binding_conflict', 'The existing Session identity or original history differs.')
+        return value
+    before = snapshot()
+    workspace = resolve_shared_workspace(intake, record, carrier)
+    if execution['session_id'] not in workspace['sessionIds']:
+        rows = [row for row in owned_call(carrier, 'session/list', {})['items']
+                if row['sessionId'] == execution['session_id']]
+        if (len(rows) != 1 or rows[0].get('cwd') != record['target']['repo_path']
+                or rows[0].get('running') is not False or rows[0].get('agentAvailable') is not True):
+            raise ManagementError('outcome_unknown', 'Only the original idle shared Session may gain its Workspace account.')
+        ledger = ledger_path(carrier.config, execution['session_id'])
+        budget_before = private_file(ledger).read_bytes() if ledger.exists() else None
+        created = owned_call(carrier, 'session/create', {'sessionId': execution['session_id'],
+            'workspaceId': workspace['workspaceId'], 'agentPreset': carrier.config['agent_preset']})
+        budget_after = private_file(ledger).read_bytes() if ledger.exists() else None
+        if (created != {'sessionId': execution['session_id'], 'agentPreset': carrier.config['agent_preset']}
+                or snapshot() != before or budget_after != budget_before):
+            raise ManagementError('outcome_unknown', 'Workspace accounting changed the original Session or budget.')
+        workspace = resolve_shared_workspace(intake, record, carrier)
+    if workspace['sessionIds'].count(execution['session_id']) != 1:
+        raise ManagementError('binding_conflict', 'The original Workspace has no unique account for this Session.')
+    return workspace
+
+
 def shared_attach(intake, record, *, observe=True):
     from .repository_execution import execution_configuration
     execution = record['dsh_execution']
@@ -182,12 +235,19 @@ def shared_attach(intake, record, *, observe=True):
         raise ManagementError('binding_conflict', 'The admitted shared execution reference changed.')
     configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
                          generation=execution['generation'])
+    if execution.get('workspace_id'):
+        configuration['workspace_id'] = execution['workspace_id']
     read_ledger(configuration, execution)
     if not observe:
         carrier = SharedDesktopTransport(configuration)
         if carrier.native_identity != execution['native_identity']:
             carrier.close()
             raise ManagementError('binding_conflict', 'The registered shared Desktop generation changed.')
+        try:
+            bind_shared_workspace(intake, record, carrier)
+        except Exception:
+            carrier.close()
+            raise
         return carrier
     cache = getattr(intake, '_shared_carriers', None)
     if cache is None:
@@ -202,7 +262,12 @@ def shared_attach(intake, record, *, observe=True):
         if carrier.native_identity != execution['native_identity']:
             carrier.close()
             raise ManagementError('binding_conflict', 'The registered shared Desktop generation changed.')
-        carrier.start_events()
+        try:
+            bind_shared_workspace(intake, record, carrier)
+            carrier.start_events()
+        except Exception:
+            carrier.close()
+            raise
         carrier.keep_open = True
         cache[record['id']] = carrier
     carrier.event_frames()
@@ -422,13 +487,16 @@ async def run_shared_work(ctx, intake, record, generation):
                 'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
         listing = await asyncio.to_thread(owned_call, carrier, 'session/list', {})
         existing = [row for row in listing['items'] if row['sessionId'] == execution['session_id']]
+        if existing and (len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']):
+            raise ManagementError('binding_conflict', 'Shared Session registration differs.')
+        workspace = await asyncio.to_thread(resolve_shared_workspace, intake, record, carrier)
         if not existing:
             if execution.get('session_creation'):
                 raise ManagementError('outcome_unknown', 'Original shared Session creation was not confirmed; no replacement.')
             execution['session_creation'] = 'intent'
             intake._save_execution(record)
             created = await asyncio.to_thread(owned_call, carrier, 'session/create',
-                {'sessionId': execution['session_id'], 'cwd': configuration['workspace'], 'agentPreset': configuration['agent_preset']})
+                {'sessionId': execution['session_id'], 'workspaceId': workspace['workspaceId'], 'agentPreset': configuration['agent_preset']})
             if created != {'sessionId': execution['session_id'], 'agentPreset': configuration['agent_preset']}:
                 raise ManagementError('binding_conflict', 'The created ordinary shared Session differs.')
         elif len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']:
@@ -450,6 +518,7 @@ async def run_shared_work(ctx, intake, record, generation):
                 {'turn/start', 'user/message', 'assistant/message', 'tool/call'} for row in snapshot.get('records', [])):
             raise ManagementError('binding_conflict', 'The newly owned shared Session has unexpected work.')
         execution.update(session_creation='registered', session_created_at=header['createdAt'])
+        await asyncio.to_thread(bind_shared_workspace, intake, record, carrier)
         if not execution.get('native_permission'):
             catalog = await asyncio.to_thread(owned_call, carrier, 'commands/list', {'agentId': execution['session_id']})
             if not isinstance(catalog, list) or not any(row.get('name') == 'permission' for row in catalog):

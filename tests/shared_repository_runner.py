@@ -27,8 +27,21 @@ service_source = service_source.replace("assert self.path == '/api/remote.mux'",
                 self.end_headers()
                 return
             assert self.path == '/api/remote.mux'""")
+service_source = service_source.replace("elif method == 'session/create':", """elif method == 'workspace/create':
+                assert set(args['request']) == {'path'}
+                created = 'workspace' not in state
+                if created:
+                    state['workspace'] = {'workspaceId': 'fixture-shared-workspace', 'path': args['request']['path'],
+                        'title': 'Fixture', 'sessionIds': [], 'createdAt': 'fixture-created', 'updatedAt': 'fixture-created'}
+                value = {'workspace': dict(state['workspace']), 'created': created}
+            elif method == 'session/create':""")
 service_source = service_source.replace("value = {'sessionId': args['request']['sessionId']}",
     "value = {'sessionId': args['request']['sessionId'], 'agentPreset': args['request']['agentPreset']}")
+service_source = service_source.replace("'cwd': args['request']['cwd']", "'cwd': (state['workspace']['path'] if 'workspaceId' in args['request'] else args['request']['cwd'])")
+service_source = service_source.replace("state['journals'].setdefault(value['sessionId'], list(behavior.get('records', [])))", """state['journals'].setdefault(value['sessionId'], list(behavior.get('records', [])))
+                if 'workspaceId' in args['request']:
+                    assert 'cwd' not in args['request'] and args['request']['workspaceId'] == state['workspace']['workspaceId']
+                    state['workspace']['sessionIds'].append(value['sessionId'])""")
 service_source = service_source.replace("'values': {'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []})}",
     "'values': {'agentPreset': 'fixture-shared', 'userQuestions': {'active': [], 'settled': []}, "
     "'permissions': {'currentValue': 'workspace-write'}, "
@@ -192,6 +205,10 @@ async def main():
         assert latest['dsh_execution']['native_identity']['kind'] == 'shared_native'
         assert latest['dsh_execution']['native_identity']['pid'] == os.getpid()
         assert latest['dsh_execution']['native_permission'] == 'workspace-write'
+        assert latest['dsh_execution']['workspace_id'] == peer['workspace']['workspaceId']
+        assert peer['workspace']['path'] == str(repo) and peer['workspace']['sessionIds'] == [latest['dsh_execution']['session_id']]
+        assert sum(call['method'] == 'workspace/create' and call['payload']['args']['request']['path'] == str(repo)
+                   for call in peer['calls']) >= 1
         if shared_scenario == 'reconcile_intent':
             assert original_binding == {key: latest['dsh_execution'][key] for key in original_binding}
             assert len([call for call in peer['calls'] if call['method'] == 'commands/execute']) == 1

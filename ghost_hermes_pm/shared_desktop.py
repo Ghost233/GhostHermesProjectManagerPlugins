@@ -55,7 +55,7 @@ def desktop_identity(reference, expected_lease):
 class SharedDesktopTransport:
     """Original HTTP/Remote mux with a strict owned-session mutation fence."""
     _reads = {'session/list', 'session/projections', 'session/page', 'commands/list'}
-    _mutations = {'session/create', 'session/prompt', 'session/cancel', 'session/rename',
+    _mutations = {'workspace/create', 'session/create', 'session/prompt', 'session/cancel', 'session/rename',
                   'session/updateQueue', 'job/kill', 'userQuestions/answer', '$events/result', 'commands/execute'}
 
     def __init__(self, configuration, timeout=15):
@@ -100,13 +100,19 @@ class SharedDesktopTransport:
         request = args.get('request', args) if isinstance(args, dict) else None
         if not isinstance(request, dict):
             raise ManagementError('invalid_change', 'An original native request is required.')
-        if method in self._mutations and method != '$events/result':
+        if method == 'workspace/create':
+            if (request != {'path': self.config['workspace']}
+                    or str(Path(self.config['workspace']).resolve(strict=True)) != self.config['workspace']):
+                raise ManagementError('unauthorized', 'Only the bound canonical repository Workspace may be resolved.')
+        elif method in self._mutations and method != '$events/result':
             target = request.get('agentId') if method in {'userQuestions/answer', 'commands/execute'} else request.get('sessionId')
             if target != self.config['session_id']:
                 raise ManagementError('unauthorized', 'The mutation is outside the owned shared Session.')
-            if method == 'session/create' and (request.get('cwd') != self.config['workspace']
-                    or request.get('agentPreset') != self.config['agent_preset']):
-                raise ManagementError('binding_conflict', 'Owned Session creation scope differs.')
+            if method == 'session/create':
+                location = ({'workspaceId': self.config['workspace_id']} if 'workspaceId' in request
+                            and self.config.get('workspace_id') else {'cwd': self.config['workspace']})
+                if request != {'sessionId': self.config['session_id'], 'agentPreset': self.config['agent_preset'], **location}:
+                    raise ManagementError('binding_conflict', 'Owned Session creation scope differs.')
             if method == 'job/kill' and self._jobs.get(request.get('jobId')) != target:
                 raise ManagementError('unauthorized', 'Only an exactly owned native job may be cancelled.')
             if method == 'commands/execute' and request != {'agentId': self.config['session_id'],
@@ -139,7 +145,21 @@ class SharedDesktopTransport:
             native_args = request
         else:
             native_args = {'_request': {}} if method == 'session/list' else {'request': request}
-        return self._transport.request(method, native_args, rpc_id)
+        packet = self._transport.request(method, native_args, rpc_id)
+        if method == 'workspace/create' and packet.get('result', {}).get('ok') is True:
+            value = packet['result'].get('value', {})
+            workspace = value.get('workspace', {})
+            identifiers = workspace.get('sessionIds')
+            identifier = workspace.get('workspaceId')
+            if (packet.get('type') != 'server-response' or packet.get('rpcId') != rpc_id
+                    or type(value.get('created')) is not bool or not isinstance(identifier, str) or not identifier
+                    or workspace.get('path') != self.config['workspace']
+                    or not isinstance(identifiers, list) or any(not isinstance(item, str) or not item for item in identifiers)
+                    or len(identifiers) != len(set(identifiers))
+                    or self.config.get('workspace_id', identifier) != identifier):
+                raise ManagementError('binding_conflict', 'The original bound Workspace identity or Session account differs.')
+            self.config['workspace_id'] = identifier
+        return packet
 
     def stream(self, endpoint, args):
         self._alive()

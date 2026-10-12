@@ -62,6 +62,9 @@ class Model extends LlmAdapter {
   }
 }
 const names = ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'];
+const teamNames = ['interrupt_agent', 'list_agents', 'send_message', 'spawn_teammate',
+  'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'wait_agent'];
+let teamEvidence;
 try {
   for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-token-meter',
     'dsh-system-prompt', 'dsh-sandbox-policy', 'dsh-tools', 'dsh-jobs-local', 'dsh-llm', 'dsh-agent', 'dsh-agent-loop']) {
@@ -72,12 +75,40 @@ try {
   await loader.await();
   assert.ok(ctx.get('agentLoop'), 'The original AgentLoop must load.');
   ctx.llm.registerAdapter(['fixture-model'], new Model());
-  for (const name of names) ctx.tools.register({name, description: 'Fixture external capability boundary.',
+  if (scenario !== 'team') for (const name of names) ctx.tools.register({name, description: 'Fixture external capability boundary.',
     parameters: {type: 'object', properties: {}}, execute: async () => {toolRuns.push(name); return 'unused';},
     output: {schema: {type: 'string'}, render: value => [{type: 'text', text: value}]}});
+  const nativeTools = [];
+  if (scenario === 'team') {
+    const skills = path.join(scratch, 'skills');
+    fs.mkdirSync(path.join(skills, 'fixture-workflow'), {recursive: true});
+    fs.writeFileSync(path.join(skills, 'fixture-workflow', 'SKILL.md'),
+      '---\nname: fixture-workflow\ndescription: Synthetic native workflow.\n---\nInspect original results.\n');
+    for (const name of ['dsh-fs-local', 'dsh-working-directory', 'dsh-shell-env', 'dsh-sandbox-local',
+      'dsh-subprocess-local', 'dsh-bash-sandbox', 'dsh-user-questions', 'dsh-user-approval', 'dsh-skill',
+      'dsh-session-persistence-jsonl', 'dsh-subagent', 'dsh-experimental-agent-team', 'dsh-experimental-tool-agent-team']) {
+      const configuration = name === 'dsh-working-directory' ? {defaultDirectory: workspace}
+        : name === 'dsh-user-approval' ? {policy: 'never'}
+        : name === 'dsh-session-persistence-jsonl' ? {root: path.join(scratch, 'session-store')} : {};
+      await loader.create({id: name, name: pathToFileURL(path.join(root, `@deepseek-ai/${name}/lib/index.js`)).href,
+        config: configuration});
+    }
+    for (const name of ['dsh-tool-bash', 'dsh-tool-jobs', 'dsh-tool-ask-user', 'dsh-skill-filesystem', 'dsh-tool-skill']) {
+      const configuration = name === 'dsh-tool-bash' ? {enableRunInBackground: true, promoteOnTimeout: true}
+        : name === 'dsh-tool-jobs' ? {completionDelivery: 'quiet'}
+        : name === 'dsh-tool-ask-user' ? {mode: 'timed', timeout: -1}
+        : name === 'dsh-skill-filesystem' ? {customSkillDirs: [skills], includeDefaultRoots: false, watch: false} : {};
+      nativeTools.push({id: name, name: pathToFileURL(path.join(root, `@deepseek-ai/${name}/lib/index.js`)).href,
+        config: configuration});
+    }
+    await loader.await();
+    assert.ok(ctx.get('agentTeams'), 'The original Team service must be mounted.');
+    ctx.systemPrompt.section({name: 'fixture:safety', order: 0, text: 'Fixture safety and responsibility stay in effect.'});
+    ctx.systemPrompt.section({name: 'team:policy-fixture', order: 1, text: 'An unrelated similarly named section stays visible.'});
+  }
   const declaration = {id: 'fixture-managed', plugins: [{id: 'shared-hook', name: moduleURL, config},
     {id: 'presentation', name: pathToFileURL(path.join(root,
-      '@deepseek-ai/dsh-agent-tool-presentation/lib/index.js')).href, config: {mode: 'native'}}]};
+      '@deepseek-ai/dsh-agent-tool-presentation/lib/index.js')).href, config: {mode: 'native'}}, ...nativeTools]};
   if (scenario === 'guard_deadline') {
     execFileSync('git', ['init', '-q', workspace]);
     const python = fs.realpathSync(process.env.HERMES_TEST_SESSION_PYTHON);
@@ -88,6 +119,8 @@ try {
       reader_sha256: crypto.createHash('sha256').update(fs.readFileSync(reader)).digest('hex')};
   }
   const removePreset = await ctx.agentPresets.register(declaration);
+  const removeManual = scenario === 'team' ? await ctx.agentPresets.register({id: 'fixture-manual',
+    plugins: declaration.plugins.filter(plugin => plugin.id !== 'shared-hook')}) : undefined;
   const roster = await ctx.agentPresets.list();
   assert.equal(roster.find(row => row.id === declaration.id)?.broken, undefined,
     'The original Loader must activate the main-plugin Hook.');
@@ -97,7 +130,7 @@ try {
       ...(restored ? {seed: restored.events} : {}),
       agentOptions: {provider: 'fixture-model', model: 'fixture-default'},
       setup: async agentCtx => {
-        if (preset === 'fixture-managed') await ctx.agentPresets.mount(agentCtx, preset);
+        if (preset === 'fixture-managed' || scenario === 'team') await ctx.agentPresets.mount(agentCtx, preset);
       }});
     setSandboxMode(handle.agent.session, 'workspace-write');
     return handle;
@@ -119,7 +152,74 @@ try {
       source: {kind: 'user'}}));
     await agent.whenIdle();
   };
-  if (scenario === 'integrity') {
+  if (scenario === 'team') {
+    const managed = await create('fixture-managed-with-native-team');
+    register(managed.agent);
+    const rawBefore = ctx.tools.schemas(managed.agent).map(tool => tool.name).sort();
+    assert.deepEqual(rawBefore, [...names, ...teamNames].sort(), 'Original Team tools must really inject into the managed Agent.');
+    await prompt(managed.agent);
+    assert.equal(calls.length, 1, 'A native Team-enabled Agent must admit its original six-tool model request.');
+    assert.deepEqual(calls[0].tools.map(tool => tool.name).sort(), names, 'The actual first native model request must advertise exactly six tools.');
+    const modelText = call => call.messages.flatMap(message => message.content)
+      .filter(part => part.type === 'text').map(part => part.text).join('\n');
+    assert.equal(modelText(calls[0]).includes('Agent Teams is available in this session'), false,
+      'The original model messages must not advertise unavailable Team operations to managed work.');
+    assert.ok(modelText(calls[0]).includes('Fixture safety and responsibility stay in effect.'));
+    assert.ok(modelText(calls[0]).includes('An unrelated similarly named section stays visible.'));
+    const denied = [];
+    const argumentsByName = {spawn_teammate: {name: 'fixture-peer', description: 'Synthetic peer.', prompt: 'Never execute.'},
+      send_message: {target: 'fixture-peer', message: 'Never deliver.'}, interrupt_agent: {target: 'fixture-peer'},
+      team_task_create: {subject: 'Never create.', description: 'Synthetic denial.'},
+      team_task_get: {task_id: 'fixture-task'}, team_task_update: {task_id: 'fixture-task', expected_revision: 0, action: 'claim'},
+      wait_agent: {timeout_ms: 10000}};
+    for (const name of teamNames) {
+      const result = await ctx.tools.execute({agent: managed.agent, name, callId: 'fixture-team-denied-' + name,
+        arguments: argumentsByName[name] ?? {}, signal: new AbortController().signal});
+      assert.equal(result.isError, true, 'Every native Team tool must be refused for managed work.');
+      assert.match(JSON.stringify(result), /Shared work tool is outside its verified catalog/, 'Denial must come from the original monotonic guard, not invalid Team arguments.');
+      denied.push(name);
+    }
+    assert.equal(ctx.agents.list().length, 1, 'Rejected Team calls must not create any teammate.');
+    assert.equal(ctx.agentTeams.listTasks(managed.agent).length, 0);
+    const manual = await create('fixture-manual-with-native-team', 'fixture-manual');
+    const manualBefore = ctx.tools.schemas(manual.agent).map(tool => tool.name).sort();
+    assert.deepEqual(manualBefore, [...names, ...teamNames].sort());
+    await prompt(manual.agent);
+    assert.deepEqual(calls[1].tools.map(tool => tool.name).sort(), manualBefore, 'Manual native Team capabilities remain model-visible.');
+    assert.ok(modelText(calls[1]).includes('Agent Teams is available in this session'),
+      'The manual Agent keeps the original Team policy.');
+    const allowed = await ctx.tools.execute({agent: manual.agent, name: 'list_agents', callId: 'fixture-manual-team-list',
+      arguments: {}, signal: new AbortController().signal});
+    assert.equal(allowed.isError, false, 'The original manual Team tool must execute normally.');
+    assert.deepEqual(ctx.tools.schemas(managed.agent).map(tool => tool.name).sort(), rawBefore,
+      'Filtering the advertised surface does not unregister SDK-owned Team tools.');
+    const unregistered = await create('fixture-native-team-without-ledger');
+    const unadmitted = await ctx.tools.execute({agent: unregistered.agent, name: 'list_agents',
+      callId: 'fixture-team-without-owner', arguments: {}, signal: new AbortController().signal});
+    assert.equal(unadmitted.isError, true);
+    assert.match(JSON.stringify(unadmitted), /Shared work tool has no admitted owner/);
+    teamEvidence = {raw_managed_catalog: rawBefore, first_model_catalog: calls[0].tools.map(tool => tool.name).sort(),
+      denied_team_tools: denied, manual_catalog: manualBefore, manual_list_agents_is_error: allowed.isError,
+      unregistered_denial: 'no-admitted-owner', managed_team_policy_present: false, manual_team_policy_present: true,
+      unrelated_safety_sections_preserved: true};
+    await managed.dispose();
+    await unregistered.dispose();
+    await removePreset();
+    const missingPreset = await ctx.agentPresets.register({...declaration,
+      plugins: declaration.plugins.filter(plugin => plugin.id !== 'dsh-tool-bash')});
+    const missing = await create('fixture-native-team-missing-required-tool');
+    register(missing.agent);
+    const beforeMissing = calls.length;
+    await prompt(missing.agent);
+    assert.equal(calls.length, beforeMissing, 'Missing an original required tool still rejects before the model request.');
+    const missingState = JSON.parse(fs.readFileSync(ledgerPath(missing.agent.session.id))).state;
+    assert.equal(missingState.requests, 0);
+    assert.equal(missingState.started_at_ms, null);
+    teamEvidence.required_tool_missing_model_requests = calls.length - beforeMissing;
+    await missing.dispose();
+    await missingPreset();
+    await manual.dispose();
+  } else if (scenario === 'integrity') {
     const held = await create('fixture-state-binding');
     const initial = register(held.agent);
     await prompt(held.agent);
@@ -324,7 +424,8 @@ try {
   await manual.dispose();
   }
   await removePreset();
-  process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: calls.length}));
+  if (removeManual) await removeManual();
+  process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: calls.length, ...(teamEvidence ? {team: teamEvidence} : {})}));
 } finally {
   await ctx.fiber.dispose();
 }

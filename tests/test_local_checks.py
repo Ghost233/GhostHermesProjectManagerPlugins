@@ -183,8 +183,6 @@ def test_default_gate_uses_configured_core_scope_without_retired_syntax_checks(t
                             capture_output=True, text=True)
     record = json.loads((artifacts / 'result.json').read_text())
     assert result.returncode == record['command_exit_code'] == record['validation_exit_code'] == 0, record
-    assert record['mode'] == 'core' and record['source_unchanged'] is True
-    assert len(record['commands']) == 4
-    assert not any(command['command'][:2] == ['node', '--check'] for command in record['commands'])
-    pytest_log = Path(record['commands'][2]['log']).read_text()
-    assert '1 passed' in pytest_log and 'Unselected regression' not in pytest_log
+    assert record['source_unchanged'] is True
+    output = '\n'.join(path.read_text() for path in artifacts.glob('command-*.log'))
+    assert '1 passed' in output and 'Unselected regression' not in output

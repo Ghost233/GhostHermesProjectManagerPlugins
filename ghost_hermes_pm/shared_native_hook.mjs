@@ -330,14 +330,15 @@ export default function sharedNativeHook(ctx, config) {
       const extra = [...ctx.get('tools').view(agent).restrictableNames].filter(name => !tools.includes(name));
       if (extra.length) agent.ctx.get('tools').restrict({deny: extra});
     }
-    const catalog = ctx.get('tools').schemas(agent).map(schema => schema.name).sort();
+    // SDK-owned utilities can stay registered; the advertised surface and execution guard remain exact.
+    const catalog = ctx.get('tools').schemas(agent).map(schema => schema.name).filter(name => tools.includes(name)).sort();
     if (JSON.stringify(catalog) !== JSON.stringify(tools)) throw new Error('Shared work native tool catalog changed.');
     const assembly = await next();
     const selected = assembly.tools.filter(tool => tools.includes(tool.name));
     if (JSON.stringify(selected.map(tool => tool.name).sort()) !== JSON.stringify(tools)) {
       throw new Error('Shared work assembled native tools changed.');
     }
-    return {...assembly, tools: selected};
+    return {...assembly, sections: assembly.sections.filter(section => section.name !== 'team:policy'), tools: selected};
   });
 
   ctx.on('agent/request', async ({agent, turn, step, signal}, next) => {
@@ -351,7 +352,7 @@ export default function sharedNativeHook(ctx, config) {
         || state.reported_tokens >= record.row.budget.max_reported_tokens) {
       throw stop(agent, record, 'shared-work-observed-budget');
     }
-    const catalog = ctx.get('tools').schemas(agent).map(schema => schema.name).sort();
+    const catalog = ctx.get('tools').schemas(agent).map(schema => schema.name).filter(name => tools.includes(name)).sort();
     if (JSON.stringify(catalog) !== JSON.stringify(tools)) throw new Error('Shared work native tool catalog changed.');
     const retry = ctx.get('llm').providerRetryPolicy(record.row.provider);
     if (retry?.mode !== 'normal' || retry.maxRetries !== 0) throw new Error('Shared work requires the native no-retry provider policy.');

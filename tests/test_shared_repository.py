@@ -21,6 +21,21 @@ import pytest
 from ghost_hermes_pm.manager import ManagementError
 
 
+def test_original_workspace_gateway_reuses_path_and_preserves_existing_session_across_reload(tmp_path):
+    sdk = Path(os.environ['DSH_TEST_SDK_ROOT']).resolve(strict=True)
+    before = source_snapshot(sdk)
+    result = subprocess.run([shutil.which('node'), str(Path(__file__).with_name('shared_workspace_native_runner.mjs')),
+        str(tmp_path)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    evidence = json.loads(result.stdout)
+    (tmp_path / 'workspace-contract.json').write_text(json.dumps(evidence))
+    assert evidence['created']['created'] is True
+    assert evidence['repeated']['created'] is evidence['restored']['created'] is False
+    assert evidence['restored']['workspace']['sessionIds'] == [evidence['original']['sessionId']]
+    assert evidence['cwd_xor_refused'] and evidence['model_requests'] == 0
+    assert source_snapshot(sdk) == before
+
+
 @pytest.mark.parametrize('initial', ['danger-full-access/never', 'workspace-write/ask', 'read-only/ask'])
 def test_shared_permission_confirmation_uses_original_command_gateway(tmp_path, initial):
     sdk = Path(os.environ['DSH_TEST_SDK_ROOT']).resolve(strict=True)
@@ -200,6 +215,34 @@ def shared_remote_peer(tmp_path, behavior):
                 self.end_headers()
                 return
             assert self.path == '/api/remote.mux'""")
+    source = source.replace("elif method == 'session/create':", """elif method == 'workspace/create':
+                assert set(args['request']) == {'path'}
+                created = 'workspace' not in state
+                if created:
+                    state['workspace'] = {'workspaceId': 'fixture-workspace', 'path': args['request']['path'],
+                        'title': 'Fixture', 'sessionIds': [], 'createdAt': 'fixture-created', 'updatedAt': 'fixture-created'}
+                value = {'workspace': dict(state['workspace']), 'created': created}
+            elif method == 'session/create':""")
+    begin = source.index("            elif method == 'session/create':")
+    end = source.index("            elif method == 'session/prompt':", begin)
+    source = source[:begin] + """            elif method == 'session/create':
+                creation = args['request']
+                assert ('workspaceId' in creation) != ('cwd' in creation)
+                cwd = state['workspace']['path'] if 'workspaceId' in creation else creation['cwd']
+                value = {'sessionId': creation['sessionId'], 'agentPreset': creation['agentPreset']}
+                rows = [row for row in state['sessions'] if row['sessionId'] == creation['sessionId']]
+                if not rows:
+                    state['sessions'].append({'sessionId': creation['sessionId'], 'cwd': cwd,
+                        'running': False, 'agentAvailable': True, 'blank': True, 'updatedAt': 3})
+                    state['journals'][creation['sessionId']] = []
+                else:
+                    assert len(rows) == 1 and rows[0]['cwd'] == cwd
+                if 'workspaceId' in creation and creation['sessionId'] not in state['workspace']['sessionIds']:
+                    assert creation['workspaceId'] == state['workspace']['workspaceId']
+                    state['workspace']['sessionIds'].append(creation['sessionId'])
+""" + source[end:]
+    source = source.replace("'values': {'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []})}",
+        "'values': {'agentPreset': 'fixture-shared', 'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []})}")
     namespace = {}
     exec(compile(source, str(path), 'exec'), namespace)
     with namespace['remote_peer'](behavior=behavior) as (url, peer):
@@ -210,11 +253,89 @@ def shared_remote_peer(tmp_path, behavior):
         from ghost_hermes_pm.shared_desktop import SharedDesktopTransport
         carrier = SharedDesktopTransport({'desktop_receipt': str(receipt), 'host_lease': 'fixture-lease',
             'service_ref': 'fixture-service', 'session_id': 'session-fixture', 'generation': 'fixture-generation',
-            'workspace': str(tmp_path)}, timeout=1)
+            'workspace': str(tmp_path), 'agent_preset': 'fixture-shared', 'ledger_dir': str(tmp_path)}, timeout=1)
         try:
             yield carrier, peer
         finally:
             carrier.close()
+
+
+def test_shared_workspace_registration_fences_path_and_adopts_only_original_session(tmp_path):
+    from ghost_hermes_pm.repository_supervision import owned_call
+    with shared_remote_peer(tmp_path, {}) as (carrier, peer):
+        peer['sessions'][0]['cwd'] = str(tmp_path)
+        original = deepcopy(peer['journals']['session-fixture'])
+        workspace = owned_call(carrier, 'workspace/create', {'path': str(tmp_path)})
+        assert workspace['created'] is True and workspace['workspace']['sessionIds'] == []
+        request = {'sessionId': 'session-fixture', 'workspaceId': workspace['workspace']['workspaceId'],
+                   'agentPreset': 'fixture-shared'}
+        assert owned_call(carrier, 'session/create', request) == {'sessionId': 'session-fixture', 'agentPreset': 'fixture-shared'}
+        repeated = owned_call(carrier, 'workspace/create', {'path': str(tmp_path)})
+        assert repeated['created'] is False and repeated['workspace']['sessionIds'] == ['session-fixture']
+        assert peer['journals']['session-fixture'] == original and peer['prompts'] == []
+        for method, arguments in [
+            ('workspace/create', {'path': str(tmp_path.parent)}),
+            ('workspace/delete', {'workspaceId': 'fixture-workspace'}),
+            ('session/create', {**request, 'cwd': str(tmp_path)}),
+            ('session/create', {**request, 'sessionId': 'foreign-session'}),
+            ('session/create', {**request, 'workspaceId': 'foreign-workspace'}),
+        ]:
+            count = len(peer['calls'])
+            with pytest.raises(ManagementError):
+                owned_call(carrier, method, arguments)
+            assert len(peer['calls']) == count
+
+
+@pytest.mark.parametrize('mismatch', [None, 'cwd', 'sid', 'created_at', 'workspace_id'])
+def test_shared_workspace_backfill_preserves_accepted_input_and_budget(tmp_path, mismatch):
+    from types import SimpleNamespace
+    from ghost_hermes_pm.shared_repository import bind_shared_workspace, ledger_path
+    from ghost_hermes_pm.shared_desktop import SharedDesktopTransport
+    with shared_remote_peer(tmp_path, {}) as (carrier, peer):
+        peer['sessions'][0]['cwd'] = str(tmp_path)
+        record = {'id': 'fixture-work', 'target': {'repo_path': str(tmp_path)}, 'dsh_execution': {
+            'mode': 'shared_native', 'state': 'execution_failed', 'session_id': 'session-fixture',
+            'session_created_at': 0, 'generation': 'fixture-generation', 'first_input': 'accepted',
+            'request_id': 'old-input', 'native_identity': carrier.native_identity}}
+        ledger = ledger_path(carrier.config, 'session-fixture')
+        budget = json.dumps({'state': {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0}}).encode()
+        ledger.write_bytes(budget)
+        ledger.chmod(0o600)
+        saved = []
+        intake = SimpleNamespace(_save_execution=lambda value, fields=None: saved.append(json.loads(json.dumps(value))))
+        if mismatch == 'cwd':
+            peer['sessions'][0]['cwd'] = str(tmp_path.parent)
+        elif mismatch == 'sid':
+            record['dsh_execution']['session_id'] = 'foreign-session'
+        elif mismatch == 'created_at':
+            record['dsh_execution']['session_created_at'] = 1
+        elif mismatch == 'workspace_id':
+            carrier.config['workspace_id'] = record['dsh_execution']['workspace_id'] = 'original-workspace'
+            peer['workspace'] = {'workspaceId': 'changed-workspace', 'path': str(tmp_path), 'sessionIds': [],
+                'title': 'Fixture', 'createdAt': 'fixture-created', 'updatedAt': 'fixture-created'}
+        original = deepcopy(record)
+        journal = deepcopy(peer['journals']['session-fixture'])
+        if mismatch:
+            with pytest.raises(ManagementError):
+                bind_shared_workspace(intake, record, carrier)
+            assert not saved and record == original
+            assert not any(call['method'] == 'session/create' for call in peer['calls'])
+            if mismatch != 'workspace_id':
+                assert not any(call['method'] == 'workspace/create' for call in peer['calls'])
+        else:
+            workspace = bind_shared_workspace(intake, record, carrier)
+            assert workspace['sessionIds'] == ['session-fixture']
+            configuration = dict(carrier.config)
+            carrier.close()
+            reconnected = SharedDesktopTransport(configuration, timeout=1)
+            try:
+                assert bind_shared_workspace(intake, record, reconnected)['workspaceId'] == workspace['workspaceId']
+            finally:
+                reconnected.close()
+            assert sum(call['method'] == 'session/create' for call in peer['calls']) == 1
+            assert {key: value for key, value in record['dsh_execution'].items() if key != 'workspace_id'} == original['dsh_execution']
+        assert peer['journals']['session-fixture'] == journal and ledger.read_bytes() == budget
+        assert peer['prompts'] == []
 
 
 def test_shared_original_waterfalls_ignore_manual_tasks_and_accept_only_one_owned_choice(tmp_path):
