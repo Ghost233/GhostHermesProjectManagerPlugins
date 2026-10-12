@@ -913,6 +913,9 @@ async def run_shared_work(ctx, intake, record, generation):
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
     try:
+        if continuation.get('kind') == 'max_tokens':
+            started_at_ms = read_ledger(configuration, execution)['state']['started_at_ms']
+            deadline = time.monotonic() + (started_at_ms + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
         if not execution.get('first_input') or pending_continuation:
             observer_deadline = time.monotonic() + 15
             while time.monotonic() < observer_deadline:
@@ -956,9 +959,8 @@ async def run_shared_work(ctx, intake, record, generation):
         elif execution['first_input'] != 'accepted' or (continuation and continuation.get('status') != 'accepted'):
             raise ManagementError('outcome_unknown', 'Original shared input needs reconciliation; no replay.')
         heartbeat_at = 0
-        deadline = time.monotonic() + configuration['budget']['max_wall_seconds'] + 15
-        if continuation.get('kind') == 'max_tokens':
-            deadline = time.monotonic() + _require_max_tokens_budget(configuration, read_ledger(configuration, execution)['state']) + 15
+        if continuation.get('kind') != 'max_tokens':
+            deadline = time.monotonic() + configuration['budget']['max_wall_seconds'] + 15
         while time.monotonic() < deadline:
             intake.require_active(generation)
             current_worker(ctx, intake, record)

@@ -16,8 +16,9 @@ shared_scenario = sys.argv[2]
 triage_continuation = shared_scenario == 'continue_triage'
 concurrent_claim = shared_scenario == 'continue_claim_race'
 native_restore = shared_scenario == 'continue_native_restore'
-max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown'}
+max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot'}
 max_tokens_unknown = shared_scenario == 'continue_max_tokens_unknown'
+max_tokens_last_slot = shared_scenario == 'continue_max_tokens_last_slot'
 if triage_continuation or concurrent_claim or native_restore or max_tokens_continuation:
     shared_scenario = 'continue_restart'
 continuation_scenarios = {'continue_restart', 'continue_unknown'}
@@ -66,7 +67,15 @@ service_source = service_source.replace("elif method == 'session/cancel':", """e
                 value = None if shared_scenario == 'reconcile_intent' else permission_contract['response']
             elif method == 'session/cancel':""")
 service_source = service_source.replace("state['prompts'].append(args['request'])", """state['prompts'].append(args['request'])
-                behavior['inbox'] = {'next-turn': [], 'next-step': []}""")
+                behavior['inbox'] = {'next-turn': [], 'next-step': []}
+                if max_tokens_last_slot and len(state['prompts']) == 3:
+                    budget_path = ledger / (hashlib.sha256(args['request']['sessionId'].encode()).hexdigest() + '.json')
+                    budget_row = json.loads(budget_path.read_bytes())
+                    assert budget_row['state']['requests'] == budget_row['budget']['max_model_requests'] - 1
+                    budget_row['state']['requests'] += 1
+                    budget_row['state']['admissions'].append(args['request']['requestId'])
+                    budget_path.write_text(json.dumps(budget_row))
+                    behavior['last_slot_budget'] = budget_path.read_bytes()""")
 service_source = service_source.replace("if behavior.get('admit_prompt'):",
     """if shared_scenario in {'continue_restart', 'continue_unknown'} and len(state['prompts']) == 1:
                     submission = args['request']
@@ -99,7 +108,7 @@ service_source = service_source.replace("elif method == 'session/cancel':\n     
                     'time': 4, 'data': {'turn': 1, 'reason': {'kind': 'aborted', 'reason': {'kind': 'user'}}}}})
                 value""")
 service_namespace = {'permission_contract': permission_contract, 'shared_scenario': shared_scenario,
-    'max_tokens_unknown': max_tokens_unknown}
+    'max_tokens_unknown': max_tokens_unknown, 'max_tokens_last_slot': max_tokens_last_slot}
 exec(compile(service_source, str(ROOT / 'tests/dsh_fixture_server.py'), 'exec'), service_namespace)
 fixture_behavior = {'admit_prompt': True}
 peer_context = service_namespace['remote_peer'](behavior=fixture_behavior)
@@ -111,6 +120,7 @@ receipt.write_text(json.dumps({'schema': 1, 'lease': 'fixture-shared-lease', 'pi
 receipt.chmod(0o600)
 ledger = scratch / 'ledger'
 ledger.mkdir(mode=0o700)
+service_namespace['ledger'] = ledger
 sdk = Path(os.environ['DSH_TEST_SDK_ROOT'])
 anchor = '@deepseek-ai/dsh/lib/profile-boot.js'
 proof = scratch / 'external-boundary-fixture.json'
@@ -129,7 +139,7 @@ reference.write_text(json.dumps({'schema': 1, 'approved': True, 'mode': 'shared_
     'desktop_receipt': str(receipt), 'host_lease': 'fixture-shared-lease', 'service_ref': 'fixture-native',
     'runtime_package_root': str(sdk), 'node_bin': str(Path(shutil.which('node')).resolve()),
     'agent_preset': 'fixture-shared', 'ledger_dir': str(ledger), 'provider': 'fixture', 'model': 'fixture',
-    'budget': {'max_wall_seconds': 60, 'max_model_requests': 80, 'max_reported_tokens': 300000,
+    'budget': {'max_wall_seconds': 60, 'max_model_requests': 9 if max_tokens_last_slot else 80, 'max_reported_tokens': 300000,
         'max_output_tokens_per_request': 8192}, 'tool_receipt_ref': str(proof),
     'composition_sha256': 'synthetic-composition', 'source_snapshot': {
         'python': str(Path(sys.executable).resolve()),
@@ -589,7 +599,7 @@ async def main():
                     break
                 if latest['dsh_execution']['continuation_control']['status'] == 'accepted' and not max_tokens_ended:
                     max_tokens_seen_at = max_tokens_seen_at or time.monotonic()
-                    assert card['status'] == 'running' and latest['dsh_execution']['state'] == 'running'
+                    assert card['status'] == 'running' and latest['dsh_execution']['state'] == 'running', latest['dsh_execution'].get('last_failure')
                     if time.monotonic() - max_tokens_seen_at > .5:
                         submission = peer['prompts'][2]
                         rows.append({'type': 'event', 'event': {'type': 'turn/start', 'seq': len(rows), 'time': 7, 'data': {'turn': 3}}})
@@ -597,13 +607,22 @@ async def main():
                             'data': {'id': 'message-' + submission['requestId'], 'role': 'user', 'content': submission['content'],
                                      'source': {'kind': 'user', 'rpcId': submission['requestId']}}}})
                         rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 8,
-                            'data': {'turn': 3, 'reason': {'kind': 'error', 'error': {'message': 'Synthetic explicit continuation ended.'}}}}})
+                            'data': {'turn': 3, 'reason': ({'kind': 'completed'} if max_tokens_last_slot else
+                                {'kind': 'error', 'error': {'message': 'Synthetic explicit continuation ended.'}})}}})
                         max_tokens_ended = True
                 if max_tokens_ended and card['status'] in {'blocked', 'triage'}:
                     assert peer['prompts'][2]['sessionId'] == peer['prompts'][0]['sessionId']
                     assert len({row['requestId'] for row in peer['prompts']}) == 3
                     assert latest['dsh_execution']['maintenance_checkpoint'] == checkpoint
-                    assert budget_file.read_bytes() == max_budget_before
+                    if max_tokens_last_slot:
+                        final_budget = json.loads(budget_file.read_bytes())
+                        assert budget_file.read_bytes() == fixture_behavior['last_slot_budget']
+                        assert final_budget['state']['requests'] == final_budget['budget']['max_model_requests'] == 9
+                        assert final_budget['state']['started_at_ms'] == json.loads(max_budget_before)['state']['started_at_ms']
+                        assert latest['dsh_execution']['state'] == 'awaiting_acceptance'
+                        assert latest['dsh_execution']['terminal_reason'] == {'kind': 'completed'}
+                    else:
+                        assert budget_file.read_bytes() == max_budget_before
                     await receive(adapter, raw('om_continue_max_tokens', '@_user_1 继续 ' + latest['id']))
                     await receive(adapter, raw('om_stop_max_tokens', '@_user_1 停止 ' + latest['id']))
                     latest = record()
