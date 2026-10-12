@@ -13,10 +13,12 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 scratch = Path(sys.argv[1]).resolve()
 shared_scenario = sys.argv[2]
+triage_continuation = shared_scenario == 'continue_triage'
+concurrent_claim = shared_scenario == 'continue_claim_race'
+if triage_continuation or concurrent_claim:
+    shared_scenario = 'continue_restart'
 continuation_scenarios = {'continue_restart', 'continue_unknown'}
 host_processes = []
-if shared_scenario in continuation_scenarios:
-    host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']))
 contract_run = subprocess.run([shutil.which('node'), str(ROOT / 'tests/shared_permission_native_runner.mjs'),
     str(scratch)], capture_output=True, text=True, check=True, timeout=20)
 permission_contract = json.loads(contract_run.stdout)
@@ -172,12 +174,22 @@ async def main():
     service.im.v1.message.reply = reply
     worker = None
     try:
+        if shared_scenario in continuation_scenarios:
+            host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            original_receipt = json.loads(receipt.read_text())
+            original_receipt['pid'] = host_processes[0].pid
+            receipt.write_text(json.dumps(original_receipt))
         await connect_service(adapter, service)
         await receive(adapter, raw('om_shared'))
         def record():
             return json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
         initial = record()
         assert initial['dsh_execution']['mode'] == 'shared_native', initial
+        if triage_continuation:
+            assert 'error' not in json.loads(registry.dispatch('kanban_block', {
+                'task_id': initial['card_id'], 'kind': 'needs_input', 'reason': 'Original failure still needs explicit continuation.'}))
+            assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
         with connect_closing() as db:
             assert dispatch_once(db, max_spawn=1).spawned
             worker = remember_worker(db, initial['card_id'])
@@ -206,7 +218,7 @@ async def main():
                 await receive(adapter, raw('om_stop', '@_user_1 停止 ' + latest['id']))
                 latest = record()
             card = json.loads(registry.dispatch('kanban_show', {'task_id': initial['card_id']}))['task']
-            if shared_scenario in {'prepare_continue', *continuation_scenarios} and not continued and card['status'] == 'blocked':
+            if shared_scenario in {'prepare_continue', *continuation_scenarios} and not continued and card['status'] in {'blocked', 'triage'}:
                 assert latest['dsh_execution']['state'] == 'execution_failed'
                 while True:
                     waited, status = os.waitpid(worker['pid'], os.WNOHANG)
@@ -215,6 +227,8 @@ async def main():
                         break
                     await asyncio.sleep(.05)
                 worker = None
+                if triage_continuation:
+                    assert card['status'] == 'triage' and card['current_run_id'] is None
                 original_execution = dict(latest['dsh_execution'])
                 if shared_scenario in continuation_scenarios:
                     original_history = json.loads(json.dumps(peer['journals'][original_execution['session_id']]))
@@ -233,7 +247,9 @@ async def main():
                 await receive(adapter, raw('om_continue_prepare', '@_user_1 继续 ' + latest['id']))
                 latest = record()
                 checkpoint = latest['dsh_execution'].get('maintenance_checkpoint')
-                assert checkpoint and checkpoint['status'] == 'prepared', latest['dsh_execution']
+                assert checkpoint and checkpoint['status'] == 'prepared', {
+                    'checkpoint': checkpoint, 'execution_state': latest['dsh_execution']['state'],
+                    'public_reply': [message.request_body.content for message in sent if message.message_id == 'om_continue_prepare']}
                 assert len(peer['prompts']) == 1 and budget_file.read_bytes() == budget_before
                 assert all(latest['dsh_execution'][key] == original_execution[key]
                            for key in ('session_id', 'generation', 'request_id', 'first_input', 'state'))
@@ -242,7 +258,8 @@ async def main():
                 assert any('续接准备' in message.request_body.content for message in sent)
                 if shared_scenario == 'prepare_continue':
                     break
-                host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']))
+                host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
                 updated = json.loads(receipt.read_text())
                 updated.update(lease='fixture-restarted-lease', pid=host_processes[-1].pid)
                 receipt.write_text(json.dumps(updated))
@@ -298,6 +315,27 @@ async def main():
                     fixture_behavior['jobs'] = [{'id': 'fixture-active-job', 'owner': sid, 'status': 'running'}]
                     await rejected('om_continue_active_job')
                     fixture_behavior.pop('jobs')
+                if concurrent_claim:
+                    import threading
+                    claim_result = {}
+                    model.worker_steps = 0
+                    def dispatch_continuation():
+                        try:
+                            until = time.monotonic() + 10
+                            with connect_closing() as db:
+                                while time.monotonic() < until:
+                                    before = record()['dsh_execution'].get('continuation_control', {}).get('dispatch_status')
+                                    if dispatch_once(db, max_spawn=1).spawned:
+                                        claim_result['worker'] = remember_worker(db, initial['card_id'])
+                                        claim_result['dispatch_status_before_claim'] = before
+                                        claim_result['dispatch_status_after_claim'] = record()['dsh_execution']['continuation_control']['dispatch_status']
+                                        return
+                                    time.sleep(.002)
+                            claim_result['error'] = 'Original dispatcher did not claim the continuation.'
+                        except Exception as error:
+                            claim_result['error'] = repr(error)
+                    dispatcher = threading.Thread(target=dispatch_continuation, daemon=True)
+                    dispatcher.start()
                 await receive(adapter, raw('om_continue_after_restart', '@_user_1 继续 ' + latest['id']))
                 latest = record()
                 control = latest['dsh_execution'].get('continuation_control')
@@ -311,10 +349,17 @@ async def main():
                 assert rebound == {**json.loads(budget_before), 'host_lease': updated['lease']}
                 await receive(adapter, raw('om_continue_after_restart', '@_user_1 继续 ' + latest['id']))
                 assert len(peer['prompts']) == 1
-                model.worker_steps = 0
-                with connect_closing() as db:
-                    assert dispatch_once(db, max_spawn=1).spawned
-                    worker = remember_worker(db, initial['card_id'])
+                if concurrent_claim:
+                    until = time.monotonic() + 10
+                    while dispatcher.is_alive() and time.monotonic() < until:
+                        await asyncio.sleep(.01)
+                    assert not dispatcher.is_alive() and 'error' not in claim_result, claim_result
+                    worker = claim_result['worker']
+                else:
+                    model.worker_steps = 0
+                    with connect_closing() as db:
+                        assert dispatch_once(db, max_spawn=1).spawned
+                        worker = remember_worker(db, initial['card_id'])
                 continued = True
             if shared_scenario == 'continue_unknown' and continued and len(peer['prompts']) == 2:
                 await asyncio.sleep(.5)
@@ -431,8 +476,14 @@ async def main():
         assert not (scratch / 'state/owned-work').exists(), 'No dedicated Home or runtime may be created.'
         result = {'status': 'passed', 'scope': 'original_Hermes_worker_external_DSH_fixture',
             'single_native_session': latest['dsh_execution']['session_id'], 'input_count': len(peer['prompts'])}
+        if concurrent_claim:
+            result['concurrent_claim'] = claim_result
         (scratch / 'shared-worker-result.json').write_text(json.dumps(result))
     finally:
+        for process in host_processes:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
         plugins.unload('ghost-hermes-pm')
         await runner.stop()
         if worker is not None:
@@ -454,10 +505,6 @@ async def main():
         model.close()
         peer_context.__exit__(None, None, None)
         namespace['flush_log_queue']()
-        for process in host_processes:
-            if process.poll() is None:
-                process.terminate()
-            process.wait(timeout=5)
 
 
 asyncio.run(main())

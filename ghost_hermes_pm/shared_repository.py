@@ -294,7 +294,8 @@ def admit_shared_continuation(intake, record, message_id, generation):
             or execution.get('reference_sha256') != checkpoint.get('reference_sha256')):
         raise ManagementError('outcome_unknown', 'Only the prepared original pre-model failure may continue once.')
     card = _card(intake, record)
-    if card['status'] != 'blocked' or _worker_end(intake, record) != checkpoint['worker']:
+    if card['status'] not in {'blocked', 'scheduled', 'triage'} or _worker_end(intake, record,
+            frozenset({'blocked', 'scheduled', 'triage'})) != checkpoint['worker']:
         raise ManagementError('outcome_unknown', 'The checkpointed original worker has not ended.')
     configuration, _ = execution_configuration(record['target'])
     approved = json.loads(private_file(record['target']['execution_ref']).read_text())
@@ -376,7 +377,14 @@ def admit_shared_continuation(intake, record, message_id, generation):
         execution['shared_event_observer'] = {'status': 'unavailable', 'session_id': execution['session_id'],
             'generation': execution['generation']}
         intake._save_execution(record, fields=['native_identity', 'reference_sha256', 'state', 'continuation_control', 'shared_event_observer'])
-        intake._kanban('kanban_unblock', {'task_id': record['card_id']})
+        if card['status'] == 'triage':
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                    raise ManagementError('outcome_unknown', 'Original native triage continuation remains unconfirmed.')
+        else:
+            intake._kanban('kanban_unblock', {'task_id': record['card_id']})
         execution['continuation_control']['dispatch_status'] = 'accepted'
         intake._save_execution(record, fields=['continuation_control'])
         return record
@@ -626,6 +634,16 @@ async def run_shared_work(ctx, intake, record, generation):
     carrier = None
     try:
         intake.require_active(generation)
+        record = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])
+        execution = record['dsh_execution']
+        run_id = current_worker(ctx, intake, record)
+        configuration, _ = execution_configuration(record['target'])
+        if configuration['reference_sha256'] != execution['reference_sha256']:
+            raise ManagementError('configuration_missing', 'The admitted shared configuration changed.')
+        continuation = execution.get('continuation_control', {})
+        pending_continuation = continuation.get('status') == 'admitted' and continuation.get('dispatch_status') == 'accepted'
+        if execution.get('stop_requested') or execution['state'] in {'budget_stopped', 'stopped'} or execution['state'] == 'execution_failed' and not pending_continuation:
+            return {'status': execution['state'], 'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
         occupied = [row for row in intake.snapshot()['work'] if row['id'] != record['id']
             and row['target'].get('repo_path') == record['target']['repo_path']
             and row.get('dsh_execution', {}).get('state') not in {None, 'admitted', 'stopped', 'released'}]
