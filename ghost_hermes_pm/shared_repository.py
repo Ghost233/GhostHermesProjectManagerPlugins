@@ -1644,6 +1644,8 @@ def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier):
     source = repository_source_state(record['target'])
     receipts = shared_receipts(configuration, execution, '.tools.jsonl')
     owned_jobs = carrier.owned_jobs()
+    if any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'} for job in owned_jobs):
+        raise ManagementError('outcome_unknown', 'Owned shared jobs must be terminal before supervision takeover.')
     if not (_source_core(execution.get('baseline')) == _source_core(source)
             and _source_core(source) is not None and not receipts
             or _verified_source_chain(execution, execution.get('baseline'), receipts, source, owned_jobs)):

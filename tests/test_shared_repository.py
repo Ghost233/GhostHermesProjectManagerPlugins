@@ -241,6 +241,74 @@ def test_source_chain_foreground_attribution_keeps_existing_exit_semantics(exit_
     assert _verified_source_chain(execution, baseline, [receipt], current)
 
 
+@pytest.mark.parametrize('job', [
+    {'id': 'fixture-unrelated-job', 'owner': 'fixture-session', 'status': 'running'},
+    {'id': 'fixture-unrelated-job', 'owner': 'fixture-session', 'status': 'stopping'},
+    {'id': 'fixture-unrelated-job', 'owner': 'fixture-session', 'status': 'unknown'},
+    {'id': 'fixture-unrelated-job', 'owner': 'fixture-session'},
+    None,
+], ids=['running', 'stopping', 'unknown', 'missing_status', 'malformed'])
+def test_supervision_takeover_read_boundary_rejects_unrelated_nonterminal_job(job, monkeypatch, tmp_path):
+    """Adverse read-fact replay; public_entry[supervise_takeover] is its canonical companion."""
+    import psutil
+    from types import SimpleNamespace
+    monkeypatch.syspath_prepend(os.environ['HERMES_TEST_SDK_ROOT'])
+    from hermes_cli import kanban_db as kb, kanban_db_connect
+    from ghost_hermes_pm import shared_repository, repository_acceptance, trusted_controller
+    child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+    birth = psutil.Process(child.pid).create_time()
+    previous = {'run_id': 17, 'identity': {'pid': child.pid, 'start_sec': str(int(birth)),
+        'start_usec': str(round((birth - int(birth)) * 1000000)),
+        'executable': str(Path(sys.executable).resolve())}, 'exit_log_offset': 0}
+    child.communicate(b'')
+    assert child.returncode == 0 and not psutil.pid_exists(child.pid)
+    source = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-source'}
+    execution = {'state': 'running', 'first_input': 'accepted', 'session_id': 'fixture-session',
+        'generation': 'fixture-generation', 'baseline': source, 'supervisor_claim': previous}
+    record = {'card_id': 'fixture-card', 'target': {'repo_path': 'fixture-repository'}, 'dsh_execution': execution}
+    old = SimpleNamespace(id=17, task_id='fixture-card', status='gave_up', outcome='gave_up',
+        ended_at=100, worker_pid=child.pid,
+        error='Iteration budget exhausted (8/8) — task could not complete within the allowed iterations')
+    log = tmp_path / 'fixture-worker.log'
+    log.write_text('[kanban-worker-exit] rc=0\n')
+    connection = object()
+    reads, saves, carrier_calls = [], [], []
+
+    @contextmanager
+    def connect_closing(*, board):
+        assert board == 'fixture-board'
+        yield connection
+
+    def get_run(actual_connection, run_id):
+        assert actual_connection is connection and run_id == 17
+        reads.append(run_id)
+        return old
+
+    class Carrier:
+        def owned_jobs(self):
+            carrier_calls.append('owned_jobs')
+            return [job]
+
+        def __getattr__(self, name):
+            pytest.fail('Takeover rejection must not prompt or use another carrier operation: ' + name)
+
+    monkeypatch.setattr(kanban_db_connect, 'connect_closing', connect_closing)
+    monkeypatch.setattr(kb, 'get_run', get_run)
+    monkeypatch.setattr(kb, 'worker_log_path', lambda *args, **kwargs: log)
+    monkeypatch.setattr(shared_repository, 'read_ledger', lambda *args: {})
+    monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda *args: source)
+    monkeypatch.setattr(shared_repository, 'shared_receipts', lambda *args: [])
+    monkeypatch.setattr(trusted_controller, 'controller_identity', lambda: {'pid': os.getpid()})
+    intake = SimpleNamespace(board='fixture-board', _save_execution=lambda *args, **kwargs: saves.append((args, kwargs)))
+    before = json.dumps(execution, sort_keys=True, separators=(',', ':')).encode()
+    with pytest.raises(ManagementError) as caught:
+        shared_repository._take_over_gave_up_claim(intake, record, 18, {}, Carrier())
+    assert caught.value.code == 'outcome_unknown'
+    assert str(caught.value) == 'Owned shared jobs must be terminal before supervision takeover.'
+    assert reads == [17] and saves == [] and carrier_calls == ['owned_jobs']
+    assert json.dumps(execution, sort_keys=True, separators=(',', ':')).encode() == before
+
+
 @pytest.mark.parametrize('error', [
     'Iteration budget exhausted (7/8) — task could not complete within the allowed iterations',
     'Iteration budget exhausted (8/8) — task could not complete within the allowed iterations; extra suffix',
