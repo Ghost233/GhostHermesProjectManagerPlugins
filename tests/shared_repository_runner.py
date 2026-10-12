@@ -8,10 +8,14 @@ import sys
 import time
 import types
 import shutil
+import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 scratch = Path(sys.argv[1]).resolve()
 shared_scenario = sys.argv[2]
+contract_run = subprocess.run([shutil.which('node'), str(ROOT / 'tests/shared_permission_native_runner.mjs'),
+    str(scratch)], capture_output=True, text=True, check=True, timeout=20)
+permission_contract = json.loads(contract_run.stdout)
 # Extend only the external service fixture to expose its native launch exchange
 # and native preset/question projections. No original SDK method is replaced.
 service_source = (ROOT / 'tests/dsh_fixture_server.py').read_text()
@@ -27,15 +31,20 @@ service_source = service_source.replace("value = {'sessionId': args['request']['
     "value = {'sessionId': args['request']['sessionId'], 'agentPreset': args['request']['agentPreset']}")
 service_source = service_source.replace("'values': {'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []})}",
     "'values': {'agentPreset': 'fixture-shared', 'userQuestions': {'active': [], 'settled': []}, "
-    "'permissions': {'sandbox': 'workspace-write', 'approval': 'ask'}, "
+    "'permissions': {'currentValue': 'workspace-write'}, "
     "'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []})}")
 service_source = service_source.replace("elif method == 'session/cancel':", """elif method == 'commands/list':
                 assert set(args) == {'agentId'}
                 value = [{'name': 'permission', 'definitionId': '@deepseek-ai/dsh-permission-presets'}]
             elif method == 'commands/execute':
                 assert args['line'] == '/permission workspace-write' and args['submittedAttachments'] == []
-                value = {'commandId': 'fixture-native-permission', 'result': {'kind': 'success'}}
+                sid = args['agentId']
+                state['journals'][sid] = [{'type': 'event', 'event': event} for event in permission_contract['events']]
+                behavior['inbox'] = permission_contract['projections']['inbox']
+                value = None if shared_scenario == 'reconcile_intent' else permission_contract['response']
             elif method == 'session/cancel':""")
+service_source = service_source.replace("state['prompts'].append(args['request'])", """state['prompts'].append(args['request'])
+                behavior['inbox'] = {'next-turn': [], 'next-step': []}""")
 service_source = service_source.replace("elif method == 'session/cancel':\n                value", """elif method == 'session/cancel':
                 sid = args['request']['sessionId']
                 row = next(row for row in state['sessions'] if row['sessionId'] == sid)
@@ -44,7 +53,7 @@ service_source = service_source.replace("elif method == 'session/cancel':\n     
                 journal.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(journal),
                     'time': 4, 'data': {'turn': 1, 'reason': {'kind': 'aborted', 'reason': {'kind': 'user'}}}}})
                 value""")
-service_namespace = {}
+service_namespace = {'permission_contract': permission_contract, 'shared_scenario': shared_scenario}
 exec(compile(service_source, str(ROOT / 'tests/dsh_fixture_server.py'), 'exec'), service_namespace)
 peer_context = service_namespace['remote_peer'](behavior={'admit_prompt': True})
 url, peer = peer_context.__enter__()
@@ -135,8 +144,10 @@ async def main():
         deadline = time.monotonic() + 35
         ended = False
         stop_sent = False
+        reconciled = False
+        original_binding = None
         while time.monotonic() < deadline:
-            if peer['prompts'] and not ended and shared_scenario == 'terminal':
+            if peer['prompts'] and not ended and shared_scenario in {'terminal', 'reconcile_intent'}:
                 sid = peer['prompts'][0]['sessionId']
                 rows = peer['journals'][sid]
                 rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows),
@@ -149,9 +160,29 @@ async def main():
                 await receive(adapter, raw('om_stop', '@_user_1 停止 ' + latest['id']))
                 latest = record()
             card = json.loads(registry.dispatch('kanban_show', {'task_id': initial['card_id']}))['task']
+            if shared_scenario == 'reconcile_intent' and not reconciled and card['status'] == 'blocked':
+                assert latest['dsh_execution']['native_permission'] == 'intent'
+                assert not peer['prompts']
+                original_binding = {key: latest['dsh_execution'][key] for key in ('session_id', 'generation', 'request_id')}
+                while True:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        break
+                    await asyncio.sleep(.05)
+                assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
+                model.worker_steps = 1
+                with connect_closing() as db:
+                    assert dispatch_once(db, max_spawn=1).spawned
+                    worker = remember_worker(db, initial['card_id'])
+                reconciled = True
+            elif shared_scenario == 'reconcile_intent' and reconciled and card['status'] == 'blocked' and not peer['prompts']:
+                raise AssertionError('Same-card permission initialization could not resume: ' + json.dumps(latest['dsh_execution']))
             if shared_scenario == 'stop' and latest['dsh_execution'].get('state') == 'stopped':
                 break
-            if (shared_scenario == 'terminal' and latest['dsh_execution'].get('acceptance') and card['status'] == 'blocked'
+            if shared_scenario == 'reconcile_intent' and latest['dsh_execution'].get('acceptance'):
+                break
+            if (shared_scenario in {'terminal', 'reconcile_intent'} and latest['dsh_execution'].get('acceptance') and card['status'] == 'blocked'
                     and any(message.message_id == 'om_shared' and '验收未满足' in message.request_body.content for message in sent)):
                 break
             await asyncio.sleep(.05)
@@ -161,9 +192,15 @@ async def main():
         assert latest['dsh_execution']['native_identity']['kind'] == 'shared_native'
         assert latest['dsh_execution']['native_identity']['pid'] == os.getpid()
         assert latest['dsh_execution']['native_permission'] == 'workspace-write'
-        if shared_scenario == 'terminal':
+        if shared_scenario == 'reconcile_intent':
+            assert original_binding == {key: latest['dsh_execution'][key] for key in original_binding}
+            assert len([call for call in peer['calls'] if call['method'] == 'commands/execute']) == 1
+            assert len([call for call in peer['calls'] if call['method'] == 'session/create']) == 1
+            assert latest['dsh_execution']['supervisor_claim']['run_id'] != latest['dsh_execution']['permission_initialization_claim']['run_id']
+        if shared_scenario in {'terminal', 'reconcile_intent'}:
             assert latest['dsh_execution']['acceptance']['status'] == 'unmet'
-            assert any(message.message_id == 'om_shared' and '验收未满足' in message.request_body.content for message in sent)
+            if shared_scenario == 'terminal':
+                assert any(message.message_id == 'om_shared' and '验收未满足' in message.request_body.content for message in sent)
         else:
             assert latest['dsh_execution']['stop_control']['proof']['session']['scope'] == 'shared_session'
             assert latest['dsh_execution']['stop_control']['proof']['session']['host_shutdown'] is False

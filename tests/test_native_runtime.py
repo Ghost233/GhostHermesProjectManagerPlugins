@@ -43,6 +43,7 @@ def test_sdk_loaded_driver_runs_real_owned_process_without_host_path_repair(prep
         'owned_process_smoke_runner.py', False, '', prepared_native_sdk)
 
 
+@pytest.mark.retired_independent_runtime
 def test_original_sdk_loads_mapped_project_executors_and_unloads_then_reloads_them(prepared_native_sdk):
     configured = os.environ.get('DSH_TEST_SDK_ROOT')
     if not configured or not (Path(configured) / '@deepseek-ai/dsh/lib/profile-boot.js').is_file():

@@ -9,6 +9,8 @@ from ghost_hermes_pm.manager import ManagementError
 from ghost_hermes_pm.repository_execution import execution_configuration
 from simple_worker_model import execution_reference
 
+pytestmark = pytest.mark.retired_independent_runtime
+
 
 @pytest.fixture
 def workflow_reference(tmp_path):

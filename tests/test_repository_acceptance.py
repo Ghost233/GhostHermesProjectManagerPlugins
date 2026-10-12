@@ -167,6 +167,7 @@ else:
         model.close()
 
 
+@pytest.mark.retired_independent_runtime
 def test_verified_delivery_can_complete_while_pr_awaits_review(completed_work):
     result = completed_work['finish']()
     assert result['unmet'] == [], result
@@ -181,6 +182,7 @@ def test_verified_delivery_can_complete_while_pr_awaits_review(completed_work):
             assert calls[offset - 2][:2] == ['auth', 'switch'] and calls[offset - 1][:2] == ['api', 'user']
 
 
+@pytest.mark.retired_independent_runtime
 def test_verification_allows_private_tmp_and_denies_repository_and_git_writes(completed_work):
     work = completed_work
     (work['repo'] / 'test_feature.py').write_text(
@@ -216,6 +218,7 @@ def test_verification_allows_private_tmp_and_denies_repository_and_git_writes(co
     assert list((artifacts / 'pytest').glob('test_scoped_verification*/result.txt'))
 
 
+@pytest.mark.retired_independent_runtime
 def test_missing_starting_source_baseline_remains_undelivered(completed_work):
     completed_work['record']['dsh_execution']['baseline'] = None
     result = completed_work['finish']()
@@ -223,6 +226,7 @@ def test_missing_starting_source_baseline_remains_undelivered(completed_work):
     assert 'workspace_handoff_unconfirmed' in result['unmet']
 
 
+@pytest.mark.retired_independent_runtime
 @pytest.mark.parametrize(('case', 'reason'), [
     ('failed', 'test_evidence_missing'), ('timeout', 'test_evidence_missing'),
     ('cancelled', 'test_evidence_missing'), ('wrong_execution', 'test_evidence_missing'),
@@ -264,6 +268,7 @@ def test_incomplete_or_mismatched_work_remains_undelivered(completed_work, case,
     assert work['record']['dsh_execution']['state'] == 'awaiting_acceptance'
 
 
+@pytest.mark.retired_independent_runtime
 def test_issue_activity_without_scope_changes_preserves_frozen_acceptance(completed_work):
     work = completed_work
     work['gh']['issue']['updatedAt'] = '2026-10-10T01:00:00Z'

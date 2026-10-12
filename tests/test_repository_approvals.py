@@ -10,6 +10,8 @@ import threading
 import pytest
 from sdk_source_integrity import source_snapshot
 
+pytestmark = pytest.mark.retired_independent_runtime
+
 
 @pytest.mark.parametrize('outcome', ['allowed-once', 'rejected', 'cancelled', 'unavailable'])
 def test_original_owned_approval_keeps_native_decision_and_tool_result(outcome):

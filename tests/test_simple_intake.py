@@ -14,10 +14,44 @@ from sdk_source_integrity import source_snapshot
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('scenario', ['existing', 'create_unknown', 'private_issue', 'concurrent', 'delegation', 'authority',
-    'wrong_card_assignee', 'wrong_card_path', 'wrong_card_body', 'wrong_card_duplicate', 'changed_card',
-    'issue_unavailable', 'issue_unavailable_unload', 'private_all_bindings',
-    'configuration_auto_decompose', 'configuration_repository', 'queued_rejection_unload', 'responsibility_conflict', 'worker_required', 'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_reaped', 'worker_stop_native_front', 'worker_stop_native_background', 'worker_stop_native_live', 'worker_stop_native_promoted', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'])
+@pytest.mark.parametrize('scenario', [
+    'existing',
+    'create_unknown',
+    'private_issue',
+    'concurrent',
+    'delegation',
+    'authority',
+    'wrong_card_assignee',
+    'wrong_card_path',
+    'wrong_card_body',
+    'wrong_card_duplicate',
+    'changed_card',
+    'issue_unavailable',
+    'issue_unavailable_unload',
+    'private_all_bindings',
+    'configuration_auto_decompose',
+    'configuration_repository',
+    'queued_rejection_unload',
+    'responsibility_conflict',
+    'worker_required',
+    pytest.param('worker_dispatch', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_query_race', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_transport_timeout', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_terminal', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_reaped', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_native_front', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_native_background', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_native_live', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_native_promoted', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_running', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_uncovered', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_retry_terminal', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_retry_message_history', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_question', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_stop_unknown', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_retry_failed', marks=pytest.mark.retired_independent_runtime),
+    pytest.param('worker_retry_observer', marks=pytest.mark.retired_independent_runtime)
+])
 def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
     flags = ('HPM_NATIVE_REAL_MODEL_REFERENCE', 'HPM_NATIVE_EXECUTION_REFERENCE')
     if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_reaped', 'worker_stop_native_front', 'worker_stop_native_background', 'worker_stop_native_live', 'worker_stop_native_promoted', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'}:
@@ -105,6 +139,7 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
             shutil.rmtree(scratch)
 
 
+@pytest.mark.retired_independent_runtime
 def test_failed_public_worker_preserves_forensics(monkeypatch):
     if not os.environ.get('HERMES_TEST_SDK_ROOT'):
         pytest.skip('Original SDK is required.')

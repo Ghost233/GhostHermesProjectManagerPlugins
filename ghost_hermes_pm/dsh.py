@@ -808,18 +808,8 @@ def configured_adapter(config, state_dir):
     """Only protected native DSH configuration and fresh hashed host receipts."""
     if not config:
         return None
-    if not isinstance(config, dict):
-        raise ManagementError('invalid_change', 'An explicit owned native configuration is required.')
-    mode = config.get('mode', 'owned_native')
-    if mode == 'owned_native':
-        from .dsh_owned import DshOwnedAdapter
-        required = {'dsh_home', 'workspace', 'runtime_package_root', 'service_ref'}
-        allowed = required | {'mode', 'node_bin', 'timeout'}
-        if not required <= set(config) or set(config) - allowed:
-            raise ManagementError('invalid_change', 'Owned native DSH requires an independent home, workspace and original runtime; no remote authentication is implicit.')
-        return DshOwnedAdapter(**{key: value for key, value in config.items() if key != 'mode'})
-    if mode != 'remote':
-        raise ManagementError('invalid_change', 'Select owned_native or an explicitly registered native remote connection.')
+    if not isinstance(config, dict) or config.get('mode') != 'remote':
+        raise ManagementError('invalid_change', 'An explicitly registered native remote connection is required; dedicated DSH instances are retired.')
     config = {key: value for key, value in config.items() if key != 'mode'}
     from .observation import resolved_configuration
     frozen, runtime = resolved_configuration(config)

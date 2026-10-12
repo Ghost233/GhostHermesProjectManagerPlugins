@@ -409,10 +409,12 @@ def register_repository_supervision(ctx, intake):
     ctx.register_system_prompt_section('hermes-pm-supervision',
         'For a plugin-managed Kanban outer card, read kanban_show, then call hermes_pm_supervise with no arguments. '
         'After supervision returns next_action=kanban_complete, call the original kanban_complete with the verified summary. '
-        'After next_action=kanban_block, call kanban_block(kind="needs_input", reason="Dedicated execution awaits acceptance or reconciliation"), then end. '
+        'After next_action=kanban_block, call kanban_block(kind="needs_input", reason="Shared execution awaits acceptance or reconciliation"), then end. '
         'Do not develop directly, create/link cards, or declare delivery. DSH owns the detailed repository work; the plugin records its real status.')
 
     async def run_work(record, generation):
+        if record['dsh_execution'].get('mode') != 'shared_native':
+            raise ManagementError('invalid_change', 'Dedicated repository execution is retired; only shared_native work on the existing DSH instance may run.')
         if record['dsh_execution'].get('mode') == 'shared_native':
             from .shared_repository import run_shared_work
             return await run_shared_work(ctx, intake, record, generation)
@@ -669,6 +671,6 @@ def register_repository_supervision(ctx, intake):
 
     ctx.register_tool(name='hermes_pm_supervise', toolset='hermes_pm_supervision',
         schema={'name': 'hermes_pm_supervise',
-                'description': 'Supervise the current dispatcher-owned outer card with its dedicated original DSH instance. Caller identity and repository are never arguments.',
+                'description': 'Supervise the current dispatcher-owned outer card in the existing shared DSH instance. Caller identity and repository are never arguments.',
                 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
-        handler=supervise, is_async=True, description='Supervise original dedicated repository execution')
+        handler=supervise, is_async=True, description='Supervise original shared repository execution')

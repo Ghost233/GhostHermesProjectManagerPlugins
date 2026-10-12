@@ -26,6 +26,8 @@ def execution_configuration(target):
     try:
         reference = private_file(target['execution_ref'])
         configuration = json.loads(reference.read_text())
+        if not isinstance(configuration, dict) or configuration.get('mode') != 'shared_native':
+            raise ManagementError('configuration_missing', 'Repository execution requires shared_native on the existing DSH instance; dedicated execution is retired.')
         if configuration.get('mode') == 'shared_native':
             from .shared_repository import shared_configuration
             return shared_configuration(reference, configuration), {}

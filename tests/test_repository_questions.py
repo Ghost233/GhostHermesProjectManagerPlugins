@@ -14,6 +14,8 @@ import pytest
 
 from sdk_source_integrity import source_snapshot
 
+pytestmark = pytest.mark.retired_independent_runtime
+
 
 class QuestionModel:
     def __init__(self, timeout=-1):

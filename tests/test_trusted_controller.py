@@ -26,6 +26,7 @@ def test_kernel_identity_does_not_collect_an_original_dispatcher_child():
     raise AssertionError('Original child exit could not be collected.')
 
 
+@pytest.mark.retired_independent_runtime
 def test_original_model_bash_controller_boundary():
     if not os.environ.get('DSH_TEST_SDK_ROOT'):
         if os.environ.get('DSH_REQUIRE_SDK_SMOKE') == '1':

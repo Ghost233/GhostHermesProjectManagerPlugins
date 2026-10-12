@@ -53,6 +53,7 @@ class WorkModel:
         assert not self.thread.is_alive()
 
 
+@pytest.mark.retired_independent_runtime
 @pytest.mark.parametrize('max_requests,token_limit,cached,expected_requests,npm_probe', [
     (1, 1000, False, 1, False), (3, 1000, False, 2, False),
     (3, 20, False, 1, False), (3, 21, False, 2, False),
@@ -180,6 +181,7 @@ def test_original_work_input_once_and_observed_budget(max_requests, token_limit,
     assert source_snapshot(sdk) == before
 
 
+@pytest.mark.retired_independent_runtime
 @pytest.mark.parametrize('background', [False, True])
 @pytest.mark.parametrize('boundary', ['outside', 'symlink', 'hardlink', 'danger', 'temporary', 'runtime'])
 def test_original_bash_write_boundary_and_aliases(boundary, background):
@@ -263,6 +265,7 @@ def test_original_bash_write_boundary_and_aliases(boundary, background):
     assert source_snapshot(sdk) == before
 
 
+@pytest.mark.retired_independent_runtime
 def test_reconnect_uses_same_original_owned_instance_and_session():
     configured = os.environ.get('DSH_TEST_SDK_ROOT')
     if not configured:
@@ -301,6 +304,7 @@ def test_reconnect_uses_same_original_owned_instance_and_session():
     assert source_snapshot(sdk) == before
 
 
+@pytest.mark.retired_independent_runtime
 def test_original_managed_job_rejects_foreign_session_cancel_and_keeps_six_tools():
     configured = os.environ.get('DSH_TEST_SDK_ROOT')
     if not configured:
@@ -373,6 +377,7 @@ def test_original_managed_job_rejects_foreign_session_cancel_and_keeps_six_tools
     assert source_snapshot(sdk) == before
 
 
+@pytest.mark.retired_independent_runtime
 def test_silent_owned_response_is_typed_unknown_without_replacing_session():
     """Stop only this original carrier; its unanswered public RPC must stay unknown."""
     import signal
@@ -443,6 +448,7 @@ def test_owned_response_preserves_known_failure_cause_and_does_not_retry(error):
     assert len(calls) == 1, 'An unknown original response is never automatically resent.'
 
 
+@pytest.mark.retired_independent_runtime
 def test_disappeared_original_owned_pid_retains_configuration_and_session():
     import signal
     import psutil
@@ -498,6 +504,7 @@ def test_disappeared_original_owned_pid_retains_configuration_and_session():
     assert source_snapshot(sdk) == before
 
 
+@pytest.mark.retired_independent_runtime
 @pytest.mark.parametrize('binding_change', ['match', 'digest', 'controller', 'work', 'runtime', 'home', 'source'])
 def test_attach_only_retains_original_profile_configuration(tmp_path, binding_change):
     """Two installed plugin copies must attach to the same pinned native scope."""
@@ -584,6 +591,7 @@ def test_attach_only_retains_original_profile_configuration(tmp_path, binding_ch
         original.close()
 
 
+@pytest.mark.retired_independent_runtime
 def test_original_sdk_attach_across_profile_sources(tmp_path):
     import importlib
     import shutil

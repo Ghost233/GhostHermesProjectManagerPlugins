@@ -11,6 +11,7 @@ import shutil
 import asyncio
 import hashlib
 import time
+from copy import deepcopy
 
 from sdk_source_integrity import source_snapshot
 from test_repository_github import github_source  # noqa: F401
@@ -18,6 +19,86 @@ from test_repository_github import github_source  # noqa: F401
 import pytest
 
 from ghost_hermes_pm.manager import ManagementError
+
+
+@pytest.mark.parametrize('initial', ['danger-full-access/never', 'workspace-write/ask', 'read-only/ask'])
+def test_shared_permission_confirmation_uses_original_command_gateway(tmp_path, initial):
+    sdk = Path(os.environ['DSH_TEST_SDK_ROOT']).resolve(strict=True)
+    before = source_snapshot(sdk)
+    result = subprocess.run([shutil.which('node'), str(Path(__file__).with_name('shared_permission_native_runner.mjs')),
+                             str(tmp_path), initial], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    evidence = json.loads(result.stdout)
+    artifact = tmp_path / 'native-permission-contract.json'
+    artifact.write_text(json.dumps(evidence))
+    artifact.chmod(0o600)
+    from ghost_hermes_pm.shared_repository import confirm_shared_permission
+    proof = confirm_shared_permission(evidence['response'], evidence['events'], evidence['projections'])
+    assert proof['command_id'] == evidence['response']['commandId']
+    assert confirm_shared_permission(None, evidence['events'], evidence['projections'], reconcile=True) == proof
+    for mutation in ('wrong_command', 'missing_done', 'changed_policy', 'unexpected_work', 'foreign_notice', 'queued_input', 'late_cursor'):
+        candidate = deepcopy(evidence)
+        kwargs = {}
+        if mutation == 'wrong_command':
+            candidate['response']['commandId'] = 'fixture-foreign-command'
+        elif mutation == 'missing_done':
+            candidate['events'] = [event for event in candidate['events'] if event['type'] != 'command/done']
+        elif mutation == 'changed_policy':
+            candidate['events'].append({'type': 'approval/policy', 'seq': len(candidate['events']), 'data': {'policy': 'never'}})
+        elif mutation == 'unexpected_work':
+            candidate['events'].append({'type': 'turn/start', 'seq': len(candidate['events']), 'data': {'turn': 1}})
+        elif mutation == 'foreign_notice':
+            notices = [event for event in candidate['events'] if event['type'] == 'agent/inbox/spliced']
+            if not notices:
+                continue
+            notices[0]['data']['inserted'][0]['source'] = {'kind': 'user'}
+        elif mutation == 'queued_input':
+            candidate['projections']['inbox']['next-turn'].append({'role': 'user', 'content': []})
+        else:
+            kwargs['before_cursor'] = proof['run_seq']
+        with pytest.raises(ManagementError):
+            confirm_shared_permission(candidate['response'], candidate['events'], candidate['projections'], **kwargs)
+    assert source_snapshot(sdk) == before
+
+
+def test_permission_initializer_exec_change_does_not_end_the_old_process():
+    from types import SimpleNamespace
+    from ghost_hermes_pm.trusted_controller import controller_identity
+    from ghost_hermes_pm.shared_repository import require_permission_initializer_end
+    identity = controller_identity()
+    original = {**identity, 'executable': '/synthetic/previous-executable'}
+    run = SimpleNamespace(id=1, task_id='fixture-card', status='blocked', ended_at=time.time(), worker_pid=identity['pid'])
+    with pytest.raises(ManagementError):
+        require_permission_initializer_end({'run_id': 1, 'identity': original}, run, 'fixture-card')
+
+
+@pytest.mark.parametrize('change', ['unfinished', 'unknown', 'changed_birth', 'gone'])
+def test_permission_initializer_requires_original_terminal_birth(change, monkeypatch):
+    import psutil
+    from types import SimpleNamespace
+    from ghost_hermes_pm.trusted_controller import controller_identity
+    from ghost_hermes_pm.shared_repository import require_permission_initializer_end
+    identity = controller_identity()
+    if change == 'gone':
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+        identity = controller_identity(child.pid)
+        child.communicate(b'')
+        assert child.returncode == 0
+    run = SimpleNamespace(id=1, task_id='fixture-card', status='blocked', ended_at=time.time(), worker_pid=identity['pid'])
+    if change == 'unfinished':
+        run.ended_at = None
+    elif change == 'unknown':
+        def unavailable(pid):
+            raise psutil.AccessDenied(pid)
+        monkeypatch.setattr(psutil, 'Process', unavailable)
+    elif change == 'changed_birth':
+        identity = {**identity, 'start_sec': str(int(identity['start_sec']) - 1)}
+    previous = {'run_id': 1, 'identity': identity}
+    if change in {'unfinished', 'unknown'}:
+        with pytest.raises(ManagementError):
+            require_permission_initializer_end(previous, run, 'fixture-card')
+    else:
+        require_permission_initializer_end(previous, run, 'fixture-card')
 
 
 @contextmanager
@@ -258,7 +339,7 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'stop'])
+@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])

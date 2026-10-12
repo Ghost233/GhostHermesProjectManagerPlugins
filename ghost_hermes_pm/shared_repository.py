@@ -102,6 +102,78 @@ def _write_initial_ledger(configuration, execution):
         os.fsync(output.fileno())
 
 
+def confirm_shared_permission(permission, events, projections, *, before_cursor=None, reconcile=False):
+    """Validate the original permission-command result and Session policy."""
+    if permission is None and not reconcile or permission is not None and (not isinstance(permission, dict)
+            or not isinstance(permission.get('result'), dict) or permission['result'].get('kind') != 'success'
+            or not isinstance(permission.get('commandId'), str) or not permission['commandId']):
+        raise ManagementError('outcome_unknown', 'The exact new shared Session permission switch was not confirmed.')
+    allowed = {'permission/preset', 'sandbox/mode', 'approval/policy', 'command/run', 'command/done', 'agent/inbox/spliced'}
+    if any(event['type'] not in allowed for event in events):
+        raise ManagementError('binding_conflict', 'The new shared Session has unexpected work before permission admission.')
+    runs = [event for event in events if event['type'] == 'command/run']
+    done = [event for event in events if event['type'] == 'command/done']
+    if (len(runs) != 1 or len(done) != 1 or runs[0]['data'].get('name') != 'permission'
+            or runs[0]['data'].get('args', '').strip() != 'workspace-write'
+            or runs[0]['data'].get('source') != {'kind': 'user'}
+            or not isinstance(runs[0]['data'].get('commandId'), str) or not runs[0]['data']['commandId']
+            or done[0]['data'].get('commandId') != runs[0]['data']['commandId']
+            or done[0]['data'].get('kind') != 'success' or done[0]['seq'] <= runs[0]['seq']
+            or before_cursor is not None and runs[0]['seq'] <= before_cursor
+            or permission is not None and permission['commandId'] != runs[0]['data']['commandId']):
+        raise ManagementError('outcome_unknown', 'The original shared permission-command pair is unconfirmed; no replay.')
+    effects = {}
+    for event in events:
+        if event['type'] in {'permission/preset', 'sandbox/mode', 'approval/policy'}:
+            effects[event['type']] = event
+    expected = {'permission/preset': ('preset', 'workspace-write'), 'sandbox/mode': ('mode', 'workspace-write'),
+                'approval/policy': ('policy', 'ask')}
+    if (projections.get('permissions') != {'currentValue': 'workspace-write'}
+            or any(kind not in effects or effects[kind]['data'].get(key) != value
+                   or effects[kind]['seq'] >= done[0]['seq']
+                   for kind, (key, value) in expected.items())):
+        raise ManagementError('binding_conflict', 'The original shared Session permission projection differs.')
+    notices = []
+    for event in events:
+        if event['type'] != 'agent/inbox/spliced':
+            continue
+        inserted = event['data'].get('inserted')
+        if (not runs[0]['seq'] < event['seq'] < done[0]['seq'] or event['data'].get('target') != 'next-step'
+                or not isinstance(inserted, list) or any(item.get('role') != 'user'
+                    or item.get('source') != {'kind': 'user-approval'} or not isinstance(item.get('id'), str)
+                    or item.get('content') != [{'type': 'text', 'text':
+                        'The approval policy changed from "never" to "ask" (changed by the user).'}]
+                    for item in inserted)):
+            raise ManagementError('binding_conflict', 'The new shared Session has unexpected queued input.')
+        notices.extend(inserted)
+    if projections.get('inbox') != {'next-turn': [], 'next-step': notices}:
+        raise ManagementError('binding_conflict', 'The new shared Session inbox differs from its original policy notice.')
+    return {'command_id': runs[0]['data']['commandId'], 'run_seq': runs[0]['seq'], 'done_seq': done[0]['seq'],
+            'policy_seq': {kind: event['seq'] for kind, event in effects.items()}}
+
+
+def require_permission_initializer_end(previous, old_run, card_id):
+    """Check only the preceding worker of this permission-initialization intent."""
+    import psutil
+    identity = previous['identity']
+    if (old_run is None or old_run.id != previous['run_id'] or old_run.task_id != card_id
+            or old_run.status == 'running' or old_run.ended_at is None
+            or type(identity.get('pid')) is not int or identity['pid'] <= 0
+            or old_run.worker_pid not in {None, identity['pid']}):
+        raise ManagementError('outcome_unknown', 'The original permission-initialization worker has not ended.')
+    if not psutil.pid_exists(identity['pid']):
+        return
+    try:
+        birth = float(identity['start_sec']) + float(identity['start_usec']) / 1000000
+        actual_birth = psutil.Process(identity['pid']).create_time()
+    except psutil.NoSuchProcess:
+        return
+    except (psutil.AccessDenied, KeyError, TypeError, ValueError, OSError):
+        raise ManagementError('outcome_unknown', 'The original permission-initialization process identity is unknown.') from None
+    if abs(actual_birth - birth) < .000001:
+        raise ManagementError('outcome_unknown', 'The original permission-initialization worker is still alive.')
+
+
 def shared_attach(intake, record, *, observe=True):
     from .repository_execution import execution_configuration
     execution = record['dsh_execution']
@@ -383,15 +455,31 @@ async def run_shared_work(ctx, intake, record, generation):
             if not isinstance(catalog, list) or not any(row.get('name') == 'permission' for row in catalog):
                 raise ManagementError('configuration_missing', 'The original per-Session permission command is unavailable.')
             execution['native_permission'] = 'intent'
+            execution['native_permission_cursor'] = snapshot['cursor']
             intake._save_execution(record)
             permission = await asyncio.to_thread(owned_call, carrier, 'commands/execute',
                 {'agentId': execution['session_id'], 'line': '/permission workspace-write', 'submittedAttachments': []})
-            if not isinstance(permission, dict) or permission.get('result', {}).get('kind') != 'success':
-                raise ManagementError('outcome_unknown', 'The exact new shared Session permission switch was not confirmed.')
-            _, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], configuration['workspace'])
-            policy = projections.get('permissions', {})
-            if policy.get('sandbox') != 'workspace-write' or policy.get('approval') != 'ask':
-                raise ManagementError('binding_conflict', 'The original shared Session permission projection differs.')
+            events, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], configuration['workspace'])
+            execution['native_permission_response'] = permission
+            intake._save_execution(record)
+            proof = confirm_shared_permission(permission, events, projections,
+                before_cursor=execution['native_permission_cursor'])
+            execution['native_permission_proof'] = proof
+            execution['native_permission'] = 'workspace-write'
+        elif execution['native_permission'] == 'intent':
+            events, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], configuration['workspace'])
+            proof = confirm_shared_permission(execution.get('native_permission_response'), events, projections,
+                before_cursor=execution.get('native_permission_cursor'), reconcile=True)
+            previous = execution['supervisor_claim']
+            if previous['run_id'] != run_id:
+                from hermes_cli.kanban_db_connect import connect_closing
+                with connect_closing(board=intake.board) as connection:
+                    old_run = kb.get_run(connection, previous['run_id'])
+                require_permission_initializer_end(previous, old_run, record['card_id'])
+                execution['permission_initialization_claim'] = previous
+                execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
+                    'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
+            execution['native_permission_proof'] = proof
             execution['native_permission'] = 'workspace-write'
         elif execution['native_permission'] != 'workspace-write':
             raise ManagementError('outcome_unknown', 'The shared Session permission transition is unconfirmed; no replay.')
@@ -402,7 +490,13 @@ async def run_shared_work(ctx, intake, record, generation):
             await asyncio.to_thread(owned_call, carrier, 'session/rename', {'sessionId': execution['session_id'], 'title': title})
             execution['native_title'] = title
             intake._save_execution(record)
-    except Exception:
+    except Exception as error:
+        if isinstance(error, ManagementError):
+            execution['last_failure'] = {'code': error.code, 'message': str(error)}
+            try:
+                intake._save_execution(record, fields=['last_failure'])
+            except ManagementError:
+                pass
         if carrier is not None:
             carrier.close()
         raise

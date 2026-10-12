@@ -22,6 +22,8 @@ ghost_hermes_pm = ["*.mjs", "trusted_controller.c"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not retired_independent_runtime'"
+markers = ["retired_independent_runtime: historical standalone DSH startup and lifecycle; excluded from the shared Desktop regression"]
 
 [tool.ruff]
 target-version = "py311"

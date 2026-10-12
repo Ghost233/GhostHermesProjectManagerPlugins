@@ -11,6 +11,8 @@ import stat
 import pytest
 from sdk_source_integrity import source_snapshot
 
+pytestmark = pytest.mark.retired_independent_runtime
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
