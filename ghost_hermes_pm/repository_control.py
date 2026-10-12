@@ -391,7 +391,12 @@ async def process_control(intake, prepared, generation):
                 text = '已受理独立新一轮执行；沿用原总 Issue 和外层卡，旧会话、预算与失败记录完整保留，等待原生派发。'
                 result = {'status': record['dsh_execution']['state'], 'work_id': record['id']}
             elif prepared.command.startswith('继续 '):
-                if execution.get('maintenance_checkpoint'):
+                if execution.get('terminal_reason', {}).get('kind') == 'max-tokens':
+                    from .shared_repository import admit_shared_max_tokens
+                    record = await asyncio.to_thread(admit_shared_max_tokens, intake, record, message_id, generation)
+                    text = '原任务截断后续接已受理；原 SID、任务、已用量与预算窗口保持，原外层卡等待原生派发。'
+                    result = {'status': 'admitted', 'work_id': record['id']}
+                elif execution.get('maintenance_checkpoint'):
                     from .shared_repository import admit_shared_continuation
                     record = await asyncio.to_thread(admit_shared_continuation, intake, record, message_id, generation)
                     text = '原会话维护后续接已受理；原 SID、任务与预算保持，原外层卡等待原生派发，随后向原会话发送明确续接。'

@@ -16,7 +16,9 @@ shared_scenario = sys.argv[2]
 triage_continuation = shared_scenario == 'continue_triage'
 concurrent_claim = shared_scenario == 'continue_claim_race'
 native_restore = shared_scenario == 'continue_native_restore'
-if triage_continuation or concurrent_claim or native_restore:
+max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown'}
+max_tokens_unknown = shared_scenario == 'continue_max_tokens_unknown'
+if triage_continuation or concurrent_claim or native_restore or max_tokens_continuation:
     shared_scenario = 'continue_restart'
 continuation_scenarios = {'continue_restart', 'continue_unknown'}
 host_processes = []
@@ -85,7 +87,7 @@ service_source = service_source.replace("if behavior.get('admit_prompt'):",
                     row.update(blank=False, running=True)
                 elif behavior.get('admit_prompt') and shared_scenario != 'continue_restart':""")
 service_source = service_source.replace("value = {'accepted': True}",
-    "value = None if method == 'session/prompt' and shared_scenario == 'continue_unknown' and len(state['prompts']) == 2 else {'accepted': True}")
+    "value = None if method == 'session/prompt' and ((shared_scenario == 'continue_unknown' and len(state['prompts']) == 2) or (max_tokens_unknown and len(state['prompts']) == 3)) else {'accepted': True}")
 service_source = service_source.replace("'createdAt': 0,", "'createdAt': behavior.get('created_at', 0),")
 service_source = service_source.replace("'isSeeded': False}", "'isSeeded': False, **behavior.get('header_defaults', {})}")
 service_source = service_source.replace("elif method == 'session/cancel':\n                value", """elif method == 'session/cancel':
@@ -96,7 +98,8 @@ service_source = service_source.replace("elif method == 'session/cancel':\n     
                 journal.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(journal),
                     'time': 4, 'data': {'turn': 1, 'reason': {'kind': 'aborted', 'reason': {'kind': 'user'}}}}})
                 value""")
-service_namespace = {'permission_contract': permission_contract, 'shared_scenario': shared_scenario}
+service_namespace = {'permission_contract': permission_contract, 'shared_scenario': shared_scenario,
+    'max_tokens_unknown': max_tokens_unknown}
 exec(compile(service_source, str(ROOT / 'tests/dsh_fixture_server.py'), 'exec'), service_namespace)
 fixture_behavior = {'admit_prompt': True}
 peer_context = service_namespace['remote_peer'](behavior=fixture_behavior)
@@ -227,6 +230,9 @@ async def main():
         continuation_ended = False
         continuation_started = False
         continuation_seen_at = None
+        max_tokens_started = False
+        max_tokens_ended = False
+        max_tokens_seen_at = None
         while time.monotonic() < deadline:
             if peer['prompts'] and not ended and shared_scenario in {'terminal', 'reconcile_intent', 'prepare_continue', *continuation_scenarios}:
                 sid = peer['prompts'][0]['sessionId']
@@ -450,7 +456,7 @@ async def main():
                 await receive(adapter, raw('om_continue_unknown_new_message', '@_user_1 继续 ' + latest['id']))
                 assert len(peer['prompts']) == 2, 'Unknown continuation admission must never be blindly replayed.'
                 break
-            if shared_scenario == 'continue_restart' and continued:
+            if shared_scenario == 'continue_restart' and continued and not max_tokens_started:
                 if len(peer['prompts']) == 2 and latest['dsh_execution'].get('continuation_control', {}).get('status') == 'accepted' and not continuation_ended:
                     sid = latest['dsh_execution']['session_id']
                     assert peer['journals'][sid][:len(original_history)] == original_history
@@ -471,9 +477,25 @@ async def main():
                             continuation_started = True
                             continuation_seen_at = time.monotonic()
                         else:
+                            reason = {'kind': 'error', 'error': {'message': 'Synthetic continuation ended.', 'code': 'UNKNOWN'}}
+                            if max_tokens_continuation:
+                                for step in range(8):
+                                    rows.append({'type': 'event', 'event': {'type': 'request/header', 'seq': len(rows), 'time': 6,
+                                        'data': {'header': {'config': {'provider': 'fixture', 'model': 'fixture'}}}}})
+                                    rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 6,
+                                        'data': {'turn': 2, 'step': step,
+                                            'message': {'id': 'fixture-partial-' + str(step), 'role': 'assistant',
+                                                'content': [{'type': 'text', 'text': 'Partial bounded fixture work.'}]},
+                                            'stream': [{'type': 'chunk', 'chunk': {'type': 'finish', 'reason': {
+                                                'kind': 'max-tokens' if step == 7 else 'completed'}}}]}}})
+                                budget_row = json.loads(budget_file.read_text())
+                                budget_row['state'] = {'started_at_ms': int(time.time() * 1000), 'requests': 8,
+                                    'reported_tokens': 145200, 'admissions': ['fixture-request-' + str(step) for step in range(8)],
+                                    'stop_reason': None}
+                                budget_file.write_text(json.dumps(budget_row))
+                                reason = {'kind': 'max-tokens'}
                             rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows),
-                                'time': 6, 'data': {'turn': 2, 'reason': {'kind': 'error',
-                                    'error': {'message': 'Synthetic continuation ended.', 'code': 'UNKNOWN'}}}}})
+                                'time': 6, 'data': {'turn': 2, 'reason': reason}}})
                             next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                             continuation_ended = True
                 if continuation_ended and card['status'] in {'blocked', 'triage'}:
@@ -492,6 +514,59 @@ async def main():
                     assert peer['prompts'][1]['sessionId'] == peer['prompts'][0]['sessionId']
                     assert peer['prompts'][1]['requestId'] == latest['dsh_execution']['continuation_request_id']
                     assert peer['prompts'][1]['requestId'] != peer['prompts'][0]['requestId']
+                    if max_tokens_continuation:
+                        while True:
+                            waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                            if waited:
+                                assert os.waitstatus_to_exitcode(status) == 0
+                                break
+                            await asyncio.sleep(.05)
+                        worker = None
+                        before_max = record()['dsh_execution']
+                        max_budget_before = budget_file.read_bytes()
+                        max_control_before = before_max['continuation_control']
+                        assert before_max['terminal_reason'] == {'kind': 'max-tokens'}
+                        async def max_rejected(message_id):
+                            before = budget_file.read_bytes()
+                            await receive(adapter, raw(message_id, '@_user_1 继续 ' + latest['id']))
+                            current = record()['dsh_execution']
+                            assert current['continuation_control'] == max_control_before
+                            assert current['maintenance_checkpoint'] == checkpoint
+                            assert budget_file.read_bytes() == before and len(peer['prompts']) == 2
+                        rows[-1]['event']['data']['reason'] = {'kind': 'error', 'error': {'message': 'Ordinary fixture error.'}}
+                        await max_rejected('om_continue_ordinary_error')
+                        rows[-1]['event']['data']['reason'] = {'kind': 'max-tokens'}
+                        for key, value in [('started_at_ms', int(time.time() * 1000) - 61000),
+                                           ('requests', 80), ('reported_tokens', 300000), ('stop_reason', 'shared-work-wall-budget')]:
+                            changed = json.loads(max_budget_before)
+                            changed['state'][key] = value
+                            budget_file.write_text(json.dumps(changed))
+                            await max_rejected('om_continue_max_' + key)
+                            budget_file.write_bytes(max_budget_before)
+                        fixture_behavior['inbox'] = {'next-turn': [{'id': 'fixture-pending-input', 'role': 'user'}], 'next-step': []}
+                        await max_rejected('om_continue_max_pending_input')
+                        fixture_behavior['inbox'] = {'next-turn': [], 'next-step': []}
+                        fixture_behavior['jobs'] = [{'id': 'fixture-running-job', 'owner': sid, 'status': 'running'}]
+                        await max_rejected('om_continue_max_running_job')
+                        fixture_behavior.pop('jobs')
+                        await receive(adapter, raw('om_continue_max_tokens', '@_user_1 继续 ' + latest['id']))
+                        latest = record()
+                        max_control = latest['dsh_execution']['continuation_control']
+                        assert max_control.get('kind') == 'max_tokens' and max_control['status'] == 'admitted', {
+                            'control': max_control, 'state': latest['dsh_execution']['state']}
+                        assert max_control['original_failure']['terminal_reason'] == {'kind': 'max-tokens'}
+                        assert max_control_before in latest['dsh_execution']['continuation_history']
+                        assert latest['dsh_execution']['maintenance_checkpoint'] == checkpoint
+                        assert all(latest['dsh_execution'][key] == before_max[key] for key in
+                                   ('session_id', 'generation', 'request_id', 'first_input', 'native_identity', 'reference_sha256'))
+                        assert budget_file.read_bytes() == max_budget_before
+                        await receive(adapter, raw('om_continue_max_tokens', '@_user_1 继续 ' + latest['id']))
+                        model.worker_steps = 0
+                        with connect_closing() as db:
+                            assert dispatch_once(db, max_spawn=1).spawned
+                            worker = remember_worker(db, initial['card_id'])
+                        max_tokens_started = True
+                        continue
                     await receive(adapter, raw('om_continue_after_restart', '@_user_1 继续 ' + latest['id']))
                     await receive(adapter, raw('om_continue_already_accepted', '@_user_1 继续 ' + latest['id']))
                     assert len(peer['prompts']) == 2
@@ -500,6 +575,41 @@ async def main():
                     assert latest['dsh_execution']['stop_requested'] and latest['dsh_execution']['state'] == 'stopped'
                     await receive(adapter, raw('om_continue_stopped', '@_user_1 继续 ' + latest['id']))
                     assert len(peer['prompts']) == 2
+                    break
+            if max_tokens_started and len(peer['prompts']) == 3:
+                latest = record()
+                if max_tokens_unknown:
+                    await asyncio.sleep(.5)
+                    latest = record()
+                    assert latest['dsh_execution']['state'] == 'outcome_unknown'
+                    assert latest['dsh_execution']['continuation_control']['status'] == 'input_intent'
+                    await receive(adapter, raw('om_continue_max_tokens', '@_user_1 继续 ' + latest['id']))
+                    await receive(adapter, raw('om_continue_max_unknown_new', '@_user_1 继续 ' + latest['id']))
+                    assert len(peer['prompts']) == 3 and budget_file.read_bytes() == max_budget_before
+                    break
+                if latest['dsh_execution']['continuation_control']['status'] == 'accepted' and not max_tokens_ended:
+                    max_tokens_seen_at = max_tokens_seen_at or time.monotonic()
+                    assert card['status'] == 'running' and latest['dsh_execution']['state'] == 'running'
+                    if time.monotonic() - max_tokens_seen_at > .5:
+                        submission = peer['prompts'][2]
+                        rows.append({'type': 'event', 'event': {'type': 'turn/start', 'seq': len(rows), 'time': 7, 'data': {'turn': 3}}})
+                        rows.append({'type': 'event', 'event': {'type': 'user/message', 'seq': len(rows), 'time': 7,
+                            'data': {'id': 'message-' + submission['requestId'], 'role': 'user', 'content': submission['content'],
+                                     'source': {'kind': 'user', 'rpcId': submission['requestId']}}}})
+                        rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 8,
+                            'data': {'turn': 3, 'reason': {'kind': 'error', 'error': {'message': 'Synthetic explicit continuation ended.'}}}}})
+                        max_tokens_ended = True
+                if max_tokens_ended and card['status'] in {'blocked', 'triage'}:
+                    assert peer['prompts'][2]['sessionId'] == peer['prompts'][0]['sessionId']
+                    assert len({row['requestId'] for row in peer['prompts']}) == 3
+                    assert latest['dsh_execution']['maintenance_checkpoint'] == checkpoint
+                    assert budget_file.read_bytes() == max_budget_before
+                    await receive(adapter, raw('om_continue_max_tokens', '@_user_1 继续 ' + latest['id']))
+                    await receive(adapter, raw('om_stop_max_tokens', '@_user_1 停止 ' + latest['id']))
+                    latest = record()
+                    assert latest['dsh_execution']['stop_requested'] and latest['dsh_execution']['state'] == 'stopped'
+                    await receive(adapter, raw('om_continue_max_stopped', '@_user_1 继续 ' + latest['id']))
+                    assert len(peer['prompts']) == 3
                     break
             if shared_scenario == 'reconcile_intent' and not reconciled and card['status'] == 'blocked':
                 assert latest['dsh_execution']['native_permission'] == 'intent'
@@ -529,7 +639,7 @@ async def main():
             await asyncio.sleep(.05)
         else:
             raise AssertionError('Original public shared worker did not settle: ' + json.dumps(record()))
-        assert len(peer['prompts']) == (2 if shared_scenario in continuation_scenarios else 1)
+        assert len(peer['prompts']) == (3 if max_tokens_continuation else 2 if shared_scenario in continuation_scenarios else 1)
         assert latest['dsh_execution']['native_identity']['kind'] == 'shared_native'
         assert latest['dsh_execution']['native_identity']['pid'] == (host_processes[-1].pid if host_processes else os.getpid())
         assert latest['dsh_execution']['native_permission'] == 'workspace-write'

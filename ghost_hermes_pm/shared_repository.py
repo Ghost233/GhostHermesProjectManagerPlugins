@@ -415,6 +415,115 @@ def admit_shared_continuation(intake, record, message_id, generation):
         carrier.close()
 
 
+def _require_max_tokens_budget(configuration, state):
+    now = time.time() * 1000
+    if (state.get('stop_reason') is not None or type(state.get('started_at_ms')) is not int
+            or not 0 < state['started_at_ms'] <= now
+            or now >= state['started_at_ms'] + configuration['budget']['max_wall_seconds'] * 1000
+            or type(state.get('requests')) is not int or not 0 < state['requests'] < configuration['budget']['max_model_requests']
+            or type(state.get('reported_tokens')) is not int
+            or not 0 <= state['reported_tokens'] < configuration['budget']['max_reported_tokens']
+            or not isinstance(state.get('admissions'), list) or len(state['admissions']) != state['requests']
+            or any(not isinstance(value, str) or not value for value in state['admissions'])
+            or len(set(state['admissions'])) != state['requests']):
+        raise ManagementError('outcome_unknown', 'The original shared budget has no confirmed remaining allowance.')
+    return (state['started_at_ms'] + configuration['budget']['max_wall_seconds'] * 1000 - now) / 1000
+
+
+def admit_shared_max_tokens(intake, record, message_id, generation):
+    """One owner-requested continuation of an idle max-tokens turn, within its original budget."""
+    from .repository_control import _card, _worker_end
+    from .repository_execution import execution_configuration
+    from .repository_supervision import owned_call
+    execution = record['dsh_execution']
+    previous = execution.get('continuation_control')
+    if (execution.get('mode') != 'shared_native' or execution.get('state') != 'execution_failed'
+            or execution.get('terminal_reason', {}).get('kind') != 'max-tokens'
+            or execution.get('first_input') != 'accepted' or execution.get('stop_requested')
+            or execution.get('lifecycle_end') or execution.get('acceptance', {}).get('status') == 'accepted'
+            or previous and previous.get('status') != 'accepted'):
+        raise ManagementError('outcome_unknown', 'Only a known unfinished max-tokens turn may explicitly continue.')
+    card = _card(intake, record)
+    worker = _worker_end(intake, record)
+    configuration, _ = execution_configuration(record['target'])
+    if configuration['reference_sha256'] != execution['reference_sha256']:
+        raise ManagementError('binding_conflict', 'The original shared scope changed.')
+    configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
+        generation=execution['generation'], workspace_id=execution['workspace_id'])
+    budget_file = ledger_path(configuration, execution['session_id'])
+    budget_before = private_file(budget_file).read_bytes()
+    budget = read_ledger(configuration, execution)['state']
+    _require_max_tokens_budget(configuration, budget)
+    carrier = SharedDesktopTransport(configuration)
+    try:
+        if carrier.native_identity != execution['native_identity']:
+            raise ManagementError('binding_conflict', 'The original max-tokens Host identity changed.')
+        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
+            'sessionId': execution['session_id']}, 'maxMessages': 500}})
+        try:
+            snapshot = next(stream)
+        finally:
+            stream.close()
+        header, values = snapshot.get('header', {}), snapshot.get('projections', {}).get('values', {})
+        events = [row['event'] for row in snapshot['records']]
+        starts = [event for event in events if event['type'] == 'turn/start']
+        ends = [event for event in events if event['type'] == 'turn/end']
+        messages = [event for event in events if event['type'] == 'assistant/message']
+        sessions = [row for row in owned_call(carrier, 'session/list', {})['items'] if row['sessionId'] == execution['session_id']]
+        workspace = owned_call(carrier, 'workspace/create', {'path': configuration['workspace']})
+        account = workspace['workspace']
+        if (header.get('id') != execution['session_id'] or header.get('createdAt') != execution['session_created_at']
+                or header.get('cwd') != configuration['workspace'] or snapshot.get('hasMore') is not False
+                or values.get('agentPreset') != configuration['agent_preset']
+                or values.get('permissions') != {'currentValue': 'workspace-write'} or execution.get('native_permission') != 'workspace-write'
+                or values.get('inbox') != {'next-turn': [], 'next-step': []}
+                or len(sessions) != 1 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
+                or sessions[0].get('cwd') != configuration['workspace'] or workspace.get('created') is not False
+                or account.get('workspaceId') != execution['workspace_id'] or account.get('path') != configuration['workspace']
+                or account.get('sessionIds', []).count(execution['session_id']) != 1
+                or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
+                or ends[-1]['data'].get('turn') != starts[-1]['data'].get('turn')
+                or ends[-1]['data'].get('reason') != execution['terminal_reason']
+                or not messages or not starts[-1]['seq'] < messages[-1]['seq'] < ends[-1]['seq']
+                or not any(row.get('type') == 'chunk' and row.get('chunk', {}).get('type') == 'finish'
+                    and row['chunk'].get('reason', {}).get('kind') == 'max-tokens' for row in messages[-1]['data'].get('stream', []))
+                or budget['requests'] != sum(event['type'] in {'assistant/message', 'assistant/attempt'} for event in events)
+                or any(job['status'] in {'running', 'stopping'} for job in carrier.owned_jobs())
+                or private_file(budget_file).read_bytes() != budget_before):
+            raise ManagementError('outcome_unknown', 'The original max-tokens turn, scope, input or jobs are unconfirmed.')
+        headers = [event['data']['header']['config'] for event in events if event['type'] == 'request/header']
+        if not headers or any(headers[-1].get(key) != configuration[key] for key in ('provider', 'model')):
+            raise ManagementError('binding_conflict', 'The original max-tokens model scope changed.')
+        _require_max_tokens_budget(configuration, budget)
+        intake.require_active(generation)
+        history = execution.setdefault('continuation_history', [])
+        if previous:
+            history.append(previous)
+        execution['continuation_request_id'] = 'continue-' + uuid.uuid4().hex
+        execution['continuation_control'] = {'kind': 'max_tokens', 'message_id': message_id,
+            'status': 'admitted', 'dispatch_status': 'intent', 'previous_claim': execution['supervisor_claim'],
+            'worker': worker, 'cursor': snapshot['cursor'],
+            'workspace': {'workspace_id': account['workspaceId'], 'session_ids': account['sessionIds']},
+            'snapshot_sha256': hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
+            'ledger_sha256': hashlib.sha256(budget_before).hexdigest(),
+            'original_failure': {key: execution[key] for key in ('state', 'terminal_reason', 'last_failure') if key in execution}}
+        execution['state'] = 'continuation_pending'
+        intake._save_execution(record, fields=['continuation_history', 'continuation_request_id', 'continuation_control', 'state'])
+        if card['status'] == 'triage':
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                    raise ManagementError('outcome_unknown', 'Original native triage continuation remains unconfirmed.')
+        else:
+            intake._kanban('kanban_unblock', {'task_id': record['card_id']})
+        execution['continuation_control']['dispatch_status'] = 'accepted'
+        intake._save_execution(record, fields=['continuation_control'])
+        return record
+    finally:
+        carrier.close()
+
+
 def shared_attach(intake, record, *, observe=True):
     from .repository_execution import execution_configuration
     execution = record['dsh_execution']
@@ -688,7 +797,7 @@ async def run_shared_work(ctx, intake, record, generation):
         elif pending_continuation and execution['supervisor_claim']['run_id'] != run_id:
             from hermes_cli.kanban_db_connect import connect_closing
             previous = continuation['previous_claim']
-            checkpoint = execution['maintenance_checkpoint']
+            checkpoint = continuation if continuation.get('kind') == 'max_tokens' else execution['maintenance_checkpoint']
             if (execution['supervisor_claim'] != previous or checkpoint['worker']['run_id'] != previous['run_id']
                     or checkpoint['worker']['identity'] != previous['identity'] or checkpoint['worker']['exit_code'] != 0):
                 raise ManagementError('binding_conflict', 'The checkpointed continuation worker claim differs.')
@@ -703,7 +812,8 @@ async def run_shared_work(ctx, intake, record, generation):
         if existing and (len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']):
             raise ManagementError('binding_conflict', 'Shared Session registration differs.')
         workspace = await asyncio.to_thread(resolve_shared_workspace, intake, record, carrier)
-        if pending_continuation and {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']} != execution['maintenance_checkpoint']['workspace']:
+        proof = continuation if continuation.get('kind') == 'max_tokens' else execution.get('maintenance_checkpoint', {})
+        if pending_continuation and {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']} != proof['workspace']:
             raise ManagementError('binding_conflict', 'The admitted original Workspace account changed before dispatch.')
         if not existing:
             if execution.get('session_creation'):
@@ -731,12 +841,18 @@ async def run_shared_work(ctx, intake, record, generation):
             raise ManagementError('binding_conflict', 'Original shared Session creation identity changed.')
         if pending_continuation:
             budget = read_ledger(configuration, execution)
-            if (not _maintenance_snapshot_matches(snapshot, execution['maintenance_checkpoint'])
+            snapshot_matches = (hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == continuation['snapshot_sha256']
+                if continuation.get('kind') == 'max_tokens' else _maintenance_snapshot_matches(snapshot, execution['maintenance_checkpoint']))
+            if continuation.get('kind') == 'max_tokens':
+                _require_max_tokens_budget(configuration, budget['state'])
+            jobs = carrier.owned_jobs()
+            if (not snapshot_matches
                     or hashlib.sha256(private_file(ledger_path(configuration, execution['session_id'])).read_bytes()).hexdigest()
                     != continuation['ledger_sha256']
-                    or budget['state'] != {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0,
+                    or continuation.get('kind') != 'max_tokens' and budget['state'] != {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0,
                                            'admissions': [], 'stop_reason': None}
-                    or carrier.owned_jobs()):
+                    or (any(job['status'] in {'running', 'stopping'} for job in jobs)
+                        if continuation.get('kind') == 'max_tokens' else bool(jobs))):
                 raise ManagementError('binding_conflict', 'The admitted pre-model continuation changed before dispatch.')
         if not execution.get('first_input') and any(row.get('event', {}).get('type') in
                 {'turn/start', 'user/message', 'assistant/message', 'tool/call'} for row in snapshot.get('records', [])):
@@ -811,11 +927,14 @@ async def run_shared_work(ctx, intake, record, generation):
             else:
                 raise ManagementError('outcome_unknown', 'The original gateway human observer is not ready; no model input sent.')
             if pending_continuation:
+                if continuation.get('kind') == 'max_tokens':
+                    _require_max_tokens_budget(configuration, read_ledger(configuration, execution)['state'])
                 continuation['status'] = 'input_intent'
                 intake._save_execution(record, fields=['continuation_control'])
                 request_id = execution['continuation_request_id']
-                prompt = ('Continue the original accepted task in this Session after its pre-model failure '
-                    'and verified maintenance restart. Keep the original scope, frozen Issue, rules and remaining '
+                reason = ('its max-tokens turn boundary' if continuation.get('kind') == 'max_tokens'
+                    else 'its pre-model failure and verified maintenance restart')
+                prompt = ('Continue the original accepted task in this Session after ' + reason + '. Keep the original scope, frozen Issue, rules and remaining '
                     'budget. Resume that task in this original Session.\n\n' + _prompt(intake, record))
             else:
                 await asyncio.to_thread(prepare_shared_github, intake, record)
@@ -838,6 +957,8 @@ async def run_shared_work(ctx, intake, record, generation):
             raise ManagementError('outcome_unknown', 'Original shared input needs reconciliation; no replay.')
         heartbeat_at = 0
         deadline = time.monotonic() + configuration['budget']['max_wall_seconds'] + 15
+        if continuation.get('kind') == 'max_tokens':
+            deadline = time.monotonic() + _require_max_tokens_budget(configuration, read_ledger(configuration, execution)['state']) + 15
         while time.monotonic() < deadline:
             intake.require_active(generation)
             current_worker(ctx, intake, record)
@@ -853,7 +974,8 @@ async def run_shared_work(ctx, intake, record, generation):
             execution.update(journal_cursor=events[-1]['seq'] if events else -1, usage=projections.get('tokenUsage'),
                 observed_events=execution_event_references(events), shared_budget=read_ledger(configuration, execution)['state'])
             intake._save_execution(record)
-            cursor = execution['maintenance_checkpoint']['cursor'] if continuation else -1
+            cursor = (continuation['cursor'] if continuation.get('kind') == 'max_tokens'
+                else execution['maintenance_checkpoint']['cursor']) if continuation else -1
             starts = [event for event in events if event['type'] == 'turn/start' and event['seq'] > cursor]
             ends = [event for event in events if event['type'] == 'turn/end' and event['seq'] > cursor]
             if row and row.get('running') is False and starts and ends and ends[-1]['seq'] > starts[-1]['seq']:
