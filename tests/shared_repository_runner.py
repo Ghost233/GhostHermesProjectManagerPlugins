@@ -13,6 +13,12 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 scratch = Path(sys.argv[1]).resolve()
 shared_scenario = sys.argv[2]
+supervise_takeover = shared_scenario.startswith('supervise_takeover')
+takeover_case = shared_scenario.removeprefix('supervise_takeover_') if shared_scenario != 'supervise_takeover' else 'valid'
+supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover
+expired_window = shared_scenario == 'supervise_expired_window'
+if expired_window:
+    shared_scenario = 'renew_window'
 runtime_metadata = shared_scenario == 'runtime_metadata'
 if runtime_metadata:
     shared_scenario = 'terminal'
@@ -121,6 +127,7 @@ service_source = service_source.replace("if behavior.get('admit_prompt'):",
                 elif behavior.get('admit_prompt') and shared_scenario != 'continue_restart':""")
 service_source = service_source.replace("value = {'accepted': True}",
     "value = None if method == 'session/prompt' and ((shared_scenario == 'continue_unknown' and len(state['prompts']) == 2) or (max_tokens_unknown and len(state['prompts']) == 3)) else {'accepted': True}")
+service_source = service_source.replace("'header': {'id': session_id,", "'header': {'id': behavior.get('header_id', session_id),")
 service_source = service_source.replace("'createdAt': 0,", "'createdAt': behavior.get('created_at', 0),")
 service_source = service_source.replace("'isSeeded': False}", "'isSeeded': False, **behavior.get('header_defaults', {})}")
 service_source = service_source.replace("elif method == 'session/cancel':\n                value", """elif method == 'session/cancel':
@@ -193,6 +200,8 @@ exec(compile(prefix, str(fixture), 'exec'), namespace)
 GatewayRunner, GatewayConfig, Platform, PlatformConfig = (namespace[name] for name in
     ('GatewayRunner', 'GatewayConfig', 'Platform', 'PlatformConfig'))
 registry, plugins, model, repo = (namespace[name] for name in ('registry', 'plugins', 'model', 'repo'))
+if supervise_slice:
+    model.repeat_supervise = True
 service_client, connect_service, receive, raw, ReplyMessageResponse = (namespace[name] for name in
     ('service_client', 'connect_service', 'receive', 'raw', 'ReplyMessageResponse'))
 
@@ -260,10 +269,71 @@ async def main():
             assert 'error' not in json.loads(registry.dispatch('kanban_block', {
                 'task_id': initial['card_id'], 'kind': 'needs_input', 'reason': 'Original failure still needs explicit continuation.'}))
             assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
+        takeover = None
+        preflight_runs = []
+        if supervise_takeover:
+            # One real 8/8 exit after a rejected terminal attempt consumes the native
+            # failure allowance. The second worker's real 8/8 exhaustion closes
+            # its run as gave_up, without editing database state or retry limits.
+            model.worker_finish_at = 8
+            model.worker_terminal_attempt_at = 7
+            model.worker_preflight = True
+            for _ in range(1):
+                model.worker_steps = 0
+                with connect_closing() as db:
+                    assert dispatch_once(db, max_spawn=1).spawned
+                    worker = remember_worker(db, initial['card_id'])
+                until = time.monotonic() + 12
+                while time.monotonic() < until:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        preflight_worker = worker
+                        worker = None
+                        exit_code = os.waitstatus_to_exitcode(status)
+                        with connect_closing() as db:
+                            run = kb.get_run(db, preflight_worker['run_id'])
+                        preflight_runs.append({'run_id': run.id, 'status': run.status,
+                            'outcome': run.outcome, 'error': run.error, 'exit_code': exit_code})
+                        assert exit_code == 0
+                        assert run.status == run.outcome == 'timed_out'
+                        assert run.error == 'Iteration budget exhausted (8/8) — task could not complete within the allowed iterations'
+                        assert model.worker_terminal_results
+                        terminal_attempt = model.worker_terminal_results[-1]
+                        assert terminal_attempt['tool_name'] == 'kanban_block'
+                        assert 'Original worker claim and supervision outcome must be verified before kanban_block; repository occupancy is retained.' in terminal_attempt['content']
+                        preflight_runs[-1]['terminal_attempt'] = terminal_attempt
+                        break
+                    await asyncio.sleep(.05)
+                assert worker is None, 'The native protocol preflight worker did not exit.'
+                assert not peer['prompts'] and 'supervisor_claim' not in record()['dsh_execution']
+            model.worker_steps = 0
+            model.worker_preflight = False
+            if takeover_case == 'nonzero':
+                model.worker_terminal_attempt_at = None
+                model.worker_first_heartbeat = True
         with connect_closing() as db:
             assert dispatch_once(db, max_spawn=1).spawned
             worker = remember_worker(db, initial['card_id'])
-        deadline = time.monotonic() + (60 if runtime_metadata or native_restore or renew_window or renew_window_again else 35)
+        observer_ready = None
+        supervise_first = None
+        supervise_terminal = None
+        supervise_ledger = None
+        supervise_ledger_before = None
+        supervise_history_before = None
+        if supervise_slice:
+            observer_deadline = time.monotonic() + 45
+            while time.monotonic() < observer_deadline:
+                current = record()['dsh_execution']
+                observer = current.get('shared_event_observer', {})
+                if (observer.get('status') == 'ready' and observer.get('session_id') == current.get('session_id')
+                        and observer.get('generation') == current.get('generation')
+                        and observer.get('host_lease') == 'fixture-shared-lease' and observer.get('client_id')):
+                    observer_ready = dict(observer)
+                    break
+                await asyncio.sleep(.05)
+            else:
+                raise AssertionError('Public hermes_pm_snapshot observer did not become ready before first public tool: ' + json.dumps(current))
+        deadline = time.monotonic() + (30 if supervise_takeover else 10 if supervise_slice else 60 if runtime_metadata or native_restore or renew_window or renew_window_again else 35)
         ended = False
         stop_sent = False
         reconciled = False
@@ -281,6 +351,12 @@ async def main():
         resume_ended = False
         renewal_admitted = False
         renewal_ended = False
+        expired_window_evidence = None
+        takeover_rejection = None
+        old_ledger_path = old_ledger = old_history = changed_ledger = None
+        supervise_first = None
+        supervise_terminal = None
+        supervise_ledger = None
         while time.monotonic() < deadline:
             if peer['prompts'] and not ended and shared_scenario in {'terminal', 'reconcile_intent', 'prepare_continue', *continuation_scenarios}:
                 sid = peer['prompts'][0]['sessionId']
@@ -355,6 +431,156 @@ async def main():
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
             latest = record()
+            if supervise_slice:
+                tool_results = [result for batch in getattr(model, 'worker_tool_results', []) for result in batch
+                                if isinstance(result, dict)]
+                running_results = [result for result in tool_results
+                                   if result.get('status') == 'running' and result.get('next_action') == 'hermes_pm_supervise']
+                stopped_results = [result for result in tool_results
+                                   if result.get('status') == 'budget_stopped']
+                rejected_results = [result for result in tool_results if result.get('status') == 'unverified']
+                if takeover is not None and takeover_case != 'valid' and rejected_results:
+                    takeover_rejection = rejected_results[-1]
+                    expected_code = ('unauthorized' if takeover_case == 'card' else 'outcome_unknown'
+                        if takeover_case in {'nonzero', 'reclaimed'} else 'binding_conflict')
+                    assert takeover_rejection['code'] == expected_code
+                    latest = record()
+                    assert latest['dsh_execution']['supervisor_claim'] == takeover['old_claim']
+                    assert len(peer['prompts']) == 1
+                    assert old_ledger_path is not None and old_ledger is not None and old_history is not None
+                    assert takeover_case != 'ledger' or changed_ledger is not None
+                    assert (json.loads(old_ledger_path.read_bytes()) == changed_ledger if takeover_case == 'ledger'
+                        else old_ledger_path.read_bytes() == old_ledger)
+                    assert peer['journals'][takeover['old_bindings']['session_id']] == old_history
+                    model.repeat_supervise = False
+                    while worker is not None:
+                        waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                        if waited:
+                            assert os.waitstatus_to_exitcode(status) == 0
+                            worker = None
+                            break
+                        await asyncio.sleep(.05)
+                    latest = record()
+                    break
+                if supervise_first is None and running_results:
+                    supervise_first = running_results[-1]
+                    assert supervise_first == {'status': 'running', 'next_action': 'hermes_pm_supervise', 'delivered': False}
+                    assert observer_ready and len(peer['prompts']) == 1
+                    if supervise_takeover and takeover is None:
+                        # The public dispatcher cannot create a second live claim.
+                        with connect_closing() as db:
+                            assert kb.claim_task(db, initial['card_id']) is None
+                            if takeover_case == 'reclaimed':
+                                assert kb.reclaim_task(db, initial['card_id'], reason='Synthetic native reclaim rejection case')
+                        # Otherwise keep supervising until the native budget ends.
+                        until = time.monotonic() + 12
+                        while time.monotonic() < until:
+                            waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                            if waited:
+                                old_exit = os.waitstatus_to_exitcode(status)
+                                if takeover_case != 'reclaimed':
+                                    assert old_exit == (1 if takeover_case == 'nonzero' else 0)
+                                break
+                            await asyncio.sleep(.05)
+                        else:
+                            raise AssertionError('The native 8/8 worker did not exit.')
+                        with connect_closing() as db:
+                            old_run = kb.get_run(db, worker['run_id'])
+                        assert old_run.status == old_run.outcome == ('reclaimed' if takeover_case == 'reclaimed' else 'gave_up'), old_run
+                        assert old_run.ended_at is not None
+                        if takeover_case == 'reclaimed':
+                            assert 'Synthetic native reclaim rejection case' in old_run.error
+                        else:
+                            assert old_run.error == 'Iteration budget exhausted (8/8) — task could not complete within the allowed iterations', old_run.error
+                        old_execution = record()['dsh_execution']
+                        assert old_execution['state'] == 'running' or takeover_case == 'reclaimed' and old_execution['state'] == 'outcome_unknown'
+                        old_claim = dict(old_execution['supervisor_claim'])
+                        old_ledger_path = ledger / (hashlib.sha256(old_execution['session_id'].encode()).hexdigest() + '.json')
+                        old_ledger = old_ledger_path.read_bytes()
+                        old_history = list(peer['journals'][old_execution['session_id']])
+                        old_bindings = {key: old_execution[key] for key in ('session_id', 'generation', 'native_identity', 'baseline', 'first_input')}
+                        worker = None
+                        if takeover_case == 'source':
+                            (repo / 'unexpected-source.txt').write_text('Synthetic out-of-band source change.\n')
+                        elif takeover_case == 'sid':
+                            fixture_behavior['header_id'] = 'session-foreign-fixture'
+                        elif takeover_case == 'native':
+                            host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                            changed_receipt = json.loads(receipt.read_text())
+                            changed_receipt['pid'] = host_processes[-1].pid
+                            receipt.write_text(json.dumps(changed_receipt))
+                        elif takeover_case == 'ledger':
+                            changed_ledger = json.loads(old_ledger)
+                            changed_ledger['generation'] = 'fixture-foreign-generation'
+                            old_ledger_path.write_text(json.dumps(changed_ledger))
+                        elif takeover_case == 'card':
+                            with connect_closing() as db:
+                                assert kb.edit_task(db, initial['card_id'], title='Changed synthetic card title')
+                        if takeover_case != 'reclaimed':
+                            assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
+                        model.worker_first_heartbeat = takeover_case == 'reclaimed'
+                        model.worker_terminal_attempt_at = 7
+                        model.worker_steps = 0
+                        model.worker_tool_results.clear()
+                        with connect_closing() as db:
+                            assert dispatch_once(db, max_spawn=1).spawned
+                            worker = remember_worker(db, initial['card_id'])
+                        takeover = {'previous_run_id': old_run.id, 'error': old_run.error,
+                            'status': old_run.status, 'outcome': old_run.outcome, 'exit_code': old_exit,
+                            'active_claim_refused': True,
+                            'old_claim': old_claim, 'old_bindings': old_bindings,
+                            'ledger_sha256': hashlib.sha256(old_ledger).hexdigest(), 'history': old_history}
+                        supervise_first = None
+                        continue
+                    if supervise_takeover:
+                        assert latest['dsh_execution']['supervisor_claim']['run_id'] == worker['run_id']
+                        assert latest['dsh_execution']['supervisor_claim']['run_id'] != takeover['previous_run_id']
+                        assert {key: latest['dsh_execution'][key] for key in takeover['old_bindings']} == takeover['old_bindings']
+                        assert old_ledger_path.read_bytes() == old_ledger and peer['journals'][latest['dsh_execution']['session_id']] == old_history
+                    sid = latest['dsh_execution']['session_id']
+                    rows = peer['journals'][sid]
+                    supervise_history_before = list(rows)
+                    rows.append({'type': 'event', 'event': {'type': 'turn/start', 'seq': len(rows), 'time': 5,
+                        'data': {'turn': 2}}})
+                    rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 5,
+                        'data': {'turn': 2, 'reason': {'kind': 'error', 'error': {
+                            'code': 'HOOK_ABORTED', 'message': 'Synthetic beforeRequest hook aborted.'}}}}})
+                    next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
+                    budget_file = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
+                    budget_row = json.loads(budget_file.read_text())
+                    supervise_ledger_before = json.loads(json.dumps(budget_row))
+                    budget_row['state'].update(started_at_ms=int(time.time() * 1000) - 80000, requests=1,
+                        reported_tokens=0, admissions=[peer['prompts'][0]['requestId']],
+                        stop_reason='shared-work-wall-budget')
+                    budget_file.write_text(json.dumps(budget_row))
+                    supervise_ledger = dict(budget_row['state'])
+                    supervise_terminal = {'session_id': sid, 'turn': 2, 'reason': rows[-1]['event']['data']['reason']}
+                elif supervise_first is not None and stopped_results:
+                    supervise_result = stopped_results[-1]
+                    assert supervise_result == {'status': 'budget_stopped', 'next_action': 'kanban_block',
+                        'block_kind': 'needs_input', 'delivered': False}
+                    assert len(peer['prompts']) == 1
+                    model.repeat_supervise = False
+                    if worker is not None:
+                        until = time.monotonic() + 8
+                        while time.monotonic() < until:
+                            waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                            if waited:
+                                assert os.waitstatus_to_exitcode(status) == 0
+                                worker = None
+                                break
+                            await asyncio.sleep(.05)
+                        assert worker is None, 'The bounded supervise worker did not exit after budget_stopped.'
+                    latest = record()
+                    assert latest['dsh_execution']['state'] == 'budget_stopped'
+                    final_ledger = json.loads(budget_file.read_text())
+                    assert {key: value for key, value in final_ledger.items() if key != 'state'} == {
+                        key: value for key, value in supervise_ledger_before.items() if key != 'state'}
+                    assert final_ledger['state'] == supervise_ledger
+                    assert final_ledger['state']['admissions'] == [peer['prompts'][0]['requestId']]
+                    assert rows[:len(supervise_history_before)] == supervise_history_before
+                    break
             if shared_scenario == 'question_material' and peer['prompts']:
                 sid = peer['prompts'][0]['sessionId']
                 rows = peer['journals'][sid]
@@ -949,6 +1175,9 @@ async def main():
                             await receive(adapter, raw('om_window_duplicate_new', '@_user_1 续预算 ' + latest['id']))
                             assert budget_file.read_bytes() == max_budget_before and len(peer['prompts']) == 2
                             model.worker_steps = 0
+                            if expired_window:
+                                model.repeat_supervise = True
+                                model.worker_pause_on_unmet = True
                             with connect_closing() as db:
                                 assert dispatch_once(db, max_spawn=1).spawned
                                 worker = remember_worker(db, initial['card_id'])
@@ -1032,9 +1261,48 @@ async def main():
                                     'message': {'id': 'fixture-window-max', 'role': 'assistant', 'content': [{'type': 'text', 'text': 'More bounded work remains.'}]},
                                     'stream': [{'type': 'chunk', 'chunk': {'type': 'finish', 'reason': {'kind': 'max-tokens'}}}]}}})
                         rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 8,
-                            'data': {'turn': 3, 'reason': ({'kind': 'max-tokens'} if renew_continue else {'kind': 'completed'} if max_tokens_last_slot else
+                            'data': {'turn': 3, 'reason': ({'kind': 'max-tokens'} if renew_continue else {'kind': 'completed'} if max_tokens_last_slot or expired_window else
                                 {'kind': 'error', 'error': {'message': 'Synthetic explicit continuation ended.'}})}}})
                         max_tokens_ended = True
+                if expired_window and model.worker_request_ready.is_set():
+                    if expired_window_evidence is None:
+                        current = record()['dsh_execution']
+                        assert current['first_input'] == 'accepted' and current['continuation_control']['status'] == 'accepted'
+                        assert current['state'] == 'awaiting_acceptance'
+                        before_expiry = json.loads(budget_file.read_bytes())
+                        expired_budget = json.loads(budget_file.read_bytes())
+                        expired_budget['renewWindow'].update(started_at_ms=int(time.time() * 1000) - 80000,
+                            stop_reason='shared-work-wall-budget')
+                        budget_file.write_text(json.dumps(expired_budget))
+                        history_before = list(rows)
+                        rows.append({'type': 'event', 'event': {'type': 'turn/start', 'seq': len(rows), 'time': 9, 'data': {'turn': 4}}})
+                        rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 10,
+                            'data': {'turn': 4, 'reason': {'kind': 'error', 'error': {'code': 'HOOK_ABORTED',
+                                'message': 'Shared work stopped: shared-work-wall-budget'}}}}})
+                        next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
+                        expired_window_evidence = {'before': before_expiry, 'expired': expired_budget,
+                            'history_prefix': history_before, 'prompt_count_before': len(peer['prompts'])}
+                        model.worker_request_release.set()
+                    results = [result for batch in model.worker_tool_results for result in batch if isinstance(result, dict)]
+                    stopped = [result for result in results if result.get('status') == 'budget_stopped']
+                    if stopped:
+                        assert stopped[-1] == {'status': 'budget_stopped', 'next_action': 'kanban_block',
+                            'block_kind': 'needs_input', 'delivered': False}
+                        assert json.loads(budget_file.read_bytes()) == expired_window_evidence['expired']
+                        assert len(peer['prompts']) == expired_window_evidence['prompt_count_before'] == 3
+                        assert rows[:len(expired_window_evidence['history_prefix'])] == expired_window_evidence['history_prefix']
+                        model.repeat_supervise = False
+                        while worker is not None:
+                            waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                            if waited:
+                                assert os.waitstatus_to_exitcode(status) == 0
+                                worker = None
+                                break
+                            await asyncio.sleep(.05)
+                        latest = record()
+                        assert latest['dsh_execution']['state'] == 'budget_stopped'
+                        expired_window_evidence.update(result=stopped[-1], worker_exit=0, prompt_count_after=len(peer['prompts']))
+                        break
                 if max_tokens_ended and card['status'] in {'blocked', 'triage'}:
                     if renew_continue:
                         while True:
@@ -1157,9 +1425,9 @@ async def main():
             await asyncio.sleep(.05)
         else:
             raise AssertionError('Original public shared worker did not settle: ' + json.dumps(record()))
-        assert len(peer['prompts']) == (4 if renew_continue else 3 if max_tokens_continuation else 2 if shared_scenario in continuation_scenarios or completed_renewed_window else 1)
+        assert len(peer['prompts']) == (1 if supervise_slice else 4 if renew_continue else 3 if max_tokens_continuation else 2 if shared_scenario in continuation_scenarios or completed_renewed_window else 1)
         assert latest['dsh_execution']['native_identity']['kind'] == 'shared_native'
-        assert latest['dsh_execution']['native_identity']['pid'] == (host_processes[-1].pid if host_processes else os.getpid())
+        assert latest['dsh_execution']['native_identity']['pid'] == (os.getpid() if supervise_takeover else host_processes[-1].pid if host_processes else os.getpid())
         assert latest['dsh_execution']['native_permission'] == 'workspace-write'
         if runtime_metadata:
             assert latest['dsh_execution']['runtime_versions']['source_python']['sha256'] == hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest()
@@ -1182,14 +1450,51 @@ async def main():
             assert latest['dsh_execution']['stop_control']['proof']['session']['host_shutdown'] is False
             assert any(message.message_id == 'om_stop' and '停止已核实' in message.request_body.content for message in sent)
             assert len([call for call in peer['calls'] if call['method'] == 'session/cancel']) == 1
+        if supervise_slice and takeover_rejection is None:
+            assert latest['dsh_execution']['state'] == 'budget_stopped'
+            assert observer_ready and supervise_first and supervise_terminal and supervise_ledger
         assert peer['sessions'][0]['sessionId'] == 'session-fixture' and peer['sessions'][0]['running'] is False
         assert not (scratch / 'state/owned-work').exists(), 'No dedicated Home or runtime may be created.'
         result = {'status': 'passed', 'scope': 'original_Hermes_worker_external_DSH_fixture',
             'single_native_session': latest['dsh_execution']['session_id'], 'input_count': len(peer['prompts'])}
+        if supervise_slice and takeover_rejection is None:
+            result.update(observer_ready=True, observer={key: observer_ready[key] for key in
+                ('status', 'session_id', 'generation', 'host_lease', 'client_id')},
+                first_result=supervise_first, second_result=supervise_result, prompt_count=len(peer['prompts']),
+                ledger_state=supervise_ledger, ledger_before=supervise_ledger_before, ledger_after=final_ledger,
+                history_prefix=supervise_history_before, terminal=supervise_terminal, worker_exit=0)
+            if supervise_takeover:
+                result['takeover'] = takeover
+                result['preflight_runs'] = preflight_runs
+                result['new_claim'] = latest['dsh_execution']['supervisor_claim']
+        if expired_window:
+            result['expired_window'] = expired_window_evidence
+        if takeover_rejection is not None:
+            result.update(case=takeover_case, rejection=takeover_rejection, takeover=takeover,
+                retained_claim=latest['dsh_execution']['supervisor_claim'],
+                last_failure=latest['dsh_execution'].get('last_failure'),
+                prompt_count=len(peer['prompts']),
+                worker_exit=0, preflight_runs=preflight_runs)
         if concurrent_claim:
             result['concurrent_claim'] = claim_result
         (scratch / 'shared-worker-result.json').write_text(json.dumps(result))
+    except BaseException:
+        if supervise_slice:
+            import traceback
+            (scratch / 'supervise-failure.json').write_text(json.dumps({
+                'traceback': traceback.format_exc(), 'public_work': record(),
+                'model_requests': model.requests, 'tool_results': model.worker_tool_results,
+                'preflight_runs': preflight_runs,
+                'prompts': peer['prompts']}))
+        raise
     finally:
+        model.worker_request_release.set()
+        if (supervise_slice or expired_window) and worker is not None:
+            # Keep both services alive through the original scoped native cleanup.
+            from simple_worker_evidence import cleanup_worker
+            cleanup = await asyncio.to_thread(cleanup_worker, worker, scratch / 'home')
+            (scratch / 'supervise-cleanup.json').write_text(json.dumps(cleanup))
+            worker = None
         for process in host_processes:
             if process.poll() is None:
                 process.terminate()

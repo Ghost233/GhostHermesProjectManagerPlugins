@@ -7,12 +7,22 @@ import time
 
 
 class WorkerModelService:
-    def __init__(self, query_lock=None, refuse=False, hold_dsh=False, budget_stop=False, hold_after_write=False, uncovered_shell=False, question_after_write=False, native_foreground=False, native_service=None):
+    def __init__(self, query_lock=None, refuse=False, hold_dsh=False, budget_stop=False, hold_after_write=False, uncovered_shell=False, question_after_write=False, native_foreground=False, native_service=None, repeat_supervise=False):
         self.requests = []
+        self.worker_tool_results = []
+        self.worker_terminal_results = []
         self.worker_steps = 0
         self.dsh_steps = 0
         self.budget_stop = budget_stop
         self.native_service = native_service
+        self.repeat_supervise = repeat_supervise
+        self.worker_finish_at = None
+        self.worker_terminal_attempt_at = None
+        self.worker_preflight = False
+        self.worker_first_heartbeat = False
+        self.worker_pause_on_unmet = False
+        self.worker_request_ready = threading.Event()
+        self.worker_request_release = threading.Event()
         self.fail_worker_after = None
         self.foreign_task_id = None
         self.query_ready = threading.Event()
@@ -42,6 +52,38 @@ class WorkerModelService:
                     'authentication_accepted': authenticated,
                     'outer_instructions_present': any('Managed outer card:' in str(m.get('content', '')) for m in payload.get('messages', [])),
                     'skill_catalog': any('fixture-matt' in str(m.get('content', '')) for m in payload.get('messages', []))})
+                if worker:
+                    results = []
+                    terminal_calls = set()
+                    for message in payload.get('messages', []):
+                        for tool_call in message.get('tool_calls') or []:
+                            function = tool_call.get('function', {})
+                            try:
+                                arguments = json.loads(function.get('arguments', '{}'))
+                            except json.JSONDecodeError:
+                                continue
+                            if (function.get('name') == 'kanban_block'
+                                    and arguments.get('reason') == 'Fixture premature budget terminal attempt.'):
+                                terminal_calls.add(tool_call['id'])
+                    for message in payload.get('messages', []):
+                        content = message.get('content')
+                        if message.get('role') != 'tool' or not isinstance(content, str):
+                            continue
+                        try:
+                            results.append(json.loads(content))
+                        except json.JSONDecodeError:
+                            # Preserve native display text without interpreting it.
+                            results.append({'content': content})
+                        if message.get('tool_call_id') in terminal_calls:
+                            service.worker_terminal_results.append({
+                                'call_id': message['tool_call_id'], 'tool_name': 'kanban_block', 'content': content})
+                    service.worker_tool_results.append(results)
+                    if service.worker_pause_on_unmet and any(result.get('status') == 'unmet'
+                            for result in results if isinstance(result, dict)):
+                        service.worker_pause_on_unmet = False
+                        service.worker_request_ready.set()
+                        if not service.worker_request_release.wait(timeout=10):
+                            raise AssertionError('The bounded external worker response was not released.')
                 if not authenticated:
                     self.send_response(401)
                     self.send_header('Content-Type', 'application/json')
@@ -68,6 +110,21 @@ class WorkerModelService:
                         extra = [('kanban_block', {'kind': 'needs_input', 'reason': 'Fixture premature block.'})]
                     elif step == 5:
                         extra = [('kanban_complete', {'summary': 'Forbidden premature delivery.'})]
+                    if service.repeat_supervise and step >= 2:
+                        call = ('hermes_pm_supervise', {})
+                        extra = []
+                    if service.worker_preflight:
+                        call = ('kanban_heartbeat', {})
+                        extra = []
+                    if service.worker_first_heartbeat and step == 1:
+                        call = ('kanban_heartbeat', {})
+                        extra = []
+                    if step == service.worker_terminal_attempt_at:
+                        call = ('kanban_block', {'kind': 'needs_input', 'reason': 'Fixture premature budget terminal attempt.'})
+                        extra = []
+                    if service.worker_finish_at is not None and step >= service.worker_finish_at:
+                        call = None
+                        extra = []
                     if refuse:
                         call = None
                         extra = []

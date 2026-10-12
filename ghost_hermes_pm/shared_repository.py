@@ -25,6 +25,7 @@ CASES = {'allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardl
          'danger_denied', 'foreground_job_registered', 'managed_background_stopped',
          'foreground_cancelled', 'foreign_job_kill_denied', 'background_write_boundary'}
 CAPS = {'max_wall_seconds': 1800, 'max_model_requests': 80}
+SUPERVISE_OBSERVATION_SLICE_SECONDS = 360
 _RUNTIME_VERSIONS = {}
 _RUNTIME_ENTRIES = set()
 
@@ -1576,6 +1577,68 @@ def _prompt(intake, record):
           'Outer Kanban acceptance belongs to the supervisor.')
 
 
+def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier):
+    import psutil
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from .repository_acceptance import repository_source_state
+    from .trusted_controller import controller_identity
+    execution = record['dsh_execution']
+    continuation = execution.get('continuation_control', {})
+    previous = execution.get('supervisor_claim', {})
+    if not previous or previous.get('run_id') == run_id:
+        return False
+    if (execution.get('state') not in {'running', 'outcome_unknown'}
+            or execution.get('first_input') != 'accepted'
+            or execution.get('state') == 'outcome_unknown' and execution.get('last_failure', {}).get('code') != 'unauthorized'
+            or continuation and continuation.get('status') != 'accepted'):
+        raise ManagementError('outcome_unknown', 'The original worker input remains unconfirmed; no claim transfer.')
+    identity = previous.get('identity', {})
+    with connect_closing(board=intake.board) as connection:
+        old = kb.get_run(connection, previous['run_id'])
+    if (old is None or old.id != previous['run_id'] or old.task_id != record['card_id']
+            or old.status != 'gave_up' or old.outcome != 'gave_up' or old.ended_at is None
+            or old.worker_pid not in {None, identity.get('pid')} or not isinstance(old.error, str)
+            or re.fullmatch(r'Iteration budget exhausted \(([1-9]\d*)/\1\) — task could not complete within the allowed iterations', old.error) is None):
+        raise ManagementError('outcome_unknown', 'The original iteration-budget worker cannot be safely supervised.')
+    try:
+        if type(identity.get('pid')) is not int or identity['pid'] <= 0:
+            raise ValueError
+        seconds, micros = int(identity['start_sec']), int(identity['start_usec'])
+        if seconds <= 0 or not 0 <= micros < 1000000 or not identity.get('executable'):
+            raise ValueError
+        # The existing kernel-birth guard also refuses access-unknown processes
+        # and treats exec changes as the same live process generation.
+        require_permission_initializer_end(previous, old, record['card_id'])
+    except (KeyError, TypeError, ValueError, psutil.AccessDenied, OSError):
+        raise ManagementError('outcome_unknown', 'The original iteration-budget worker identity is incomplete.') from None
+    offset = previous.get('exit_log_offset')
+    path = kb.worker_log_path(record['card_id'], board=intake.board)
+    if type(offset) is not int or offset < 0 or offset > path.stat().st_size:
+        raise ManagementError('outcome_unknown', 'The original iteration-budget log boundary changed.')
+    exit_code = None
+    with path.open('rb') as log:
+        log.seek(offset)
+        for line in log:
+            receipt = re.fullmatch(rb'\[kanban-worker-exit\] rc=(-?\d+)\s*', line)
+            if receipt:
+                exit_code = receipt.group(1)
+                break
+    if exit_code != b'0':
+        raise ManagementError('outcome_unknown', 'The original iteration-budget worker lacks its native exit receipt.')
+    read_ledger(configuration, execution)
+    source = repository_source_state(record['target'])
+    receipts = shared_receipts(configuration, execution, '.tools.jsonl')
+    if not (_source_core(execution.get('baseline')) == _source_core(source)
+            and _source_core(source) is not None and not receipts
+            or _verified_source_chain(execution, execution.get('baseline'), receipts, source)):
+        raise ManagementError('binding_conflict', 'The original shared source changed before supervision takeover.')
+    execution.update(state='running', supervisor_claim={'run_id': run_id, 'identity': controller_identity(),
+        'exit_log_offset': path.stat().st_size})
+    intake._save_execution(record, fields=['state', 'supervisor_claim'])
+    return True
+
+
 async def run_shared_work(ctx, intake, record, generation):
     from .repository_execution import execution_configuration
     from .repository_supervision import current_worker, native_call, owned_call, original_history, execution_event_references
@@ -1669,6 +1732,7 @@ async def run_shared_work(ctx, intake, record, generation):
             raise ManagementError('binding_conflict', 'Original shared Session header or preset is unverified.')
         if execution.get('session_created_at', header.get('createdAt')) != header.get('createdAt'):
             raise ManagementError('binding_conflict', 'Original shared Session creation identity changed.')
+        _take_over_gave_up_claim(intake, record, run_id, configuration, carrier)
         if pending_continuation:
             budget = read_ledger(configuration, execution)
             snapshot_matches = (hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == continuation['snapshot_sha256']
@@ -1749,8 +1813,15 @@ async def run_shared_work(ctx, intake, record, generation):
         window_start = None
         if continuation.get('kind') in {'renew_window', 'resume_window'}:
             budget = read_ledger(configuration, execution)
-            deadline = time.monotonic() + _require_window_budget(configuration, budget) + 15
             window_start = budget['renewWindow']['started_at_ms']
+            if (not pending_continuation and execution.get('first_input') == 'accepted'
+                    and continuation.get('status') == 'accepted' and type(window_start) is int
+                    and time.time() * 1000 >= window_start + configuration['budget']['max_wall_seconds'] * 1000):
+                _require_expired_window_budget(configuration, budget)
+                remaining = (window_start + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000
+            else:
+                remaining = _require_window_budget(configuration, budget)
+            deadline = time.monotonic() + remaining + 15
         if continuation.get('kind') == 'max_tokens':
             budget = read_ledger(configuration, execution)
             started_at_ms = (budget.get('renewWindow') or budget['state'])['started_at_ms']
@@ -1812,8 +1883,15 @@ async def run_shared_work(ctx, intake, record, generation):
             raise ManagementError('outcome_unknown', 'Original shared input needs reconciliation; no replay.')
         heartbeat_at = 0
         if continuation.get('kind') not in {'max_tokens', 'renew_window', 'resume_window'}:
-            deadline = time.monotonic() + configuration['budget']['max_wall_seconds'] + 15
-        while time.monotonic() < deadline:
+            budget = read_ledger(configuration, execution)
+            started_at_ms = budget['state']['started_at_ms']
+            remaining = (configuration['budget']['max_wall_seconds'] if started_at_ms is None else
+                (started_at_ms + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000)
+            deadline = time.monotonic() + remaining + 15
+        observation_deadline = min(deadline, time.monotonic() + SUPERVISE_OBSERVATION_SLICE_SECONDS)
+        observed = False
+        while not observed or time.monotonic() < observation_deadline:
+            observed = True
             intake.require_active(generation)
             current_worker(ctx, intake, record)
             current = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])['dsh_execution']
@@ -1826,6 +1904,10 @@ async def run_shared_work(ctx, intake, record, generation):
             row = next((row for row in listing['items'] if row['sessionId'] == execution['session_id']), None)
             events, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], configuration['workspace'])
             budget = read_ledger(configuration, execution)
+            active_budget = budget.get('renewWindow') or budget['state']
+            if active_budget['started_at_ms'] is not None:
+                deadline = time.monotonic() + (active_budget['started_at_ms'] + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
+                observation_deadline = min(observation_deadline, deadline)
             if continuation.get('kind') in {'renew_window', 'resume_window'} and window_start is None and budget['renewWindow']['started_at_ms'] is not None:
                 window_start = budget['renewWindow']['started_at_ms']
                 deadline = time.monotonic() + (window_start + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
@@ -1858,6 +1940,8 @@ async def run_shared_work(ctx, intake, record, generation):
                     return result
                 return {'status': state, 'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
             await asyncio.sleep(.25)
+        if time.monotonic() < deadline:
+            return {'status': 'running', 'next_action': 'hermes_pm_supervise', 'delivered': False}
         raise ManagementError('outcome_unknown', 'Original shared execution has no confirmed terminal boundary.')
     except (ManagementError, OSError, TimeoutError, ValueError, KeyError) as error:
         execution.update(state='outcome_unknown', last_failure={'code': getattr(error, 'code', 'outcome_unknown'),

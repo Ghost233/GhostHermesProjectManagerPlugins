@@ -503,7 +503,7 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'runtime_metadata'])
+@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])
@@ -517,11 +517,25 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
             shutil.copytree(root / name, plugin / name, ignore=shutil.ignore_patterns('__pycache__'))
         else:
             shutil.copy2(root / name, plugin / name)
+    if scenario == 'supervise_slice' or scenario.startswith('supervise_takeover'):
+        production = root / 'ghost_hermes_pm/shared_repository.py'
+        copied = plugin / 'ghost_hermes_pm/shared_repository.py'
+        declaration = 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 360'
+        original = copied.read_text()
+        assert original.count(declaration) == 1 and production.read_text().count(declaration) == 1
+        copied.write_text(original.replace(declaration, 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 0.5', 1))
+        (tmp_path / 'slice-clock-transform.json').write_text(json.dumps({
+            'production_sha256': hashlib.sha256(production.read_bytes()).hexdigest(),
+            'original_sha256': hashlib.sha256(original.encode()).hexdigest(),
+            'fixture_sha256': hashlib.sha256(copied.read_bytes()).hexdigest(),
+            'path': str(copied), 'delta': [declaration, 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 0.5']}))
     env = {**os.environ, 'HERMES_HOME': str(home), 'HERMES_KANBAN_HOME': str(home),
         'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'), 'PYTHONPATH': str(sdk),
         'PYTHONDONTWRITEBYTECODE': '1'}
     result = subprocess.run([sys.executable, str(Path(__file__).with_name('shared_repository_runner.py')),
-        str(tmp_path), scenario], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=100)
+        str(tmp_path), scenario], cwd=tmp_path, env=env, capture_output=True, text=True,
+        timeout=65 if scenario == 'supervise_slice' or scenario.startswith('supervise_takeover') else 100)
+    (tmp_path / 'public-runner-output.log').write_text(result.stdout + result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
     assert source_snapshot(sdk) == sdk_before
     assert json.loads((tmp_path / 'shared-worker-result.json').read_text())['status'] == 'passed'
