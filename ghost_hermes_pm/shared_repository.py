@@ -579,7 +579,7 @@ def _source_core(value):
     return core
 
 
-def _verified_source_chain(execution, baseline, receipts, current):
+def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=()):
     previous = _source_core(baseline)
     current = _source_core(current)
     if previous is None or current is None:
@@ -591,10 +591,23 @@ def _verified_source_chain(execution, baseline, receipts, current):
         if before is None and after is None:
             continue
         if (receipt.get('generation') != execution['generation'] or receipt.get('session_id') != execution['session_id']
-                or receipt.get('name') != 'bash' or receipt.get('kind') != 'foreground'
-                or receipt.get('execution_admission') != 'admitted' or receipt.get('is_error') is not False
-                or type(receipt.get('exit_code')) is not int or receipt.get('timed_out') is not False
-                or receipt.get('aborted') is not False):
+                or receipt.get('name') != 'bash'
+                or receipt.get('execution_admission') != 'admitted' or receipt.get('is_error') is not False):
+            return False
+        if receipt.get('kind') == 'foreground':
+            if (type(receipt.get('exit_code')) is not int or receipt.get('timed_out') is not False
+                    or receipt.get('aborted') is not False):
+                return False
+        elif receipt.get('kind') == 'promoted':
+            job_id = receipt.get('job_id')
+            if (any(key not in receipt or receipt[key] is not None for key in ('exit_code', 'timed_out', 'aborted'))
+                    or not isinstance(job_id, str) or not job_id or not isinstance(owned_jobs, (list, tuple))):
+                return False
+            matches = [job for job in owned_jobs if isinstance(job, dict) and job.get('id') == job_id]
+            if (len(matches) != 1 or matches[0].get('owner') != execution['session_id']
+                    or matches[0].get('status') not in {'completed', 'killed', 'failed'}):
+                return False
+        else:
             return False
         sequence = receipt.get('native_session_seq')
         if type(sequence) is not int or sequence <= previous_seq:
@@ -876,7 +889,8 @@ def prepare_shared_window_renewal(intake, record, message_id):
         sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
         workspace = resolve_shared_workspace(intake, record, carrier)
         receipts = shared_receipts(configuration, execution, '.tools.jsonl')
-        if not _verified_source_chain(execution, execution.get('baseline'), receipts, source):
+        owned_jobs = carrier.owned_jobs()
+        if not _verified_source_chain(execution, execution.get('baseline'), receipts, source, owned_jobs):
             raise ManagementError('binding_conflict', 'The original shared source receipt chain changed before renewal.')
         delivery = any(DELIVERY_MARKER in block.get('text', '') for event in events if event['type'] == 'assistant/message'
                        for block in event['data'].get('message', {}).get('content', []) if isinstance(block, dict)
@@ -890,7 +904,7 @@ def prepare_shared_window_renewal(intake, record, message_id):
                 or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
                 or ends[-1]['data'].get('reason') != execution['terminal_reason']
                 or len(settlements) != row['state']['requests'] or delivery or not _rejected_bash_window_evidence(events, receipts)
-                or any(job['status'] in {'running', 'stopping'} for job in carrier.owned_jobs())
+                or any(job['status'] in {'running', 'stopping'} for job in owned_jobs)
                 or private_file(budget_file).read_bytes() != raw):
             raise ManagementError('outcome_unknown', 'The expired window has unverified delivery, tool, job or budget activity.')
         backup = budget_file.with_name(budget_file.name + '.renewal-window-' + hashlib.sha256(raw).hexdigest())
@@ -1629,9 +1643,10 @@ def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier):
     read_ledger(configuration, execution)
     source = repository_source_state(record['target'])
     receipts = shared_receipts(configuration, execution, '.tools.jsonl')
+    owned_jobs = carrier.owned_jobs()
     if not (_source_core(execution.get('baseline')) == _source_core(source)
             and _source_core(source) is not None and not receipts
-            or _verified_source_chain(execution, execution.get('baseline'), receipts, source)):
+            or _verified_source_chain(execution, execution.get('baseline'), receipts, source, owned_jobs)):
         raise ManagementError('binding_conflict', 'The original shared source changed before supervision takeover.')
     execution.update(state='running', supervisor_claim={'run_id': run_id, 'identity': controller_identity(),
         'exit_log_offset': path.stat().st_size})

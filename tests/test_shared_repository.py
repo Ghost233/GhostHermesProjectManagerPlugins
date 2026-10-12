@@ -159,6 +159,88 @@ def test_permission_initializer_requires_original_terminal_birth(change, monkeyp
         require_permission_initializer_end(previous, run, 'fixture-card')
 
 
+@pytest.mark.parametrize('job_status', ['completed', 'killed', 'failed'])
+def test_source_chain_attributes_terminal_promoted_job_write(job_status):
+    from ghost_hermes_pm.shared_repository import _verified_source_chain
+    execution = {'generation': 'fixture-generation', 'session_id': 'fixture-session'}
+    baseline = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-baseline'}
+    promoted_after = {'head': None, 'workspace_status': '?? fixture-output/', 'source_digest': 'fixture-promoted'}
+    current = {'head': None, 'workspace_status': '?? fixture-output/\n?? fixture-result', 'source_digest': 'fixture-current'}
+    promoted = {**execution, 'name': 'bash', 'kind': 'promoted', 'execution_admission': 'admitted',
+        'is_error': False, 'exit_code': None, 'timed_out': None, 'aborted': None,
+        'job_id': 'fixture-promoted-job', 'native_session_seq': 3,
+        'source_before': baseline, 'source_after': promoted_after}
+    foreground = {**execution, 'name': 'bash', 'kind': 'foreground', 'execution_admission': 'admitted',
+        'is_error': False, 'exit_code': 0, 'timed_out': False, 'aborted': False, 'native_session_seq': 7,
+        'source_before': promoted_after, 'source_after': current}
+    owned_jobs = [{'id': 'fixture-promoted-job', 'owner': 'fixture-session', 'status': job_status}]
+    assert _verified_source_chain(execution, baseline, [promoted, foreground], current, owned_jobs)
+
+
+@pytest.mark.parametrize('change', [
+    'running', 'stopping', 'unknown', 'missing', 'duplicate', 'wrong_owner', 'missing_owner',
+    'missing_job_id', 'wrong_job_id', 'exit_code', 'timed_out', 'aborted',
+    'missing_exit_code', 'missing_timed_out', 'missing_aborted', 'generation', 'session_id',
+    'admission', 'is_error', 'name', 'kind', 'sequence', 'before', 'after', 'current',
+])
+def test_source_chain_rejects_unverified_promoted_job_write(change):
+    from ghost_hermes_pm.shared_repository import _verified_source_chain
+    execution = {'generation': 'fixture-generation', 'session_id': 'fixture-session'}
+    baseline = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-baseline'}
+    current = {'head': None, 'workspace_status': '?? fixture-output', 'source_digest': 'fixture-current'}
+    receipt = {**execution, 'name': 'bash', 'kind': 'promoted', 'execution_admission': 'admitted',
+        'is_error': False, 'exit_code': None, 'timed_out': None, 'aborted': None,
+        'job_id': 'fixture-promoted-job', 'native_session_seq': 3,
+        'source_before': baseline, 'source_after': current}
+    job = {'id': 'fixture-promoted-job', 'owner': 'fixture-session', 'status': 'completed'}
+    jobs = [job]
+    if change in {'running', 'stopping', 'unknown'}:
+        job['status'] = change
+    elif change == 'missing':
+        jobs = []
+    elif change == 'duplicate':
+        jobs.append(dict(job))
+    elif change == 'wrong_owner':
+        job['owner'] = 'fixture-foreign-session'
+    elif change == 'missing_owner':
+        job.pop('owner')
+    elif change.startswith('missing_'):
+        receipt.pop(change.removeprefix('missing_'))
+    elif change == 'wrong_job_id':
+        receipt['job_id'] = 'fixture-other-job'
+    elif change == 'exit_code':
+        receipt['exit_code'] = 0
+    elif change in {'timed_out', 'aborted'}:
+        receipt[change] = False
+    elif change in {'generation', 'session_id', 'name', 'kind'}:
+        receipt[change] = 'fixture-other'
+    elif change == 'admission':
+        receipt['execution_admission'] = 'rejected'
+    elif change == 'is_error':
+        receipt['is_error'] = True
+    elif change == 'sequence':
+        receipt['native_session_seq'] = 0
+    elif change == 'before':
+        receipt['source_before'] = {**baseline, 'source_digest': 'fixture-other-source'}
+    elif change == 'after':
+        receipt['source_after'] = None
+    elif change == 'current':
+        current = {**current, 'source_digest': 'fixture-other-current'}
+    assert not _verified_source_chain(execution, baseline, [receipt], current, jobs)
+
+
+@pytest.mark.parametrize('exit_code', [0, 1])
+def test_source_chain_foreground_attribution_keeps_existing_exit_semantics(exit_code):
+    from ghost_hermes_pm.shared_repository import _verified_source_chain
+    execution = {'generation': 'fixture-generation', 'session_id': 'fixture-session'}
+    baseline = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-baseline'}
+    current = {'head': None, 'workspace_status': '?? fixture-output', 'source_digest': 'fixture-current'}
+    receipt = {**execution, 'name': 'bash', 'kind': 'foreground', 'execution_admission': 'admitted',
+        'is_error': False, 'exit_code': exit_code, 'timed_out': False, 'aborted': False,
+        'native_session_seq': 3, 'source_before': baseline, 'source_after': current}
+    assert _verified_source_chain(execution, baseline, [receipt], current)
+
+
 @pytest.mark.parametrize('error', [
     'Iteration budget exhausted (7/8) — task could not complete within the allowed iterations',
     'Iteration budget exhausted (8/8) — task could not complete within the allowed iterations; extra suffix',
