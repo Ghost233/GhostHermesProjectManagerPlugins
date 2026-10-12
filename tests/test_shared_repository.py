@@ -167,7 +167,7 @@ def test_source_chain_attributes_terminal_promoted_job_write(job_status):
     promoted_after = {'head': None, 'workspace_status': '?? fixture-output/', 'source_digest': 'fixture-promoted'}
     current = {'head': None, 'workspace_status': '?? fixture-output/\n?? fixture-result', 'source_digest': 'fixture-current'}
     promoted = {**execution, 'name': 'bash', 'kind': 'promoted', 'execution_admission': 'admitted',
-        'is_error': False, 'exit_code': None, 'timed_out': None, 'aborted': None,
+        'is_error': False,
         'job_id': 'fixture-promoted-job', 'native_session_seq': 3,
         'source_before': baseline, 'source_after': promoted_after}
     foreground = {**execution, 'name': 'bash', 'kind': 'foreground', 'execution_admission': 'admitted',
@@ -180,7 +180,7 @@ def test_source_chain_attributes_terminal_promoted_job_write(job_status):
 @pytest.mark.parametrize('change', [
     'running', 'stopping', 'unknown', 'missing', 'duplicate', 'wrong_owner', 'missing_owner',
     'missing_job_id', 'wrong_job_id', 'exit_code', 'timed_out', 'aborted',
-    'missing_exit_code', 'missing_timed_out', 'missing_aborted', 'generation', 'session_id',
+    'null_exit_code', 'null_timed_out', 'null_aborted', 'generation', 'session_id',
     'admission', 'is_error', 'name', 'kind', 'sequence', 'before', 'after', 'current',
 ])
 def test_source_chain_rejects_unverified_promoted_job_write(change):
@@ -189,7 +189,7 @@ def test_source_chain_rejects_unverified_promoted_job_write(change):
     baseline = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-baseline'}
     current = {'head': None, 'workspace_status': '?? fixture-output', 'source_digest': 'fixture-current'}
     receipt = {**execution, 'name': 'bash', 'kind': 'promoted', 'execution_admission': 'admitted',
-        'is_error': False, 'exit_code': None, 'timed_out': None, 'aborted': None,
+        'is_error': False,
         'job_id': 'fixture-promoted-job', 'native_session_seq': 3,
         'source_before': baseline, 'source_after': current}
     job = {'id': 'fixture-promoted-job', 'owner': 'fixture-session', 'status': 'completed'}
@@ -206,6 +206,8 @@ def test_source_chain_rejects_unverified_promoted_job_write(change):
         job.pop('owner')
     elif change.startswith('missing_'):
         receipt.pop(change.removeprefix('missing_'))
+    elif change.startswith('null_'):
+        receipt[change.removeprefix('null_')] = None
     elif change == 'wrong_job_id':
         receipt['job_id'] = 'fixture-other-job'
     elif change == 'exit_code':

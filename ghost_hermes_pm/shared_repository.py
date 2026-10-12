@@ -600,7 +600,7 @@ def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=()
                 return False
         elif receipt.get('kind') == 'promoted':
             job_id = receipt.get('job_id')
-            if (any(key not in receipt or receipt[key] is not None for key in ('exit_code', 'timed_out', 'aborted'))
+            if (any(key in receipt for key in ('exit_code', 'timed_out', 'aborted'))
                     or not isinstance(job_id, str) or not job_id or not isinstance(owned_jobs, (list, tuple))):
                 return False
             matches = [job for job in owned_jobs if isinstance(job, dict) and job.get('id') == job_id]
