@@ -159,6 +159,57 @@ def test_permission_initializer_requires_original_terminal_birth(change, monkeyp
         require_permission_initializer_end(previous, run, 'fixture-card')
 
 
+@pytest.mark.parametrize('error', [
+    'Iteration budget exhausted (7/8) — task could not complete within the allowed iterations',
+    'Iteration budget exhausted (8/8) — task could not complete within the allowed iterations; extra suffix',
+], ids=['unequal_budget', 'suffix'])
+def test_supervision_takeover_read_boundary_rejects_noncanonical_budget_error(error, monkeypatch):
+    """Guard read-boundary replay, not SDK-generated noncanonical gave_up.
+
+    The public_entry[supervise_takeover] scenario supplies the real canonical
+    native lifecycle companion; this isolates its adverse Kanban read facts.
+    """
+    from types import SimpleNamespace
+    monkeypatch.syspath_prepend(os.environ['HERMES_TEST_SDK_ROOT'])
+    from hermes_cli import kanban_db as kb, kanban_db_connect
+    from ghost_hermes_pm.shared_repository import _take_over_gave_up_claim
+    previous = {'run_id': 17, 'identity': {'pid': os.getpid(), 'start_sec': '100',
+        'start_usec': '0', 'executable': str(Path(sys.executable).resolve())}, 'exit_log_offset': 0}
+    execution = {'state': 'running', 'first_input': 'accepted',
+        'continuation_control': {'status': 'accepted'}, 'supervisor_claim': previous}
+    record = {'card_id': 'fixture-card', 'dsh_execution': execution}
+    old = SimpleNamespace(id=17, task_id='fixture-card', status='gave_up', outcome='gave_up',
+        ended_at=100, worker_pid=previous['identity']['pid'], error=error)
+    connection = object()
+    reads, saves = [], []
+
+    @contextmanager
+    def connect_closing(*, board):
+        assert board == 'fixture-board'
+        yield connection
+
+    def get_run(actual_connection, run_id):
+        assert actual_connection is connection and run_id == 17
+        reads.append(run_id)
+        return old
+
+    class UnusedCarrier:
+        def __getattr__(self, name):
+            pytest.fail('Read-boundary rejection must not use the carrier or send a prompt: ' + name)
+
+    monkeypatch.setattr(kanban_db_connect, 'connect_closing', connect_closing)
+    monkeypatch.setattr(kb, 'get_run', get_run)
+    intake = SimpleNamespace(board='fixture-board',
+        _save_execution=lambda *args, **kwargs: saves.append((args, kwargs)))
+    before = json.dumps(previous, sort_keys=True, separators=(',', ':')).encode()
+    with pytest.raises(ManagementError) as caught:
+        _take_over_gave_up_claim(intake, record, 18, {}, UnusedCarrier())
+    assert caught.value.code == 'outcome_unknown'
+    assert str(caught.value) == 'The original iteration-budget worker cannot be safely supervised.'
+    assert reads == [17] and saves == []
+    assert json.dumps(execution['supervisor_claim'], sort_keys=True, separators=(',', ':')).encode() == before
+
+
 @contextmanager
 def desktop_service(tmp_path):
     calls = []
