@@ -39,7 +39,8 @@ class Model extends LlmAdapter {
     initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 0}; }
   async *stream(options) {
     calls.push(options);
-    if (options.model === 'fixture-wait') {
+    if (options.model === 'fixture-wait' || options.model === 'fixture-window-wait'
+        && calls.filter(call => call.model === 'fixture-window-wait').length > 1) {
       await new Promise((resolve, reject) => {
         const timer = setTimeout(resolve, 5000);
         options.signal.addEventListener('abort', () => {clearTimeout(timer); reject(options.signal.reason);}, {once: true});
@@ -121,7 +122,7 @@ try {
       reader_sha256: crypto.createHash('sha256').update(fs.readFileSync(reader)).digest('hex')};
   }
   const removePreset = await ctx.agentPresets.register(declaration);
-  if (scenario === 'late_host') {
+  if (scenario === 'late_host' || scenario === 'renew_window') {
     const configs = {'dsh-storage-json': {root: path.join(scratch, 'domain')},
       'dsh-storage-domain': {backend: 'json'},
       'dsh-session-persistence-jsonl': {root: path.join(scratch, 'sessions')},
@@ -137,13 +138,16 @@ try {
       await loader.create({id: name, name: pathToFileURL(path.join(root, `@deepseek-ai/${name}/lib/index.js`)).href,
         config: configs[name]});
     }
-    const provider = path.join(scratch, 'late-host-provider.mjs');
-    fs.writeFileSync(provider, 'export default function(ctx,config){ctx.provide("workflowHostInstance",{instanceId:config.instanceId});}\n');
-    await loader.create({id: 'late-host-provider', name: pathToFileURL(provider).href,
-      config: {instanceId: currentHostLease}});
+    if (scenario === 'late_host') {
+      const provider = path.join(scratch, 'late-host-provider.mjs');
+      fs.writeFileSync(provider, 'export default function(ctx,config){ctx.provide("workflowHostInstance",{instanceId:config.instanceId});}\n');
+      await loader.create({id: 'late-host-provider', name: pathToFileURL(provider).href,
+        config: {instanceId: currentHostLease}});
+    }
     await loader.await();
     const {TYPERT} = await import(pathToFileURL(path.join(root, '@deepseek-ai/dsh-api-session-controller/lib/typert.host.js')).href);
     ctx.typert.register(TYPERT);
+    if (scenario === 'late_host') {
     const response = await ctx.typertGateway.dispatchRpc('session/create', {args: {request: {
       sessionId: 'fixture-late-host-session', cwd: workspace, agentPreset: config.agent_preset}}}, new AbortController().signal);
     assert.equal(response.ok, true, 'Late original Host service must admit the preset through public session/create: ' + JSON.stringify(response));
@@ -153,7 +157,9 @@ try {
     await removePreset();
     process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: 0, late_host: response.value}));
     process.exitCode = 0;
-  } else {
+    }
+  }
+  if (scenario !== 'late_host') {
   const removeManual = scenario === 'team' ? await ctx.agentPresets.register({id: 'fixture-manual',
     plugins: declaration.plugins.filter(plugin => plugin.id !== 'shared-hook')}) : undefined;
   const roster = await ctx.agentPresets.list();
@@ -416,6 +422,62 @@ try {
     await missing.dispose();
     await blocked.dispose();
     await manual.dispose();
+  } else if (scenario === 'renew_window') {
+    const renew = async (id, model = 'fixture-route') => {
+      const original = await create(id);
+      const registration = register(original.agent, {model});
+      registration.budget.max_wall_seconds = 1;
+      fs.writeFileSync(ledgerPath(id), JSON.stringify(registration));
+      await prompt(original.agent);
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      const raw = fs.readFileSync(ledgerPath(id));
+      const row = JSON.parse(raw);
+      assert.equal(row.state.stop_reason, 'shared-work-wall-budget');
+      const oldEvents = Array.from({length: original.agent.session.seq}, (_, index) => structuredClone(original.agent.session.eventAt(index)));
+      const createdAt = original.agent.session.header.createdAt;
+      await original.dispose();
+      fs.writeFileSync(ledgerPath(id) + '.old-window', raw, {mode: 0o600});
+      row.renewWindow = {id: 'window-' + id, message_id: 'fixture-owner-' + id, host_lease: currentHostLease,
+        request_base: row.state.requests, original_state: structuredClone(row.state),
+        original_host_lease: 'fixture-pre-maintenance-lease', started_at_ms: null, stop_reason: null, hook_marker: null};
+      row.state.binding_sha256 = crypto.createHash('sha256').update(JSON.stringify({
+        ...Object.fromEntries(['schema', 'service_ref', 'host_lease', 'agent_preset', 'session_id', 'session_created_at',
+          'generation', 'workspace', 'provider', 'model', 'budget'].map(key => [key, row[key]])),
+        renewWindow: Object.fromEntries(Object.entries(row.renewWindow).filter(([key]) => !['started_at_ms', 'stop_reason', 'hook_marker'].includes(key)))})).digest('hex');
+      fs.writeFileSync(ledgerPath(id), JSON.stringify(row));
+      assert.equal(JSON.parse(fs.readFileSync(ledgerPath(id))).renewWindow.started_at_ms, null);
+      const adoption = await ctx.typertGateway.dispatchRpc('session/create', {args: {request: {
+        sessionId: id, cwd: workspace, agentPreset: config.agent_preset}}}, new AbortController().signal);
+      assert.equal(adoption.ok, true, JSON.stringify(adoption));
+      assert.deepEqual(adoption.value, {sessionId: id, agentPreset: config.agent_preset});
+      const current = ctx.agents.get(id);
+      assert.equal(current.session.header.createdAt, createdAt);
+      assert.deepEqual(oldEvents.map((_, index) => current.session.eventAt(index)), oldEvents);
+      await prompt(current);
+      const after = JSON.parse(fs.readFileSync(ledgerPath(id)));
+      assert.equal(after.renewWindow.hook_marker, 'same-sid-window-v1', 'Only the actual original AgentLoop beforeRequest writes its Hook marker.');
+      assert.ok(after.renewWindow.started_at_ms > row.state.started_at_ms);
+      assert.equal(after.state.started_at_ms, row.state.started_at_ms);
+      assert.equal(after.state.stop_reason, row.state.stop_reason);
+      assert.equal(after.state.requests, row.state.requests + 1);
+      assert.deepEqual(after.renewWindow.original_state, row.renewWindow.original_state);
+      assert.deepEqual(fs.readFileSync(ledgerPath(id) + '.old-window'), raw);
+      return current;
+    };
+    const counted = await renew('fixture-window-count');
+    await prompt(counted);
+    await prompt(counted);
+    const countedRow = JSON.parse(fs.readFileSync(ledgerPath(counted.session.id)));
+    assert.equal(countedRow.state.requests - countedRow.renewWindow.request_base, 2);
+    assert.equal(countedRow.state.requests, 3, 'Cumulative reservations are never reset.');
+    assert.equal(countedRow.state.reported_tokens, 60);
+    assert.equal(countedRow.renewWindow.stop_reason, 'shared-work-observed-budget');
+    assert.equal(calls.length, 3, 'Exactly two new requests fit the explicit window.');
+    const timed = await renew('fixture-window-wall', 'fixture-window-wait');
+    const timedRow = JSON.parse(fs.readFileSync(ledgerPath(timed.session.id)));
+    assert.equal(timedRow.renewWindow.stop_reason, 'shared-work-wall-budget');
+    assert.equal(timedRow.state.stop_reason, 'shared-work-wall-budget');
+    assert.equal(calls.length, 5, 'The new wall stop cancels the fifth external request.');
   } else if (scenario === 'limits') {
     const tokens = await create('fixture-token-limit');
     const row = register(tokens.agent, {model: 'fixture-large-usage'});

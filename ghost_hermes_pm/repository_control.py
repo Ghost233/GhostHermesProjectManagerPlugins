@@ -377,15 +377,25 @@ async def process_control(intake, prepared, generation):
                 intake._save_execution(record, fields=['control_message_ids'])
             if historical:
                 text, result = '这是前轮已登记的控制消息；本轮执行没有改变。原操作结果仍按原记录核对。', {'status': 'duplicate', 'work_id': record['id']}
-            elif duplicate and (prepared.command.startswith(('重试 ', '继续 ')) or execution.get('state') == 'stopped'):
+            elif duplicate and (prepared.command.startswith(('重试 ', '继续 ', '续预算 ')) or execution.get('state') == 'stopped'):
                 field = ('continuation_control' if execution.get('continuation_control', {}).get('message_id') == message_id
-                    else 'maintenance_checkpoint') if prepared.command.startswith('继续 ') else 'retry_control' if prepared.command.startswith('重试 ') else 'stop_control'
+                    else 'renew_window_checkpoint' if prepared.command.startswith('续预算 ') else 'maintenance_checkpoint') if prepared.command.startswith(('继续 ', '续预算 ')) else 'retry_control' if prepared.command.startswith('重试 ') else 'stop_control'
                 saved = execution.get(field, {})
                 text = '这条控制消息已登记；不会重送操作或新增预算。原结果仍按记录核对，未受理或未知时请用新的消息明确请求。'
                 result = {'status': 'duplicate', 'work_id': record['id'],
                     'original_status': saved.get('status', 'unverified') if saved.get('message_id') == message_id else 'unverified'}
                 if saved.get('message_id') == message_id and 'dispatch_status' in saved:
                     result['dispatch_status'] = saved['dispatch_status']
+            elif prepared.command.startswith('续预算 '):
+                from .shared_repository import prepare_shared_window, admit_shared_window
+                if execution.get('renew_window_checkpoint'):
+                    record = await asyncio.to_thread(admit_shared_window, intake, record, message_id, generation)
+                    text = '原 SID 新有限窗口已受理；旧窗口与累计用量完整保留，实际请求前才开始新窗口，等待原生派发。'
+                    result = {'status': 'admitted', 'work_id': record['id']}
+                else:
+                    record = await asyncio.to_thread(prepare_shared_window, intake, record, message_id)
+                    text = '续预算准备已保存；未新增输入或启动窗口。正常维护后须再次明确续预算，原 SID、任务与旧窗口完整保留。'
+                    result = {'status': 'prepared', 'work_id': record['id']}
             elif prepared.command.startswith('重试 '):
                 record = await _retry(intake, record, prepared, generation)
                 text = '已受理独立新一轮执行；沿用原总 Issue 和外层卡，旧会话、预算与失败记录完整保留，等待原生派发。'
@@ -425,7 +435,7 @@ async def process_control(intake, prepared, generation):
                     last_failure={'code': error.code if isinstance(error, ManagementError) else 'outcome_unknown',
                         'type': type(error).__name__, 'message': str(error) if isinstance(error, ManagementError) else 'Original cleanup remains unconfirmed.'})
                 intake._save_execution(record, fields=['stop_control'])
-            text = ('继续未受理；原 SID、历史与预算保留，先核对原失败、维护重载及连接身份。' if prepared.command.startswith('继续 ')
+            text = ('继续未受理；原 SID、历史与预算保留，先核对原失败、维护重载及连接身份。' if prepared.command.startswith(('继续 ', '续预算 '))
                 else '重试未受理；原工作与记录保留，先核对停止、当前配置、Issue 和仓库队列。' if prepared.command.startswith('重试 ')
                 else '停止尚未核实；保留仓库占用，不启动重试或后续工作。原记录与改动保留。')
             result = {'status': 'unverified', 'code': error.code if isinstance(error, ManagementError) else 'outcome_unknown',

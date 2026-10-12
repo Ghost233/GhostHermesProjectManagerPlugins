@@ -44,7 +44,9 @@ function binding(row) {
   return JSON.stringify({schema: row.schema, service_ref: row.service_ref, host_lease: row.host_lease,
     agent_preset: row.agent_preset, session_id: row.session_id, session_created_at: row.session_created_at,
     generation: row.generation, workspace: row.workspace, provider: row.provider, model: row.model,
-    budget: Object.fromEntries(budgetKeys.filter(key => Object.hasOwn(row.budget ?? {}, key)).map(key => [key, row.budget[key]]))});
+    budget: Object.fromEntries(budgetKeys.filter(key => Object.hasOwn(row.budget ?? {}, key)).map(key => [key, row.budget[key]])),
+    ...(row.renewWindow ? {renewWindow: Object.fromEntries(Object.entries(row.renewWindow)
+      .filter(([key]) => !['started_at_ms', 'stop_reason', 'hook_marker'].includes(key)))} : {})});
 }
 
 export default function sharedNativeHook(ctx, config) {
@@ -113,6 +115,26 @@ export default function sharedNativeHook(ctx, config) {
     const previous = admitted.get(session.id);
     const now = Date.now();
     const fingerprint = digest(binding(row));
+    const window = row.renewWindow;
+    if (window && (Object.keys(window).sort().join() !== ['id', 'message_id', 'host_lease', 'request_base', 'original_state',
+        'original_host_lease', 'started_at_ms', 'stop_reason', 'hook_marker'].sort().join()
+        || !text(window.id) || !text(window.message_id) || window.host_lease !== hostLease
+        || !text(window.original_host_lease) || window.original_host_lease === hostLease
+        || !integer(window.request_base) || window.request_base <= 0 || state.requests < window.request_base
+        || window.original_state?.requests !== window.request_base
+        || !integer(window.original_state?.started_at_ms) || window.original_state.started_at_ms <= 0
+        || !integer(window.original_state?.reported_tokens) || state.reported_tokens < window.original_state.reported_tokens
+        || ![null, 'shared-work-wall-budget'].includes(window.original_state.stop_reason)
+        || state.started_at_ms !== window.original_state.started_at_ms || state.stop_reason !== window.original_state.stop_reason
+        || !Array.isArray(window.original_state.admissions) || window.original_state.admissions.length !== window.request_base
+        || !window.original_state.admissions.every((key, index) => state.admissions[index] === key)
+        || window.started_at_ms !== null && (!integer(window.started_at_ms) || window.started_at_ms > now)
+        || window.stop_reason !== null && !text(window.stop_reason)
+        || ![null, 'same-sid-window-v1'].includes(window.hook_marker)
+        || previous?.window && (previous.window.started_at_ms !== window.started_at_ms
+          || previous.window.stop_reason !== null && previous.window.stop_reason !== window.stop_reason))) {
+      throw new Error('Shared work explicit renewed window changed or is unknown.');
+    }
     if (!state || !integer(state.requests) || !integer(state.reported_tokens)
         || !Array.isArray(state.admissions) || state.admissions.length !== state.requests
         || !state.admissions.every(text) || new Set(state.admissions).size !== state.admissions.length
@@ -158,7 +180,10 @@ export default function sharedNativeHook(ctx, config) {
       try {fs.fsyncSync(directory);} finally {fs.closeSync(directory);}
       record.raw = JSON.stringify(record.row);
       const previous = admitted.get(record.row.session_id);
-      if (previous) previous.state = structuredClone(record.row.state);
+      if (previous) {
+        previous.state = structuredClone(record.row.state);
+        previous.window = record.row.renewWindow ? structuredClone(record.row.renewWindow) : undefined;
+      }
     } finally {
       if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
     }
@@ -211,14 +236,15 @@ export default function sharedNativeHook(ctx, config) {
     return cleanup;
   };
   const stop = (agent, record, reason) => {
-    record.row.state.stop_reason ??= reason;
+    const active = record.row.renewWindow ?? record.row.state;
+    active.stop_reason ??= reason;
     try {save(record);} finally {
-      cancel(agent, record.row.state.stop_reason);
+      cancel(agent, active.stop_reason);
     }
-    return new Error('Shared work stopped: ' + record.row.state.stop_reason);
+    return new Error('Shared work stopped: ' + active.stop_reason);
   };
-  const expired = record => record.row.state.started_at_ms !== null
-    && (Date.now() - record.row.state.started_at_ms >= record.row.budget.max_wall_seconds * 1000
+  const expired = record => (record.row.renewWindow ?? record.row.state).started_at_ms !== null
+    && (Date.now() - (record.row.renewWindow ?? record.row.state).started_at_ms >= record.row.budget.max_wall_seconds * 1000
       || performance.now() >= (admitted.get(record.row.session_id)?.deadline ?? Infinity));
   const validateSettlements = session => {
     for (let index = 0; index < session.seq; index++) {
@@ -258,7 +284,7 @@ export default function sharedNativeHook(ctx, config) {
     if (!agent || owned?.agent !== agent) return reject('Shared work tool has no admitted owner.');
     try {
       const record = ledgerFor(agent);
-      if (record.row.state.stop_reason || expired(record)) {
+      if ((record.row.renewWindow ?? record.row.state).stop_reason || expired(record)) {
         stop(agent, record, expired(record) ? 'shared-work-wall-budget' : 'shared-work-observed-budget');
         return reject('Shared work tool budget stopped.');
       }
@@ -275,7 +301,7 @@ export default function sharedNativeHook(ctx, config) {
       if (exec.name === 'bash') {
         const before = sourceSnapshot(record.row.workspace);
         const current = ledgerFor(agent);
-        if (current.row.state.stop_reason || expired(current)) {
+        if ((current.row.renewWindow ?? current.row.state).stop_reason || expired(current)) {
           stop(agent, current, 'shared-work-wall-budget');
           return reject('Shared work tool budget stopped after source inspection.');
         }
@@ -351,8 +377,9 @@ export default function sharedNativeHook(ctx, config) {
     const {state} = record.row;
     validateSettlements(agent.session);
     usage(agent, record);
-    if (state.stop_reason || expired(record)) throw stop(agent, record, 'shared-work-wall-budget');
-    if (state.requests >= record.row.budget.max_model_requests) {
+    const active = record.row.renewWindow ?? state;
+    if (active.stop_reason || expired(record)) throw stop(agent, record, 'shared-work-wall-budget');
+    if (state.requests - (record.row.renewWindow?.request_base ?? 0) >= record.row.budget.max_model_requests) {
       throw stop(agent, record, 'shared-work-observed-budget');
     }
     const catalog = ctx.get('tools').schemas(agent).map(schema => schema.name).filter(name => tools.includes(name)).sort();
@@ -370,17 +397,19 @@ export default function sharedNativeHook(ctx, config) {
     if (!integer(turn) || !integer(step)) throw new Error('Shared work request identity is unavailable.');
     const key = `${turn}:${step}:${agent.session.seq}`;
     if (state.admissions.includes(key)) throw new Error('Shared work request reservation is already consumed.');
-    state.started_at_ms ??= Date.now();
+    active.started_at_ms ??= Date.now();
+    if (record.row.renewWindow) active.hook_marker = 'same-sid-window-v1';
     state.requests++;
     state.admissions.push(key);
     save(record); // A crash or downstream failure never refunds an uncertain request.
     admitted.set(agent.session.id, {agent, fingerprint: record.fingerprint,
       state: structuredClone(state), last_wall: Date.now(),
-      deadline: performance.now() + record.row.budget.max_wall_seconds * 1000 - (Date.now() - state.started_at_ms)});
+      ...(record.row.renewWindow ? {window: structuredClone(record.row.renewWindow)} : {}),
+      deadline: performance.now() + record.row.budget.max_wall_seconds * 1000 - (Date.now() - active.started_at_ms)});
     const request = await next();
     const current = ledgerFor(agent);
     signal.throwIfAborted();
-    if (current.row.state.stop_reason || expired(current)) throw stop(agent, current, 'shared-work-wall-budget');
+    if ((current.row.renewWindow ?? current.row.state).stop_reason || expired(current)) throw stop(agent, current, 'shared-work-wall-budget');
     return {...request, provider: current.row.provider, model: current.row.model};
   });
   ctx.on('session/event', (session, event) => {
@@ -409,7 +438,7 @@ export default function sharedNativeHook(ctx, config) {
         if (owned.cleanup) continue;
         try {
           const record = ledgerFor(agent);
-          if (record.row.state.stop_reason || expired(record)) stop(agent, record, 'shared-work-wall-budget');
+          if ((record.row.renewWindow ?? record.row.state).stop_reason || expired(record)) stop(agent, record, 'shared-work-wall-budget');
         } catch {
           cancel(agent, 'shared-work-ownership-unknown');
         }
