@@ -8,9 +8,12 @@ import os
 from pathlib import Path
 import stat
 import shlex
+import re
+import subprocess
 import time
 import tempfile
 import uuid
+from copy import deepcopy
 
 from .manager import ManagementError, _private_state_directory
 from .repository_execution import private_file
@@ -22,9 +25,72 @@ CASES = {'allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardl
          'danger_denied', 'foreground_job_registered', 'managed_background_stopped',
          'foreground_cancelled', 'foreign_job_kill_denied', 'background_write_boundary'}
 CAPS = {'max_wall_seconds': 1800, 'max_model_requests': 80}
+_RUNTIME_VERSIONS = {}
+_RUNTIME_ENTRIES = set()
 
 
-def shared_configuration(reference, configuration):
+def _trusted_binary(value, workspace, kind):
+    path = Path(value)
+    info = path.lstat()
+    if (not path.is_absolute() or str(path.resolve(strict=True)) != str(path)
+            or not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, os.getuid()}
+            or info.st_mode & 0o022 or not os.access(path, os.R_OK | os.X_OK)
+            or workspace is not None and path.is_relative_to(Path(workspace).resolve(strict=True))):
+        raise ManagementError('configuration_missing', 'The approved runtime path is not a safe executable outside the repository.')
+    key = (str(path), kind, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    if key in _RUNTIME_VERSIONS:
+        return dict(_RUNTIME_VERSIONS[key])
+    environment = {key: value for key, value in os.environ.items()
+        if not key.startswith(('PYTHON', 'NODE_', 'DYLD_', 'LD_', 'GIT_'))}
+    result = subprocess.run([str(path), '--version'], env=environment, capture_output=True, text=True, timeout=5)
+    version = (result.stdout + result.stderr).strip()
+    match = re.fullmatch(r'Python (\d+)\.(\d+)\.(\d+)' if kind == 'python' else r'v(\d+)\.(\d+)\.(\d+)', version)
+    if result.returncode or not match or tuple(map(int, match.groups())) < ((3, 11, 0) if kind == 'python' else (22, 0, 0)):
+        raise ManagementError('configuration_missing', 'The approved runtime version is incompatible.')
+    evidence = {'path': str(path), 'version': version, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    _RUNTIME_VERSIONS[key] = evidence
+    return dict(evidence)
+
+
+def _runtime_entries(configuration, workspace):
+    source, verification = configuration['source_snapshot'], configuration['verification']
+    evidence = {'source_python': _trusted_binary(source['python'], workspace, 'python'),
+        'verification_python': _trusted_binary(verification['python'], workspace, 'python'),
+        'node': _trusted_binary(verification['node'], workspace, 'node'),
+        'native_node': _trusted_binary(configuration['node_bin'], workspace, 'node')}
+    paths = (source['python'], verification['python'], verification['node'], configuration['node_bin'], source['reader'], verification['runner'])
+    key = tuple((path, *(getattr(Path(path).stat(), name) for name in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))) for path in paths)
+    key += (source.get('reader_sha256'), verification.get('runner_sha256'))
+    if key in _RUNTIME_ENTRIES:
+        return evidence
+    environment = {key: value for key, value in os.environ.items()
+        if not key.startswith(('PYTHON', 'NODE_', 'DYLD_', 'LD_', 'GIT_'))}
+    with tempfile.TemporaryDirectory(prefix='hc-runtime-', dir='/tmp') as directory:
+        private_root = Path(directory).resolve(strict=True)
+        probe = private_root / 'repository'
+        probe.mkdir(mode=0o700)
+        subprocess.run(['/usr/bin/git', 'init', '-q', str(probe)], env=environment, check=True, timeout=5)
+        for python, entry in ((source['python'], source['reader']), (verification['python'], verification['runner'])):
+            arguments = [python, '-I', '-B', entry, str(probe), *(['--state'] if entry == verification['runner'] else [])]
+            result = subprocess.run(arguments, env=environment, capture_output=True, text=True, timeout=10)
+            if result.returncode or not isinstance(json.loads(result.stdout), dict):
+                raise ManagementError('configuration_missing', 'The original isolated read-only runtime entry failed.')
+        (probe / 'runtime.test.mjs').write_text("import test from 'node:test'; import assert from 'node:assert/strict'; test('runtime',()=>assert.equal(1+1,2));\n")
+        artifacts = private_root / 'artifacts'
+        artifacts.mkdir(mode=0o700)
+        result = subprocess.run([verification['python'], '-I', '-B', verification['runner'], str(probe), str(artifacts),
+            '--node', verification['node'], '--binding', 'runtime-probe', 'runtime-probe', 'runtime-probe', '--', 'runtime.test.mjs'],
+            env=environment, capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise ManagementError('configuration_missing', 'The original Node test runtime entry failed.')
+        receipt = json.loads(result.stdout)
+        if receipt.get('executed_tests') != 1 or receipt.get('failed_tests') != 0 or receipt.get('exit_code') != 0:
+            raise ManagementError('configuration_missing', 'The original Node framework runtime result is unverified.')
+    _RUNTIME_ENTRIES.add(key)
+    return evidence
+
+
+def shared_configuration(reference, configuration, *, workspace=None):
     required = {'schema', 'approved', 'mode', 'desktop_receipt', 'host_lease', 'service_ref',
                 'runtime_package_root', 'node_bin', 'agent_preset', 'ledger_dir', 'provider', 'model',
                 'budget', 'tool_receipt_ref', 'composition_sha256', 'source_snapshot', 'verification'}
@@ -48,11 +114,13 @@ def shared_configuration(reference, configuration):
     for name in ('python', 'reader'):
         path = Path(source[name])
         if (not path.is_absolute() or str(path.resolve(strict=True)) != str(path)
-                or hashlib.sha256(path.read_bytes()).hexdigest() != source[name + '_sha256']):
+                or workspace is not None and path.is_relative_to(Path(workspace).resolve(strict=True))
+                or name == 'reader' and hashlib.sha256(path.read_bytes()).hexdigest() != source[name + '_sha256']):
             raise ManagementError('configuration_missing', 'The fixed source fingerprint entry changed.')
     if source['reader_sha256'] != hashlib.sha256(Path(__file__).with_name('shared_source_reader.py').read_bytes()).hexdigest():
         raise ManagementError('configuration_missing', 'The shared source reader must be this reviewed main plugin entry.')
-    verify_configuration(configuration)
+    verify_configuration(configuration, workspace=workspace)
+    runtime_versions = _runtime_entries(configuration, workspace)
     receipt = json.loads(private_file(configuration['tool_receipt_ref']).read_text())
     if (receipt.get('schema') != 1 or receipt.get('status') != 'passed'
         or sorted(receipt.get('tool_catalog', [])) != TOOLS
@@ -68,7 +136,7 @@ def shared_configuration(reference, configuration):
             raise ManagementError('configuration_missing', 'An original shared native SDK proof source changed.')
     desktop_identity(configuration['desktop_receipt'], configuration['host_lease'])
     return dict(configuration, reference_sha256=hashlib.sha256(reference.read_bytes()).hexdigest(),
-                runtime_configuration={'budget': budget})
+                runtime_configuration={'budget': budget}, runtime_versions=runtime_versions)
 
 
 def ledger_path(configuration, session_id, suffix='.json'):
@@ -304,8 +372,20 @@ def _maintenance_snapshot_matches(snapshot, checkpoint):
         projections=dict(projections, asOfSeq=cursor))
     if hashlib.sha256(json.dumps(original, sort_keys=True).encode()).hexdigest() == checkpoint['snapshot_sha256']:
         return True
-    original['header'] = {key: value for key, value in header.items() if key != 'delegationDepth'}
-    return hashlib.sha256(json.dumps(original, sort_keys=True).encode()).hexdigest() == checkpoint['snapshot_sha256']
+    candidates = [original, dict(original, header={key: value for key, value in header.items() if key != 'delegationDepth'})]
+    for candidate in candidates:
+        if hashlib.sha256(json.dumps(candidate, sort_keys=True).encode()).hexdigest() == checkpoint['snapshot_sha256']:
+            return True
+        attributed = deepcopy(candidate)
+        changed = False
+        for entry in attributed.get('projections', {}).get('values', {}).get('contextHeaders', {}).get('headers', []):
+            for tool in entry.get('tools', []):
+                if tool.get('name') == 'bash' and tool.get('plugin') == 'tool-bash-persistent':
+                    tool['plugin'] = 'tool-bash'
+                    changed = True
+        if changed and hashlib.sha256(json.dumps(attributed, sort_keys=True).encode()).hexdigest() == checkpoint['snapshot_sha256']:
+            return True
+    return False
 
 
 def admit_shared_continuation(intake, record, message_id, generation):
@@ -479,9 +559,7 @@ def prepare_shared_window(intake, record, message_id):
     checked = json.loads(json.dumps(scope))
     if checked['source_snapshot']['python'] != checked['verification']['python']:
         raise ManagementError('binding_conflict', 'The two approved Python entries must name the same canonical binary.')
-    for field in ('source_snapshot', 'verification'):
-        checked[field]['python_sha256'] = hashlib.sha256(Path(checked[field]['python']).read_bytes()).hexdigest()
-    configuration = shared_configuration(Path(record['target']['execution_ref']), checked)
+    configuration = shared_configuration(Path(record['target']['execution_ref']), checked, workspace=record['target']['repo_path'])
     configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'], generation=execution['generation'])
     budget_file = ledger_path(configuration, execution['session_id'])
     raw = private_file(budget_file).read_bytes()
@@ -569,7 +647,8 @@ def admit_shared_window(intake, record, message_id, generation):
         entry = expected[field]
         if entry['python'] != expected['source_snapshot']['python'] or scope[field]['python'] != entry['python']:
             raise ManagementError('binding_conflict', 'Only the same canonical approved Python binary may refresh its two fingerprints.')
-        entry['python_sha256'] = hashlib.sha256(Path(entry['python']).read_bytes()).hexdigest()
+        entry['python_sha256'] = scope[field]['python_sha256']
+    expected['verification']['node_sha256'] = scope['verification']['node_sha256']
     if scope != expected:
         raise ManagementError('binding_conflict', 'The prepared source scope changed beyond Host lease or the two approved Python fingerprints.')
     old = checkpoint['native_identity']
@@ -924,22 +1003,25 @@ def cleanup_shared_github(intake, record):
     return result
 
 
-def verify_configuration(configuration):
+def verify_configuration(configuration, *, workspace=None):
     verification = configuration.get('verification')
     if not isinstance(verification, dict) or set(verification) != {'python', 'runner', 'node', 'python_sha256', 'runner_sha256', 'node_sha256'}:
         raise ManagementError('configuration_missing', 'The fixed shared test entry is required.')
     for name in ('python', 'runner', 'node'):
         path = Path(verification[name])
         if (not path.is_absolute() or str(path.resolve(strict=True)) != str(path)
-            or hashlib.sha256(path.read_bytes()).hexdigest() != verification[name + '_sha256']):
+            or workspace is not None and path.is_relative_to(Path(workspace).resolve(strict=True))
+            or name == 'runner' and hashlib.sha256(path.read_bytes()).hexdigest() != verification[name + '_sha256']):
             raise ManagementError('configuration_missing', 'An original fixed shared test executable changed.')
     if verification['runner_sha256'] != hashlib.sha256(Path(__file__).with_name('repository_test_runner.py').read_bytes()).hexdigest():
         raise ManagementError('configuration_missing', 'The shared test entry must be this reviewed original runner.')
+    for name in ('python', 'node'):
+        _trusted_binary(verification[name], workspace or configuration.get('workspace'), name)
     return verification
 
 
 def verification_command(configuration, execution, workspace, test_files):
-    verification = verify_configuration(configuration)
+    verification = verify_configuration(configuration, workspace=workspace)
     if (not isinstance(test_files, list) or not test_files or len(test_files) != len(set(test_files))
         or any(not isinstance(path, str) or path.startswith('-') or Path(path).is_absolute()
             or not (Path(workspace) / path).resolve(strict=True).is_relative_to(Path(workspace))
@@ -951,7 +1033,7 @@ def verification_command(configuration, execution, workspace, test_files):
 
 
 def prepare_shared_verification(intake, record, configuration):
-    verification = verify_configuration(configuration)
+    verification = verify_configuration(configuration, workspace=record['target']['repo_path'])
     execution = record['dsh_execution']
     if not execution.get('verification'):
         execution['verification'] = {'artifact_root': str(Path(tempfile.mkdtemp(prefix='hpm-shared-tests-', dir='/tmp')).resolve(strict=True)),
@@ -1138,6 +1220,7 @@ async def run_shared_work(ctx, intake, record, generation):
         elif execution['native_permission'] != 'workspace-write':
             raise ManagementError('outcome_unknown', 'The shared Session permission transition is unconfirmed; no replay.')
         _write_initial_ledger(configuration, execution)
+        execution['runtime_versions'] = configuration['runtime_versions']
         intake._save_execution(record)
         if not execution.get('native_title'):
             title = record['issue']['title']

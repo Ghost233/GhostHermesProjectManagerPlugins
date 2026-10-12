@@ -68,14 +68,23 @@ export default function sharedNativeHook(ctx, config) {
       const file = reference[key];
       if (!text(file) || !path.isAbsolute(file) || fs.realpathSync(file) !== file
           || !fs.lstatSync(file).isFile() || file === workspace || file.startsWith(workspace + path.sep)
-          || !/^[a-f0-9]{64}$/.test(reference[key + '_sha256'] ?? '')
-          || digest(fs.readFileSync(file)) !== reference[key + '_sha256']) {
+          || key === 'reader' && (!/^[a-f0-9]{64}$/.test(reference.reader_sha256 ?? '')
+            || digest(fs.readFileSync(file)) !== reference.reader_sha256)) {
         throw new Error('Shared work source reader binding changed.');
       }
     }
-    const result = spawnSync(reference.python, ['-I', reference.reader, workspace],
+    const info = fs.statSync(reference.python);
+    if (![0, process.getuid()].includes(info.uid) || (info.mode & 0o022) !== 0) throw new Error('Shared work Python permissions are unsafe.');
+    fs.accessSync(reference.python, fs.constants.R_OK | fs.constants.X_OK);
+    const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(PYTHON|NODE_|DYLD_|LD_|GIT_)/.test(key)));
+    const version = spawnSync(reference.python, ['-I', '--version'], {timeout: 5000, maxBuffer: 4096, encoding: 'utf8', shell: false, env: environment});
+    const match = (String(version.stdout ?? '') + String(version.stderr ?? '')).trim().match(/^Python (\d+)\.(\d+)\.(\d+)$/);
+    if (version.error || version.status !== 0 || !match || Number(match[1]) < 3 || Number(match[1]) === 3 && Number(match[2]) < 11) {
+      throw new Error('Shared work Python version is incompatible.');
+    }
+    const result = spawnSync(reference.python, ['-I', '-B', reference.reader, workspace],
       {timeout: 15000, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8', shell: false,
-        env: {PATH: process.env.PATH, LANG: 'C.UTF-8', PYTHONDONTWRITEBYTECODE: '1'}});
+        env: {...environment, LANG: 'C.UTF-8'}});
     if (result.error || result.status !== 0) throw new Error('Shared work source snapshot is unknown.');
     const value = JSON.parse(result.stdout);
     if (value.head !== null && !/^[a-f0-9]{40}$/.test(value.head)

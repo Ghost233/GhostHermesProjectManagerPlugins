@@ -21,6 +21,49 @@ import pytest
 from ghost_hermes_pm.manager import ManagementError
 
 
+@pytest.mark.parametrize('change', ['noncanonical', 'in_workspace', 'unsafe_permissions', 'not_executable', 'wrong_python', 'wrong_node'])
+def test_shared_runtime_path_version_and_permissions_refuse_unsafe_entries(tmp_path, change):
+    from ghost_hermes_pm.shared_repository import _trusted_binary
+    workspace = tmp_path / 'repository'
+    workspace.mkdir()
+    binary = tmp_path / 'approved-runtime'
+    binary.write_text('#!/bin/sh\nprintf "Python 3.10.0\\n"\n')
+    binary.chmod(0o700)
+    kind = 'python'
+    if change == 'noncanonical':
+        alias = tmp_path / 'alias-runtime'
+        alias.symlink_to(Path(sys.executable).resolve())
+        binary = alias
+    elif change == 'in_workspace':
+        binary = workspace / 'runtime'
+        binary.write_text('#!/bin/sh\nprintf "Python 3.12.0\\n"\n')
+        binary.chmod(0o700)
+    elif change == 'unsafe_permissions':
+        binary.chmod(0o777)
+    elif change == 'not_executable':
+        binary.chmod(0o600)
+    elif change == 'wrong_node':
+        kind = 'node'
+        binary.write_text('#!/bin/sh\nprintf "v18.0.0\\n"\n')
+    with pytest.raises(ManagementError):
+        _trusted_binary(str(binary), str(workspace), kind)
+
+
+def test_shared_runtime_requires_actual_isolated_entry_success(tmp_path):
+    from ghost_hermes_pm.shared_repository import _runtime_entries
+    workspace = tmp_path / 'repository'
+    workspace.mkdir()
+    binary = tmp_path / 'approved-runtime'
+    binary.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then printf "Python 3.12.0\\n"; else exit 9; fi\n')
+    binary.chmod(0o700)
+    root = Path(__file__).resolve().parents[1]
+    configuration = {'source_snapshot': {'python': str(binary), 'reader': str(root / 'ghost_hermes_pm/shared_source_reader.py')},
+        'verification': {'python': str(Path(sys.executable).resolve()), 'node': str(Path(shutil.which('node')).resolve()),
+            'runner': str(root / 'ghost_hermes_pm/repository_test_runner.py')}, 'node_bin': str(Path(shutil.which('node')).resolve())}
+    with pytest.raises(ManagementError, match='read-only runtime entry failed'):
+        _runtime_entries(configuration, str(workspace))
+
+
 def test_original_workspace_gateway_reuses_path_and_preserves_existing_session_across_reload(tmp_path):
     sdk = Path(os.environ['DSH_TEST_SDK_ROOT']).resolve(strict=True)
     before = source_snapshot(sdk)
@@ -460,7 +503,7 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue'])
+@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'runtime_metadata'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])

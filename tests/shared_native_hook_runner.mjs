@@ -121,6 +121,27 @@ try {
     config.source_snapshot = {python, reader, python_sha256: crypto.createHash('sha256').update(fs.readFileSync(python)).digest('hex'),
       reader_sha256: crypto.createHash('sha256').update(fs.readFileSync(reader)).digest('hex')};
   }
+  if (scenario.startsWith('runtime_')) {
+    execFileSync('git', ['init', '-q', workspace]);
+    let python = fs.realpathSync(process.env.HERMES_TEST_SESSION_PYTHON);
+    const reader = fs.realpathSync('ghost_hermes_pm/shared_source_reader.py');
+    if (scenario === 'runtime_noncanonical') {
+      const alias = path.join(scratch, 'python-alias');
+      fs.symlinkSync(python, alias);
+      python = alias;
+    } else if (['runtime_workspace', 'runtime_writable', 'runtime_notexec',
+                'runtime_old_version', 'runtime_entry_failed'].includes(scenario)) {
+      python = path.join(scenario === 'runtime_workspace' ? workspace : scratch, 'fixture-python');
+      const version = scenario === 'runtime_old_version' ? '3.10.0' : '3.11.0';
+      fs.writeFileSync(python, '#!/bin/sh\nif [ "$1" = "-I" ] && [ "$2" = "--version" ]; then\n'
+        + '  echo "Python ' + version + '"\n  exit 0\nfi\nexit 23\n', {mode: 0o700});
+      if (scenario === 'runtime_writable') fs.chmodSync(python, 0o722);
+      if (scenario === 'runtime_notexec') fs.chmodSync(python, 0o600);
+    }
+    config.source_snapshot = {python, reader, python_sha256: '0'.repeat(64),
+      reader_sha256: scenario === 'runtime_reader_changed' ? '0'.repeat(64)
+        : crypto.createHash('sha256').update(fs.readFileSync(reader)).digest('hex')};
+  }
   const removePreset = await ctx.agentPresets.register(declaration);
   if (scenario === 'late_host' || scenario === 'renew_window') {
     const configs = {'dsh-storage-json': {root: path.join(scratch, 'domain')},
@@ -303,6 +324,30 @@ try {
     await prompt(invalidFile.agent);
     assert.equal(calls.length, 1, 'A public ledger is not an ownership grant.');
     await invalidFile.dispose();
+  } else if (scenario.startsWith('runtime_')) {
+    const owned = await create('fixture-runtime-source');
+    register(owned.agent);
+    await prompt(owned.agent);
+    const result = await ctx.tools.execute({agent: owned.agent, name: 'bash', callId: 'fixture-runtime-source',
+      arguments: {command: 'synthetic source receipt'}, signal: new AbortController().signal});
+    const receipts = fs.readFileSync(ledgerPath(owned.agent.session.id).replace('.json', '.tools.jsonl'), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    if (scenario === 'runtime_stale_hash') {
+      assert.equal(result.isError, false, 'A trusted compatible Python upgrade must accept stale binary metadata.');
+      assert.equal(toolRuns.length, 1);
+      assert.equal(receipts[0].execution_admission, 'admitted');
+      assert.equal(receipts[0].source_before.head, null);
+      assert.equal(receipts[0].source_before.workspace_status, '');
+      assert.match(receipts[0].source_before.source_digest, /^[a-f0-9]{64}$/);
+      assert.deepEqual(receipts[0].source_after, receipts[0].source_before,
+        'The actual reader must record the same unmodified repository before and after tool dispatch.');
+    } else {
+      assert.equal(result.isError, true, 'An unsafe runtime or changed source reader must refuse tool execution: ' + scenario);
+      assert.equal(toolRuns.length, 0);
+      assert.equal(receipts[0].execution_admission, 'rejected');
+      assert.equal(receipts[0].source_before, undefined);
+    }
+    await owned.dispose();
   } else if (scenario === 'guard_deadline') {
     const owned = await create('fixture-guard-deadline');
     const row = register(owned.agent);

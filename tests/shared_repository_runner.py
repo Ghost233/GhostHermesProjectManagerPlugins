@@ -13,6 +13,9 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 scratch = Path(sys.argv[1]).resolve()
 shared_scenario = sys.argv[2]
+runtime_metadata = shared_scenario == 'runtime_metadata'
+if runtime_metadata:
+    shared_scenario = 'terminal'
 triage_continuation = shared_scenario == 'continue_triage'
 concurrent_claim = shared_scenario == 'continue_claim_race'
 native_restore = shared_scenario == 'continue_native_restore'
@@ -62,7 +65,8 @@ service_source = service_source.replace("state['journals'].setdefault(value['ses
 service_source = service_source.replace("'values': {'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []})}",
     "'values': {'agentPreset': behavior.get('agent_preset', 'fixture-shared'), 'userQuestions': {'active': [], 'settled': []}, "
     "'permissions': {'currentValue': 'workspace-write'}, "
-    "'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []})}")
+    "'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []}), "
+    "**({'contextHeaders': behavior['context_headers']} if 'context_headers' in behavior else {})}")
 service_source = service_source.replace("elif method == 'session/cancel':", """elif method == 'commands/list':
                 assert set(args) == {'agentId'}
                 value = [{'name': 'permission', 'definitionId': '@deepseek-ai/dsh-permission-presets'}]
@@ -127,6 +131,8 @@ service_namespace = {'permission_contract': permission_contract, 'shared_scenari
     'max_tokens_unknown': max_tokens_unknown, 'max_tokens_last_slot': max_tokens_last_slot, 'renew_window': renew_window, 'time': time}
 exec(compile(service_source, str(ROOT / 'tests/dsh_fixture_server.py'), 'exec'), service_namespace)
 fixture_behavior = {'admit_prompt': True}
+if native_restore:
+    fixture_behavior['context_headers'] = {'headers': [{'tools': [{'name': 'bash', 'plugin': 'tool-bash', 'tokens': 10}]}]}
 peer_context = service_namespace['remote_peer'](behavior=fixture_behavior)
 url, peer = peer_context.__enter__()
 shared_address = ('127.0.0.1', int(url.rsplit(':', 1)[1]))
@@ -167,6 +173,11 @@ reference.write_text(json.dumps({'schema': 1, 'approved': True, 'mode': 'shared_
         'runner_sha256': hashlib.sha256((ROOT / 'ghost_hermes_pm/repository_test_runner.py').read_bytes()).hexdigest(),
         'node_sha256': hashlib.sha256(Path(shutil.which('node')).resolve().read_bytes()).hexdigest()}}))
 reference.chmod(0o600)
+if runtime_metadata:
+    metadata = json.loads(reference.read_text())
+    metadata['source_snapshot']['python_sha256'] = '0' * 64
+    metadata['verification'].update(python_sha256='0' * 64, node_sha256='0' * 64)
+    reference.write_text(json.dumps(metadata))
 os.environ['HPM_NATIVE_EXECUTION_REFERENCE'] = str(reference)
 fixture = ROOT / 'tests/simple_intake_smoke_runner.py'
 prefix = fixture.read_text().split('async def main():', 1)[0]
@@ -246,7 +257,7 @@ async def main():
         with connect_closing() as db:
             assert dispatch_once(db, max_spawn=1).spawned
             worker = remember_worker(db, initial['card_id'])
-        deadline = time.monotonic() + 35
+        deadline = time.monotonic() + (60 if runtime_metadata or native_restore or renew_window else 35)
         ended = False
         stop_sent = False
         reconciled = False
@@ -414,6 +425,14 @@ async def main():
                         rows.append({'type': 'event', 'event': {'type': 'session/end-seed', 'seq': len(rows),
                             'time': 6, 'data': {}}})
                         fixture_behavior['header_defaults'] = {'delegationDepth': 0}
+                        fixture_behavior['context_headers']['headers'][0]['tools'][0]['plugin'] = 'tool-bash-persistent'
+                        attribution = fixture_behavior['context_headers']['headers'][0]['tools'][0]
+                        for label, key, value in [('other_tool', 'name', 'skill'), ('changed_tokens', 'tokens', 11),
+                                ('unknown_alias', 'plugin', 'foreign-tool-bash')]:
+                            original_value = attribution[key]
+                            attribution[key] = value
+                            await rejected('om_continue_attribution_' + label)
+                            attribution[key] = original_value
                         marker = rows[-1]['event']
                         marker['type'] = 'fixture/unexpected-marker'
                         await rejected('om_continue_unknown_restore_marker')
@@ -821,6 +840,9 @@ async def main():
         assert latest['dsh_execution']['native_identity']['kind'] == 'shared_native'
         assert latest['dsh_execution']['native_identity']['pid'] == (host_processes[-1].pid if host_processes else os.getpid())
         assert latest['dsh_execution']['native_permission'] == 'workspace-write'
+        if runtime_metadata:
+            assert latest['dsh_execution']['runtime_versions']['source_python']['sha256'] == hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest()
+            assert latest['dsh_execution']['runtime_versions']['node']['sha256'] != '0' * 64
         assert latest['dsh_execution']['workspace_id'] == peer['workspace']['workspaceId']
         assert peer['workspace']['path'] == str(repo) and peer['workspace']['sessionIds'] == [latest['dsh_execution']['session_id']]
         assert sum(call['method'] == 'workspace/create' and call['payload']['args']['request']['path'] == str(repo)
