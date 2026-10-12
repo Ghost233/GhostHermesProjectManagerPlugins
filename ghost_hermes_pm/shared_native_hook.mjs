@@ -431,4 +431,4 @@ export default function sharedNativeHook(ctx, config) {
     };
   });
 }
-sharedNativeHook.inject = ['sessionProjections', 'tools', 'llm', 'agentPresets', 'sandboxPolicy', 'jobs'];
+sharedNativeHook.inject = ['sessionProjections', 'tools', 'llm', 'agentPresets', 'sandboxPolicy', 'jobs', 'workflowHostInstance'];

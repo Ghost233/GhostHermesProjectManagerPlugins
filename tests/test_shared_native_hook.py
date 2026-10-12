@@ -12,7 +12,7 @@ from sdk_source_integrity import source_snapshot
 
 
 @pytest.mark.parametrize('scenario', ['basic', 'integrity', 'limits', 'unknown', 'observer', 'recovery',
-                                      'lifecycle', 'tool_guard', 'inherited', 'guard_deadline', 'team', 'host_restart'])
+                                      'lifecycle', 'tool_guard', 'inherited', 'guard_deadline', 'team', 'host_restart', 'late_host'])
 def test_native_shared_preset_budget_and_lifecycle(tmp_path, scenario):
     configured = os.environ.get('DSH_TEST_SDK_ROOT')
     if not configured:

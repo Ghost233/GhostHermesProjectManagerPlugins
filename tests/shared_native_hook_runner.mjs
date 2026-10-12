@@ -30,7 +30,7 @@ const diagnostics = [];
 ctx.logger.exporter({levels: {default: 3}, export: message => diagnostics.push(message.args.map(String).join(' '))});
 const scenario = process.argv[3] ?? 'basic';
 const currentHostLease = scenario === 'host_restart' ? 'fixture-restarted-lease' : config.host_lease;
-ctx.provide('workflowHostInstance', {instanceId: currentHostLease});
+if (scenario !== 'late_host') ctx.provide('workflowHostInstance', {instanceId: currentHostLease});
 class Model extends LlmAdapter {
   resolveModel(provider, model) {
     return Promise.resolve({provider, id: model, name: model, context: {contextWindow: 16384}});
@@ -121,6 +121,39 @@ try {
       reader_sha256: crypto.createHash('sha256').update(fs.readFileSync(reader)).digest('hex')};
   }
   const removePreset = await ctx.agentPresets.register(declaration);
+  if (scenario === 'late_host') {
+    const configs = {'dsh-storage-json': {root: path.join(scratch, 'domain')},
+      'dsh-storage-domain': {backend: 'json'},
+      'dsh-session-persistence-jsonl': {root: path.join(scratch, 'sessions')},
+      'dsh-working-directory': {defaultDirectory: workspace},
+      'dsh-attachment-local': {dshHome: path.join(scratch, 'attachments')},
+      'dsh-agent-default-model': {provider: 'fixture-model', model: 'fixture-default'},
+      'dsh-credentials-local': {path: path.join(scratch, 'fixture-credentials.yaml'), watch: false}};
+    for (const name of ['dsh-typert-registry', 'dsh-api-gateway', 'dsh-storage', 'dsh-storage-json',
+      'dsh-storage-domain', 'dsh-session-persistence-jsonl', 'dsh-session-query', 'dsh-agent-default-model',
+      'dsh-fs-local', 'dsh-working-directory', 'dsh-shell-env', 'dsh-user-approval', 'dsh-commands',
+      'dsh-permission-presets', 'dsh-attachment-local', 'dsh-credentials-local', 'dsh-client-connection',
+      'dsh-client-file-upload', 'dsh-workspace', 'dsh-api-session-controller']) {
+      await loader.create({id: name, name: pathToFileURL(path.join(root, `@deepseek-ai/${name}/lib/index.js`)).href,
+        config: configs[name]});
+    }
+    const provider = path.join(scratch, 'late-host-provider.mjs');
+    fs.writeFileSync(provider, 'export default function(ctx,config){ctx.provide("workflowHostInstance",{instanceId:config.instanceId});}\n');
+    await loader.create({id: 'late-host-provider', name: pathToFileURL(provider).href,
+      config: {instanceId: currentHostLease}});
+    await loader.await();
+    const {TYPERT} = await import(pathToFileURL(path.join(root, '@deepseek-ai/dsh-api-session-controller/lib/typert.host.js')).href);
+    ctx.typert.register(TYPERT);
+    const response = await ctx.typertGateway.dispatchRpc('session/create', {args: {request: {
+      sessionId: 'fixture-late-host-session', cwd: workspace, agentPreset: config.agent_preset}}}, new AbortController().signal);
+    assert.equal(response.ok, true, 'Late original Host service must admit the preset through public session/create: ' + JSON.stringify(response));
+    assert.deepEqual(response.value, {sessionId: 'fixture-late-host-session', agentPreset: config.agent_preset});
+    assert.equal(calls.length, 0, 'Adoption must not send model input.');
+    assert.equal(ctx.agents.get(response.value.sessionId)?.session, ctx.sessions.get(response.value.sessionId));
+    await removePreset();
+    process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: 0, late_host: response.value}));
+    process.exitCode = 0;
+  } else {
   const removeManual = scenario === 'team' ? await ctx.agentPresets.register({id: 'fixture-manual',
     plugins: declaration.plugins.filter(plugin => plugin.id !== 'shared-hook')}) : undefined;
   const roster = await ctx.agentPresets.list();
@@ -444,6 +477,7 @@ try {
   await removePreset();
   if (removeManual) await removeManual();
   process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: calls.length, ...(teamEvidence ? {team: teamEvidence} : {})}));
+  }
 } finally {
   await ctx.fiber.dispose();
 }
