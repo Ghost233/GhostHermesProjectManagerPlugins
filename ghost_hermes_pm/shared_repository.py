@@ -279,6 +279,29 @@ def prepare_shared_continuation(intake, record, message_id):
         carrier.close()
 
 
+def _maintenance_snapshot_matches(snapshot, checkpoint):
+    """Prove the original snapshot through the one native restore marker and default."""
+    if hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == checkpoint['snapshot_sha256']:
+        return True
+    cursor = checkpoint['cursor']
+    header, projections, records = snapshot.get('header', {}), snapshot.get('projections', {}), snapshot.get('records', [])
+    if (header.get('isSeeded') is not False or type(header.get('delegationDepth')) is not int
+            or header['delegationDepth'] != 0 or snapshot.get('cursor') != cursor + 1
+            or projections.get('asOfSeq') != cursor + 1 or len(records) != cursor + 2):
+        return False
+    marker = records[-1]
+    event = marker.get('event', {})
+    if (set(marker) != {'type', 'event'} or marker['type'] != 'event'
+            or set(event) != {'type', 'seq', 'time', 'data'} or event['type'] != 'session/end-seed'
+            or type(event['seq']) is not int or event['seq'] != cursor + 1 or event['data'] != {}
+            or type(event['time']) is not int or not 0 <= event['time'] <= 2 ** 53 - 1):
+        return False
+    original = dict(snapshot, cursor=cursor, records=records[:-1],
+        header={key: value for key, value in header.items() if key != 'delegationDepth'},
+        projections=dict(projections, asOfSeq=cursor))
+    return hashlib.sha256(json.dumps(original, sort_keys=True).encode()).hexdigest() == checkpoint['snapshot_sha256']
+
+
 def admit_shared_continuation(intake, record, message_id, generation):
     """Rebind only a checkpointed pre-model failure after the original Host ended."""
     import psutil
@@ -338,7 +361,7 @@ def admit_shared_continuation(intake, record, message_id, generation):
         if (header.get('id') != execution['session_id'] or header.get('createdAt') != execution['session_created_at']
                 or header.get('cwd') != configuration['workspace'] or snapshot.get('hasMore') is not False
                 or snapshot.get('projections', {}).get('values', {}).get('agentPreset') != configuration['agent_preset']
-                or hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() != checkpoint['snapshot_sha256']
+                or not _maintenance_snapshot_matches(snapshot, checkpoint)
                 or len(sessions) != 1 or sessions[0].get('cwd') != configuration['workspace']
                 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
                 or workspace.get('created') is not False or account.get('path') != configuration['workspace']
@@ -708,8 +731,7 @@ async def run_shared_work(ctx, intake, record, generation):
             raise ManagementError('binding_conflict', 'Original shared Session creation identity changed.')
         if pending_continuation:
             budget = read_ledger(configuration, execution)
-            if (hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()
-                    != execution['maintenance_checkpoint']['snapshot_sha256']
+            if (not _maintenance_snapshot_matches(snapshot, execution['maintenance_checkpoint'])
                     or hashlib.sha256(private_file(ledger_path(configuration, execution['session_id'])).read_bytes()).hexdigest()
                     != continuation['ledger_sha256']
                     or budget['state'] != {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0,

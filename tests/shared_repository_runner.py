@@ -15,7 +15,8 @@ scratch = Path(sys.argv[1]).resolve()
 shared_scenario = sys.argv[2]
 triage_continuation = shared_scenario == 'continue_triage'
 concurrent_claim = shared_scenario == 'continue_claim_race'
-if triage_continuation or concurrent_claim:
+native_restore = shared_scenario == 'continue_native_restore'
+if triage_continuation or concurrent_claim or native_restore:
     shared_scenario = 'continue_restart'
 continuation_scenarios = {'continue_restart', 'continue_unknown'}
 host_processes = []
@@ -86,6 +87,7 @@ service_source = service_source.replace("if behavior.get('admit_prompt'):",
 service_source = service_source.replace("value = {'accepted': True}",
     "value = None if method == 'session/prompt' and shared_scenario == 'continue_unknown' and len(state['prompts']) == 2 else {'accepted': True}")
 service_source = service_source.replace("'createdAt': 0,", "'createdAt': behavior.get('created_at', 0),")
+service_source = service_source.replace("'isSeeded': False}", "'isSeeded': False, **behavior.get('header_defaults', {})}")
 service_source = service_source.replace("elif method == 'session/cancel':\n                value", """elif method == 'session/cancel':
                 sid = args['request']['sessionId']
                 row = next(row for row in state['sessions'] if row['sessionId'] == sid)
@@ -315,6 +317,27 @@ async def main():
                     fixture_behavior['jobs'] = [{'id': 'fixture-active-job', 'owner': sid, 'status': 'running'}]
                     await rejected('om_continue_active_job')
                     fixture_behavior.pop('jobs')
+                    if native_restore:
+                        rows.append({'type': 'event', 'event': {'type': 'session/end-seed', 'seq': len(rows),
+                            'time': 6, 'data': {}}})
+                        fixture_behavior['header_defaults'] = {'delegationDepth': 0}
+                        marker = rows[-1]['event']
+                        marker['type'] = 'fixture/unexpected-marker'
+                        await rejected('om_continue_unknown_restore_marker')
+                        marker['type'] = 'session/end-seed'
+                        marker['data'] = {'inherited': True}
+                        await rejected('om_continue_inherited_restore_marker')
+                        marker['data'] = {}
+                        fixture_behavior['header_defaults']['delegationDepth'] = 1
+                        await rejected('om_continue_changed_delegation_depth')
+                        fixture_behavior['header_defaults']['delegationDepth'] = 0
+                        original_reason = rows[-2]['event']['data']['reason']
+                        rows[-2]['event']['data']['reason'] = {'kind': 'error', 'error': {'message': 'Changed original failure.', 'code': 'UNKNOWN'}}
+                        await rejected('om_continue_changed_original_history')
+                        rows[-2]['event']['data']['reason'] = original_reason
+                        rows.append({'type': 'event', 'event': {'type': 'session/end-seed', 'seq': len(rows), 'time': 7, 'data': {}}})
+                        await rejected('om_continue_extra_restore_marker')
+                        rows.pop()
                 if concurrent_claim:
                     import threading
                     claim_result = {}
