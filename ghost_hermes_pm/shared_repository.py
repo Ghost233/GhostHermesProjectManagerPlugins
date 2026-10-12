@@ -1602,9 +1602,13 @@ def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier):
     previous = execution.get('supervisor_claim', {})
     if not previous or previous.get('run_id') == run_id:
         return False
+    failure = execution.get('last_failure', {})
     if (execution.get('state') not in {'running', 'outcome_unknown'}
             or execution.get('first_input') != 'accepted'
-            or execution.get('state') == 'outcome_unknown' and execution.get('last_failure', {}).get('code') != 'unauthorized'
+            or execution.get('state') == 'outcome_unknown' and failure.get('code') != 'unauthorized'
+            and (failure.get('code'), failure.get('message')) not in {
+                ('binding_conflict', 'The original shared source changed before supervision takeover.'),
+                ('outcome_unknown', 'The original worker input remains unconfirmed; no claim transfer.')}
             or continuation and continuation.get('status') != 'accepted'):
         raise ManagementError('outcome_unknown', 'The original worker input remains unconfirmed; no claim transfer.')
     identity = previous.get('identity', {})
