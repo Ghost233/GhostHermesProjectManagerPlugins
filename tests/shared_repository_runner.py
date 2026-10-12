@@ -21,6 +21,8 @@ concurrent_claim = shared_scenario == 'continue_claim_race'
 native_restore = shared_scenario == 'continue_native_restore'
 renew_continue = shared_scenario == 'renew_window_continue'
 resume_completed_window = shared_scenario == 'resume_completed_window'
+renew_window_again = shared_scenario == 'renew_window_again'
+completed_renewed_window = resume_completed_window or renew_window_again
 renew_window = shared_scenario in {'renew_window', 'renew_window_unknown', 'renew_window_continue'}
 max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'continue_tokens_uncapped', 'renew_window', 'renew_window_unknown', 'renew_window_continue'}
 max_tokens_unknown = shared_scenario in {'continue_max_tokens_unknown', 'renew_window_unknown'}
@@ -88,7 +90,8 @@ service_source = service_source.replace("state['prompts'].append(args['request']
                     budget_row['state']['admissions'].append(args['request']['requestId'])
                     budget_path.write_text(json.dumps(budget_row))
                     behavior['last_slot_budget'] = budget_path.read_bytes()
-                if renew_window and not max_tokens_unknown and len(state['prompts']) >= 3:
+                if ((renew_window and not max_tokens_unknown and len(state['prompts']) >= 3)
+                        or (renew_window_again and len(state['prompts']) >= 2)):
                     budget_path = ledger / (hashlib.sha256(args['request']['sessionId'].encode()).hexdigest() + '.json')
                     budget_row = json.loads(budget_path.read_bytes())
                     budget_row['renewWindow'].update(started_at_ms=int(time.time() * 1000), hook_marker='same-sid-window-v1')
@@ -129,7 +132,8 @@ service_source = service_source.replace("elif method == 'session/cancel':\n     
                     'time': 4, 'data': {'turn': 1, 'reason': {'kind': 'aborted', 'reason': {'kind': 'user'}}}}})
                 value""")
 service_namespace = {'permission_contract': permission_contract, 'shared_scenario': shared_scenario,
-    'max_tokens_unknown': max_tokens_unknown, 'max_tokens_last_slot': max_tokens_last_slot, 'renew_window': renew_window, 'time': time}
+    'max_tokens_unknown': max_tokens_unknown, 'max_tokens_last_slot': max_tokens_last_slot, 'renew_window': renew_window,
+    'renew_window_again': renew_window_again, 'time': time}
 exec(compile(service_source, str(ROOT / 'tests/dsh_fixture_server.py'), 'exec'), service_namespace)
 fixture_behavior = {'admit_prompt': True}
 if native_restore:
@@ -239,7 +243,7 @@ async def main():
                 ('absolute_escape', '`' + str(outside) + '`', False), ('symlink_escape', '`docs/linked.md`', False),
                 ('sensitive', '`docs/hidden.md`', False), ('file_limit', '`docs/large.md`', False),
                 ('message_limit', '`docs/long-message.md`', False)]
-        if shared_scenario in continuation_scenarios or resume_completed_window:
+        if shared_scenario in continuation_scenarios or completed_renewed_window:
             host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
             original_receipt = json.loads(receipt.read_text())
@@ -258,7 +262,7 @@ async def main():
         with connect_closing() as db:
             assert dispatch_once(db, max_spawn=1).spawned
             worker = remember_worker(db, initial['card_id'])
-        deadline = time.monotonic() + (60 if runtime_metadata or native_restore or renew_window else 35)
+        deadline = time.monotonic() + (60 if runtime_metadata or native_restore or renew_window or renew_window_again else 35)
         ended = False
         stop_sent = False
         reconciled = False
@@ -274,6 +278,8 @@ async def main():
         window_continue_ended = False
         resume_admitted = False
         resume_ended = False
+        renewal_admitted = False
+        renewal_ended = False
         while time.monotonic() < deadline:
             if peer['prompts'] and not ended and shared_scenario in {'terminal', 'reconcile_intent', 'prepare_continue', *continuation_scenarios}:
                 sid = peer['prompts'][0]['sessionId']
@@ -284,18 +290,23 @@ async def main():
                         if shared_scenario in {'prepare_continue', *continuation_scenarios} else {'kind': 'completed'})}}})
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
-            if peer['prompts'] and not ended and resume_completed_window:
+            if peer['prompts'] and not ended and completed_renewed_window:
                 sid = peer['prompts'][0]['sessionId']
                 rows = peer['journals'][sid]
                 budget_file = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
                 budget_row = json.loads(budget_file.read_text())
-                started = int(time.time() * 1000) - 1000
-                original_state = {'started_at_ms': started, 'requests': 3, 'reported_tokens': 30,
-                                  'admissions': ['fixture-old-' + str(index) for index in range(3)], 'stop_reason': None}
-                budget_row['state'] = {**original_state, 'requests': 9, 'reported_tokens': 90,
-                    'admissions': [*original_state['admissions'], *['fixture-current-' + str(index) for index in range(6)]]}
+                started = int(time.time() * 1000) - (61000 if renew_window_again else 1000)
+                base_requests = 9 if renew_window_again else 3
+                total_requests = 17 if renew_window_again else 9
+                original_state = {'started_at_ms': started, 'requests': base_requests,
+                                  'reported_tokens': 555000 if renew_window_again else 30,
+                                  'admissions': ['fixture-old-' + str(index) for index in range(base_requests)], 'stop_reason': None}
+                budget_row['state'] = {**original_state, 'requests': total_requests,
+                    'reported_tokens': 555422 if renew_window_again else 90,
+                    'admissions': [*original_state['admissions'],
+                        *['fixture-current-' + str(index) for index in range(total_requests - base_requests)]]}
                 budget_row['renewWindow'] = {'id': 'window-fixture', 'message_id': 'om-prior-window',
-                    'host_lease': 'fixture-shared-lease', 'request_base': 3, 'original_state': original_state,
+                    'host_lease': 'fixture-shared-lease', 'request_base': base_requests, 'original_state': original_state,
                     'original_host_lease': 'fixture-original-lease', 'started_at_ms': started, 'stop_reason': None,
                     'hook_marker': 'same-sid-window-v1'}
                 binding = {key: budget_row[key] for key in ('schema', 'service_ref', 'host_lease', 'agent_preset',
@@ -308,7 +319,7 @@ async def main():
                 budget_row['state']['binding_sha256'] = hashlib.sha256(json.dumps(binding, separators=(',', ':'),
                     ensure_ascii=False).encode()).hexdigest()
                 budget_file.write_text(json.dumps(budget_row))
-                for index in range(9):
+                for index in range(total_requests):
                     rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 4,
                         'data': {'turn': 1, 'step': index, 'usage': {'inputTokens': 10, 'outputTokens': 5},
                             'message': {'id': 'fixture-settlement-' + str(index), 'role': 'assistant',
@@ -369,6 +380,106 @@ async def main():
                         assert '原生 DSH 私有界面' in notification
                     assert 'fixture-sensitive-value' not in notification and 'Outside fixture material' not in notification
                 assert len(peer['prompts']) == 1, 'Question material notifications do not submit new DSH input.'
+                break
+            if renew_window_again and ended and not renewal_admitted and card['status'] in {'blocked', 'triage'}:
+                assert latest['dsh_execution']['state'] == 'awaiting_acceptance', latest['dsh_execution']
+                assert latest['dsh_execution']['acceptance']['status'] == 'unmet'
+                assert 'delivery_report_missing' in latest['dsh_execution']['acceptance']['unmet']
+                while True:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        break
+                    await asyncio.sleep(.05)
+                worker = None
+                budget_file = ledger / (hashlib.sha256(latest['dsh_execution']['session_id'].encode()).hexdigest() + '.json')
+                budget_before = budget_file.read_bytes()
+                await receive(adapter, raw('om_window_again_continue_expired', '@_user_1 继续 ' + latest['id']))
+                assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                unexpired = json.loads(budget_before)
+                unexpired['renewWindow']['started_at_ms'] = int(time.time() * 1000)
+                budget_file.write_text(json.dumps(unexpired))
+                await receive(adapter, raw('om_window_again_unexpired', '@_user_1 续预算 ' + latest['id']))
+                assert json.loads(budget_file.read_text()) == unexpired and len(peer['prompts']) == 1
+                budget_file.write_bytes(budget_before)
+                receipt_path = ledger / (hashlib.sha256(latest['dsh_execution']['session_id'].encode()).hexdigest() + '.tools.jsonl')
+                receipts = [json.loads(row) for row in receipt_path.read_text().splitlines()]
+                receipts[0]['execution_admission'] = 'admitted'
+                receipt_path.write_text(''.join(json.dumps(row) + '\n' for row in receipts))
+                receipt_path.chmod(0o600)
+                await receive(adapter, raw('om_window_again_admitted_bash', '@_user_1 续预算 ' + latest['id']))
+                assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                receipt_path.write_text(''.join(json.dumps(row) + '\n' for row in record()['dsh_execution']['tool_receipts']))
+                receipt_path.chmod(0o600)
+                fixture_behavior['jobs'] = [{'id': 'fixture-running-job', 'owner': latest['dsh_execution']['session_id'], 'status': 'running'}]
+                await receive(adapter, raw('om_window_again_active_job', '@_user_1 续预算 ' + latest['id']))
+                assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                fixture_behavior.pop('jobs')
+                await receive(adapter, raw('om_window_again_prepare', '@_user_1 续预算 ' + latest['id']))
+                latest = record()
+                checkpoint = latest['dsh_execution'].get('renewal_window_checkpoint')
+                assert checkpoint and checkpoint['status'] == 'prepared', latest['dsh_execution']
+                assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                assert Path(checkpoint['ledger_backup']).read_bytes() == budget_before
+                assert checkpoint['previous_renew_window'] == json.loads(budget_before)['renewWindow']
+                await receive(adapter, raw('om_window_again_prepare', '@_user_1 续预算 ' + latest['id']))
+                assert budget_file.read_bytes() == budget_before and len(peer['prompts']) == 1
+                host_processes[0].terminate()
+                assert host_processes[0].wait(timeout=5) == -15
+                host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                updated = json.loads(receipt.read_text())
+                updated.update(lease='fixture-renewed-again-lease', pid=host_processes[-1].pid)
+                receipt.write_text(json.dumps(updated))
+                renewed_scope = json.loads(reference.read_text())
+                renewed_scope['host_lease'] = updated['lease']
+                reference.write_text(json.dumps(renewed_scope))
+                rows = peer['journals'][latest['dsh_execution']['session_id']]
+                rows.append({'type': 'event', 'event': {'type': 'session/end-seed', 'seq': len(rows), 'time': 5, 'data': {}}})
+                fixture_behavior['header_defaults'] = {'delegationDepth': 0}
+                next(row for row in peer['sessions'] if row['sessionId'] == latest['dsh_execution']['session_id'])['agentAvailable'] = False
+                await receive(adapter, raw('om_window_again_admit', '@_user_1 续预算 ' + latest['id']))
+                latest = record()
+                control = latest['dsh_execution']['continuation_control']
+                assert control['kind'] == 'renew_window' and control['status'] == 'admitted', latest['dsh_execution']
+                granted = json.loads(budget_file.read_text())
+                old = json.loads(budget_before)
+                assert granted['renewWindow']['request_base'] == 17
+                assert granted['renewWindow']['original_state'] == old['state']
+                assert granted['renewWindow']['started_at_ms'] is None
+                assert granted['renewWindow']['host_lease'] == granted['host_lease'] == updated['lease']
+                assert granted['renewWindow']['original_host_lease'] == latest['dsh_execution']['renewal_window_history'][-1]['renew_window']['host_lease']
+                assert {key: value for key, value in granted['state'].items() if key != 'binding_sha256'} == {
+                    key: value for key, value in old['state'].items() if key != 'binding_sha256'}
+                await receive(adapter, raw('om_window_again_admit', '@_user_1 续预算 ' + latest['id']))
+                assert len(peer['prompts']) == 1
+                model.worker_steps = 0
+                with connect_closing() as db:
+                    assert dispatch_once(db, max_spawn=1).spawned
+                    worker = remember_worker(db, initial['card_id'])
+                renewal_admitted = True
+                continue
+            if renew_window_again and renewal_admitted and len(peer['prompts']) == 2 and not renewal_ended:
+                latest = record()
+                budget = json.loads(budget_file.read_text())
+                assert budget['renewWindow']['started_at_ms'] is not None and budget['renewWindow']['request_base'] == 17
+                assert budget['state']['requests'] == 18 and budget['renewWindow']['hook_marker'] == 'same-sid-window-v1'
+                sid = latest['dsh_execution']['session_id']
+                rows = peer['journals'][sid]
+                rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 6,
+                    'data': {'turn': 2, 'reason': {'kind': 'error', 'error': {'code': 'UNKNOWN', 'message': 'Synthetic renewed terminal.'}}}}})
+                next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
+                renewal_ended = True
+            if renew_window_again and renewal_ended and card['status'] in {'blocked', 'triage'}:
+                assert latest['dsh_execution']['state'] == 'execution_failed', latest['dsh_execution']
+                while True:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        break
+                    await asyncio.sleep(.05)
+                worker = None
+                assert len(peer['prompts']) == 2
                 break
             if resume_completed_window and ended and not resume_admitted and card['status'] in {'blocked', 'triage'}:
                 assert latest['dsh_execution']['state'] == 'awaiting_acceptance', latest['dsh_execution']
@@ -962,7 +1073,7 @@ async def main():
             await asyncio.sleep(.05)
         else:
             raise AssertionError('Original public shared worker did not settle: ' + json.dumps(record()))
-        assert len(peer['prompts']) == (4 if renew_continue else 3 if max_tokens_continuation else 2 if shared_scenario in continuation_scenarios or resume_completed_window else 1)
+        assert len(peer['prompts']) == (4 if renew_continue else 3 if max_tokens_continuation else 2 if shared_scenario in continuation_scenarios or completed_renewed_window else 1)
         assert latest['dsh_execution']['native_identity']['kind'] == 'shared_native'
         assert latest['dsh_execution']['native_identity']['pid'] == (host_processes[-1].pid if host_processes else os.getpid())
         assert latest['dsh_execution']['native_permission'] == 'workspace-write'

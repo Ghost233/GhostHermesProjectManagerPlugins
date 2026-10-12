@@ -380,6 +380,7 @@ async def process_control(intake, prepared, generation):
             elif duplicate and (prepared.command.startswith(('重试 ', '继续 ', '续预算 ')) or execution.get('state') == 'stopped'):
                 field = ('continuation_control' if execution.get('continuation_control', {}).get('message_id') == message_id
                     else 'window_resume_checkpoint' if execution.get('window_resume_checkpoint', {}).get('message_id') == message_id
+                    else 'renewal_window_checkpoint' if execution.get('renewal_window_checkpoint', {}).get('message_id') == message_id
                     else 'renew_window_checkpoint' if prepared.command.startswith('续预算 ') else 'maintenance_checkpoint') if prepared.command.startswith(('继续 ', '续预算 ')) else 'retry_control' if prepared.command.startswith('重试 ') else 'stop_control'
                 saved = execution.get(field, {})
                 text = '这条控制消息已登记；不会重送操作或新增预算。原结果仍按记录核对，未受理或未知时请用新的消息明确请求。'
@@ -388,15 +389,27 @@ async def process_control(intake, prepared, generation):
                 if saved.get('message_id') == message_id and 'dispatch_status' in saved:
                     result['dispatch_status'] = saved['dispatch_status']
             elif prepared.command.startswith('续预算 '):
-                from .shared_repository import prepare_shared_window, admit_shared_window
-                if execution.get('renew_window_checkpoint'):
-                    record = await asyncio.to_thread(admit_shared_window, intake, record, message_id, generation)
-                    text = '原 SID 新有限窗口已受理；旧窗口与累计用量完整保留，实际请求前才开始新窗口，等待原生派发。'
+                if execution.get('renewal_window_checkpoint'):
+                    from .shared_repository import admit_shared_window_renewal
+                    record = await asyncio.to_thread(admit_shared_window_renewal, intake, record, message_id, generation)
+                    text = '原 SID 新有限窗口已受理；旧窗口完整备份保留，实际请求前才开始新窗口，等待原生派发。'
                     result = {'status': 'admitted', 'work_id': record['id']}
-                else:
-                    record = await asyncio.to_thread(prepare_shared_window, intake, record, message_id)
-                    text = '续预算准备已保存；未新增输入或启动窗口。正常维护后须再次明确续预算，原 SID、任务与旧窗口完整保留。'
+                elif (execution.get('state') == 'awaiting_acceptance'
+                        and execution.get('terminal_reason', {}).get('kind') == 'completed'):
+                    from .shared_repository import prepare_shared_window_renewal
+                    record = await asyncio.to_thread(prepare_shared_window_renewal, intake, record, message_id)
+                    text = '原到期窗口续预算准备已保存；未新增输入、预算或期限。正常维护后须再次明确续预算，原 SID 与旧窗口完整保留。'
                     result = {'status': 'prepared', 'work_id': record['id']}
+                else:
+                    from .shared_repository import prepare_shared_window, admit_shared_window
+                    if execution.get('renew_window_checkpoint'):
+                        record = await asyncio.to_thread(admit_shared_window, intake, record, message_id, generation)
+                        text = '原 SID 新有限窗口已受理；旧窗口与累计用量完整保留，实际请求前才开始新窗口，等待原生派发。'
+                        result = {'status': 'admitted', 'work_id': record['id']}
+                    else:
+                        record = await asyncio.to_thread(prepare_shared_window, intake, record, message_id)
+                        text = '续预算准备已保存；未新增输入或启动窗口。正常维护后须再次明确续预算，原 SID、任务与旧窗口完整保留。'
+                        result = {'status': 'prepared', 'work_id': record['id']}
             elif prepared.command.startswith('重试 '):
                 record = await _retry(intake, record, prepared, generation)
                 text = '已受理独立新一轮执行；沿用原总 Issue 和外层卡，旧会话、预算与失败记录完整保留，等待原生派发。'
