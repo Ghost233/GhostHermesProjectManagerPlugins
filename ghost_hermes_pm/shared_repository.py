@@ -853,6 +853,63 @@ def admit_shared_natural_qa_rework(intake, record, source_context, feedback, win
         os.close(descriptor)
 
 
+def _refresh_qa_desktop_lease(intake, record, source_context, feedback):
+    """Refresh only the Launcher lease after the verified maintenance reply."""
+    import psutil
+    execution = record['dsh_execution']
+    control = execution.get('natural_qa_rework_control', {})
+    checkpoint = execution.get('renewal_window_checkpoint', {})
+    delivery = control.get('proposal_delivery', {})
+    if (feedback != '维护完成' or checkpoint.get('status') != 'prepared'
+            or checkpoint != control.get('checkpoint') or delivery.get('status') != 'delivered'
+            or source_context.get('reply_to_message_id') != delivery.get('message_id')
+            or any(source_context.get(key) != delivery.get(key) for key in ('chat_id', 'profile_id'))):
+        raise ManagementError('binding_conflict', 'The maintenance reply does not match the original delivered proposal.')
+    reference = private_file(record['target']['execution_ref'])
+    raw = reference.read_bytes()
+    scope = json.loads(raw)
+    original_scope = checkpoint.get('scope', {})
+    if (hashlib.sha256(raw).hexdigest() != execution.get('reference_sha256')
+            or scope != dict(original_scope, host_lease=scope.get('host_lease'))):
+        raise ManagementError('binding_conflict', 'The original maintenance configuration changed.')
+    receipt = json.loads(private_file(scope['desktop_receipt']).read_text())
+    lease = receipt.get('lease')
+    if lease == original_scope.get('host_lease') and scope == original_scope:
+        return
+    identity, _, _ = desktop_identity(scope['desktop_receipt'], lease)
+    old = checkpoint['native_identity']
+    if (any(identity.get(key) == old.get(key) for key in ('lease', 'pid', 'created_at'))
+            or psutil.pid_exists(old['pid']) and psutil.Process(old['pid']).create_time() == old['created_at']):
+        raise ManagementError('binding_conflict', 'Normal maintenance of the original Desktop is unverified.')
+    if lease == scope['host_lease']:
+        saved = control.get('desktop_reference_backup', {})
+        preserved = private_file(saved['path']).read_bytes() if saved.get('path') else b''
+        if (hashlib.sha256(preserved).hexdigest() != saved.get('sha256')
+                or json.loads(preserved) != original_scope):
+            raise ManagementError('binding_conflict', 'The original maintenance configuration backup is unverified.')
+        return
+    updated = {**scope, 'host_lease': lease}
+    shared_configuration(reference, updated, workspace=record['target']['repo_path'])
+    backup = reference.with_name(reference.name + '.before-maintenance-' + hashlib.sha256(raw).hexdigest())
+    if not backup.exists():
+        with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+    if private_file(backup).read_bytes() != raw or reference.read_bytes() != raw:
+        raise ManagementError('binding_conflict', 'The original maintenance configuration backup differs.')
+    content = (json.dumps(updated, indent=2) + '\n').encode()
+    temporary = reference.with_name(reference.name + '.' + uuid.uuid4().hex)
+    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, reference)
+    execution['reference_sha256'] = hashlib.sha256(content).hexdigest()
+    control['desktop_reference_backup'] = {'path': str(backup), 'sha256': hashlib.sha256(raw).hexdigest()}
+    intake._save_execution(record, fields=['reference_sha256', 'natural_qa_rework_control'])
+
+
 def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedback, window, generation):
     """Queue bounded browser acceptance feedback from the public NATURAL-QA-INTAKE tool."""
     import psutil
@@ -899,6 +956,8 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     if card['status'] not in {'blocked', 'triage'} or card.get('current_run_id') is not None or card.get('worker_pid') is not None:
         raise ManagementError('outcome_unknown', 'The browser acceptance rework card is not idle.')
     worker = _worker_end(intake, record)
+    if prior_natural.get('status') == 'maintenance_required' and feedback == '维护完成':
+        _refresh_qa_desktop_lease(intake, record, source_context, feedback)
     configuration, _ = execution_configuration(record['target'])
     if configuration['reference_sha256'] != execution.get('reference_sha256'):
         raise ManagementError('binding_conflict', 'The original shared execution reference changed.')

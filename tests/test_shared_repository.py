@@ -156,10 +156,18 @@ def _natural_qa_fixture(tmp_path, monkeypatch, *, expired=False, foreign_host=Fa
         'generation': generation, 'workspace_id': 'workspace-fixture', 'agent_preset': 'fixture-shared',
         'host_lease': 'lease-fixture', 'ledger_dir': str(ledger_dir),
         'budget': {'max_wall_seconds': 1800, 'max_model_requests': 80}}
+    desktop_receipt = tmp_path / 'desktop-receipt'
+    desktop_receipt.write_text(json.dumps({'lease': 'lease-fixture'}))
+    desktop_receipt.chmod(0o600)
+    config['desktop_receipt'] = str(desktop_receipt)
     intake.config = config
     reference_file.write_text(json.dumps(config))
+    record['dsh_execution']['reference_sha256'] = hashlib.sha256(reference_file.read_bytes()).hexdigest()
+    config['reference_sha256'] = record['dsh_execution']['reference_sha256']
     monkeypatch.setattr(shared_repository, 'shared_configuration', lambda _reference, _configuration, workspace=None: config)
-    monkeypatch.setattr(repository_execution, 'execution_configuration', lambda _target: (config, {}))
+    monkeypatch.setattr(repository_execution, 'execution_configuration', lambda _target: (
+        {**config, 'reference_sha256': hashlib.sha256(reference_file.read_bytes()).hexdigest()}, {}))
+    monkeypatch.setattr(shared_repository, 'desktop_identity', lambda *_args: (carrier.native_identity, 'fixture-endpoint', 'fixture-login'))
     monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda _target: source)
     monkeypatch.setattr(shared_repository, 'shared_receipts', lambda *_args: [{'source_before': baseline,
         'source_after': source, 'generation': generation, 'session_id': sid, 'name': 'bash',
@@ -278,6 +286,7 @@ def test_natural_qa_rework_expired_window_renews_once_and_keeps_sealed_usage(tmp
     record_shared_natural_qa_proposal(intake, record, prepared['proposal']['id'],
         {'status': 'delivered', 'message_id': 'proposal-maintenance', 'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
     carrier.native_identity = {'kind': 'shared_native', 'lease': 'lease-new', 'pid': 14, 'created_at': 2}
+    Path(intake.config['desktop_receipt']).write_text(json.dumps({'lease': 'lease-new'}))
     context = {**context, 'message_id': 'natural-qa-message-adopt', 'reply_to_message_id': 'proposal-maintenance'}
     intake.config['host_lease'] = 'lease-new'
     result = admit_shared_natural_qa_rework(intake, record, context, '维护完成', None, intake.generation)
@@ -301,6 +310,77 @@ def test_natural_qa_rework_expired_window_renews_once_and_keeps_sealed_usage(tmp
         'prior_window_id': 'old-window'}
     assert len(carrier.prompts) == 0 and record['dsh_execution']['state'] == 'continuation_pending'
     assert record['dsh_execution']['continuation_control']['kind'] == 'qa_rework'
+
+
+@pytest.mark.parametrize('change', [None, 'wrong_parent', 'wrong_profile', 'scope_changed', 'old_instance_live', 'admission_retry'])
+def test_natural_qa_maintenance_reply_refreshes_only_the_original_desktop_lease(tmp_path, monkeypatch, change):
+    from ghost_hermes_pm import shared_repository, repository_execution
+    record, context, intake, carrier, ledger_file, _source, _request = _natural_qa_fixture(tmp_path, monkeypatch, expired=True)
+    reference = Path(record['target']['execution_ref'])
+    receipt = tmp_path / 'desktop-receipt.json'
+    receipt.write_text(json.dumps({'lease': 'lease-fixture'}))
+    receipt.chmod(0o600)
+    scope = json.loads(reference.read_text())
+    scope['desktop_receipt'] = str(receipt)
+    reference.write_text(json.dumps(scope))
+    record['dsh_execution']['reference_sha256'] = hashlib.sha256(reference.read_bytes()).hexdigest()
+
+    def configuration(path, value, **_kwargs):
+        if value['host_lease'] != json.loads(receipt.read_text())['lease']:
+            raise ManagementError('binding_conflict', 'Original Desktop lease differs.')
+        return {**value, 'reference_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    monkeypatch.setattr(shared_repository, 'shared_configuration', configuration)
+    monkeypatch.setattr(repository_execution, 'execution_configuration', lambda _target:
+        (configuration(reference, json.loads(reference.read_text())), {}))
+    proposal = shared_repository.admit_shared_natural_qa_rework(intake, record, context, 'Repair synthetic QA.', None, intake.generation)
+    shared_repository.record_shared_natural_qa_proposal(intake, record, proposal['proposal']['id'],
+        {'status': 'delivered', 'message_id': 'proposal-window', 'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
+    context = {**context, 'message_id': 'confirm-window', 'reply_to_message_id': 'proposal-window'}
+    prepared = shared_repository.admit_shared_natural_qa_rework(intake, record, context, '同意', None, intake.generation)
+    shared_repository.record_shared_natural_qa_proposal(intake, record, prepared['proposal']['id'],
+        {'status': 'delivered', 'message_id': 'proposal-maintenance', 'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
+    before = reference.read_bytes()
+    receipt.write_text(json.dumps({'lease': 'lease-new'}))
+    carrier.native_identity = {'kind': 'shared_native', 'lease': 'lease-new', 'pid': 14, 'created_at': 2}
+    monkeypatch.setattr(shared_repository, 'desktop_identity', lambda *_args: (carrier.native_identity, 'fixture-endpoint', 'fixture-login'))
+    import psutil
+    monkeypatch.setattr(psutil, 'pid_exists', lambda _pid: False)
+    context = {**context, 'message_id': 'confirm-maintenance', 'reply_to_message_id': 'proposal-maintenance'}
+    if change == 'wrong_parent':
+        context['reply_to_message_id'] = 'unrelated-proposal'
+    elif change == 'wrong_profile':
+        context['profile_id'] = 'unrelated-profile'
+    elif change == 'scope_changed':
+        reference.write_text(json.dumps({**json.loads(before), 'model': 'other-model'}))
+    elif change == 'old_instance_live':
+        monkeypatch.setattr(psutil, 'pid_exists', lambda _pid: True)
+        monkeypatch.setattr(psutil, 'Process', lambda _pid: SimpleNamespace(create_time=lambda: 1))
+    if change and change != 'admission_retry':
+        reference_before, ledger_before = reference.read_bytes(), ledger_file.read_bytes()
+        with pytest.raises(ManagementError):
+            shared_repository.admit_shared_natural_qa_rework(intake, record, context, '维护完成', None, intake.generation)
+        assert reference.read_bytes() == reference_before and ledger_file.read_bytes() == ledger_before
+        assert not carrier.prompts
+        return
+    if change == 'admission_retry':
+        from ghost_hermes_pm import repository_acceptance
+        original_source = repository_acceptance.repository_source_state
+        monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda _target:
+            (_ for _ in ()).throw(ManagementError('outcome_unknown', 'Synthetic temporary admission failure.')))
+        with pytest.raises(ManagementError):
+            shared_repository.admit_shared_natural_qa_rework(intake, record, context, '维护完成', None, intake.generation)
+        assert json.loads(reference.read_text())['host_lease'] == 'lease-new'
+        assert json.loads(ledger_file.read_text())['state']['requests'] == 2 and not carrier.prompts
+        monkeypatch.setattr(repository_acceptance, 'repository_source_state', original_source)
+        context = {**context, 'message_id': 'retry-confirm-maintenance'}
+    result = shared_repository.admit_shared_natural_qa_rework(intake, record, context, '维护完成', None, intake.generation)
+    assert result['status'] == 'accepted'
+    assert json.loads(reference.read_text()) == {**json.loads(before), 'host_lease': 'lease-new'}
+    assert record['dsh_execution']['reference_sha256'] == hashlib.sha256(reference.read_bytes()).hexdigest()
+    backup = reference.with_name(reference.name + '.before-maintenance-' + hashlib.sha256(before).hexdigest())
+    assert backup.read_bytes() == before
+    assert json.loads(ledger_file.read_text())['state']['requests'] == 2 and not carrier.prompts
 
 
 def test_natural_qa_rework_expired_window_requires_maintenance_without_side_effects(tmp_path, monkeypatch):
