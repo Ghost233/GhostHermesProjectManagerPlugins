@@ -327,14 +327,21 @@ async def observe_human_requests(intake):
                             execution['session_id'], record['target']['repo_path'])
                         await observe_questions(intake, record, carrier, events, projections, intake.generation)
                         await observe_approvals(intake, record, carrier, events, projections, intake.generation)
-                    except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES):
+                    except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES) as error:
                         if carrier is not None:
                             carrier.close()
                         if execution.get('mode') == 'shared_native':
                             from .shared_repository import retire_shared
+                            from .manager import _public_text
                             retire_shared(intake, record['id'])
+                            message = str(error) if isinstance(error, ManagementError) else type(error).__name__
+                            try:
+                                _public_text(message, intake.secret_values)
+                            except ManagementError:
+                                message = 'Original observer failure details remain private.'
                             execution['shared_event_observer'] = {'status': 'unavailable',
-                                'session_id': execution['session_id'], 'generation': execution['generation']}
+                                'session_id': execution['session_id'], 'generation': execution['generation'],
+                                'code': getattr(error, 'code', 'outcome_unknown'), 'message': message}
                             intake._save_execution(record, fields=['shared_event_observer'])
                         carriers.pop(record['id'], None)
             await asyncio.sleep(.25)
