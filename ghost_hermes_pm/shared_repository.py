@@ -775,7 +775,7 @@ def _validate_renew_window(window):
         raise ManagementError('binding_conflict', 'The sealed historical unknown-usage boundary is malformed.')
 
 
-def _qa_rework_prompt(intake, record, feedback):
+def _qa_rework_prompt(intake, record, feedback, *, test_files=None):
     acceptance = record['dsh_execution'].get('acceptance', {})
     unmet = '、'.join(acceptance.get('unmet', [])) or '当前 QA 证据'
     return ('This is browser acceptance rework for the same original work in this existing Session. '
@@ -785,7 +785,7 @@ def _qa_rework_prompt(intake, record, feedback):
             'request a new budget, or merge any PR. Use this same repository and finite renewal window. '
             'Run the actual tests through the original native bash tool. Emit one corrected delivery JSON with '
             'actual native bash call IDs, including source_commit, issue_updated_at, criteria [{text,test_call_ids}], '
-            'test_files, fine_issue_urls, pr_url, sync_branches, and leftovers.\n\n' + _prompt(intake, record))
+            'test_files, fine_issue_urls, pr_url, sync_branches, and leftovers.\n\n' + _prompt(intake, record, test_files=test_files))
 
 
 def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=(), *, job_receipts=()):
@@ -1259,8 +1259,6 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
             raise ManagementError('invalid_change', 'Natural QA renewal must use the configured finite window exactly.')
         _require_expired_window_budget(ledger_configuration, budget)
         renewal_required = prior_natural.get('status') not in {'renewal_required', 'maintenance_required'}
-    prompt_feedback = execution.get('natural_qa_rework_control', {}).get('feedback') if adopting else feedback
-    prompt = _qa_rework_prompt(intake, record, prompt_feedback.strip())
     request_id = 'qa-rework-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest()
     carrier = SharedDesktopTransport(configuration)
     control = None
@@ -2734,7 +2732,7 @@ def prepare_shared_verification(intake, record, configuration):
         '--node', verification['node'], '--binding', execution['session_id'], execution['generation'], work['nonce'], '--'])
 
 
-def _prompt(intake, record):
+def _prompt(intake, record, *, test_files=None):
     from .delivery import acceptance_criteria
     from .repository_execution import execution_configuration
     execution = record['dsh_execution']
@@ -2748,6 +2746,7 @@ def _prompt(intake, record):
         active_budget = _active_budget_snapshot(configuration, read_ledger(configuration, execution))
         budget_declaration = 'Current authoritative budget from the original ledger: ' + json.dumps(active_budget) + '. '
     evidence = {key: execution.get('acceptance', {}).get(key, []) for key in ('eligible_test_calls', 'test_files')}
+    evidence['test_files'] = execution.get('acceptance', {}).get('test_files', test_files if test_files is not None else [])
     canonical = None
     if evidence['test_files']:
         try:
@@ -2949,7 +2948,7 @@ async def run_shared_work(ctx, intake, record, generation):
     from .repository_execution import execution_configuration
     from .repository_supervision import current_worker, native_call, owned_call, original_history, execution_event_references
     from .trusted_controller import controller_identity
-    from .repository_acceptance import repository_source_state, accept_repository_work, finish_delivery_range
+    from .repository_acceptance import repository_source_state, accept_repository_work, finish_delivery_range, _report
     from hermes_cli import kanban_db as kb
     run_id = current_worker(ctx, intake, record)
     configuration, _ = execution_configuration(record['target'])
@@ -3205,9 +3204,9 @@ async def run_shared_work(ctx, intake, record, generation):
                 prompt = ('Continue the original accepted task in this Session after ' + reason + '. Keep the original scope, frozen Issue, rules and remaining '
                     'budget. Resume that task in this original Session.\n\n' + _prompt(intake, record))
                 if continuation.get('kind') == 'qa_rework':
-                    prompt = ('Perform the browser acceptance rework using only the persisted owner feedback. '
-                        'Preserve the frozen Issue and run actual tests, then report actual native bash call IDs. '
-                        'Do not merge any PR.\n\n' + continuation.get('qa_feedback', '') + '\n\n' + _prompt(intake, record))
+                    original_report = _report([row['event'] for row in snapshot.get('records', [])]) or {}
+                    prompt = _qa_rework_prompt(intake, record, continuation.get('qa_feedback', ''),
+                        test_files=original_report.get('test_files'))
                     if ('取消30分钟截止，保留80次请求' in continuation.get('qa_feedback', '')
                             and 'max_wall_seconds' not in configuration['budget']):
                         row = read_ledger(configuration, execution)

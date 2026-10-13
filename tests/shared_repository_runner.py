@@ -1084,6 +1084,10 @@ async def main():
                         break
                     await asyncio.sleep(.05)
                 assert worker is None, 'The original QA delivery worker did not exit.'
+                legacy = record()
+                for field in ('eligible_test_calls', 'test_files'):
+                    legacy['dsh_execution']['acceptance'].pop(field, None)
+                adapter.intake._save_execution(legacy, fields=['acceptance'])
                 if qa_request_only_resume:
                     prior_qa = record()
                     prior_qa['dsh_execution'].update(renewal_window_adoption='accepted',
@@ -1242,6 +1246,12 @@ async def main():
                 assert peer['prompts'][1]['sessionId'] == peer['prompts'][0]['sessionId'] == sid
                 assert peer['prompts'][1]['requestId'] == request_id
                 assert feedback in peer['prompts'][1]['content'][0]['text']
+                shared_module = importlib.import_module(package + '.shared_repository')
+                execution_module = importlib.import_module(package + '.repository_execution')
+                actual_configuration, _ = execution_module.execution_configuration(initial['target'])
+                canonical = shared_module.verification_command(actual_configuration, current, str(repo), ['qa.test.mjs'])
+                assert 'Complete canonical trusted test command for the declared test files: ' + canonical in peer['prompts'][1]['content'][0]['text']
+                assert '"eligible_test_calls": []' in peer['prompts'][1]['content'][0]['text']
                 if qa_request_only_resume:
                     actual_prompt = peer['prompts'][1]['content'][0]['text']
                     assert 'no plugin wall deadline' in actual_prompt and '79 model requests remain' in actual_prompt

@@ -162,7 +162,7 @@ def test_shared_prompt_uses_current_ledger_and_verified_test_mapping(tmp_path, m
         'exit_code': 0, 'generation': execution['generation'], 'session_id': execution['session_id'],
         'source_after': {'source_digest': execution['acceptance']['source_digest']}}]
     before = ledger_file.read_bytes()
-    prompt = _prompt(intake, record)
+    prompt = _prompt(intake, record, test_files=['../foreign.test.mjs'])
     declaration = json.JSONDecoder().raw_decode(prompt.split('original ledger: ', 1)[1])[0]
     assert declaration == {'limits': {'max_model_requests': 40}, 'request_base': 1, 'requests_total': 5,
         'requests_used': 4, 'requests_remaining': 36, 'wall_seconds_remaining': None}
@@ -189,6 +189,38 @@ def test_shared_prompt_without_ledger_never_claims_usage_or_adds_a_grant(tmp_pat
         assert 'usage is uninitialized' in prompt and 'requests_used' not in prompt
         assert 'Current authoritative budget from the original ledger' not in prompt
     assert not ledger_file.exists() and not intake.saved
+
+
+@pytest.mark.parametrize('valid_files', [True, False])
+def test_natural_qa_legacy_report_supplies_canonical_files_without_changing_acceptance(tmp_path, monkeypatch, valid_files):
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework, verification_command, _qa_rework_prompt
+    record, context, intake, carrier, ledger_file, _source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    paths = {'python': str(Path(sys.executable).resolve()), 'node': str(Path(shutil.which('node')).resolve()),
+        'runner': str(Path(__file__).resolve().parents[1] / 'ghost_hermes_pm/repository_test_runner.py')}
+    intake.config['verification'] = {**paths, **{key + '_sha256': hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for key, path in paths.items()}}
+    record['dsh_execution']['verification'] = {'artifact_root': str(tmp_path / 'artifacts'), 'nonce': 'synthetic-nonce'}
+    test_files = ['synthetic.test.mjs'] if valid_files else ['../foreign.test.mjs']
+    (Path(record['target']['repo_path']) / test_files[0]).write_text('import test from "node:test";\n')
+    snapshot = next(carrier.stream('session/follow', {}))
+    message = next(row['event']['data']['message'] for row in snapshot['records']
+        if row['event']['type'] == 'assistant/message')
+    report = json.loads(message['content'][0]['text'].split('HERMES_REPOSITORY_DELIVERY_JSON ', 1)[1])
+    report['test_files'] = test_files
+    message['content'][0]['text'] = 'HERMES_REPOSITORY_DELIVERY_JSON ' + json.dumps(report)
+    before_acceptance, before_budget = deepcopy(record['dsh_execution']['acceptance']), ledger_file.read_bytes()
+    result = admit_shared_natural_qa_rework(intake, record, context, 'Fix only the synthetic test evidence.', None, intake.generation)
+    assert result['status'] == 'accepted'
+    prompt = _qa_rework_prompt(intake, record, 'Fix only the synthetic test evidence.', test_files=report['test_files'])
+    if valid_files:
+        canonical = verification_command(intake.config, record['dsh_execution'], record['target']['repo_path'], test_files)
+        assert 'Complete canonical trusted test command for the declared test files: ' + canonical in prompt
+    else:
+        assert 'Complete canonical trusted test command for the declared test files:' not in prompt
+    assert '"eligible_test_calls": []' in prompt
+    assert record['dsh_execution']['acceptance'] == before_acceptance
+    assert ledger_file.read_bytes() == before_budget
+    assert not carrier.prompts
 
 
 def _natural_qa_fixture(tmp_path, monkeypatch, *, expired=False, foreign_host=False):
