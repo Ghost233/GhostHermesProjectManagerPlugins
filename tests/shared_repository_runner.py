@@ -22,7 +22,8 @@ supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover
 background_ended_worker = shared_scenario == 'background_cleanup_ended_worker'
 background_secret = shared_scenario == 'background_cleanup_secret_stop'
 background_unknown = shared_scenario == 'background_cleanup_unknown_stop' or background_secret
-background_cleanup = shared_scenario == 'background_cleanup' or background_ended_worker or background_unknown
+background_foreign_notice = shared_scenario == 'background_cleanup_foreign_notice'
+background_cleanup = shared_scenario == 'background_cleanup' or background_ended_worker or background_unknown or background_foreign_notice
 supervision_checkpoints = shared_scenario == 'supervision_checkpoints' or background_cleanup
 expired_window = shared_scenario == 'supervise_expired_window'
 if expired_window:
@@ -109,7 +110,31 @@ if background_cleanup:
                     settled = dict(behavior['registered_preview'], type='settled', status='killed', cause='cancelled', awaited=True)
                     with behavior['job_receipts'].open('a') as output:
                         output.write(json.dumps(settled) + '\\n')
+                    budget_row = json.loads(behavior['budget_path'].read_text())
+                    budget_row['state']['observed_at_ms'] = int(time.time() * 1000)
+                    behavior['budget_path'].write_text(json.dumps(budget_row))
+                    notice = {'id': 'fixture-native-job-notice', 'role': 'user', 'content': [],
+                        'source': {'kind': 'tool-jobs', 'form': 'notice', 'summary': 'Synthetic preview job finished.'}}
+                    inserted = [notice]
+                    if behavior.get('foreign_job_notice'):
+                        inserted.append({'id': 'fixture-foreign-input', 'role': 'user', 'content': [],
+                            'source': {'kind': 'user', 'rpcId': 'foreign-input'}})
+                    behavior['inbox'] = {'next-turn': [], 'next-step': inserted}
+                    journal = state['journals'][job_request['sessionId']]
+                    journal.append({'type': 'event', 'event': {'type': 'agent/inbox/spliced', 'seq': len(journal),
+                        'time': 6, 'data': {'target': 'next-step', 'start': 0, 'inserted': json.loads(json.dumps(inserted))}}})
                     value = {'outcome': 'requested'}
+            elif method == 'session/updateQueue':
+                removal = args['request']
+                assert removal['sessionId'] == behavior['jobs'][0]['owner'] and removal['action'] == {'kind': 'remove'}
+                queued = behavior['inbox']['next-step']
+                assert removal['itemId'] == 'fixture-native-job-notice'
+                index = next(index for index, item in enumerate(queued) if item['id'] == removal['itemId'])
+                del queued[index]
+                journal = state['journals'][removal['sessionId']]
+                journal.append({'type': 'event', 'event': {'type': 'agent/inbox/spliced', 'seq': len(journal),
+                    'time': 7, 'data': {'target': 'next-step', 'start': index, 'removedCount': 1, 'inserted': []}}})
+                value = {'accepted': True}
             elif method == 'commands/list':""", 1)
 service_source = service_source.replace("state['prompts'].append(args['request'])", """state['prompts'].append(args['request'])
                 behavior['inbox'] = {'next-turn': [], 'next-step': []}
@@ -340,6 +365,8 @@ async def main():
             row['state'].update(started_at_ms=row['state']['started_at_ms'] or int(time.time() * 1000) - 1100,
                 requests=requests, reported_tokens=requests * 20,
                 admissions=['fixture-checkpoint-request-' + str(index) for index in range(requests)])
+            if background_cleanup:
+                row['state'].setdefault('observed_at_ms', row['state']['started_at_ms'])
             binding = {key: row[key] for key in ('schema', 'service_ref', 'host_lease', 'agent_preset',
                 'session_id', 'session_created_at', 'generation', 'workspace', 'provider', 'model', 'budget')}
             row['state']['binding_sha256'] = hashlib.sha256(json.dumps(binding,
@@ -477,6 +504,7 @@ async def main():
                     job_receipts.write_text(json.dumps(registered) + '\n')
                     job_receipts.chmod(0o600)
                     fixture_behavior.update(registered_preview=registered, job_receipts=job_receipts)
+                    fixture_behavior.update(budget_path=checkpoint_ledger, foreign_job_notice=background_foreign_notice)
                     fixture_behavior['unknown_background_cleanup'] = background_unknown
                     source = record()['dsh_execution']['baseline']
                     import importlib
@@ -635,7 +663,7 @@ async def main():
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
             latest = record()
-            if background_cleanup:
+            if background_cleanup and not background_foreign_notice:
                 assert latest['dsh_execution']['state'] != 'outcome_unknown', latest['dsh_execution'].get('last_failure')
             if supervision_checkpoints:
                 checkpoint = latest['dsh_execution'].get('supervision_checkpoint', {})
@@ -670,6 +698,17 @@ async def main():
                     assert not any(call['method'] == 'job/kill' for call in peer['calls'])
                     await receive(adapter, raw('om_end_preview', '@_user_1 结束后台 ' + latest['id']))
                     cleanup = record()['dsh_execution']
+                    if background_foreign_notice:
+                        assert cleanup['stop_control']['status'] == 'unverified'
+                        assert cleanup['stop_control']['job_cancel'] == {'fixture-preview': 'accepted'}
+                        assert len([call for call in peer['calls'] if call['method'] == 'job/kill']) == 1
+                        assert not any(call['method'] == 'session/updateQueue' for call in peer['calls'])
+                        assert [item['id'] for item in fixture_behavior['inbox']['next-step']] == [
+                            'fixture-native-job-notice', 'fixture-foreign-input']
+                        assert len(peer['prompts']) == 1
+                        checkpoint_evidence = {'mixed_notice_preserved': True, 'foreign_input_rejected': True,
+                            'input_count': 1, 'job_kill_count': 1}
+                        break
                     if background_unknown:
                         assert cleanup['stop_control']['status'] == 'unverified'
                         assert cleanup['stop_control']['job_cancel'] == {'fixture-preview': 'intent'}
@@ -701,7 +740,16 @@ async def main():
                     assert cleanup.get('stop_control', {}).get('status') == 'background_ended', cleanup.get('last_failure')
                     await receive(adapter, raw('om_end_preview', '@_user_1 结束后台 ' + latest['id']))
                     assert len([call for call in peer['calls'] if call['method'] == 'job/kill']) == 1
-                    assert len(peer['prompts']) == 1 and checkpoint_ledger.read_bytes() == checkpoint_first_budget
+                    assert len(peer['prompts']) == 1
+                    after_jobs = json.loads(checkpoint_ledger.read_text())
+                    observed_at = after_jobs['state'].pop('observed_at_ms')
+                    before_jobs = json.loads(checkpoint_first_budget)
+                    assert before_jobs['state'].pop('observed_at_ms') <= observed_at <= int(time.time() * 1000)
+                    assert after_jobs == before_jobs
+                    assert len([call for call in peer['calls'] if call['method'] == 'session/updateQueue']) == 1
+                    assert fixture_behavior['inbox'] == {'next-turn': [], 'next-step': []}
+                    assert any(item.get('source', {}).get('kind') == 'tool-jobs' for row in peer['journals'][sid]
+                        if row['event']['type'] == 'agent/inbox/spliced' for item in row['event']['data'].get('inserted', []))
                     assert not record()['dsh_execution'].get('stop_requested')
                     if background_ended_worker:
                         assert cleanup['stop_control']['proof']['worker']['run_id'] == old_claim['run_id']

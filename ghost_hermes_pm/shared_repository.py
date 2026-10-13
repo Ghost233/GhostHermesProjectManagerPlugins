@@ -3304,8 +3304,6 @@ async def end_shared_background(intake, record, message_id, generation):
         worker = _worker_end(intake, record)
     carrier = shared_attach(intake, record, observe=False)
     try:
-        budget_file = ledger_path(carrier.config, execution['session_id'])
-        budget_before = private_file(budget_file).read_bytes()
         budget = read_ledger(carrier.config, execution)
         control = execution.get('stop_control', {})
         if control.get('status') == 'background_ended':
@@ -3320,19 +3318,53 @@ async def end_shared_background(intake, record, message_id, generation):
             events, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], record['target']['repo_path'])
             starts = [event for event in events if event['type'] == 'turn/start']
             ends = [event for event in events if event['type'] == 'turn/end']
+            current_budget = read_ledger(carrier.config, execution)
+            before_budget, after_budget = deepcopy(budget), deepcopy(current_budget)
+            old_observed = before_budget['state'].pop('observed_at_ms', 0)
+            new_observed = after_budget['state'].pop('observed_at_ms', 0)
             if (len(sessions) != 1 or sessions[0].get('cwd') != record['target']['repo_path']
                     or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
-                    or projections.get('inbox') != {'next-turn': [], 'next-step': []}
                     or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
                     or ends[-1]['data'].get('reason') != {'kind': 'completed'}
-                    or private_file(budget_file).read_bytes() != budget_before):
+                    or before_budget != after_budget or type(old_observed) is not int or type(new_observed) is not int
+                    or not 0 <= old_observed <= new_observed <= int(time.time() * 1000)):
                 raise ManagementError('outcome_unknown', 'The completed original foreground, input or budget changed.')
+            budget = current_budget
             jobs = await asyncio.to_thread(carrier.owned_jobs)
             receipts = shared_receipts(carrier.config, execution, '.tools.jsonl')
             background = {row.get('job_id') for row in receipts if row.get('name') == 'bash'
                 and row.get('kind') in {'background', 'promoted'} and row.get('execution_admission') == 'admitted'}
             registered = {row['job_id'] for row in shared_receipts(carrier.config, execution, '.jobs.jsonl')
                 if row['type'] == 'registered' and row.get('owner') == execution['session_id']}
+            inbox = projections.get('inbox')
+            if inbox != {'next-turn': [], 'next-step': []}:
+                if (not isinstance(inbox, dict) or set(inbox) != {'next-turn', 'next-step'}
+                        or inbox['next-turn'] != [] or not isinstance(inbox['next-step'], list) or not inbox['next-step']
+                        or not jobs or any(job['status'] not in {'completed', 'killed', 'failed'}
+                            or job['id'] not in registered or job['id'] not in background for job in jobs)
+                        or any(not isinstance(item, dict) or item.get('role') != 'user'
+                            or not isinstance(item.get('id'), str) or not item['id']
+                            or not isinstance(item.get('source'), dict)
+                            or set(item['source']) != {'kind', 'form', 'summary'}
+                            or item['source'].get('kind') != 'tool-jobs' or item['source'].get('form') != 'notice'
+                            or not isinstance(item['source'].get('summary'), str) or not item['source']['summary']
+                            for item in inbox['next-step'])):
+                    raise ManagementError('outcome_unknown', 'Foreign or unconfirmed input in the shared Session was preserved.')
+                execution['stop_control'] = control
+                for item in inbox['next-step']:
+                    removed = control.setdefault('queue_remove', {})
+                    if removed.get(item['id']) == 'intent':
+                        raise ManagementError('outcome_unknown', 'Original job notice removal is unconfirmed; no replay.')
+                    if item['id'] not in removed:
+                        removed[item['id']] = 'intent'
+                        intake._save_execution(record, fields=['stop_control'])
+                        answer = await asyncio.to_thread(owned_call, carrier, 'session/updateQueue',
+                            {'sessionId': execution['session_id'], 'itemId': item['id'], 'action': {'kind': 'remove'}})
+                        if answer.get('accepted') is not True:
+                            raise ManagementError('outcome_unknown', 'Original job notice removal admission is unknown.')
+                        removed[item['id']] = 'accepted'
+                        intake._save_execution(record, fields=['stop_control'])
+                continue
             active = [job for job in jobs if job['status'] in {'running', 'stopping'}]
             if any(job['id'] not in registered or job['id'] not in background for job in active):
                 raise ManagementError('coverage_unverified', 'An unregistered original background job was preserved.')
