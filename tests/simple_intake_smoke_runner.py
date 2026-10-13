@@ -250,7 +250,7 @@ async def main():
                   'recipient_tenant_key': 'tenant-bot', 'recipient_open_id': 'ou_lead',
                   'chat_id': 'oc_fixture', 'sender_open_id': 'ou_owner'}
         work_id = 'work-' + 'd' * 32
-        adapter.intake._save({'id': work_id, 'profile_id': 'lead', 'source_anchor': anchor,
+        adapter.intake._save({'id': work_id, 'profile_id': 'child', 'superior_profile_id': 'lead', 'source_anchor': anchor,
             'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
                 'acceptance': {'status': 'unmet', 'delivered': False}}})
         snapshots = []
@@ -360,8 +360,9 @@ async def main():
                   'chat_id': 'oc_fixture', 'sender_open_id': 'ou_owner'}
         work_id = 'work-' + 'a' * 32
 
-        def record(identifier=work_id, profile_id='lead'):
-            return {'id': identifier, 'profile_id': profile_id, 'source_anchor': dict(anchor),
+        def record(identifier=work_id, profile_id='child', superior_profile_id='lead'):
+            return {'id': identifier, 'profile_id': profile_id, 'superior_profile_id': superior_profile_id,
+                    'source_anchor': dict(anchor),
                     'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
                                       'first_input': 'accepted', 'terminal_reason': {'kind': 'completed'},
                                       'acceptance': {'status': 'unmet', 'delivered': False}}}
@@ -478,7 +479,7 @@ async def main():
                                         'work_ids': [work_id, 'work-' + 'b' * 32]}
             assert admissions == [work_id]
 
-            adapter.intake._save(record('work-' + 'f' * 32, profile_id='foreign-profile'))
+            adapter.intake._save(record('work-' + 'f' * 32, profile_id='foreign-profile', superior_profile_id='foreign-superior'))
             await receive(adapter, raw('om_foreign_profile', text='@_user_1 这个工作继续。'))
             for _ in range(100):
                 if len(tool_results) >= 10:

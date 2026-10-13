@@ -186,9 +186,12 @@ def _natural_qa_fixture(tmp_path, monkeypatch, *, expired=False, foreign_host=Fa
     return record, context, intake, carrier, ledger_file, source, request
 
 
-def test_natural_qa_rework_active_public_tool_queues_one_same_session_prompt(tmp_path, monkeypatch):
+@pytest.mark.parametrize('source_profile', ['fixture-profile', 'fixture-superior'])
+def test_natural_qa_rework_active_public_tool_queues_one_same_session_prompt(tmp_path, monkeypatch, source_profile):
     from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
     record, context, intake, carrier, ledger_file, _source, request = _natural_qa_fixture(tmp_path, monkeypatch)
+    record['superior_profile_id'] = 'fixture-superior'
+    context['profile_id'] = source_profile
     result = admit_shared_natural_qa_rework(intake, record, context, 'Fix only the missing synthetic QA receipt.', None, intake.generation)
     assert result == {'status': 'accepted', 'work_id': record['id']}
     assert len(carrier.prompts) == 0 and not request
@@ -300,7 +303,7 @@ def test_natural_qa_rework_expired_window_requires_maintenance_without_side_effe
     assert ledger_file.read_bytes() == before and not carrier.prompts
 
 
-@pytest.mark.parametrize('case', ['source', 'jobs', 'identity'])
+@pytest.mark.parametrize('case', ['source', 'jobs', 'identity', 'foreign_profile'])
 def test_natural_qa_rework_rejects_changed_active_evidence_without_side_effects(tmp_path, monkeypatch, case):
     from ghost_hermes_pm import repository_acceptance
     from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
@@ -311,8 +314,11 @@ def test_natural_qa_rework_rejects_changed_active_evidence_without_side_effects(
             lambda _target: {**source, 'source_digest': 'f' * 64})
     elif case == 'jobs':
         carrier.owned_jobs = lambda: [{'id': 'foreign-job', 'owner': 'foreign-session', 'status': 'running'}]
-    else:
+    elif case == 'identity':
         carrier.native_identity = {'kind': 'shared_native', 'lease': 'foreign-lease', 'pid': 19, 'created_at': 3}
+    else:
+        record['superior_profile_id'] = 'fixture-superior'
+        context['profile_id'] = 'foreign-profile'
     with pytest.raises(ManagementError):
         admit_shared_natural_qa_rework(intake, record, context, 'Fix synthetic evidence.', None, intake.generation)
     assert ledger_file.read_bytes() == before and not carrier.prompts and intake.card['status'] == 'blocked'

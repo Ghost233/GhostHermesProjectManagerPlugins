@@ -844,6 +844,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     from .repository_control import _card, _worker_end
     from .repository_execution import execution_configuration
     from .repository_supervision import owned_call
+    from .simple_development import _qa_profile_matches
     execution = record['dsh_execution']
     allowed_context = {'app_id', 'transport_tenant_key', 'tenant_key', 'chat_id', 'profile_id', 'message_id',
                        'reply_to_message_id',
@@ -860,7 +861,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     for key in ('app_id', 'transport_tenant_key', 'tenant_key', 'chat_id'):
         if source_context.get(key) != anchor.get(key):
             raise ManagementError('binding_conflict', 'The natural QA intake identity differs from the frozen source.')
-    if source_context['profile_id'] != record.get('profile_id'):
+    if not _qa_profile_matches(record, source_context['profile_id']):
         raise ManagementError('unauthorized', 'The natural QA intake profile differs from the original owner.')
     if any(source_context.get(key) != anchor.get(key) for key in
            ('recipient_tenant_key', 'recipient_open_id', 'sender_open_id') if key in source_context):

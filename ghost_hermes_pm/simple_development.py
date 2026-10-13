@@ -18,6 +18,10 @@ from .simple_github import GitHubWorkSource
 OWNER_CONTEXT_MAX_CHARS = 4000
 
 
+def _qa_profile_matches(record, profile_id):
+    return bool(profile_id) and profile_id in (record.get('profile_id'), record.get('superior_profile_id'))
+
+
 @dataclass(frozen=True)
 class WorkMessage:
     event: object
@@ -618,7 +622,7 @@ def register_simple_development(ctx):
                          'recipient_open_id': binding['recipient_open_id'], 'chat_id': binding['chat_id'],
                          'sender_open_id': binding['owner_open_id']}
         candidates = [record for record in intake.snapshot()['work']
-                      if record.get('profile_id') == binding['profile_id']
+                      if _qa_profile_matches(record, binding['profile_id'])
                       and all(record.get('source_anchor', {}).get(key) == value for key, value in source_anchor.items())
                       and record.get('dsh_execution', {}).get('mode') == 'shared_native'
                       and record['dsh_execution'].get('state') == 'awaiting_acceptance'
@@ -712,7 +716,7 @@ def register_simple_development(ctx):
             for record in intake.snapshot()['work']:
                 execution = record.get('dsh_execution', {})
                 acceptance = execution.get('acceptance', {}) if isinstance(execution, dict) else {}
-                if (work_id is None or record.get('id') == work_id) and record.get('profile_id') == source_context['profile_id'] \
+                if (work_id is None or record.get('id') == work_id) and _qa_profile_matches(record, source_context['profile_id']) \
                         and all(record.get('source_anchor', {}).get(key) == source_context[key] for key in anchor_keys) \
                         and execution.get('mode') == 'shared_native' and execution.get('state') == 'awaiting_acceptance' \
                         and acceptance.get('status') == 'unmet' and acceptance.get('delivered') is False:
