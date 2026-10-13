@@ -110,7 +110,7 @@ service_source = service_source.replace("state['prompts'].append(args['request']
 service_source = service_source.replace("if behavior.get('admit_prompt'):",
     """if owner_context and len(state['prompts']) >= 3:
                     submission = args['request']
-                    if len(state['prompts']) >= 4:
+                    if owner_context and len(state['prompts']) >= 4:
                         durable = record()['dsh_execution']['owner_context_control']
                         assert durable['status'] == 'intent' and durable['request_id'] == submission['requestId']
                         assert set(record()['dsh_execution']['renewal_window_checkpoint']['receipts']) == {'.tools.jsonl', '.jobs.jsonl'}
