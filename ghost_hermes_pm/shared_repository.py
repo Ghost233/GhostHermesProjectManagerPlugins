@@ -697,7 +697,7 @@ def _qa_rework_prompt(intake, record, feedback):
             'test_files, fine_issue_urls, pr_url, sync_branches, and leftovers.\n\n' + _prompt(intake, record))
 
 
-def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=()):
+def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=(), *, job_receipts=()):
     previous = _source_core(baseline)
     current = _source_core(current)
     if previous is None or current is None:
@@ -722,6 +722,21 @@ def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=()
                     or not isinstance(job_id, str) or not job_id or not isinstance(owned_jobs, (list, tuple))):
                 return False
             matches = [job for job in owned_jobs if isinstance(job, dict) and job.get('id') == job_id]
+            if owned_jobs == [] and job_receipts:
+                keys = ('schema', 'generation', 'session_id', 'session_created_at', 'service_ref', 'host_lease',
+                        'command_sha256', 'job_id')
+                rows = [row for row in job_receipts if isinstance(row, dict)
+                        and row.get('job_id') == job_id and row.get('host_lease') == receipt.get('host_lease')]
+                if (len(rows) != 2 or any(any(key not in receipt or row.get(key) != receipt[key] for key in keys)
+                        or row.get('owner') != execution['session_id'] or row.get('kind') != 'bash' for row in rows)
+                        or rows[0].get('type') != 'registered' or rows[0].get('status') != 'running'
+                        or rows[1].get('type') != 'settled' or rows[1].get('cause') not in {'producer', 'kill'}
+                        or type(rows[0].get('started_at_ms')) is not int or rows[0]['started_at_ms'] <= 0
+                        or rows[1].get('started_at_ms') != rows[0]['started_at_ms']
+                        or type(rows[1].get('finished_at_ms')) is not int
+                        or rows[1]['finished_at_ms'] < rows[0]['started_at_ms']):
+                    return False
+                matches = [{'id': job_id, 'owner': rows[1]['owner'], 'status': rows[1].get('status')}]
             if (len(matches) != 1 or matches[0].get('owner') != execution['session_id']
                     or matches[0].get('status') not in {'completed', 'killed', 'failed'}):
                 return False
@@ -1002,7 +1017,8 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
                 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
                 or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'}
                     or job.get('owner', execution['session_id']) != execution['session_id'] for job in jobs)
-                or not _verified_source_chain(execution, execution.get('baseline'), receipts, source, jobs)
+                or not _verified_source_chain(execution, execution.get('baseline'), receipts, source, jobs,
+                    job_receipts=shared_receipts(receipt_configuration, execution, '.jobs.jsonl'))
                 or private_file(budget_file).read_bytes() != budget_before):
             raise ManagementError('outcome_unknown', 'The original Session, Workspace, receipts or jobs are not idle.')
         if not renewal_required and requested_window is None and not adopting:
@@ -1242,8 +1258,12 @@ def prepare_shared_window_renewal(intake, record, message_id):
         and execution.get('terminal_reason') == {'kind': 'completed'}
         and acceptance.get('status') == 'unmet' and acceptance.get('delivered') is False
         and 'delivery_report_missing' not in acceptance.get('unmet', []))
+    prior_qa_window = (qa_case and previous_checkpoint.get('status') == 'admitted'
+        and execution.get('renewal_window_adoption') == 'accepted'
+        and execution.get('continuation_control', {}).get('status') == 'accepted'
+        and execution.get('continuation_control', {}).get('dispatch_status') == 'accepted')
     completed = (execution.get('state') == 'awaiting_acceptance'
-        and execution.get('terminal_reason') == {'kind': 'completed'} and not previous_checkpoint
+        and execution.get('terminal_reason') == {'kind': 'completed'} and (not previous_checkpoint or prior_qa_window)
         and ('delivery_report_missing' in acceptance.get('unmet', []) or qa_case))
     if (execution.get('mode') != 'shared_native' or not (completed or repeat)
             or execution.get('first_input') != 'accepted' or execution.get('stop_requested') or execution.get('lifecycle_end')
@@ -1287,7 +1307,8 @@ def prepare_shared_window_renewal(intake, record, message_id):
         workspace = resolve_shared_workspace(intake, record, carrier)
         receipts = shared_receipts(configuration, execution, '.tools.jsonl')
         owned_jobs = carrier.owned_jobs()
-        if not _verified_source_chain(execution, execution.get('baseline'), receipts, source, owned_jobs):
+        if not _verified_source_chain(execution, execution.get('baseline'), receipts, source, owned_jobs,
+                job_receipts=shared_receipts(configuration, execution, '.jobs.jsonl')):
             raise ManagementError('binding_conflict', 'The original shared source receipt chain changed before renewal.')
         delivery = any(DELIVERY_MARKER in block.get('text', '') for event in events if event['type'] == 'assistant/message'
                        for block in event['data'].get('message', {}).get('content', []) if isinstance(block, dict)
@@ -1327,7 +1348,7 @@ def prepare_shared_window_renewal(intake, record, message_id):
             path = ledger_path(configuration, execution['session_id'], suffix)
             content = private_file(path).read_bytes() if path.exists() else b''
             proofs[suffix] = {'size': len(content), 'sha256': hashlib.sha256(content).hexdigest()}
-        if repeat:
+        if repeat or prior_qa_window:
             execution.setdefault('renewal_window_checkpoint_history', []).append({
                 'checkpoint': deepcopy(previous_checkpoint), 'adoption': execution['renewal_window_adoption']})
             execution['renewal_window_adoption'] = None
@@ -1345,7 +1366,7 @@ def prepare_shared_window_renewal(intake, record, message_id):
         if qa_case:
             execution['renewal_window_checkpoint']['sealed_unknown_usage'] = _sealed_unknown_usage(events, row['renewWindow'])
         fields = ['renewal_window_checkpoint']
-        if repeat:
+        if repeat or prior_qa_window:
             fields += ['renewal_window_checkpoint_history', 'renewal_window_adoption']
         intake._save_execution(record, fields=fields)
         return record
@@ -2397,6 +2418,8 @@ def record_shared_natural_qa_proposal(intake, record, proposal_id, delivery_cont
         if current is None:
             raise ManagementError('outcome_unknown', 'The natural QA work record disappeared before proposal delivery.')
         execution = current['dsh_execution']
+        prior = execution.get('natural_qa_rework_control', {}).get('proposal_delivery', {})
+        from .simple_development import _qa_profile_matches
         proposal = execution.get('natural_qa_rework_control', {}).get('proposal', {})
         if proposal.get('id') != proposal_id or execution.get('natural_qa_rework_control', {}).get('status') not in {
                 'renewal_required', 'maintenance_required'}:
@@ -2409,9 +2432,9 @@ def record_shared_natural_qa_proposal(intake, record, proposal_id, delivery_cont
                 or not all(isinstance(value, str) and value for key, value in delivery_context.items()
                            if key not in {'status', 'message_id'})
                 or delivery_context['chat_id'] != current.get('source_anchor', {}).get('chat_id')
-                or delivery_context['profile_id'] != current.get('profile_id')):
+                or not _qa_profile_matches(current, delivery_context['profile_id'])
+                or any(delivery_context.get(key) != prior.get(key) for key in ('chat_id', 'profile_id'))):
             raise ManagementError('binding_conflict', 'The natural QA proposal delivery identity differs.')
-        prior = execution['natural_qa_rework_control'].get('proposal_delivery')
         if prior is None or prior.get('status') != 'intent' or prior.get('proposal_id') != proposal_id:
             raise ManagementError('duplicate', 'The natural QA proposal is no longer awaiting delivery.')
         if prior.get('status') != 'intent':

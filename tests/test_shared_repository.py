@@ -165,7 +165,7 @@ def _natural_qa_fixture(tmp_path, monkeypatch, *, expired=False, foreign_host=Fa
         'source_after': source, 'generation': generation, 'session_id': sid, 'name': 'bash',
         'execution_admission': 'admitted', 'is_error': False, 'kind': 'foreground', 'exit_code': 0,
         'timed_out': False, 'aborted': False, 'native_session_seq': 1}])
-    monkeypatch.setattr(shared_repository, '_verified_source_chain', lambda *_args: True)
+    monkeypatch.setattr(shared_repository, '_verified_source_chain', lambda *_args, **_kwargs: True)
     monkeypatch.setattr(shared_repository, 'read_ledger', lambda _config, _execution: json.loads(ledger_file.read_text()))
     def owned_call(_carrier, method, args):
         if method == 'session/list':
@@ -242,20 +242,38 @@ def test_renew_window_hook_metadata_is_strict_and_controlled():
                 'effective_max_output_tokens': value}))
 
 
-def test_natural_qa_rework_expired_window_renews_once_and_keeps_sealed_usage(tmp_path, monkeypatch):
+@pytest.mark.parametrize('prior_qa_window', [False, True])
+def test_natural_qa_rework_expired_window_renews_once_and_keeps_sealed_usage(tmp_path, monkeypatch, prior_qa_window):
     from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
     record, context, intake, carrier, ledger_file, _source, _request = _natural_qa_fixture(tmp_path, monkeypatch, expired=True)
+    record['superior_profile_id'] = 'fixture-superior'
+    context['profile_id'] = 'fixture-superior'
+    if prior_qa_window:
+        from ghost_hermes_pm.shared_repository import prepare_shared_window_renewal
+        prepare_shared_window_renewal(intake, record, 'previous-window-message')
+        record['dsh_execution']['renewal_window_checkpoint']['status'] = 'admitted'
+        record['dsh_execution']['renewal_window_adoption'] = 'accepted'
+        record['dsh_execution']['continuation_control'] = {'status': 'accepted', 'dispatch_status': 'accepted'}
     required = admit_shared_natural_qa_rework(intake, record, context, 'Re-run the actual synthetic QA test.', None, intake.generation)
     assert required['status'] == 'renewal_required'
     assert required['proposal']['limits'] == {'max_wall_seconds': 1800, 'max_model_requests': 80}
     before = ledger_file.read_bytes()
     from ghost_hermes_pm.shared_repository import record_shared_natural_qa_proposal
+    with pytest.raises(ManagementError):
+        record_shared_natural_qa_proposal(intake, record, required['proposal']['id'],
+            {'status': 'delivered', 'message_id': 'wrong-profile-proposal', 'chat_id': context['chat_id'],
+             'profile_id': record['profile_id']})
+    assert record['dsh_execution']['natural_qa_rework_control']['proposal_delivery']['status'] == 'intent'
     record_shared_natural_qa_proposal(intake, record, required['proposal']['id'],
         {'status': 'delivered', 'message_id': 'proposal-window', 'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
     context = {**context, 'message_id': 'natural-qa-message-maintenance', 'reply_to_message_id': 'proposal-window'}
     prepared = admit_shared_natural_qa_rework(intake, record, context, '同意', None, intake.generation)
     assert prepared['status'] == 'maintenance_required'
     assert record['dsh_execution'].get('renewal_window_checkpoint'), record['dsh_execution']
+    if prior_qa_window:
+        history = record['dsh_execution']['renewal_window_checkpoint_history']
+        assert history[-1]['checkpoint']['message_id'] == 'previous-window-message'
+        assert history[-1]['checkpoint']['status'] == 'admitted' and history[-1]['adoption'] == 'accepted'
     assert ledger_file.read_bytes() == before and not carrier.prompts
     record_shared_natural_qa_proposal(intake, record, prepared['proposal']['id'],
         {'status': 'delivered', 'message_id': 'proposal-maintenance', 'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
@@ -571,7 +589,8 @@ def test_permission_initializer_requires_original_terminal_birth(change, monkeyp
 
 
 @pytest.mark.parametrize('job_status', ['completed', 'killed', 'failed'])
-def test_source_chain_attributes_terminal_promoted_job_write(job_status):
+@pytest.mark.parametrize('historical', [False, True])
+def test_source_chain_attributes_terminal_promoted_job_write(job_status, historical):
     from ghost_hermes_pm.shared_repository import _verified_source_chain
     execution = {'generation': 'fixture-generation', 'session_id': 'fixture-session'}
     baseline = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-baseline'}
@@ -585,7 +604,18 @@ def test_source_chain_attributes_terminal_promoted_job_write(job_status):
         'is_error': False, 'exit_code': 0, 'timed_out': False, 'aborted': False, 'native_session_seq': 7,
         'source_before': promoted_after, 'source_after': current}
     owned_jobs = [{'id': 'fixture-promoted-job', 'owner': 'fixture-session', 'status': job_status}]
-    assert _verified_source_chain(execution, baseline, [promoted, foreground], current, owned_jobs)
+    job_receipts = []
+    if historical:
+        promoted.update(schema=1, session_created_at=1, service_ref='fixture-service', host_lease='fixture-lease',
+                        command_sha256='c' * 64)
+        registered = {key: promoted[key] for key in ('schema', 'generation', 'session_id', 'session_created_at',
+                      'service_ref', 'host_lease', 'command_sha256', 'job_id')}
+        registered.update(type='registered', status='running', kind='bash', owner=execution['session_id'], started_at_ms=10)
+        job_receipts = [registered, {**registered, 'type': 'settled', 'status': job_status,
+            'finished_at_ms': 20, 'cause': 'kill' if job_status == 'killed' else 'producer', 'awaited': False}]
+        owned_jobs = []
+    assert _verified_source_chain(execution, baseline, [promoted, foreground], current, owned_jobs,
+                                  job_receipts=job_receipts)
 
 
 @pytest.mark.parametrize('change', [
@@ -593,6 +623,8 @@ def test_source_chain_attributes_terminal_promoted_job_write(job_status):
     'missing_job_id', 'wrong_job_id', 'exit_code', 'timed_out', 'aborted',
     'null_exit_code', 'null_timed_out', 'null_aborted', 'generation', 'session_id',
     'admission', 'is_error', 'name', 'kind', 'sequence', 'before', 'after', 'current',
+    'native_missing', 'native_duplicate', 'native_wrong_owner', 'native_wrong_command',
+    'native_wrong_time', 'native_teardown', 'native_running', 'native_partial_roster',
 ])
 def test_source_chain_rejects_unverified_promoted_job_write(change):
     from ghost_hermes_pm.shared_repository import _verified_source_chain
@@ -605,7 +637,33 @@ def test_source_chain_rejects_unverified_promoted_job_write(change):
         'source_before': baseline, 'source_after': current}
     job = {'id': 'fixture-promoted-job', 'owner': 'fixture-session', 'status': 'completed'}
     jobs = [job]
-    if change in {'running', 'stopping', 'unknown'}:
+    job_receipts = []
+    if change.startswith('native_'):
+        receipt.update(schema=1, session_created_at=1, service_ref='fixture-service', host_lease='fixture-lease',
+                       command_sha256='c' * 64)
+        registered = {key: receipt[key] for key in ('schema', 'generation', 'session_id', 'session_created_at',
+                      'service_ref', 'host_lease', 'command_sha256', 'job_id')}
+        registered.update(type='registered', status='running', kind='bash', owner=execution['session_id'], started_at_ms=10)
+        settled = {**registered, 'type': 'settled', 'status': 'completed', 'finished_at_ms': 20,
+                   'cause': 'producer', 'awaited': False}
+        job_receipts, jobs = [registered, settled], []
+        if change == 'native_missing':
+            job_receipts.pop()
+        elif change == 'native_duplicate':
+            job_receipts.append(dict(settled))
+        elif change == 'native_wrong_owner':
+            settled['owner'] = 'fixture-foreign-session'
+        elif change == 'native_wrong_command':
+            settled['command_sha256'] = 'd' * 64
+        elif change == 'native_wrong_time':
+            settled['finished_at_ms'] = 9
+        elif change == 'native_teardown':
+            settled['cause'] = 'teardown'
+        elif change == 'native_running':
+            settled['status'] = 'running'
+        else:
+            jobs = [{'id': 'fixture-other-job', 'owner': 'fixture-session', 'status': 'completed'}]
+    elif change in {'running', 'stopping', 'unknown'}:
         job['status'] = change
     elif change == 'missing':
         jobs = []
@@ -639,7 +697,7 @@ def test_source_chain_rejects_unverified_promoted_job_write(change):
         receipt['source_after'] = None
     elif change == 'current':
         current = {**current, 'source_digest': 'fixture-other-current'}
-    assert not _verified_source_chain(execution, baseline, [receipt], current, jobs)
+    assert not _verified_source_chain(execution, baseline, [receipt], current, jobs, job_receipts=job_receipts)
 
 
 @pytest.mark.parametrize('exit_code', [0, 1])
