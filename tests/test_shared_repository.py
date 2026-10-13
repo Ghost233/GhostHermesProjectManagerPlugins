@@ -24,7 +24,8 @@ from ghost_hermes_pm.manager import ManagementError
 @pytest.mark.parametrize('case', ['wrong_sender', 'bot_sender', 'wrong_profile', 'wrong_chat', 'no_newline',
     'empty', 'too_long', 'sensitive', 'wrong_state', 'stop_requested', 'lifecycle_end', 'checkpoint_unknown',
     'continuation_pending', 'duplicate_intent', 'duplicate_unknown', 'duplicate_accepted',
-    'new_message_after_intent', 'new_message_after_unknown', 'new_message_after_accepted'])
+    'new_message_after_intent', 'new_message_after_unknown', 'new_message_after_accepted',
+    'retry_wrong_status', 'retry_wrong_dispatch', 'retry_wrong_request', 'retry_wrong_cursor', 'retry_history_present'])
 def test_owner_context_public_rejections_never_replay_or_reach_native(tmp_path, monkeypatch, case):
     from types import SimpleNamespace as NS
     from ghost_hermes_pm.simple_development import RepositoryIntake
@@ -83,6 +84,22 @@ def test_owner_context_public_rejections_never_replay_or_reach_native(tmp_path, 
         execution['owner_context_control'] = {'message_id': 'fixture-message', 'request_id': 'fixture-request', 'status': status}
         if case.startswith('duplicate_'):
             execution['control_message_ids'] = ['fixture-message']
+    elif case.startswith('retry_'):
+        execution['continuation_control']['cursor'] = 0
+        first = {'message_id': 'fixture-first-message', 'request_id': 'owner-context-' + hashlib.sha256(
+            (work_id + ':fixture-first-message').encode()).hexdigest(), 'status': 'accepted', 'dispatch_status': 'accepted',
+            'snapshot_sha256': 'fixture-owner-snapshot', 'cursor': 6, 'failed_turn': 1, 'turn': 2, 'turn_start_seq': 8}
+        if case == 'retry_wrong_status':
+            first['status'] = 'unknown'
+        elif case == 'retry_wrong_dispatch':
+            first['dispatch_status'] = 'intent'
+        elif case == 'retry_wrong_request':
+            first['request_id'] = 'foreign-request'
+        elif case == 'retry_wrong_cursor':
+            first['cursor'] = 7
+        elif case == 'retry_history_present':
+            execution['owner_context_history'] = [deepcopy(first)]
+        execution['owner_context_control'] = first
     intake._save(record)
     mid = 'fixture-new-message' if case.startswith('new_message_') else 'fixture-message'
     message = NS(chat_type='group', message_type='text', chat_id=anchor['chat_id'], message_id=mid,
@@ -102,6 +119,8 @@ def test_owner_context_public_rejections_never_replay_or_reach_native(tmp_path, 
     assert prepared is not None and prepared.action == 'control'
     result = asyncio.run(intake.process_prepared(prepared))
     assert result['status'] in {'rejected', 'unverified', 'duplicate'}
+    if case.startswith('retry_'):
+        assert result['status'] == 'unverified' and result['code'] == 'outcome_unknown'
     assert sent and intake.snapshot()['work'][0]['dsh_execution'].get('owner_context_control') == execution.get('owner_context_control')
 
 
@@ -621,7 +640,8 @@ def test_owner_context_refuses_incomplete_receipt_checkpoint(repeat_window_read_
             'snapshot_sha256': 'fixture-snapshot', 'ledger_sha256': 'fixture-ledger'})
     execution['renewal_window_checkpoint']['receipts'] = {'.tools.jsonl': {'size': 0, 'sha256': 'fixture-missing-jobs'}}
     with pytest.raises(ManagementError, match='receipt checkpoints are incomplete'):
-        admit_shared_owner_context(f.intake, f.record, SimpleNamespace(command='补充 fixture-work\nVerify fixture scope.'), 0)
+        admit_shared_owner_context(f.intake, f.record, SimpleNamespace(command='补充 fixture-work\nVerify fixture scope.',
+            envelope={'message_id': 'fixture-owner-message'}), 0)
     assert f.saves == [] and f.carrier_calls == []
 
 

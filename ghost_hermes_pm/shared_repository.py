@@ -1306,16 +1306,18 @@ def admit_shared_window(intake, record, message_id, generation):
         carrier.close()
 
 
-def _owner_context_failed_turn(snapshot, execution):
+def _owner_context_failed_turn(snapshot, execution, owner_control=None):
     """Only the exact admitted renewal input that failed before its first request."""
-    continuation = execution['continuation_control']
-    cursor = continuation.get('cursor')
+    proof = owner_control if owner_control is not None else execution['continuation_control']
+    cursor = proof.get('cursor')
     events = [row['event'] for row in snapshot['records']]
     reason = {'kind': 'error', 'error': {'message': 'Shared work native settlement usage is unknown.', 'code': 'UNKNOWN'}}
     if (type(cursor) is not int or cursor < 0 or len(events) != cursor + 7
             or snapshot.get('cursor') != cursor + 6
             or any(event.get('seq') != index for index, event in enumerate(events))
-            or events[cursor].get('type') != 'session/end-seed' or events[cursor].get('data') != {}):
+            or owner_control is None and (events[cursor].get('type') != 'session/end-seed' or events[cursor].get('data') != {})
+            or owner_control is not None and (events[cursor].get('type') != 'turn/end'
+                or events[cursor].get('data') != {'turn': proof.get('failed_turn'), 'reason': reason})):
         raise ManagementError('outcome_unknown', 'The original renewal input boundary is unconfirmed.')
     delta = events[cursor + 1:]
     if [event['type'] for event in delta] != ['agent/inbox/spliced', 'turn/start', 'agent/inbox/spliced',
@@ -1327,7 +1329,8 @@ def _owner_context_failed_turn(snapshot, execution):
     if (set(inserted) != {'target', 'start', 'inserted'} or inserted.get('target') != 'next-turn'
             or inserted.get('start') != 0 or len(items) != 1 or items[0].get('role') != 'user'
             or not isinstance(items[0].get('id'), str) or not items[0]['id']
-            or items[0].get('source') != {'kind': 'user', 'rpcId': execution['continuation_request_id']}
+            or items[0].get('source') != {'kind': 'user', 'rpcId': (
+                proof.get('request_id') if owner_control is not None else execution['continuation_request_id'])}
             or not isinstance(items[0].get('content'), list) or not items[0]['content']
             or any(not isinstance(block, dict) or block.get('type') != 'text' or not isinstance(block.get('text'), str) or not block['text']
                 for block in items[0]['content'])
@@ -1336,6 +1339,10 @@ def _owner_context_failed_turn(snapshot, execution):
             or delta[3]['data'] != {'turn': turn, 'step': 1} or delta[4]['data'] != {'turn': turn, 'step': 1}
             or delta[5]['data'] != {'turn': turn, 'reason': reason}):
         raise ManagementError('outcome_unknown', 'The exact pre-request native failure is unconfirmed.')
+    if owner_control is not None and (turn != proof.get('turn') or delta[1]['seq'] != proof.get('turn_start_seq')
+            or len(items[0]['content']) != 1
+            or hashlib.sha256(items[0]['content'][0]['text'].encode()).hexdigest() != proof.get('text_sha256')):
+        raise ManagementError('outcome_unknown', 'The original owner context input or turn correlation changed.')
     return turn
 
 
@@ -1349,12 +1356,26 @@ def admit_shared_owner_context(intake, record, prepared, generation):
     from .repository_acceptance import repository_source_state
     execution = record['dsh_execution']
     continuation, checkpoint = execution.get('continuation_control', {}), execution.get('renewal_window_checkpoint', {})
+    previous = execution.get('owner_context_control')
+    history = execution.get('owner_context_history', [])
+    message_id = prepared.envelope['message_id']
     if (execution.get('mode') != 'shared_native' or execution.get('state') != 'outcome_unknown'
             or execution.get('first_input') != 'accepted' or execution.get('stop_requested') or execution.get('lifecycle_end')
             or execution.get('last_failure', {}).get('code') != 'outcome_unknown'
             or checkpoint.get('status') != 'admitted' or execution.get('renewal_window_adoption') != 'accepted'
             or continuation.get('kind') != 'renew_window' or continuation.get('status') != 'accepted'
-            or continuation.get('dispatch_status') != 'accepted' or execution.get('owner_context_control')
+            or continuation.get('dispatch_status') != 'accepted'
+            or not isinstance(history, list) or history
+            or 'owner_context_control' in execution and (not isinstance(previous, dict)
+                or previous.get('status') != 'accepted' or previous.get('dispatch_status') != 'accepted'
+                or not isinstance(previous.get('message_id'), str) or not previous['message_id']
+                or previous['message_id'] == message_id or not previous.get('snapshot_sha256')
+                or type(continuation.get('cursor')) is not int or type(previous.get('cursor')) is not int
+                or previous['cursor'] != continuation['cursor'] + 6
+                or type(previous.get('failed_turn')) is not int or previous.get('turn') != previous['failed_turn'] + 1
+                or previous.get('turn_start_seq') != previous['cursor'] + 2
+                or previous.get('request_id') != 'owner-context-' + hashlib.sha256(
+                    (record['id'] + ':' + previous['message_id']).encode()).hexdigest())
             or not continuation.get('snapshot_sha256') or not continuation.get('ledger_sha256')):
         raise ManagementError('outcome_unknown', 'Only the unstarted original admitted renewal may accept owner context once.')
     if not isinstance(checkpoint.get('receipts'), dict) or set(checkpoint['receipts']) != {'.tools.jsonl', '.jobs.jsonl'}:
@@ -1384,17 +1405,17 @@ def admit_shared_owner_context(intake, record, prepared, generation):
     raw = private_file(ledger_file).read_bytes()
     row = read_ledger(configuration, execution)
     window, state = row.get('renewWindow', {}), row['state']
-    previous = checkpoint['previous_state']
+    previous_state = checkpoint['previous_state']
     backup = private_file(checkpoint['ledger_backup']).read_bytes()
     old = json.loads(backup)
     if (hashlib.sha256(raw).hexdigest() != continuation['ledger_sha256']
             or window.get('request_base') != state.get('requests') or window.get('host_lease') != configuration['host_lease']
             or any(window.get(key, 'missing') is not None for key in ('started_at_ms', 'hook_marker', 'stop_reason'))
-            or window.get('original_state') != previous or old.get('state') != previous
+            or window.get('original_state') != previous_state or old.get('state') != previous_state
             or old.get('renewWindow') != checkpoint['previous_renew_window']
             or hashlib.sha256(backup).hexdigest() != checkpoint['ledger_sha256']
             or {key: value for key, value in state.items() if key != 'binding_sha256'}
-                != {key: value for key, value in previous.items() if key != 'binding_sha256'}
+                != {key: value for key, value in previous_state.items() if key != 'binding_sha256'}
             or state.get('binding_sha256') != _window_fingerprint(row)
             or execution.get('renewal_window_history', [])[-1:] != [{'message_id': checkpoint['message_id'],
                 'ledger_backup': checkpoint['ledger_backup'], 'renew_window': checkpoint['previous_renew_window']}]):
@@ -1438,15 +1459,23 @@ def admit_shared_owner_context(intake, record, prepared, generation):
                 or jobs and [{'id': job.get('id'), 'status': job['status']} for job in jobs] != checkpoint.get('jobs')
                 or private_file(ledger_file).read_bytes() != raw):
             raise ManagementError('outcome_unknown', 'The original owner-context Session, queue or jobs are not idle.')
-        turn = _owner_context_failed_turn(before, execution)
+        if previous is not None:
+            cursor = previous.get('cursor')
+            if type(cursor) is not int or cursor < 0:
+                raise ManagementError('outcome_unknown', 'The original owner-context cursor is unconfirmed.')
+            prefix = dict(before, cursor=cursor, records=before['records'][:cursor + 1])
+            if _owner_context_failed_turn(prefix, execution) != previous.get('failed_turn'):
+                raise ManagementError('outcome_unknown', 'The original renewal-to-owner failure boundary changed.')
+        turn = _owner_context_failed_turn(before, execution, previous)
         intake.require_active(generation)
-        message_id = prepared.envelope['message_id']
         request_id = 'owner-context-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest()
+        if previous is not None:
+            execution['owner_context_history'] = [deepcopy(previous)]
         control = execution['owner_context_control'] = {'message_id': message_id, 'request_id': request_id,
             'text_sha256': hashlib.sha256(text.encode()).hexdigest(), 'status': 'intent', 'cursor': before['cursor'],
             'snapshot_sha256': hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
             'previous_claim': execution['supervisor_claim'], 'worker': worker, 'failed_turn': turn}
-        intake._save_execution(record, fields=['owner_context_control'])
+        intake._save_execution(record, fields=['owner_context_control'] + (['owner_context_history'] if previous is not None else []))
         try:
             answer = owned_call(carrier, 'session/prompt', {'sessionId': execution['session_id'], 'requestId': request_id,
                 'mode': 'queue', 'content': [{'type': 'text', 'text': text}]})
@@ -2194,6 +2223,15 @@ async def run_shared_work(ctx, intake, record, generation):
                 else execution['maintenance_checkpoint']['cursor']) if continuation else -1
             if execution.get('owner_context_control', {}).get('status') == 'accepted':
                 cursor = execution['owner_context_control']['cursor']
+                submitted = {execution.get('request_id'), execution.get('continuation_request_id'),
+                    execution['owner_context_control'].get('request_id')}
+                submitted.update(control.get('request_id') for control in execution.get('owner_context_history', []))
+                submitted.update(question.get('request_id') for question in execution.get('questions', []))
+                submitted.discard(None)
+                if any(item.get('source', {}).get('kind') != 'user' or item.get('source', {}).get('rpcId') not in submitted
+                        for event in events if event['type'] == 'agent/inbox/spliced' and event['seq'] > continuation['cursor']
+                        for item in event['data'].get('inserted', []) if item.get('role') == 'user'):
+                    raise ManagementError('outcome_unknown', 'Foreign input in the original owner-context history was preserved.')
             starts = [event for event in events if event['type'] == 'turn/start' and event['seq'] > cursor]
             ends = [event for event in events if event['type'] == 'turn/end' and event['seq'] > cursor]
             if row and row.get('running') is False and starts and ends and ends[-1]['seq'] > starts[-1]['seq']:
@@ -2272,7 +2310,9 @@ async def stop_shared_work(intake, record, generation):
                     raise ManagementError('outcome_unknown', 'Shared pending input coverage is unavailable.')
                 submitted = {execution.get('request_id'), execution.get('continuation_request_id'),
                     execution.get('owner_context_control', {}).get('request_id')}
+                submitted.update(control.get('request_id') for control in execution.get('owner_context_history', []))
                 submitted.update(question.get('request_id') for question in execution.get('questions', []))
+                submitted.discard(None)
                 for item in [*inbox['next-turn'], *inbox['next-step']]:
                     source = item.get('source', {})
                     if source.get('kind') != 'user' or source.get('rpcId') not in submitted:

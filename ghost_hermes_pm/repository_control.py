@@ -377,13 +377,17 @@ async def process_control(intake, prepared, generation):
                 or any(message_id == previous['execution'].get(field, {}).get('message_id') for field in ('stop_control', 'retry_control'))
                 for previous in record.get('execution_attempts', []))
             duplicate = message_id in execution.get('control_message_ids', [])
+            if prepared.command.startswith('补充 '):
+                owner_controls = [execution.get('owner_context_control', {}), *execution.get('owner_context_history', [])]
+                saved_owner = next((control for control in owner_controls if control.get('message_id') == message_id), {})
+                duplicate = duplicate or bool(saved_owner)
             if not historical and not duplicate:
                 execution.setdefault('control_message_ids', []).append(message_id)
                 intake._save_execution(record, fields=['control_message_ids'])
             if historical:
                 text, result = '这是前轮已登记的控制消息；本轮执行没有改变。原操作结果仍按原记录核对。', {'status': 'duplicate', 'work_id': record['id']}
             elif duplicate and prepared.command.startswith('补充 '):
-                saved = execution.get('owner_context_control', {})
+                saved = saved_owner
                 text = '这条补充控制消息已登记；不会重送要求或新增预算。原 SID 受理结果仍按记录核对。'
                 result = {'status': 'duplicate', 'work_id': record['id'], 'original_status': saved.get('status', 'unverified')}
             elif duplicate and (prepared.command.startswith(('重试 ', '继续 ', '续预算 ')) or execution.get('state') == 'stopped'):
