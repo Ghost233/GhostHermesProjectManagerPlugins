@@ -179,6 +179,62 @@ async def notify_acceptance(intake, record, generation):
     intake._save_execution(record, fields=['delivery_notification'])
 
 
+async def review_checkpoint(ctx, intake, record, args):
+    from .manager import _public_text
+    if (not isinstance(args, dict) or set(args) != {'checkpoint_id', 'summary', 'notify_owner'}
+            or not isinstance(args['summary'], str) or not 0 < len(args['summary'].strip()) <= 2500
+            or type(args['notify_owner']) is not bool):
+        raise ManagementError('invalid_change', 'A checkpoint review requires one bounded summary and notification decision.')
+    _public_text(args['summary'], intake.secret_values)
+    current_worker(ctx, intake, record)
+    checkpoint = record['dsh_execution'].get('supervision_checkpoint', {})
+    if (checkpoint.get('id') != args['checkpoint_id'] or checkpoint.get('session_id') != record['dsh_execution'].get('session_id')
+            or checkpoint.get('generation') != record['dsh_execution'].get('generation')):
+        raise ManagementError('unauthorized', 'Only this original work checkpoint may be reviewed.')
+    if checkpoint.get('status') != 'pending':
+        return {'status': 'duplicate', 'delivery': checkpoint.get('delivery'), 'next_action': 'hermes_pm_supervise'}
+    intake.require_active(intake.generation)
+    checkpoint.update(summary=args['summary'], notify_owner=args['notify_owner'], status='reviewed',
+        reviewer_claim=record['dsh_execution']['supervisor_claim'],
+        delivery={'status': 'pending' if args['notify_owner'] else 'not_requested'})
+    intake.require_active(intake.generation)
+    intake._save_execution(record, fields=['supervision_checkpoint'])
+    return {'status': 'reviewed', 'delivery': checkpoint['delivery'], 'next_action': 'hermes_pm_supervise'}
+
+
+async def notify_checkpoint(intake, record, generation):
+    from .manager import _public_text
+    from .repository_questions import question_destination
+    execution = record['dsh_execution']
+    checkpoint = execution.get('supervision_checkpoint', {})
+    if (checkpoint.get('status') != 'reviewed' or checkpoint.get('notify_owner') is not True
+            or checkpoint.get('delivery', {}).get('status') != 'pending'):
+        return
+    if (checkpoint.get('session_id') != execution.get('session_id') or checkpoint.get('generation') != execution.get('generation')
+            or checkpoint.get('reviewer_claim') != execution.get('supervisor_claim')):
+        raise ManagementError('unauthorized', 'The original checkpoint reviewer binding changed.')
+    _public_text(checkpoint['summary'], intake.secret_values)
+    destination = question_destination(intake, record)
+    if destination is None:
+        return
+    transport, binding = destination
+    if await transport.verify_identity(binding) != {'app_id': binding['app_id'], 'open_id': binding['recipient_open_id']}:
+        raise ManagementError('binding_conflict', 'The original checkpoint recipient is unverified.')
+    intake.require_active(generation)
+    checkpoint['delivery'] = {'status': 'intent'}
+    intake._save_execution(record, fields=['supervision_checkpoint'])
+    text = ('进度检查（截至 ' + time.strftime('%H:%M:%S', time.localtime(checkpoint['observed_at'])) + '）：'
+        + '\n执行状态：' + checkpoint['observed_state'] + '\n本段模型请求：' + str(checkpoint['request_delta'])
+        + '；累计：' + str(checkpoint['requests']) + '\n待答问题：' + str(checkpoint['questions_pending'])
+        + '；待批操作：' + str(checkpoint['approvals_pending']) + '\n\n' + checkpoint['summary'])
+    result = await transport.send({'uuid': hashlib.sha256((record['id'] + ':checkpoint:' + checkpoint['id']).encode()).hexdigest()[:32],
+        'text': text, 'chat_id': binding['chat_id'], 'reply_to': record['source_anchor']['message_id'],
+        'thread_id': record['source_anchor'].get('thread_id')})
+    intake.require_active(generation)
+    checkpoint['delivery'] = result
+    intake._save_execution(record, fields=['supervision_checkpoint'])
+
+
 def attach_existing_owned(intake, record):
     """Attach a registered generation; absence never starts replacement work."""
     if record['dsh_execution'].get('mode') == 'shared_native':
@@ -296,6 +352,10 @@ async def observe_human_requests(intake):
             if intake.transports:
                 for record in intake.snapshot()['work']:
                     execution = record.get('dsh_execution', {})
+                    try:
+                        await notify_checkpoint(intake, record, intake.generation)
+                    except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES):
+                        pass
                     if execution.get('lifecycle_end', {}).get('status') == 'ended' and not execution.get('stop_requested') and execution.get('state') != 'released':
                         try:
                             await reconcile_completed_delivery(intake, record, intake.generation)
@@ -425,6 +485,8 @@ def register_repository_supervision(ctx, intake):
         'For a plugin-managed Kanban outer card, read kanban_show, then call hermes_pm_supervise with no arguments. '
         'After supervision returns next_action=kanban_complete, call the original kanban_complete with the verified summary. '
         'After next_action=kanban_block, call kanban_block(kind="needs_input", reason="Shared execution awaits acceptance or reconciliation"), then end. '
+        'When a supervision checkpoint is returned, summarize its verified progress, blockers and usage, decide whether the owner needs immediate feedback, '
+        'and call hermes_pm_supervise with checkpoint_id, summary and notify_owner. A checkpoint does not stop DSH or authorize any new execution. '
         'Do not develop directly, create/link cards, or declare delivery. DSH owns the detailed repository work; the plugin records its real status.')
 
     async def run_work(record, generation):
@@ -659,8 +721,6 @@ def register_repository_supervision(ctx, intake):
             connections.discard(carrier)
 
     async def supervise(args):
-        if args:
-            return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
         from agent.delegation_context import owned_kanban_task
         card_id = owned_kanban_task()
         if not card_id:
@@ -669,6 +729,8 @@ def register_repository_supervision(ctx, intake):
         if len(records) != 1 or records[0]['target']['native_profile'] != ctx.profile_name:
             return json.dumps({'status': 'rejected', 'code': 'unauthorized'})
         try:
+            if args:
+                return json.dumps(await review_checkpoint(ctx, intake, records[0], args))
             return json.dumps(await run_work(records[0], intake.generation))
         except ManagementError as error:
             if error.code in {'repository_busy', 'configuration_missing', 'outcome_unknown'}:
@@ -687,5 +749,6 @@ def register_repository_supervision(ctx, intake):
     ctx.register_tool(name='hermes_pm_supervise', toolset='hermes_pm_supervision',
         schema={'name': 'hermes_pm_supervise',
                 'description': 'Supervise the current dispatcher-owned outer card in the existing shared DSH instance. Caller identity and repository are never arguments.',
-                'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
+                'parameters': {'type': 'object', 'properties': {'checkpoint_id': {'type': 'string'},
+                    'summary': {'type': 'string', 'maxLength': 2500}, 'notify_owner': {'type': 'boolean'}}, 'additionalProperties': False}},
         handler=supervise, is_async=True, description='Supervise original shared repository execution')

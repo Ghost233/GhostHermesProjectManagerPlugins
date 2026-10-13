@@ -74,6 +74,7 @@ const teamNames = ['interrupt_agent', 'list_agents', 'send_message', 'spawn_team
   'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'wait_agent'];
 let teamEvidence;
 let settlementEvidence;
+let budgetEvidence;
 try {
   for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-token-meter',
     'dsh-system-prompt', 'dsh-sandbox-policy', 'dsh-tools', 'dsh-jobs-local', 'dsh-llm', 'dsh-agent', 'dsh-agent-loop']) {
@@ -236,6 +237,80 @@ try {
     await managed.dispose();
     await stale.dispose();
     await manual.dispose();
+  } else if (scenario === 'optional_caps') {
+    const uncapped = await create('fixture-uncapped');
+    const originalStart = Date.now() - 3600000;
+    register(uncapped.agent, {budget: {}, state: {started_at_ms: originalStart,
+      requests: 0, reported_tokens: 0, admissions: [], stop_reason: null}});
+    for (let index = 0; index < 11; index++) await prompt(uncapped.agent);
+    assert.equal(calls.length, 11, 'An uncapped native Session accounts for eleven requests without a plugin stop.');
+    const unbounded = JSON.parse(fs.readFileSync(ledgerPath(uncapped.agent.session.id)));
+    assert.deepEqual(unbounded.budget, {});
+    assert.equal(unbounded.state.started_at_ms, originalStart);
+    assert.equal(unbounded.state.requests, 11);
+    assert.equal(unbounded.state.reported_tokens, 220);
+    assert.equal(unbounded.state.admissions.length, 11);
+    assert.equal(unbounded.state.stop_reason, null);
+    const allowed = await ctx.tools.execute({agent: uncapped.agent, name: 'job_list',
+      callId: 'fixture-uncapped-tool', arguments: {}, signal: new AbortController().signal});
+    assert.equal(allowed.isError, false, 'An absent wall cap must not deny the original allowed tool.');
+    const counted = await create('fixture-request-only');
+    register(counted.agent, {budget: {max_model_requests: 2}});
+    await prompt(counted.agent);
+    await prompt(counted.agent);
+    await prompt(counted.agent);
+    assert.equal(calls.length, 13, 'The explicit request-only cap still stops the third request.');
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(counted.agent.session.id))).state.stop_reason,
+      'shared-work-observed-budget');
+    const wall = await create('fixture-wall-only');
+    register(wall.agent, {budget: {max_wall_seconds: 1}, state: {started_at_ms: Date.now() - 2000,
+      requests: 0, reported_tokens: 0, admissions: [], stop_reason: null}});
+    await prompt(wall.agent);
+    assert.equal(calls.length, 13, 'The explicit wall-only cap denies an expired request.');
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(wall.agent.session.id))).state.stop_reason,
+      'shared-work-wall-budget');
+    const extended = await create('fixture-owner-selected-cap');
+    register(extended.agent, {budget: {max_wall_seconds: 3600, max_model_requests: 100}});
+    await prompt(extended.agent);
+    assert.equal(calls.length, 14, 'Positive owner-selected caps are accepted beyond the former 1800/80 whitelist.');
+    const tokens = await create('fixture-token-metadata-only');
+    register(tokens.agent, {budget: {max_reported_tokens: 1, max_output_tokens_per_request: 1}});
+    await prompt(tokens.agent);
+    await prompt(tokens.agent);
+    assert.equal(calls.length, 16, 'Historical token fields remain accounting metadata without wall or request caps.');
+    assert.equal(calls.at(-1).maxTokens, 12288);
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath(tokens.agent.session.id))).state.reported_tokens, 40);
+    const malformed = [null, [], {max_wall_seconds: 0}, {max_model_requests: -1},
+      {max_wall_seconds: 1.5}, {max_model_requests: true}, {max_model_requests: Number.MAX_SAFE_INTEGER + 1},
+      {unregistered_cap: 1}];
+    for (let index = 0; index < malformed.length; index++) {
+      const invalid = await create('fixture-malformed-cap-' + index);
+      register(invalid.agent, {budget: malformed[index]});
+      await prompt(invalid.agent);
+      assert.equal(calls.length, 16, 'Malformed optional caps must reject before model dispatch.');
+      await invalid.dispose();
+    }
+    for (const violation of ['stopped', 'identity', 'sandbox']) {
+      const guarded = await create('fixture-uncapped-' + violation);
+      const row = register(guarded.agent, {budget: {}, ...(violation === 'identity' ? {host_lease: 'foreign-lease'} : {})});
+      if (violation === 'stopped') {
+        row.state.stop_reason = 'shared-work-observed-budget';
+        fs.writeFileSync(ledgerPath(guarded.agent.session.id), JSON.stringify(row));
+      }
+      if (violation === 'sandbox') setSandboxMode(guarded.agent.session, 'danger-full-access');
+      await prompt(guarded.agent);
+      assert.equal(calls.length, 16, 'Optional caps do not relax stop, identity or sandbox guards.');
+      await guarded.dispose();
+    }
+    const rollback = JSON.parse(fs.readFileSync(ledgerPath(uncapped.agent.session.id)));
+    rollback.state.requests = 0;
+    rollback.state.admissions = [];
+    fs.writeFileSync(ledgerPath(uncapped.agent.session.id), JSON.stringify(rollback));
+    await prompt(uncapped.agent);
+    assert.equal(calls.length, 16, 'An uncapped Session still rejects admission rollback.');
+    budgetEvidence = {unbounded_requests: 11, unbounded_reported_tokens: 220,
+      explicit_request_stop: true, explicit_wall_stop: true, selected_caps: {max_wall_seconds: 3600, max_model_requests: 100}};
+    for (const handle of [uncapped, counted, wall, extended, tokens]) await handle.dispose();
   } else if (scenario === 'team') {
     const managed = await create('fixture-managed-with-native-team');
     register(managed.agent);
@@ -800,7 +875,8 @@ try {
   await removePreset();
   if (removeManual) await removeManual();
   process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: calls.length,
-    ...(teamEvidence ? {team: teamEvidence} : {}), ...(settlementEvidence ? {settlements: settlementEvidence} : {})}));
+    ...(teamEvidence ? {team: teamEvidence} : {}), ...(settlementEvidence ? {settlements: settlementEvidence} : {}),
+    ...(budgetEvidence ? {budgets: budgetEvidence} : {})}));
   }
 } finally {
   await ctx.fiber.dispose();

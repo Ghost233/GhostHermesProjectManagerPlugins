@@ -348,6 +348,25 @@ def test_completed_natural_qa_accepts_new_feedback_in_the_same_active_window(tmp
     assert carrier.prompts == [] and request == {}
 
 
+@pytest.mark.parametrize('limits', [{}, {'max_wall_seconds': 3600}, {'max_model_requests': 100}])
+def test_natural_qa_preserves_original_optional_limits_without_a_renewal(tmp_path, monkeypatch, limits):
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    record, context, intake, carrier, ledger_file, _source, request = _natural_qa_fixture(tmp_path, monkeypatch)
+    row = json.loads(ledger_file.read_text())
+    row.pop('renewWindow')
+    row['budget'] = limits
+    ledger_file.write_text(json.dumps(row))
+    intake.config['budget'] = limits
+    reference = Path(record['target']['execution_ref'])
+    reference.write_text(json.dumps(intake.config))
+    record['dsh_execution']['reference_sha256'] = hashlib.sha256(reference.read_bytes()).hexdigest()
+    before = ledger_file.read_bytes()
+    result = admit_shared_natural_qa_rework(intake, record, context, 'Verify the synthetic remaining work.', None, intake.generation)
+    assert result['status'] == 'accepted' and intake.card['status'] == 'ready'
+    assert record['dsh_execution']['continuation_control']['kind'] == 'qa_rework'
+    assert ledger_file.read_bytes() == before and not carrier.prompts and not request
+
+
 def test_sealed_unknown_usage_counts_attempt_before_interrupted_message():
     from ghost_hermes_pm.shared_repository import _sealed_unknown_usage
     events = [
@@ -1887,7 +1906,7 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata', 'qa_preinput_retry'])
+@pytest.mark.parametrize('scenario', ['terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata', 'qa_preinput_retry', 'supervision_checkpoints'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])
@@ -1904,7 +1923,7 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
     if scenario == 'supervise_slice' or scenario.startswith('supervise_takeover'):
         production = root / 'ghost_hermes_pm/shared_repository.py'
         copied = plugin / 'ghost_hermes_pm/shared_repository.py'
-        declaration = 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 360'
+        declaration = 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 300'
         original = copied.read_text()
         assert original.count(declaration) == 1 and production.read_text().count(declaration) == 1
         copied.write_text(original.replace(declaration, 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 0.5', 1))

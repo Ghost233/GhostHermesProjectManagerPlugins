@@ -24,8 +24,8 @@ TOOLS = ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'ski
 CASES = {'allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied',
          'danger_denied', 'foreground_job_registered', 'managed_background_stopped',
          'foreground_cancelled', 'foreign_job_kill_denied', 'background_write_boundary'}
-CAPS = {'max_wall_seconds': 1800, 'max_model_requests': 80}
-SUPERVISE_OBSERVATION_SLICE_SECONDS = 360
+CAPS = {'max_wall_seconds', 'max_model_requests'}
+SUPERVISE_OBSERVATION_SLICE_SECONDS = 300
 _RUNTIME_VERSIONS = {}
 _RUNTIME_ENTRIES = set()
 
@@ -95,16 +95,20 @@ def shared_configuration(reference, configuration, *, workspace=None):
     required = {'schema', 'approved', 'mode', 'desktop_receipt', 'host_lease', 'service_ref',
                 'runtime_package_root', 'node_bin', 'agent_preset', 'ledger_dir', 'provider', 'model',
                 'budget', 'tool_receipt_ref', 'composition_sha256', 'source_snapshot', 'verification'}
-    if (set(configuration) != required or configuration['schema'] != 1
+    if (set(configuration) not in (required, required | {'supervision'}) or configuration['schema'] != 1
         or configuration['approved'] is not True or configuration['mode'] != 'shared_native'):
         raise ManagementError('configuration_missing', 'An approved shared native execution reference is required.')
     for key in ('host_lease', 'service_ref', 'agent_preset', 'provider', 'model'):
         if not isinstance(configuration[key], str) or not configuration[key]:
             raise ManagementError('configuration_missing', 'Shared execution identities are incomplete.')
     budget = configuration['budget']
-    if (not isinstance(budget, dict) or set(budget) != set(CAPS)
-        or any(type(budget[key]) is not int or not 0 < budget[key] <= maximum for key, maximum in CAPS.items())):
-        raise ManagementError('configuration_missing', 'The shared work requires its explicit finite budget.')
+    if (not isinstance(budget, dict) or not set(budget) <= CAPS
+        or any(type(value) is not int or not 0 < value <= 2**53 - 1 for value in budget.values())):
+        raise ManagementError('configuration_missing', 'Shared hard limits must be explicit positive integers.')
+    supervision = configuration.get('supervision', {'interval_seconds': 300, 'request_interval': 10})
+    if (not isinstance(supervision, dict) or set(supervision) != {'interval_seconds', 'request_interval'}
+        or any(type(value) is not int or value <= 0 for value in supervision.values())):
+        raise ManagementError('configuration_missing', 'Shared supervision checkpoints require positive intervals.')
     sdk, node, ledger = (Path(configuration[key]) for key in ('runtime_package_root', 'node_bin', 'ledger_dir'))
     if any(not path.is_absolute() or str(path.resolve(strict=True)) != str(path) for path in (sdk, node, ledger)):
         raise ManagementError('unsafe_state', 'Shared native paths must be canonical.')
@@ -152,8 +156,9 @@ def read_ledger(configuration, execution):
     budget = row.get('budget')
     legacy_tokens = {'max_reported_tokens', 'max_output_tokens_per_request'}
     if (any(row.get(key) != value for key, value in expected.items())
-            or not isinstance(budget, dict) or set(budget) not in (set(CAPS), set(CAPS) | legacy_tokens)
-            or any(type(budget[key]) is not int or budget[key] != configuration['budget'][key] for key in CAPS)
+            or not isinstance(budget, dict) or not set(budget) <= CAPS | legacy_tokens
+            or {key: value for key, value in budget.items() if key in CAPS} != configuration['budget']
+            or any(type(value) is not int or value <= 0 for value in budget.values())
             or any(type(budget[key]) is not int or budget[key] <= 0 for key in legacy_tokens & set(budget))):
         raise ManagementError('binding_conflict', 'The original shared Session ledger changed.')
     if 'renewWindow' in row:
@@ -510,21 +515,78 @@ def _require_max_tokens_budget(configuration, state, window=None):
     now = time.time() * 1000
     if (state.get('stop_reason') is not None or type(state.get('started_at_ms')) is not int
             or not 0 < state['started_at_ms'] <= now
-            or now >= state['started_at_ms'] + configuration['budget']['max_wall_seconds'] * 1000
-            or type(state.get('requests')) is not int or not 0 < state['requests'] < configuration['budget']['max_model_requests']
+            or _wall_remaining(configuration, state['started_at_ms']) <= 0
+            or type(state.get('requests')) is not int or not 0 < state['requests']
+            or state['requests'] >= configuration['budget'].get('max_model_requests', float('inf'))
             or type(state.get('reported_tokens')) is not int
             or state['reported_tokens'] < 0
             or not isinstance(state.get('admissions'), list) or len(state['admissions']) != state['requests']
             or any(not isinstance(value, str) or not value for value in state['admissions'])
             or len(set(state['admissions'])) != state['requests']):
         raise ManagementError('outcome_unknown', 'The original shared budget has no confirmed remaining allowance.')
-    return (state['started_at_ms'] + configuration['budget']['max_wall_seconds'] * 1000 - now) / 1000
+    return _wall_remaining(configuration, state['started_at_ms'])
+
+
+def _wall_remaining(configuration, started):
+    limit = configuration['budget'].get('max_wall_seconds')
+    if limit is None:
+        return float('inf')
+    return limit if started is None else limit - (time.time() * 1000 - started) / 1000
+
+
+def supervision_checkpoint(intake, record, configuration, budget, events=()):
+    from .manager import _public_text
+    execution = record['dsh_execution']
+    latest = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])['dsh_execution']
+    prior = latest.get('supervision_checkpoint', {})
+    if prior.get('status') == 'pending':
+        return prior
+    if prior.get('delivery', {}).get('status') in {'pending', 'intent'}:
+        return None
+    active = budget.get('renewWindow') or budget['state']
+    started = active.get('started_at_ms')
+    if started is None:
+        return None
+    now = time.time()
+    policy = configuration.get('supervision', {'interval_seconds': 300, 'request_interval': 10})
+    baseline_time = prior.get('observed_at', started / 1000)
+    baseline_requests = prior.get('requests', budget.get('renewWindow', {}).get('request_base', 0))
+    reasons = []
+    if now - baseline_time >= policy['interval_seconds']:
+        reasons.append('time')
+    if budget['state']['requests'] - baseline_requests >= policy['request_interval']:
+        reasons.append('requests')
+    if not reasons:
+        return None
+    checkpoint = {'id': uuid.uuid4().hex, 'status': 'pending', 'observed_at': now,
+        'session_id': execution['session_id'], 'generation': execution['generation'],
+        'requests': budget['state']['requests'], 'request_delta': budget['state']['requests'] - baseline_requests,
+        'reported_tokens': budget['state']['reported_tokens'], 'trigger': reasons,
+        'observed_state': execution['state'], 'journal_cursor': execution.get('journal_cursor'),
+        'questions_pending': sum(q.get('reply_status') not in {'accepted', 'settled'} for q in execution.get('questions', [])),
+        'approvals_pending': sum(q.get('reply_status') not in {'accepted', 'settled'} for q in execution.get('approvals', []))}
+    messages = [event for event in events if event['type'] == 'assistant/message']
+    if messages:
+        text = '\n'.join(part.get('text', '') for part in messages[-1]['data'].get('message', {}).get('content', [])
+            if part.get('type') == 'text')[:2000]
+        try:
+            _public_text(text, intake.secret_values)
+            checkpoint['latest_progress'] = {'seq': messages[-1]['seq'], 'text': text}
+        except ManagementError:
+            checkpoint['latest_progress'] = {'seq': messages[-1]['seq'], 'text': 'Progress details remain in the original private Session.'}
+    checkpoint['recent_tool_results'] = [{'seq': event['seq'], 'is_error': event['data'].get('message', {}).get('isError')}
+        for event in events if event['type'] == 'tool/result'][-10:]
+    if prior:
+        execution['supervision_history'] = deepcopy(latest.get('supervision_history', [])) + [deepcopy(prior)]
+    execution['supervision_checkpoint'] = checkpoint
+    intake._save_execution(record, fields=['supervision_checkpoint', *(['supervision_history'] if prior else [])])
+    return checkpoint
 
 
 def _window_fingerprint(row):
     binding = {key: row[key] for key in ('schema', 'service_ref', 'host_lease', 'agent_preset', 'session_id',
         'session_created_at', 'generation', 'workspace', 'provider', 'model')}
-    binding['budget'] = {key: row['budget'][key] for key in (*CAPS, 'max_reported_tokens', 'max_output_tokens_per_request') if key in row['budget']}
+    binding['budget'] = {key: row['budget'][key] for key in ('max_wall_seconds', 'max_model_requests', 'max_reported_tokens', 'max_output_tokens_per_request') if key in row['budget']}
     binding['renewWindow'] = {key: value for key, value in row['renewWindow'].items() if key not in {'stop_reason', 'hook_marker', 'started_at_ms'}}
     if 'sealed_unknown_usage' in row['renewWindow']:
         binding['renewWindow']['sealed_unknown_usage'] = row['renewWindow']['sealed_unknown_usage']
@@ -532,16 +594,18 @@ def _window_fingerprint(row):
 
 
 def _require_window_budget(configuration, row):
+    if 'renewWindow' not in row:
+        return _require_max_tokens_budget(configuration, row['state'])
     window, state = row['renewWindow'], row['state']
     original = window['original_state']
     used = state['requests'] - window['request_base']
-    if (window['stop_reason'] is not None or not 0 <= used < configuration['budget']['max_model_requests']
+    if (window['stop_reason'] is not None or not 0 <= used < configuration['budget'].get('max_model_requests', float('inf'))
             or state['started_at_ms'] != original['started_at_ms'] or state['stop_reason'] != original['stop_reason']
             or state['reported_tokens'] < original['reported_tokens']
             or state['admissions'][:window['request_base']] != original['admissions']):
         raise ManagementError('outcome_unknown', 'The explicit new window is stopped or has no request remainder.')
     started = window['started_at_ms']
-    remaining = configuration['budget']['max_wall_seconds'] if started is None else (started + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000
+    remaining = _wall_remaining(configuration, started)
     if remaining <= 0:
         raise ManagementError('outcome_unknown', 'The explicit new window wall deadline has passed.')
     return remaining
@@ -1076,9 +1140,11 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     if baseline is None or current is None or baseline == current:
         raise ManagementError('binding_conflict', 'The delivered source was not promoted from the original baseline.')
     current_window = budget.get('renewWindow')
+    if current_window is None:
+        current_window = budget['state']
     expected_lease = maintenance.get('native_identity', {}).get('lease') if adopting else configuration['host_lease']
-    if (not isinstance(current_window, dict) or current_window.get('host_lease') != expected_lease
-            or current_window.get('hook_marker') != 'same-sid-window-v1'):
+    if (not isinstance(current_window, dict) or 'renewWindow' in budget
+            and (current_window.get('host_lease') != expected_lease or current_window.get('hook_marker') != 'same-sid-window-v1')):
         raise ManagementError('outcome_unknown', 'The original renewed window is unavailable.')
     requested_window = None
     approved_renewal = False
@@ -1382,6 +1448,8 @@ def admit_shared_window_resume(intake, record, message_id, generation):
 
 
 def _require_expired_window_budget(configuration, row):
+    if not CAPS <= set(configuration['budget']):
+        raise ManagementError('outcome_unknown', 'No explicit finite wall window is available to renew.')
     window, state = row.get('renewWindow', {}), row.get('state', {})
     original = window.get('original_state', {})
     started = window.get('started_at_ms')
@@ -2917,19 +2985,19 @@ async def run_shared_work(ctx, intake, record, generation):
         window_start = None
         if continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'}:
             budget = read_ledger(configuration, execution)
-            window_start = budget['renewWindow']['started_at_ms']
+            window_start = (budget.get('renewWindow') or budget['state'])['started_at_ms']
             if (not pending_continuation and execution.get('first_input') == 'accepted'
                     and continuation.get('status') == 'accepted' and type(window_start) is int
-                    and time.time() * 1000 >= window_start + configuration['budget']['max_wall_seconds'] * 1000):
+                    and _wall_remaining(configuration, window_start) <= 0):
                 _require_expired_window_budget(configuration, budget)
-                remaining = (window_start + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000
+                remaining = _wall_remaining(configuration, window_start)
             else:
                 remaining = _require_window_budget(configuration, budget)
             deadline = time.monotonic() + remaining + 15
         if continuation.get('kind') == 'max_tokens':
             budget = read_ledger(configuration, execution)
             started_at_ms = (budget.get('renewWindow') or budget['state'])['started_at_ms']
-            deadline = time.monotonic() + (started_at_ms + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
+            deadline = time.monotonic() + _wall_remaining(configuration, started_at_ms) + 15
         if not execution.get('first_input') or pending_continuation:
             phase = 'observer'
             observer_deadline = time.monotonic() + 15
@@ -2971,8 +3039,7 @@ async def run_shared_work(ctx, intake, record, generation):
                         'cumulative usage and remaining allowance. Do not create or extend any budget window.\n\n' + _prompt(intake, record))
                 elif read_ledger(configuration, execution).get('renewWindow'):
                     prompt = ('The owner explicitly authorized one new finite execution window in this same Session. '
-                        'Its wall limit is ' + str(configuration['budget']['max_wall_seconds']) + ' seconds and its request limit is '
-                        + str(configuration['budget']['max_model_requests']) + '. It starts at the first actual native request. '
+                        'Its explicitly configured hard limits are ' + json.dumps(configuration['budget']) + '. It starts at the first actual native request. '
                         'These current instructions override all old budget and token quota text in the frozen Issue: no plugin output-token or cumulative-token quota. '
                         'Native model limits still apply. Preserve the original game scope, history and cumulative usage.\n\n' + _prompt(intake, record))
             else:
@@ -2996,8 +3063,7 @@ async def run_shared_work(ctx, intake, record, generation):
         if continuation.get('kind') not in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'}:
             budget = read_ledger(configuration, execution)
             started_at_ms = budget['state']['started_at_ms']
-            remaining = (configuration['budget']['max_wall_seconds'] if started_at_ms is None else
-                (started_at_ms + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000)
+            remaining = _wall_remaining(configuration, started_at_ms)
             deadline = time.monotonic() + remaining + 15
         observation_deadline = min(deadline, time.monotonic() + SUPERVISE_OBSERVATION_SLICE_SECONDS)
         observed = False
@@ -3019,11 +3085,11 @@ async def run_shared_work(ctx, intake, record, generation):
             budget = read_ledger(configuration, execution)
             active_budget = budget.get('renewWindow') or budget['state']
             if active_budget['started_at_ms'] is not None:
-                deadline = time.monotonic() + (active_budget['started_at_ms'] + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
+                deadline = time.monotonic() + _wall_remaining(configuration, active_budget['started_at_ms']) + 15
                 observation_deadline = min(observation_deadline, deadline)
-            if continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'} and window_start is None and budget['renewWindow']['started_at_ms'] is not None:
-                window_start = budget['renewWindow']['started_at_ms']
-                deadline = time.monotonic() + (window_start + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
+            if continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'} and window_start is None and active_budget['started_at_ms'] is not None:
+                window_start = active_budget['started_at_ms']
+                deadline = time.monotonic() + _wall_remaining(configuration, window_start) + 15
             execution.update(journal_cursor=events[-1]['seq'] if events else -1, usage=projections.get('tokenUsage'),
                 observed_events=execution_event_references(events), shared_budget=budget['state'])
             intake._save_execution(record)
@@ -3064,6 +3130,12 @@ async def run_shared_work(ctx, intake, record, generation):
                         await asyncio.to_thread(cleanup_shared_github, intake, record)
                     return result
                 return {'status': state, 'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
+            checkpoint = supervision_checkpoint(intake, record, configuration, budget, events)
+            if checkpoint is not None:
+                return {'status': 'review_required', 'next_action': 'hermes_pm_supervise',
+                    'checkpoint': checkpoint, 'delivered': False,
+                    'instruction': 'Summarize the verified checkpoint and decide whether immediate owner feedback is needed. '
+                        'Call this same tool with checkpoint_id, summary and notify_owner. Do not stop DSH, renew a budget or send another prompt.'}
             await asyncio.sleep(.25)
         if time.monotonic() < deadline:
             return {'status': 'running', 'next_action': 'hermes_pm_supervise', 'delivered': False}

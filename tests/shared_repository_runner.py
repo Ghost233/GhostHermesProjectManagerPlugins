@@ -19,6 +19,7 @@ if observer_restart:
 supervise_takeover = shared_scenario.startswith('supervise_takeover')
 takeover_case = shared_scenario.removeprefix('supervise_takeover_') if shared_scenario != 'supervise_takeover' else 'valid'
 supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover
+supervision_checkpoints = shared_scenario == 'supervision_checkpoints'
 expired_window = shared_scenario == 'supervise_expired_window'
 if expired_window:
     shared_scenario = 'renew_window'
@@ -213,6 +214,10 @@ reference.write_text(json.dumps({'schema': 1, 'approved': True, 'mode': 'shared_
         'runner_sha256': hashlib.sha256((ROOT / 'ghost_hermes_pm/repository_test_runner.py').read_bytes()).hexdigest(),
         'node_sha256': hashlib.sha256(Path(shutil.which('node')).resolve().read_bytes()).hexdigest()}}))
 reference.chmod(0o600)
+if supervision_checkpoints:
+    checkpoint_scope = json.loads(reference.read_text())
+    checkpoint_scope.update(budget={}, supervision={'interval_seconds': 1, 'request_interval': 10})
+    reference.write_text(json.dumps(checkpoint_scope))
 if runtime_metadata:
     metadata = json.loads(reference.read_text())
     metadata['source_snapshot']['python_sha256'] = '0' * 64
@@ -230,6 +235,8 @@ GatewayRunner, GatewayConfig, Platform, PlatformConfig = (namespace[name] for na
 registry, plugins, model, repo = (namespace[name] for name in ('registry', 'plugins', 'model', 'repo'))
 if supervise_slice:
     model.repeat_supervise = True
+if supervision_checkpoints:
+    model.review_supervision_checkpoints = True
 service_client, connect_service, receive, raw, ReplyMessageResponse = (namespace[name] for name in
     ('service_client', 'connect_service', 'receive', 'raw', 'ReplyMessageResponse'))
 
@@ -292,6 +299,28 @@ async def main():
         def record():
             return json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
         service_namespace['record'] = record
+        def checkpoint_progress(requests):
+            sid = record()['dsh_execution']['session_id']
+            path = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
+            row = json.loads(path.read_text())
+            rows = peer['journals'][sid]
+            for index in range(row['state']['requests'], requests):
+                rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 4,
+                    'data': {'turn': 1, 'step': index, 'usage': {'inputTokens': 12, 'outputTokens': 8},
+                        'message': {'id': 'fixture-checkpoint-settlement-' + str(index), 'role': 'assistant',
+                            'content': [{'type': 'text', 'text': 'Synthetic active DSH progress.'}]}}}})
+            row['state'].update(started_at_ms=row['state']['started_at_ms'] or int(time.time() * 1000) - 1100,
+                requests=requests, reported_tokens=requests * 20,
+                admissions=['fixture-checkpoint-request-' + str(index) for index in range(requests)])
+            binding = {key: row[key] for key in ('schema', 'service_ref', 'host_lease', 'agent_preset',
+                'session_id', 'session_created_at', 'generation', 'workspace', 'provider', 'model', 'budget')}
+            row['state']['binding_sha256'] = hashlib.sha256(json.dumps(binding,
+                separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+            temporary = path.with_name(path.name + '.external-progress')
+            temporary.write_text(json.dumps(row))
+            temporary.chmod(0o600)
+            os.replace(temporary, path)
+            return path
         initial = record()
         assert initial['dsh_execution']['mode'] == 'shared_native', initial
         if observer_restart:
@@ -386,12 +415,19 @@ async def main():
         repeat_window_evidence = None
         expired_window_evidence = None
         qa_retry_evidence = None
+        checkpoint_ledger = None
+        checkpoint_first_budget = None
+        checkpoint_quiet = None
+        checkpoint_evidence = None
         takeover_rejection = None
         old_ledger_path = old_ledger = old_history = changed_ledger = None
         supervise_first = None
         supervise_terminal = None
         supervise_ledger = None
         while time.monotonic() < deadline:
+            if supervision_checkpoints and peer['prompts'] and checkpoint_ledger is None:
+                checkpoint_ledger = checkpoint_progress(1)
+                checkpoint_first_budget = checkpoint_ledger.read_bytes()
             if peer['prompts'] and not ended and shared_scenario in {'terminal', 'reconcile_intent', 'prepare_continue', *continuation_scenarios}:
                 sid = peer['prompts'][0]['sessionId']
                 rows = peer['journals'][sid]
@@ -500,6 +536,48 @@ async def main():
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
             latest = record()
+            if supervision_checkpoints:
+                checkpoint = latest['dsh_execution'].get('supervision_checkpoint', {})
+                if checkpoint.get('status') == 'reviewed' and checkpoint.get('notify_owner') is False and checkpoint_quiet is None:
+                    checkpoint_quiet = json.loads(json.dumps(checkpoint))
+                    assert checkpoint_quiet['trigger'] == ['time'], checkpoint_quiet
+                    assert checkpoint_quiet['requests'] == 1 and checkpoint_quiet['request_delta'] == 1
+                    assert checkpoint_quiet['delivery']['status'] == 'not_requested'
+                    assert not any(checkpoint_quiet['summary'] in message.request_body.content for message in sent)
+                    assert checkpoint_ledger.read_bytes() == checkpoint_first_budget
+                    checkpoint_progress(11)
+                    checkpoint_budget = checkpoint_ledger.read_bytes()
+                results = [item for batch in model.worker_tool_results for item in batch if isinstance(item, dict)]
+                if checkpoint_quiet is not None and checkpoint.get('status') == 'reviewed' and checkpoint.get('notify_owner') is True \
+                        and checkpoint.get('delivery', {}).get('status') == 'delivered' \
+                        and any(item.get('status') == 'duplicate' for item in results):
+                    assert checkpoint['id'] != checkpoint_quiet['id']
+                    assert 'requests' in checkpoint['trigger'] and checkpoint['request_delta'] == 10, checkpoint
+                    assert checkpoint['requests'] == 11 and checkpoint['reported_tokens'] == 220
+                    assert latest['dsh_execution']['supervision_history'][-1] == checkpoint_quiet
+                    notices = [message for message in sent if checkpoint['summary'] in message.request_body.content]
+                    assert len(notices) == 1 and notices[0].message_id == 'om_shared'
+                    assert checkpoint['delivery']['status'] == 'delivered'
+                    assert checkpoint_ledger.read_bytes() == checkpoint_budget
+                    assert latest['dsh_execution']['state'] == 'running' and len(peer['prompts']) == 1
+                    assert len(model.checkpoint_review_calls) == 2 and model.checkpoint_duplicate_sent
+                    unauthorized = await asyncio.to_thread(registry.dispatch, 'hermes_pm_supervise',
+                        model.checkpoint_review_calls[-1])
+                    assert json.loads(unauthorized) == {'status': 'rejected', 'code': 'worker_required'}
+                    assert checkpoint_ledger.read_bytes() == checkpoint_budget and len(notices) == 1
+                    await receive(adapter, raw('om_checkpoint_stop', '@_user_1 停止 ' + latest['id']))
+                    latest = record()
+                    assert latest['dsh_execution']['state'] == 'stopped', latest['dsh_execution']
+                    proof = latest['dsh_execution']['stop_control']['proof']
+                    assert proof['session']['scope'] == 'shared_session' and proof['session']['host_shutdown'] is False
+                    assert proof['worker']['exit_code'] == 0
+                    assert latest['dsh_execution']['session_id'] == checkpoint['session_id']
+                    assert json.loads(checkpoint_ledger.read_text())['state']['requests'] == 11
+                    worker = None
+                    checkpoint_evidence = {'quiet': checkpoint_quiet, 'notified': checkpoint,
+                        'notification_count': len(notices), 'duplicate': True, 'unauthorized': json.loads(unauthorized),
+                        'worker_exit': 0, 'ledger_before_stop': json.loads(checkpoint_budget), 'stop_proof': proof}
+                    break
             if supervise_slice:
                 tool_results = [result for batch in getattr(model, 'worker_tool_results', []) for result in batch
                                 if isinstance(result, dict)]
@@ -2045,6 +2123,8 @@ async def main():
             result['expired_window'] = expired_window_evidence
         if qa_preinput_retry:
             result['qa_preinput_retry'] = qa_retry_evidence
+        if supervision_checkpoints:
+            result['supervision_checkpoints'] = checkpoint_evidence
         if takeover_rejection is not None:
             result.update(case=takeover_case, rejection=takeover_rejection, takeover=takeover,
                 retained_claim=latest['dsh_execution']['supervisor_claim'],
@@ -2055,7 +2135,7 @@ async def main():
             result['concurrent_claim'] = claim_result
         (scratch / 'shared-worker-result.json').write_text(json.dumps(result))
     except BaseException:
-        if supervise_slice or owner_context or qa_preinput_retry:
+        if supervise_slice or owner_context or qa_preinput_retry or supervision_checkpoints:
             import traceback
             (scratch / 'supervise-failure.json').write_text(json.dumps({
                 'traceback': traceback.format_exc(), 'public_work': record(),
@@ -2065,7 +2145,7 @@ async def main():
         raise
     finally:
         model.worker_request_release.set()
-        if (supervise_slice or expired_window or qa_preinput_retry) and worker is not None:
+        if (supervise_slice or expired_window or qa_preinput_retry or supervision_checkpoints) and worker is not None:
             # Keep both services alive through the original scoped native cleanup.
             from simple_worker_evidence import cleanup_worker
             cleanup = await asyncio.to_thread(cleanup_worker, worker, scratch / 'home')

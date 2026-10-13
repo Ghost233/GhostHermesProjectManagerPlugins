@@ -16,6 +16,9 @@ class WorkerModelService:
         self.budget_stop = budget_stop
         self.native_service = native_service
         self.repeat_supervise = repeat_supervise
+        self.review_supervision_checkpoints = False
+        self.checkpoint_review_calls = []
+        self.checkpoint_duplicate_sent = False
         self.worker_finish_at = None
         self.worker_terminal_attempt_at = None
         self.worker_preflight = False
@@ -113,6 +116,34 @@ class WorkerModelService:
                     if service.repeat_supervise and step >= 2:
                         call = ('hermes_pm_supervise', {})
                         extra = []
+                    if service.review_supervision_checkpoints:
+                        last = results[-1] if results else {}
+                        if isinstance(last.get('content'), str):
+                            try:
+                                native = json.JSONDecoder().raw_decode(last['content'])[0]
+                            except ValueError:
+                                native = {}
+                            if isinstance(native, dict) and native.get('ok') is True:
+                                last = native
+                        extra = []
+                        if last.get('status') == 'review_required':
+                            review = {'checkpoint_id': last['checkpoint']['id'],
+                                'summary': 'Synthetic checkpoint review ' + str(len(service.checkpoint_review_calls) + 1)
+                                    + '. Verified original DSH progress.',
+                                'notify_owner': bool(service.checkpoint_review_calls)}
+                            service.checkpoint_review_calls.append(review)
+                            call = ('hermes_pm_supervise', review)
+                        elif last.get('status') == 'reviewed' and len(service.checkpoint_review_calls) == 2 \
+                                and not service.checkpoint_duplicate_sent:
+                            service.checkpoint_duplicate_sent = True
+                            call = ('hermes_pm_supervise', service.checkpoint_review_calls[-1])
+                        elif last.get('status') in {'stopped', 'stop_requested'}:
+                            call = ('kanban_block', {'kind': 'needs_input', 'reason': 'Owner stopped the original shared work.'})
+                        elif last.get('status') in {'blocked', 'triage'} \
+                                or last.get('task', {}).get('status') in {'blocked', 'triage'}:
+                            call = None
+                        else:
+                            call = ('hermes_pm_supervise', {})
                     if service.worker_preflight:
                         call = ('kanban_heartbeat', {})
                         extra = []

@@ -5,8 +5,7 @@ import crypto from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 
 const tools = ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'];
-const caps = {max_wall_seconds: 1800, max_model_requests: 80};
-const budgetKeys = [...Object.keys(caps), 'max_reported_tokens', 'max_output_tokens_per_request'];
+const budgetKeys = ['max_wall_seconds', 'max_model_requests', 'max_reported_tokens', 'max_output_tokens_per_request'];
 const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const integer = value => Number.isSafeInteger(value) && value >= 0;
 const text = value => typeof value === 'string' && value.length > 0;
@@ -109,10 +108,8 @@ export default function sharedNativeHook(ctx, config) {
         || !text(row.generation) || !text(row.workspace) || !path.isAbsolute(row.workspace)
         || fs.realpathSync(row.workspace) !== row.workspace || fs.realpathSync(session.header.cwd) !== row.workspace
         || !text(row.provider) || !text(row.model)
-        || !row.budget || ![2, 4].includes(Object.keys(row.budget).length)
-        || !Object.keys(row.budget).every(key => budgetKeys.includes(key) && integer(row.budget[key]) && row.budget[key] > 0)
-        || !Object.entries(caps).every(([key, maximum]) => integer(row.budget?.[key])
-          && row.budget[key] > 0 && row.budget[key] <= maximum)) {
+        || !row.budget || typeof row.budget !== 'object' || Array.isArray(row.budget)
+        || !Object.keys(row.budget).every(key => budgetKeys.includes(key) && integer(row.budget[key]) && row.budget[key] > 0)) {
       throw new Error('Shared work ledger binding rejected.');
     }
     const policy = ctx.get('sandboxPolicy').resolve({session});
@@ -261,7 +258,8 @@ export default function sharedNativeHook(ctx, config) {
     }
     return new Error('Shared work stopped: ' + active.stop_reason);
   };
-  const expired = record => (record.row.renewWindow ?? record.row.state).started_at_ms !== null
+  const expired = record => record.row.budget.max_wall_seconds !== undefined
+    && (record.row.renewWindow ?? record.row.state).started_at_ms !== null
     && (Date.now() - (record.row.renewWindow ?? record.row.state).started_at_ms >= record.row.budget.max_wall_seconds * 1000
       || performance.now() >= (admitted.get(record.row.session_id)?.deadline ?? Infinity));
   const validateSettlements = (session, record) => {
@@ -425,7 +423,8 @@ export default function sharedNativeHook(ctx, config) {
     usage(agent, record);
     const active = record.row.renewWindow ?? state;
     if (active.stop_reason || expired(record)) throw stop(agent, record, 'shared-work-wall-budget');
-    if (state.requests - (record.row.renewWindow?.request_base ?? 0) >= record.row.budget.max_model_requests) {
+    if (record.row.budget.max_model_requests !== undefined
+        && state.requests - (record.row.renewWindow?.request_base ?? 0) >= record.row.budget.max_model_requests) {
       throw stop(agent, record, 'shared-work-observed-budget');
     }
     const catalog = ctx.get('tools').schemas(agent).map(schema => schema.name).filter(name => tools.includes(name)).sort();
@@ -451,7 +450,8 @@ export default function sharedNativeHook(ctx, config) {
     admitted.set(agent.session.id, {agent, fingerprint: record.fingerprint,
       state: structuredClone(state), last_wall: Date.now(),
       ...(record.row.renewWindow ? {window: structuredClone(record.row.renewWindow)} : {}),
-      deadline: performance.now() + record.row.budget.max_wall_seconds * 1000 - (Date.now() - active.started_at_ms)});
+      deadline: record.row.budget.max_wall_seconds === undefined ? Infinity
+        : performance.now() + record.row.budget.max_wall_seconds * 1000 - (Date.now() - active.started_at_ms)});
     const request = await next();
     const current = ledgerFor(agent);
     signal.throwIfAborted();
