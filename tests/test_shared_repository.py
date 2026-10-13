@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import time
 from copy import deepcopy
+from types import SimpleNamespace
 
 from sdk_source_integrity import source_snapshot
 from test_repository_github import github_source  # noqa: F401
@@ -19,6 +20,302 @@ from test_repository_github import github_source  # noqa: F401
 import pytest
 
 from ghost_hermes_pm.manager import ManagementError
+
+
+def _natural_qa_fixture(tmp_path, monkeypatch, *, expired=False, foreign_host=False):
+    from ghost_hermes_pm import shared_repository
+    from ghost_hermes_pm import repository_acceptance, repository_control, repository_execution, repository_supervision
+    now = int(time.time() * 1000)
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    ledger_dir = tmp_path / 'ledger'
+    ledger_dir.mkdir(mode=0o700)
+    sid = 'session-fixture'
+    generation = 'generation-fixture'
+    source = {'head': 'a' * 40, 'source_digest': 'd' * 64, 'workspace_status': ''}
+    baseline = {'head': 'b' * 40, 'source_digest': 'e' * 64, 'workspace_status': ''}
+    started = now - (2_000_000 if expired else 1_000)
+    total_requests = 2 if expired else 5
+    state = {'started_at_ms': started, 'requests': total_requests, 'reported_tokens': 20,
+             'admissions': ['request-' + str(index) for index in range(total_requests)],
+             'stop_reason': 'shared-work-wall-budget' if expired else None}
+    previous_state = {'started_at_ms': started, 'requests': 1, 'reported_tokens': 10,
+                      'admissions': ['request-0'],
+                      'stop_reason': 'shared-work-wall-budget' if expired else None}
+    renew_window = {'id': 'old-window', 'message_id': 'old-message', 'host_lease': 'lease-fixture',
+        'request_base': 1, 'original_state': previous_state, 'original_host_lease': 'lease-original',
+        'started_at_ms': started, 'stop_reason': 'shared-work-wall-budget' if expired else None,
+        'hook_marker': 'same-sid-window-v1'}
+    row = {'schema': 1, 'session_id': sid, 'generation': generation, 'session_created_at': 7,
+        'workspace': str(repo), 'host_lease': 'lease-fixture', 'service_ref': 'fixture-native',
+        'agent_preset': 'fixture-shared', 'provider': 'fixture', 'model': 'fixture',
+        'budget': {'max_wall_seconds': 1800, 'max_model_requests': 80}, 'state': state,
+        'renewWindow': renew_window}
+    ledger_file = ledger_dir / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
+    ledger_file.write_text(json.dumps(row))
+    ledger_file.chmod(0o600)
+    anchor = {'app_id': 'fixture-app', 'transport_tenant_key': 'fixture-app-tenant',
+        'tenant_key': 'fixture-owner-tenant', 'recipient_tenant_key': 'fixture-bot-tenant',
+        'recipient_open_id': 'fixture-bot', 'chat_id': 'fixture-chat', 'sender_open_id': 'fixture-owner'}
+    context = {**anchor, 'profile_id': 'fixture-profile', 'message_id': 'natural-qa-message'}
+    events = []
+    if expired:
+        events.extend([
+            {'type': 'event', 'event': {'type': 'turn/start', 'seq': 0, 'time': 1, 'data': {'turn': 1}}},
+            {'type': 'event', 'event': {'type': 'assistant/message', 'seq': 1, 'time': 1,
+                'data': {'turn': 1, 'step': 1, 'message': {'id': 'interrupted', 'role': 'assistant', 'content': []}}}},
+            {'type': 'event', 'event': {'type': 'step/end', 'seq': 2, 'time': 1, 'data': {'turn': 1, 'step': 1}}},
+            {'type': 'event', 'event': {'type': 'turn/end', 'seq': 3, 'time': 1, 'data': {'turn': 1,
+                'reason': {'kind': 'aborted', 'reason': {'kind': 'hook', 'reason': 'shared-work-wall-budget'}}}}},
+        ])
+        start_seq, turn = 4, 2
+    else:
+        start_seq, turn = 0, 1
+    report = {'source_commit': source['head'], 'issue_updated_at': '2026-10-10T00:00:00Z',
+        'criteria': [{'text': 'Implement synthetic QA and verify it.', 'test_call_ids': ['fixture-test']}],
+        'test_files': ['qa.test.mjs'], 'fine_issue_urls': [], 'pr_url': None, 'sync_branches': [], 'leftovers': []}
+    events.extend([
+        {'type': 'event', 'event': {'type': 'turn/start', 'seq': start_seq, 'time': 2, 'data': {'turn': turn}}},
+        {'type': 'event', 'event': {'type': 'assistant/message', 'seq': start_seq + 1, 'time': 2,
+            'data': {'turn': turn, 'step': 1, 'message': {'id': 'delivery', 'role': 'assistant',
+                'content': [{'type': 'text', 'text': 'HERMES_REPOSITORY_DELIVERY_JSON ' + json.dumps(report)}]}}}},
+        {'type': 'event', 'event': {'type': 'turn/end', 'seq': start_seq + 2, 'time': 2,
+            'data': {'turn': turn, 'reason': {'kind': 'completed'}}}},
+    ])
+    before = {'header': {'id': sid, 'createdAt': 7, 'cwd': str(repo)}, 'hasMore': False,
+        'cursor': events[-1]['event']['seq'], 'records': events,
+        'projections': {'values': {'agentPreset': 'fixture-shared', 'permissions': {'currentValue': 'workspace-write'},
+            'inbox': {'next-turn': [], 'next-step': []}}}}
+    request = {}
+    after = json.loads(json.dumps(before))
+    after['cursor'] += 2
+    after['records'].extend([
+        {'type': 'event', 'event': {'type': 'agent/inbox/spliced', 'seq': before['cursor'] + 1, 'time': 3,
+            'data': {'target': 'next-turn', 'start': 0, 'inserted': []}}},
+        {'type': 'event', 'event': {'type': 'turn/start', 'seq': before['cursor'] + 2, 'time': 3,
+            'data': {'turn': turn + 1}}},
+    ])
+    card = {'status': 'blocked', 'current_run_id': None, 'worker_pid': None}
+    carrier_identity = {'kind': 'shared_native', 'lease': 'lease-fixture', 'pid': 12, 'created_at': 1}
+    carrier_current_identity = {'kind': 'shared_native', 'lease': 'foreign-lease', 'pid': 13, 'created_at': 2} if foreign_host else carrier_identity
+
+    class Carrier:
+        native_identity = carrier_current_identity
+        config = {'generation': generation}
+        def __init__(self):
+            self.prompts = []
+        def stream(self, *_args):
+            value = before if not self.prompts else after
+            class Stream:
+                def __iter__(self):
+                    return iter((value,))
+                def __next__(self):
+                    return value
+                def close(self):
+                    return None
+            return Stream()
+        def owned_jobs(self):
+            return []
+        def close(self):
+            return None
+
+    carrier = Carrier()
+    execution = {'mode': 'shared_native', 'state': 'awaiting_acceptance', 'terminal_reason': {'kind': 'completed'},
+        'first_input': 'accepted', 'session_id': sid, 'generation': generation, 'session_created_at': 7,
+        'workspace_id': 'workspace-fixture', 'native_identity': carrier_identity,
+        'reference_sha256': 'reference-sha', 'supervisor_claim': {'run_id': 1}, 'control_message_ids': [],
+        'baseline': baseline, 'acceptance': {'status': 'unmet', 'delivered': False, 'unmet': ['test_evidence_missing'],
+            'source_commit': source['head'], 'source_digest': source['source_digest'],
+            'workspace_status': source['workspace_status']}, 'verification_prefix': 'fixture-verification-entry',
+        'github_reference': {'config_dir': '/private/tmp/fixture-gh', 'account': 'fixture-account'}}
+    record = {'id': 'work-' + 'a' * 32, 'profile_id': 'fixture-profile', 'source_anchor': anchor,
+        'target': {'repo_path': str(repo), 'repository': 'fixture-user/fixture', 'execution_ref': str(tmp_path / 'reference')},
+        'issue': {'url': 'https://github.com/fixture-user/fixture/issues/7', 'title': 'Synthetic QA',
+                  'body': 'Implement synthetic QA and verify it.', 'updated_at': '2026-10-10T00:00:00Z'},
+        'card_id': 'card-fixture', 'dsh_execution': execution}
+    reference_file = tmp_path / 'reference'
+    reference_file.write_text('{}')
+    reference_file.chmod(0o600)
+    lock_path = tmp_path / 'intake.lock'
+    lock_path.touch(mode=0o600)
+    intake = SimpleNamespace(secret_values=[], generation=generation, saved=[], card=card, lock_path=str(lock_path))
+    intake.snapshot = lambda: {'work': [record]}
+    def save_execution(saved_record, fields=None):
+        intake.saved.append(tuple(fields or []))
+    def kanban(name, _args):
+        if name == 'kanban_unblock':
+            card.update(status='ready', current_run_id=None, worker_pid=None)
+        return {'task': card}
+    intake._save_execution = save_execution
+    intake._kanban = kanban
+    intake.require_active = lambda _generation: None
+    monkeypatch.setattr(shared_repository, 'SharedDesktopTransport', lambda _configuration: carrier)
+    monkeypatch.setattr(repository_control, '_card', lambda _intake, _record: card)
+    monkeypatch.setattr(repository_control, '_worker_end', lambda _intake, _record, **_kwargs: {'run_id': 1, 'exit_code': 0})
+    config = {'reference_sha256': 'reference-sha', 'workspace': str(repo), 'session_id': sid,
+        'generation': generation, 'workspace_id': 'workspace-fixture', 'agent_preset': 'fixture-shared',
+        'host_lease': 'lease-fixture', 'ledger_dir': str(ledger_dir),
+        'budget': {'max_wall_seconds': 1800, 'max_model_requests': 80}}
+    intake.config = config
+    reference_file.write_text(json.dumps(config))
+    monkeypatch.setattr(shared_repository, 'shared_configuration', lambda _reference, _configuration, workspace=None: config)
+    monkeypatch.setattr(repository_execution, 'execution_configuration', lambda _target: (config, {}))
+    monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda _target: source)
+    monkeypatch.setattr(shared_repository, 'shared_receipts', lambda *_args: [{'source_before': baseline,
+        'source_after': source, 'generation': generation, 'session_id': sid, 'name': 'bash',
+        'execution_admission': 'admitted', 'is_error': False, 'kind': 'foreground', 'exit_code': 0,
+        'timed_out': False, 'aborted': False, 'native_session_seq': 1}])
+    monkeypatch.setattr(shared_repository, '_verified_source_chain', lambda *_args: True)
+    monkeypatch.setattr(shared_repository, 'read_ledger', lambda _config, _execution: json.loads(ledger_file.read_text()))
+    def owned_call(_carrier, method, args):
+        if method == 'session/list':
+            return {'items': [{'sessionId': sid, 'cwd': str(repo), 'running': False, 'agentAvailable': True}]}
+        if method == 'workspace/create':
+            return {'created': False, 'workspace': {'workspaceId': 'workspace-fixture', 'path': str(repo), 'sessionIds': [sid]}}
+        if method == 'session/create':
+            return {'sessionId': sid, 'agentPreset': 'fixture-shared'}
+        if method == 'session/prompt':
+            request.update(args)
+            carrier.prompts.append(args)
+            inserted = after['records'][-2]['event']['data']['inserted']
+            inserted.append({'id': 'message-' + args['requestId'], 'role': 'user',
+                'content': args['content'], 'source': {'kind': 'user', 'rpcId': args['requestId']}})
+            return {'accepted': True}
+        raise AssertionError(method)
+    monkeypatch.setattr(repository_supervision, 'owned_call', owned_call)
+    return record, context, intake, carrier, ledger_file, source, request
+
+
+def test_natural_qa_rework_active_public_tool_queues_one_same_session_prompt(tmp_path, monkeypatch):
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    record, context, intake, carrier, ledger_file, _source, request = _natural_qa_fixture(tmp_path, monkeypatch)
+    result = admit_shared_natural_qa_rework(intake, record, context, 'Fix only the missing synthetic QA receipt.', None, intake.generation)
+    assert result == {'status': 'accepted', 'work_id': record['id']}
+    assert len(carrier.prompts) == 0 and not request
+    assert record['dsh_execution']['state'] == 'continuation_pending'
+    assert record['dsh_execution']['continuation_control']['kind'] == 'qa_rework'
+    assert record['dsh_execution']['continuation_control']['dispatch_status'] == 'accepted'
+    assert intake.card['status'] == 'ready'
+    assert json.loads(ledger_file.read_text())['state']['requests'] == 5
+    with pytest.raises(ManagementError) as duplicate:
+        admit_shared_natural_qa_rework(intake, record, context, 'Fix only the missing synthetic QA receipt.', None, intake.generation)
+    assert duplicate.value.code in {'duplicate', 'outcome_unknown'}
+    assert len(carrier.prompts) == 0
+
+
+def test_sealed_unknown_usage_counts_attempt_before_interrupted_message():
+    from ghost_hermes_pm.shared_repository import _sealed_unknown_usage
+    events = [
+        {'type': 'assistant/attempt', 'seq': 0, 'data': {'turn': 1, 'step': 0, 'usage': {'outputTokens': 1}}},
+        {'type': 'assistant/message', 'seq': 1, 'data': {'turn': 1, 'step': 1, 'message': {'content': []}}},
+        {'type': 'step/end', 'seq': 2, 'data': {'turn': 1, 'step': 1}},
+        {'type': 'turn/end', 'seq': 3, 'data': {'turn': 1,
+            'reason': {'kind': 'aborted', 'reason': {'kind': 'hook', 'reason': 'shared-work-wall-budget'}}}},
+    ]
+    seal = _sealed_unknown_usage(events, {'id': 'prior', 'request_base': 2,
+        'original_state': {'stop_reason': 'shared-work-wall-budget'}})
+    assert seal['ordinal'] == 2 and seal['prior_window_id'] == 'prior'
+
+
+def test_renew_window_hook_metadata_is_strict_and_controlled():
+    from ghost_hermes_pm.shared_repository import _validate_renew_window
+    from ghost_hermes_pm.manager import ManagementError
+    window = {'id': 'window', 'message_id': 'message', 'host_lease': 'lease', 'request_base': 2,
+        'original_host_lease': 'old-lease', 'started_at_ms': None, 'stop_reason': None,
+        'hook_marker': None, 'original_state': {'started_at_ms': None, 'requests': 2,
+            'reported_tokens': 0, 'admissions': ['a', 'b'], 'stop_reason': None,
+            'binding_sha256': 'a' * 64, 'observed_at_ms': 1, 'model_context_window': 100,
+            'stop_cleanup': {'kind': 'terminal', 'job_ids': ['job']}}}
+    _validate_renew_window(window)
+    invalid = dict(window, original_state={**window['original_state'], 'unexpected': True})
+    with pytest.raises(ManagementError):
+        _validate_renew_window(invalid)
+    with pytest.raises(ManagementError):
+        _validate_renew_window(dict(window, request_base=0))
+
+
+def test_natural_qa_rework_expired_window_renews_once_and_keeps_sealed_usage(tmp_path, monkeypatch):
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    record, context, intake, carrier, ledger_file, _source, _request = _natural_qa_fixture(tmp_path, monkeypatch, expired=True)
+    required = admit_shared_natural_qa_rework(intake, record, context, 'Re-run the actual synthetic QA test.', None, intake.generation)
+    assert required['status'] == 'renewal_required'
+    assert required['proposal']['limits'] == {'max_wall_seconds': 1800, 'max_model_requests': 80}
+    before = ledger_file.read_bytes()
+    from ghost_hermes_pm.shared_repository import record_shared_natural_qa_proposal
+    record_shared_natural_qa_proposal(intake, record, required['proposal']['id'],
+        {'status': 'delivered', 'message_id': 'proposal-window', 'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
+    context = {**context, 'message_id': 'natural-qa-message-maintenance', 'reply_to_message_id': 'proposal-window'}
+    prepared = admit_shared_natural_qa_rework(intake, record, context, '同意', None, intake.generation)
+    assert prepared['status'] == 'maintenance_required'
+    assert record['dsh_execution'].get('renewal_window_checkpoint'), record['dsh_execution']
+    assert ledger_file.read_bytes() == before and not carrier.prompts
+    record_shared_natural_qa_proposal(intake, record, prepared['proposal']['id'],
+        {'status': 'delivered', 'message_id': 'proposal-maintenance', 'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
+    carrier.native_identity = {'kind': 'shared_native', 'lease': 'lease-new', 'pid': 14, 'created_at': 2}
+    context = {**context, 'message_id': 'natural-qa-message-adopt', 'reply_to_message_id': 'proposal-maintenance'}
+    intake.config['host_lease'] = 'lease-new'
+    result = admit_shared_natural_qa_rework(intake, record, context, '维护完成', None, intake.generation)
+    assert result['status'] == 'accepted'
+    budget = json.loads(ledger_file.read_text())
+    assert budget['state']['requests'] == 2 and budget['renewWindow']['request_base'] == 2
+    assert budget['renewWindow']['started_at_ms'] is None
+    assert budget['renewWindow']['host_lease'] == 'lease-new'
+    assert budget['renewWindow']['original_host_lease'] == 'lease-fixture'
+    assert budget['renewWindow']['hook_marker'] is None
+    triplet = [
+        {'type': 'assistant/message', 'seq': 1, 'time': 1,
+         'data': {'turn': 1, 'step': 1, 'message': {'id': 'interrupted', 'role': 'assistant', 'content': []}}},
+        {'type': 'step/end', 'seq': 2, 'time': 1, 'data': {'turn': 1, 'step': 1}},
+        {'type': 'turn/end', 'seq': 3, 'time': 1,
+         'data': {'turn': 1, 'reason': {'kind': 'aborted', 'reason': {'kind': 'hook', 'reason': 'shared-work-wall-budget'}}}},
+    ]
+    expected_seal = hashlib.sha256(json.dumps(triplet, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+    assert budget['renewWindow']['sealed_unknown_usage'] == {
+        'ordinal': 1, 'event_sha256': expected_seal,
+        'prior_window_id': 'old-window'}
+    assert len(carrier.prompts) == 0 and record['dsh_execution']['state'] == 'continuation_pending'
+    assert record['dsh_execution']['continuation_control']['kind'] == 'qa_rework'
+
+
+def test_natural_qa_rework_expired_window_requires_maintenance_without_side_effects(tmp_path, monkeypatch):
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    record, context, intake, carrier, ledger_file, _source, _request = _natural_qa_fixture(
+        tmp_path, monkeypatch, expired=True, foreign_host=False)
+    before = ledger_file.read_bytes()
+    required = admit_shared_natural_qa_rework(intake, record, context, 'Wait for the approved native maintenance.',
+        {'max_wall_seconds': 1800, 'max_model_requests': 80}, intake.generation)
+    from ghost_hermes_pm.shared_repository import record_shared_natural_qa_proposal
+    record_shared_natural_qa_proposal(intake, record, required['proposal']['id'],
+        {'status': 'delivered', 'message_id': 'proposal-window', 'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
+    result = admit_shared_natural_qa_rework(intake, record,
+        {**context, 'message_id': 'natural-qa-maintenance', 'reply_to_message_id': 'proposal-window'},
+        '同意', None, intake.generation)
+    assert result['status'] == 'maintenance_required'
+    assert ledger_file.read_bytes() == before and not carrier.prompts
+    assert record['dsh_execution']['natural_qa_rework_control']['status'] == 'maintenance_required'
+    carrier.native_identity = record['dsh_execution']['native_identity']
+    with pytest.raises(ManagementError):
+        admit_shared_natural_qa_rework(intake, record, {**context, 'message_id': 'natural-qa-repeat'},
+            'Wait for the approved native maintenance.', {'max_wall_seconds': 1800, 'max_model_requests': 80}, intake.generation)
+    assert ledger_file.read_bytes() == before and not carrier.prompts
+
+
+@pytest.mark.parametrize('case', ['source', 'jobs', 'identity'])
+def test_natural_qa_rework_rejects_changed_active_evidence_without_side_effects(tmp_path, monkeypatch, case):
+    from ghost_hermes_pm import repository_acceptance
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    record, context, intake, carrier, ledger_file, source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    before = ledger_file.read_bytes()
+    if case == 'source':
+        monkeypatch.setattr(repository_acceptance, 'repository_source_state',
+            lambda _target: {**source, 'source_digest': 'f' * 64})
+    elif case == 'jobs':
+        carrier.owned_jobs = lambda: [{'id': 'foreign-job', 'owner': 'foreign-session', 'status': 'running'}]
+    else:
+        carrier.native_identity = {'kind': 'shared_native', 'lease': 'foreign-lease', 'pid': 19, 'created_at': 3}
+    with pytest.raises(ManagementError):
+        admit_shared_natural_qa_rework(intake, record, context, 'Fix synthetic evidence.', None, intake.generation)
+    assert ledger_file.read_bytes() == before and not carrier.prompts and intake.card['status'] == 'blocked'
 
 
 @pytest.mark.parametrize('case', ['wrong_sender', 'bot_sender', 'wrong_profile', 'wrong_chat', 'no_newline',

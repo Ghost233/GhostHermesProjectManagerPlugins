@@ -543,6 +543,95 @@ try {
       await owned.dispose();
     }
     settlementEvidence = {accepted: ['exact'], rejected: variants.slice(1).map(([name]) => name)};
+  } else if (scenario === 'repeat_settlement') {
+    const original = await create('fixture-repeat-history-source');
+    const registration = register(original.agent, {model: 'fixture-window-interrupted'});
+    registration.budget.max_wall_seconds = 1;
+    fs.writeFileSync(ledgerPath(original.agent.session.id), JSON.stringify(registration));
+    await prompt(original.agent);
+    const history = {meta: {...original.agent.session.header},
+      events: Array.from({length: original.agent.session.seq}, (_, index) => structuredClone(original.agent.session.eventAt(index)))};
+    assert.deepEqual(history.events.slice(-3).map(event => event.type), ['assistant/message', 'step/end', 'turn/end']);
+    await original.dispose();
+    const hashEvents = events => crypto.createHash('sha256').update(JSON.stringify(events)).digest('hex');
+    const repeatEvents = () => {
+      const [message, stepEnd, turnEnd] = history.events.slice(-3).map(event => structuredClone(event));
+      const completed = structuredClone(message);
+      completed.data = {...completed.data, interrupted: false, usage: {inputTokens: 7, outputTokens: 5}, stream: [],
+        message: {...(completed.data.message ?? {}), id: 'fixture-repeat-completed'}};
+      const events = [...history.events.slice(0, -3).map(event => structuredClone(event)), message, stepEnd, turnEnd, completed];
+      events.forEach((event, index) => {event.seq = index;});
+      return events;
+    };
+    const variants = ['exact', 'wrong-ordinal', 'ordinal-zero', 'ordinal-type', 'wrong-hash', 'hash-uppercase',
+      'prior-id', 'prior-empty', 'extra-key', 'prefix', 'suffix', 'multiple', 'current-missing'];
+    const accepted = ['exact', 'current-missing'];
+    const schemaRejected = new Set(['wrong-ordinal', 'ordinal-zero', 'ordinal-type', 'hash-uppercase',
+      'prior-id', 'prior-empty', 'extra-key']);
+    for (const name of variants) {
+      const current = name === 'current-missing';
+      const events = current ? structuredClone(history.events) : repeatEvents();
+      const triple = current ? events.slice(-3) : events.slice(-4, -1);
+      const requests = name === 'multiple' ? 3 : current ? 1 : 2;
+      const windowId = 'fixture-repeat-window-' + name;
+      const sealed = {ordinal: name === 'wrong-ordinal' ? 2 : name === 'ordinal-zero' ? 0 : 1,
+        event_sha256: hashEvents(triple), prior_window_id: 'fixture-prior-window-' + name};
+      if (name === 'ordinal-type') sealed.ordinal = '1';
+      if (name === 'wrong-hash') sealed.event_sha256 = '0'.repeat(64);
+      if (name === 'hash-uppercase') sealed.event_sha256 = sealed.event_sha256.toUpperCase();
+      if (name === 'prior-id') sealed.prior_window_id = windowId;
+      if (name === 'prior-empty') sealed.prior_window_id = '';
+      if (name === 'extra-key') sealed.extra = true;
+      if (name === 'prefix') sealed.event_sha256 = hashEvents([events.at(-1), ...triple]);
+      if (name === 'suffix') sealed.event_sha256 = hashEvents([...triple, events.at(-1)]);
+      if (name === 'multiple') {
+        const second = structuredClone(triple);
+        second[0].data = {...second[0].data, turn: second[0].data.turn + 1,
+          message: {...(second[0].data.message ?? {}), id: 'fixture-repeat-second'}};
+        second[1].data = {...second[1].data, turn: second[1].data.turn + 1};
+        second[2].data = {...second[2].data, turn: second[2].data.turn + 1};
+        events.push(...second);
+        events.forEach((event, index) => {event.seq = index;});
+      }
+      const restored = {meta: {...history.meta}, events};
+      const owned = await create('fixture-repeat-' + name, 'fixture-managed', restored);
+      const row = register(owned.agent, {model: 'fixture-route',
+        state: {started_at_ms: Date.now() - 2000, requests, reported_tokens: 0,
+          admissions: Array.from({length: requests}, (_, index) => 'fixture-repeat-old-' + index),
+          stop_reason: 'shared-work-wall-budget'}});
+      row.renewWindow = {id: windowId, message_id: 'fixture-owner-' + name, host_lease: currentHostLease,
+        request_base: requests, original_state: structuredClone(row.state),
+        original_host_lease: 'fixture-pre-maintenance-lease', started_at_ms: null, stop_reason: null, hook_marker: null,
+        ...(current ? {} : {sealed_unknown_usage: sealed})};
+      row.state.binding_sha256 = crypto.createHash('sha256').update(JSON.stringify({
+        ...Object.fromEntries(['schema', 'service_ref', 'host_lease', 'agent_preset', 'session_id', 'session_created_at',
+          'generation', 'workspace', 'provider', 'model', 'budget'].map(key => [key, row[key]])),
+        renewWindow: Object.fromEntries(Object.entries(row.renewWindow)
+          .filter(([key]) => !['started_at_ms', 'stop_reason', 'hook_marker'].includes(key)))})).digest('hex');
+      fs.writeFileSync(ledgerPath(owned.agent.session.id), JSON.stringify(row));
+      const before = calls.length;
+      await prompt(owned.agent);
+      const after = JSON.parse(fs.readFileSync(ledgerPath(owned.agent.session.id)));
+      if (accepted.includes(name)) {
+        assert.equal(calls.length, before + 1, name + ' must admit one renewed request.');
+        assert.equal(after.state.requests, requests + 1);
+        assert.ok(after.state.reported_tokens > row.state.reported_tokens,
+          name + ' must report actual usage without inventing a zero-token settlement.');
+        assert.equal(after.renewWindow.hook_marker, 'same-sid-window-v1');
+        if (!current) assert.deepEqual(after.renewWindow.sealed_unknown_usage, sealed);
+      } else {
+        assert.equal(calls.length, before, name + ' must fail before model dispatch.');
+        assert.deepEqual(after.state, row.state, name + ' must preserve the old reservation and tokens.');
+        const turnEnd = owned.agent.session.eventAt(owned.agent.session.seq - 1);
+        assert.equal(turnEnd.type, 'turn/end');
+        assert.equal(turnEnd.data.reason.kind, 'error');
+        const expected = schemaRejected.has(name) ? 'Shared work explicit renewed window changed or is unknown.'
+          : 'Shared work native settlement usage is unknown.';
+        assert.ok(JSON.stringify(turnEnd.data.reason).includes(expected), name);
+      }
+      await owned.dispose();
+    }
+    settlementEvidence = {repeat_accepted: accepted, repeat_rejected: variants.filter(name => !accepted.includes(name))};
   } else if (scenario === 'renew_window' || scenario === 'renew_interrupted') {
     const renew = async (id, model = 'fixture-route') => {
       const original = await create(id);

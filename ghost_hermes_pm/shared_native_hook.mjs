@@ -125,8 +125,17 @@ export default function sharedNativeHook(ctx, config) {
     const now = Date.now();
     const fingerprint = digest(binding(row));
     const window = row.renewWindow;
-    if (window && (Object.keys(window).sort().join() !== ['id', 'message_id', 'host_lease', 'request_base', 'original_state',
-        'original_host_lease', 'started_at_ms', 'stop_reason', 'hook_marker'].sort().join()
+    const windowKeys = window ? Object.keys(window) : [];
+    const requiredWindowKeys = ['id', 'message_id', 'host_lease', 'request_base', 'original_state',
+      'original_host_lease', 'started_at_ms', 'stop_reason', 'hook_marker'];
+    const sealed = window?.sealed_unknown_usage;
+    if (window && (windowKeys.some(key => !requiredWindowKeys.includes(key) && key !== 'sealed_unknown_usage')
+        || requiredWindowKeys.some(key => !windowKeys.includes(key))
+        || sealed !== undefined && (typeof sealed !== 'object' || sealed === null
+          || Object.keys(sealed).sort().join() !== ['ordinal', 'event_sha256', 'prior_window_id'].sort().join()
+          || !integer(sealed.ordinal) || sealed.ordinal <= 0 || sealed.ordinal >= window.request_base
+          || !/^[a-f0-9]{64}$/.test(sealed.event_sha256 ?? '')
+          || !text(sealed.prior_window_id) || sealed.prior_window_id === window.id)
         || !text(window.id) || !text(window.message_id) || window.host_lease !== hostLease
         || !text(window.original_host_lease) || window.original_host_lease === hostLease
         || !integer(window.request_base) || window.request_base <= 0 || state.requests < window.request_base
@@ -257,18 +266,23 @@ export default function sharedNativeHook(ctx, config) {
       || performance.now() >= (admitted.get(record.row.session_id)?.deadline ?? Infinity));
   const validateSettlements = (session, record) => {
     let settlements = 0;
-    let interrupted = false;
+    let unknownSettlement;
+    const sealed = record.row.renewWindow?.sealed_unknown_usage;
     for (let index = 0; index < session.seq; index++) {
       const event = session.eventAt(index);
       if (!['assistant/message', 'assistant/attempt'].includes(event.type)) continue;
       settlements++;
       const value = event.data.usage ?? event.data.stream?.findLast(record => record.type === 'chunk'
         && record.chunk?.type === 'usage')?.chunk.usage;
-      if (value === undefined && event.data.usage === undefined && !interrupted && event.type === 'assistant/message'
-          && event.data.interrupted === true && integer(event.data.turn) && integer(event.data.step)
+      const currentWindow = !sealed && record.row.renewWindow?.original_state.stop_reason === 'shared-work-wall-budget'
+        && settlements === record.row.renewWindow?.request_base;
+      const sealedWindow = sealed && unknownSettlement === undefined && settlements === sealed.ordinal;
+      if (value === undefined && event.data.usage === undefined && (currentWindow || sealedWindow)
+          && event.type === 'assistant/message' && event.data.interrupted === true
+          && integer(event.data.turn) && integer(event.data.step)
           && !event.data.stream?.some(record => record.type === 'chunk' && record.chunk?.type === 'usage')
           && record.row.renewWindow?.original_state.stop_reason === 'shared-work-wall-budget'
-          && settlements === record.row.renewWindow.request_base && index + 2 < session.seq) {
+          && index + 2 < session.seq) {
         const stepEnd = session.eventAt(index + 1);
         const turnEnd = session.eventAt(index + 2);
         const reason = turnEnd.data?.reason;
@@ -277,7 +291,10 @@ export default function sharedNativeHook(ctx, config) {
             && reason?.kind === 'aborted' && Object.keys(reason).length === 2
             && reason.reason?.kind === 'hook' && reason.reason.reason === 'shared-work-wall-budget'
             && Object.keys(reason.reason).length === 2) {
-          interrupted = true;
+          if (sealedWindow && digest(JSON.stringify([event, stepEnd, turnEnd])) !== sealed.event_sha256) {
+            throw new Error('Shared work native settlement usage is unknown.');
+          }
+          unknownSettlement = settlements;
           continue; // The sealed old request stays reserved without inventing reported usage.
         }
       }

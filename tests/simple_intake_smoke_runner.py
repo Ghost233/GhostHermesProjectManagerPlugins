@@ -245,6 +245,210 @@ async def main():
             'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     native.im.v1.message.reply = reply
     await connect_service(adapter, native)
+    if scenario == 'natural_qa_intake':
+        import importlib
+        from inspect import isawaitable
+
+        package = type(adapter).__module__.rsplit('.', 1)[0]
+        shared = importlib.import_module(package + '.shared_repository')
+        admissions, shared_calls, proposal_deliveries, proposal_records, tool_results, synthetic_events = [], [], {}, [], [], []
+        shared_modules = [module for name, module in sys.modules.items()
+                          if name.endswith('.shared_repository') and hasattr(module, 'admit_shared_natural_qa_rework')]
+        original_admissions = {module: module.admit_shared_natural_qa_rework for module in shared_modules}
+        original_recorders = {module: module.record_shared_natural_qa_proposal for module in shared_modules}
+        ManagementError = importlib.import_module(package + '.manager').ManagementError
+        main_thread = threading.get_ident()
+        window_proposal = {'id': 'proposal-window', 'kind': 'window',
+                           'limits': {'max_wall_seconds': 1800, 'max_model_requests': 80},
+                           'options': ['同意', '拒绝'], 'text': '确认一次有限 QA 窗口。'}
+        maintenance_proposal = {'id': 'proposal-maintenance', 'kind': 'maintenance',
+                                'options': ['维护完成', '取消'], 'text': '完成原生维护后回复。'}
+
+        def admitted(intake, record, source_context, feedback, window, generation):
+            assert threading.get_ident() != main_thread and window is None
+            shared_calls.append({'work_id': record['id'], 'source_context': source_context,
+                                 'feedback': feedback, 'generation': generation})
+            if source_context['message_id'] == 'om_oserror':
+                raise OSError('synthetic shared boundary failure')
+            if source_context['message_id'] == 'om_qa':
+                return {'status': 'renewal_required', 'work_id': record['id'], 'proposal': window_proposal}
+            if source_context['message_id'] in {'om_wrong_parent', 'om_reject', 'om_renew'}:
+                if source_context.get('reply_to_message_id') != proposal_deliveries.get(window_proposal['id']):
+                    raise ManagementError('binding_conflict', 'Proposal reference differs.')
+                if feedback == '拒绝':
+                    return {'status': 'declined', 'work_id': record['id']}
+                if feedback == '同意':
+                    return {'status': 'maintenance_required', 'work_id': record['id'], 'proposal': maintenance_proposal}
+            if source_context['message_id'] == 'om_maintenance':
+                if (source_context.get('reply_to_message_id') != proposal_deliveries.get(maintenance_proposal['id'])
+                        or feedback != '维护完成'):
+                    raise ManagementError('binding_conflict', 'Maintenance proposal reference differs.')
+                admissions.append(record['id'])
+                return {'status': 'accepted', 'work_id': record['id']}
+            raise ManagementError('binding_conflict', 'Natural reply is not accepted.')
+
+        def record_proposal(intake, record, proposal_id, delivery):
+            assert threading.get_ident() != main_thread
+            proposal_records.append((proposal_id, delivery))
+            if delivery['status'] == 'delivered':
+                proposal_deliveries[proposal_id] = delivery['message_id']
+            return {'status': 'recorded', 'work_id': record['id']}
+
+        for module in shared_modules:
+            module.admit_shared_natural_qa_rework = admitted
+            module.record_shared_natural_qa_proposal = record_proposal
+        anchor = {'app_id': 'cli_fixture', 'transport_tenant_key': 'tenant-app', 'tenant_key': 'tenant-owner',
+                  'recipient_tenant_key': 'tenant-bot', 'recipient_open_id': 'ou_lead',
+                  'chat_id': 'oc_fixture', 'sender_open_id': 'ou_owner'}
+        work_id = 'work-' + 'a' * 32
+
+        def record(identifier=work_id, profile_id='lead'):
+            return {'id': identifier, 'profile_id': profile_id, 'source_anchor': dict(anchor),
+                    'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
+                                      'first_input': 'accepted', 'terminal_reason': {'kind': 'completed'},
+                                      'acceptance': {'status': 'unmet', 'delivered': False}}}
+
+        adapter.intake._save(record())
+
+        async def invoke(arguments):
+            try:
+                value = registry.dispatch('hermes_pm_repository_rework', arguments)
+            except Exception as error:
+                return {'status': 'tool_unavailable', 'code': type(error).__name__}
+            if isawaitable(value):
+                try:
+                    value = await value
+                except Exception as error:
+                    return {'status': 'tool_unavailable', 'code': type(error).__name__}
+            return json.loads(value)
+
+        async def ordinary_tool_handler(event):
+            assert adapter._command_source.get() is event.source
+            assert adapter.intake.prepare(event, adapter) is None
+            synthetic_events.append(event)
+            if event.message_id == 'om_qa':
+                assert await invoke({'feedback': event.text, 'window': {'max_wall_seconds': 1800,
+                                                                         'max_model_requests': 80}}) == {
+                    'status': 'rejected', 'code': 'invalid_change'}
+                tool_results.append(await invoke({'feedback': event.text}))
+                tool_results.append(await invoke({'feedback': event.text}))
+                return
+            if event.message_id in {'om_wrong_parent', 'om_reject', 'om_renew', 'om_maintenance'}:
+                tool_results.append(await invoke({'feedback': event.text}))
+                return
+            if event.message_id == 'om_oserror':
+                tool_results.append(await invoke({'feedback': event.text}))
+                tool_results.append(await invoke({'feedback': event.text}))
+                return
+            if event.message_id == 'om_ambiguous':
+                tool_results.append(await invoke({'feedback': event.text}))
+                return
+            if event.message_id == 'om_foreign_profile':
+                tool_results.append(await invoke({'feedback': event.text, 'work_id': 'work-' + 'f' * 32}))
+
+        runner._wire_adapter_handlers(adapter, message_handler=ordinary_tool_handler)
+        try:
+            feedback = '提示后出牌说没选牌，请修复，使用一轮30分钟/80请求有限窗口'
+            await receive(adapter, raw('om_qa', text='@_user_1 ' + feedback))
+            for _ in range(100):
+                if len(tool_results) >= 2:
+                    break
+                await asyncio.sleep(.01)
+            assert len(synthetic_events) == 1 and [result['status'] for result in tool_results] == [
+                'renewal_required', 'renewal_required'], {
+                    'events': [event.message_id for event in synthetic_events], 'results': tool_results,
+                    'calls': shared_calls}
+            assert len(shared_calls) == 1 and shared_calls[0] == {
+                'work_id': work_id, 'source_context': {**anchor, 'profile_id': 'lead', 'message_id': 'om_qa'},
+                'feedback': feedback, 'generation': adapter.intake.generation}
+            assert proposal_records == [(window_proposal['id'], {
+                'status': 'delivered', 'message_id': 'om_sent_1', 'chat_id': 'oc_fixture', 'profile_id': 'lead'})]
+            assert proposal_deliveries == {window_proposal['id']: 'om_sent_1'}
+
+            await receive(adapter, raw('om_wrong_parent', text='@_user_1 同意', parent_id='om_wrong'))
+            for _ in range(100):
+                if len(tool_results) >= 3:
+                    break
+                await asyncio.sleep(.01)
+            assert tool_results[-1] == {'status': 'unverified', 'code': 'binding_conflict'} and len([
+                item for item in proposal_records if item[0] == window_proposal['id']]) == 1
+            assert len(shared_calls) == 2 and not admissions and len(proposal_records) == 1
+
+            await receive(adapter, raw('om_reject', text='@_user_1 拒绝', parent_id=proposal_deliveries[window_proposal['id']]))
+            for _ in range(100):
+                if len(tool_results) >= 4:
+                    break
+                await asyncio.sleep(.01)
+            assert tool_results[-1] == {'status': 'declined', 'work_id': work_id} and not admissions and len(proposal_records) == 1
+
+            await receive(adapter, raw('om_renew', text='@_user_1 同意', parent_id=proposal_deliveries[window_proposal['id']]))
+            for _ in range(100):
+                if len(tool_results) >= 5:
+                    break
+                await asyncio.sleep(.01)
+            assert tool_results[-1]['status'] == 'maintenance_required' and tool_results[-1]['proposal_delivery'] == 'delivered'
+            assert [item[0] for item in proposal_records] == [window_proposal['id'], maintenance_proposal['id']]
+            assert isinstance(proposal_deliveries[maintenance_proposal['id']], str) and proposal_deliveries[maintenance_proposal['id']]
+
+            await receive(adapter, raw('om_maintenance', text='@_user_1 维护完成',
+                                       parent_id=proposal_deliveries[maintenance_proposal['id']]))
+            for _ in range(100):
+                if len(tool_results) >= 6:
+                    break
+                await asyncio.sleep(.01)
+            assert tool_results[-1] == {'status': 'accepted', 'work_id': work_id} and admissions == [work_id]
+
+            calls_before, proposals_before = len(shared_calls), len(proposal_records)
+            await receive(adapter, raw('om_oserror', text='@_user_1 保留当前 QA 结果。'))
+            for _ in range(100):
+                if len(tool_results) >= 8:
+                    break
+                await asyncio.sleep(.01)
+            assert tool_results[-2:] == [{'status': 'unverified', 'code': 'outcome_unknown'}] * 2, {
+                'results': tool_results[-2:], 'calls': len(shared_calls),
+                'proposals': len(proposal_records)}
+            assert len(shared_calls) == calls_before + 1 and len(proposal_records) == proposals_before
+
+            adapter.intake._save(record('work-' + 'b' * 32))
+            await receive(adapter, raw('om_ambiguous', text='@_user_1 请继续浏览器验收修复。'))
+            for _ in range(100):
+                if len(tool_results) >= 9:
+                    break
+                await asyncio.sleep(.01)
+            assert tool_results[-1] == {'status': 'needs_clarification', 'code': 'ambiguous_work',
+                                        'work_ids': [work_id, 'work-' + 'b' * 32]}
+            assert admissions == [work_id]
+
+            adapter.intake._save(record('work-' + 'f' * 32, profile_id='foreign-profile'))
+            await receive(adapter, raw('om_foreign_profile', text='@_user_1 这个工作继续。'))
+            for _ in range(100):
+                if len(tool_results) >= 10:
+                    break
+                await asyncio.sleep(.01)
+            assert tool_results[-1] == {'status': 'unassociated', 'code': 'no_matching_work'}
+            assert admissions == [work_id]
+
+            before = len(synthetic_events)
+            await receive(adapter, raw('om_foreign_owner', text='@_user_1 外部所有者', sender={
+                'sender_id': {'open_id': 'ou_foreign', 'user_id': 'u_foreign', 'union_id': 'on_foreign'}}))
+            await receive(adapter, raw('om_foreign_chat', text='@_user_1 外部群', chat_id='oc_foreign'))
+            await receive(adapter, raw('om_bot', text='@_user_1 机器人', sender={
+                'sender_type': 'bot', 'sender_id': {'open_id': 'ou_bot', 'user_id': 'u_bot', 'union_id': 'on_bot'}}))
+            assert len(synthetic_events) == before and admissions == [work_id]
+
+            assert await invoke({'feedback': feedback}) == {'status': 'unassociated', 'code': 'missing_current_source'}
+            assert await invoke({'feedback': ''}) == {'status': 'rejected', 'code': 'invalid_change'}
+            assert await invoke({'feedback': feedback, 'window': {'max_wall_seconds': 1800}}) == {
+                'status': 'rejected', 'code': 'invalid_change'}
+            assert await invoke({'feedback': feedback, 'actor': 'owner'}) == {'status': 'rejected', 'code': 'invalid_change'}
+        finally:
+            for module, original_admission in original_admissions.items():
+                module.admit_shared_natural_qa_rework = original_admission
+            for module, original_recorder in original_recorders.items():
+                module.record_shared_natural_qa_proposal = original_recorder
+        assert plugins.unload('ghost-hermes-pm')
+        (scratch / 'simple-smoke-result').write_text('passed')
+        return
     if scenario.startswith('configuration_'):
         await receive(adapter, raw('om_configuration'))
         assert len(sent) == 1 and sent[0].message_id == 'om_configuration'

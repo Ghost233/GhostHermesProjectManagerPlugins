@@ -156,6 +156,8 @@ def read_ledger(configuration, execution):
             or any(type(budget[key]) is not int or budget[key] != configuration['budget'][key] for key in CAPS)
             or any(type(budget[key]) is not int or budget[key] <= 0 for key in legacy_tokens & set(budget))):
         raise ManagementError('binding_conflict', 'The original shared Session ledger changed.')
+    if 'renewWindow' in row:
+        _validate_renew_window(row['renewWindow'])
     return row
 
 
@@ -524,6 +526,8 @@ def _window_fingerprint(row):
         'session_created_at', 'generation', 'workspace', 'provider', 'model')}
     binding['budget'] = {key: row['budget'][key] for key in (*CAPS, 'max_reported_tokens', 'max_output_tokens_per_request') if key in row['budget']}
     binding['renewWindow'] = {key: value for key, value in row['renewWindow'].items() if key not in {'stop_reason', 'hook_marker', 'started_at_ms'}}
+    if 'sealed_unknown_usage' in row['renewWindow']:
+        binding['renewWindow']['sealed_unknown_usage'] = row['renewWindow']['sealed_unknown_usage']
     return hashlib.sha256(json.dumps(binding, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
 
 
@@ -579,6 +583,118 @@ def _source_core(value):
     return core
 
 
+def _qa_rework_acceptance(execution):
+    acceptance = execution.get('acceptance', {})
+    unmet = acceptance.get('unmet', [])
+    return (execution.get('state') == 'awaiting_acceptance'
+            and execution.get('terminal_reason') == {'kind': 'completed'}
+            and acceptance.get('status') == 'unmet' and acceptance.get('delivered') is False
+            and isinstance(unmet, list) and 'delivery_report_missing' not in unmet
+            and isinstance(acceptance.get('source_commit'), str) and acceptance.get('source_commit')
+            and isinstance(acceptance.get('source_digest'), str) and acceptance.get('source_digest')
+            and isinstance(acceptance.get('workspace_status'), str))
+
+
+def _sealed_unknown_usage(events, previous_window):
+    if (not isinstance(previous_window, dict)
+            or previous_window.get('original_state', {}).get('stop_reason') != 'shared-work-wall-budget'
+            or type(previous_window.get('request_base')) is not int or previous_window['request_base'] <= 0
+            or not isinstance(previous_window.get('id'), str) or not previous_window['id']):
+        raise ManagementError('outcome_unknown', 'The prior wall-stopped renewal window has no sealed usage boundary.')
+    settlements = [event for event in events if event.get('type') in {'assistant/message', 'assistant/attempt'}]
+    matches = []
+    for index in range(len(events) - 2):
+        assistant, step_end, turn_end = events[index:index + 3]
+        assistant_data = assistant.get('data', {})
+        stream = assistant_data.get('stream', [])
+        has_usage = 'usage' in assistant_data or any(
+            isinstance(item, dict) and isinstance(item.get('chunk'), dict) and 'usage' in item['chunk']
+            for item in stream)
+        reason = turn_end.get('data', {}).get('reason')
+        turn, step = assistant_data.get('turn'), assistant_data.get('step')
+        if (assistant.get('type') == 'assistant/message' and not has_usage
+                and step_end.get('type') == 'step/end'
+                and step_end.get('data') == {'turn': turn, 'step': step}
+                and turn_end.get('data') == {'turn': turn,
+                    'reason': {'kind': 'aborted', 'reason': {'kind': 'hook', 'reason': 'shared-work-wall-budget'}}}):
+            matches.append((index, [assistant, step_end, turn_end]))
+    if len(matches) != 1:
+        raise ManagementError('outcome_unknown', 'The exact interrupted no-usage wall-stop triplet is unconfirmed.')
+    ordinal = settlements.index(matches[0][1][0]) + 1
+    if ordinal != previous_window['request_base']:
+        raise ManagementError('outcome_unknown', 'The interrupted usage boundary does not match the prior request base.')
+    triplet = matches[0][1]
+    return {'ordinal': ordinal,
+        'event_sha256': hashlib.sha256(json.dumps(triplet, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest(),
+        'prior_window_id': previous_window.get('id')}
+
+
+def _validate_renew_window(window):
+    if not isinstance(window, dict):
+        raise ManagementError('binding_conflict', 'The renewed window shape is malformed.')
+    required = {'id', 'message_id', 'host_lease', 'request_base', 'original_state', 'original_host_lease',
+        'started_at_ms', 'stop_reason', 'hook_marker'}
+    if set(window) not in (required, required | {'sealed_unknown_usage'}):
+        raise ManagementError('binding_conflict', 'The renewed window shape is malformed.')
+    if (any(not isinstance(window.get(key), str) or not window[key]
+            for key in ('id', 'message_id', 'host_lease', 'original_host_lease'))
+            or type(window.get('request_base')) is not int or window['request_base'] <= 0
+            or window.get('started_at_ms') is not None and type(window['started_at_ms']) is not int
+            or window.get('stop_reason') is not None and not isinstance(window['stop_reason'], str)
+            or window.get('hook_marker') is not None and not isinstance(window['hook_marker'], str)):
+        raise ManagementError('binding_conflict', 'The renewed window shape is malformed.')
+    original = window.get('original_state')
+    state_keys = {'started_at_ms', 'requests', 'reported_tokens', 'admissions', 'stop_reason'}
+    metadata_keys = {'binding_sha256', 'observed_at_ms', 'model_context_window', 'stop_cleanup'}
+    if (not isinstance(original, dict) or not state_keys <= set(original)
+            or set(original) - state_keys - metadata_keys
+            or original.get('started_at_ms') is not None and type(original['started_at_ms']) is not int
+            or type(original.get('requests')) is not int or original['requests'] < 0
+            or type(original.get('reported_tokens')) is not int or original['reported_tokens'] < 0
+            or not isinstance(original.get('admissions'), list)
+            or any(not isinstance(value, str) or not value for value in original['admissions'])
+            or len(original['admissions']) != original['requests']
+            or original.get('stop_reason') is not None and not isinstance(original['stop_reason'], str)):
+        raise ManagementError('binding_conflict', 'The renewed window original state is malformed.')
+    if ('binding_sha256' in original and (not isinstance(original['binding_sha256'], str)
+            or not re.fullmatch(r'[a-f0-9]{64}', original['binding_sha256']))
+            or 'observed_at_ms' in original and (type(original['observed_at_ms']) is not int or original['observed_at_ms'] <= 0)
+            or 'model_context_window' in original and (type(original['model_context_window']) is not int
+                or original['model_context_window'] <= 0)):
+        raise ManagementError('binding_conflict', 'The renewed window metadata is malformed.')
+    if 'stop_cleanup' in original:
+        cleanup = original['stop_cleanup']
+        if cleanup == {'kind': 'unknown'}:
+            pass
+        elif (not isinstance(cleanup, dict) or cleanup.get('kind') != 'terminal'
+              or set(cleanup) != {'kind', 'job_ids'} or not isinstance(cleanup.get('job_ids'), list)
+              or any(not isinstance(job_id, str) or not job_id for job_id in cleanup['job_ids'])):
+            raise ManagementError('binding_conflict', 'The renewed window stop cleanup metadata is malformed.')
+    sealed = window.get('sealed_unknown_usage')
+    if sealed is None:
+        return
+    if (not isinstance(sealed, dict) or set(sealed) != {'ordinal', 'event_sha256', 'prior_window_id'}
+            or type(sealed.get('ordinal')) is not int or sealed['ordinal'] <= 0
+            or not isinstance(sealed.get('event_sha256'), str) or not re.fullmatch(r'[a-f0-9]{64}', sealed['event_sha256'])
+            or not isinstance(sealed.get('prior_window_id'), str) or not sealed['prior_window_id']
+            or sealed['prior_window_id'] == window.get('id')
+            or sealed['ordinal'] >= window.get('request_base', 0)):
+        raise ManagementError('binding_conflict', 'The sealed historical unknown-usage boundary is malformed.')
+
+
+def _qa_rework_prompt(intake, record, feedback):
+    acceptance = record['dsh_execution'].get('acceptance', {})
+    unmet = '、'.join(acceptance.get('unmet', [])) or '当前 QA 证据'
+    return ('This is browser acceptance rework for the same original work in this existing Session. '
+            'Read the latest comments on the frozen original Issue URL before acting: ' + record['issue']['url'] + '. '
+            'Fix only the current unmet acceptance/QA evidence: ' + unmet + '. Public owner feedback: ' + feedback + '\n'
+            'Retain the frozen original Issue URL and body; do not expand the scope, create a new Session, '
+            'request a new budget, or merge any PR. Use this same repository and finite renewal window. '
+            'Run the actual tests through the original native bash tool. Emit one corrected delivery JSON with '
+            'actual native bash call IDs, including source_commit, issue_updated_at, criteria [{text,test_call_ids}], '
+            'test_files, fine_issue_urls, pr_url, sync_branches, and leftovers.\n\n' + _prompt(intake, record))
+
+
 def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=()):
     previous = _source_core(baseline)
     current = _source_core(current)
@@ -621,7 +737,7 @@ def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=()
 
 def prepare_shared_window_resume(intake, record, message_id):
     """Freeze one explicitly rejected, undelivered active window before normal maintenance."""
-    from .repository_acceptance import DELIVERY_MARKER, repository_source_state
+    from .repository_acceptance import DELIVERY_MARKER, _report, repository_source_state
     from .repository_control import _card, _worker_end
     from .repository_supervision import owned_call
     execution = record['dsh_execution']
@@ -702,6 +818,259 @@ def prepare_shared_window_resume(intake, record, message_id):
             'receipts': receipt_proofs, 'source': source}
         intake._save_execution(record, fields=['window_resume_checkpoint'])
         return record
+    finally:
+        carrier.close()
+
+
+def admit_shared_natural_qa_rework(intake, record, source_context, feedback, window, generation):
+    """Serialize one public QA intake and execute it against a fresh record snapshot."""
+    descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        current = next((item for item in intake.snapshot().get('work', []) if item.get('id') == record.get('id')), None)
+        if current is None:
+            raise ManagementError('outcome_unknown', 'The natural QA work record disappeared before admission.')
+        return _admit_shared_natural_qa_rework_locked(intake, current, source_context, feedback, window, generation)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedback, window, generation):
+    """Queue bounded browser acceptance feedback from the public NATURAL-QA-INTAKE tool."""
+    import psutil
+    from .manager import _public_text
+    from .repository_acceptance import _human_pending, _report, repository_source_state
+    from .repository_control import _card, _worker_end
+    from .repository_execution import execution_configuration
+    from .repository_supervision import owned_call
+    execution = record['dsh_execution']
+    allowed_context = {'app_id', 'transport_tenant_key', 'tenant_key', 'chat_id', 'profile_id', 'message_id',
+                       'reply_to_message_id',
+                       'recipient_tenant_key', 'recipient_open_id', 'sender_open_id'}
+    message_id = source_context.get('message_id') if isinstance(source_context, dict) else None
+    if (not isinstance(source_context, dict) or not set(source_context) <= allowed_context
+            or not {'app_id', 'transport_tenant_key', 'tenant_key', 'chat_id', 'profile_id', 'message_id'} <= set(source_context)
+            or not all(isinstance(source_context.get(key), str) and source_context[key] for key in source_context)
+            or not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 4000
+            or not isinstance(window, (dict, type(None)))):
+        raise ManagementError('invalid_change', 'Natural QA intake requires bounded public identity, feedback and window data.')
+    _public_text(feedback, intake.secret_values)
+    anchor = record.get('source_anchor', {})
+    for key in ('app_id', 'transport_tenant_key', 'tenant_key', 'chat_id'):
+        if source_context.get(key) != anchor.get(key):
+            raise ManagementError('binding_conflict', 'The natural QA intake identity differs from the frozen source.')
+    if source_context['profile_id'] != record.get('profile_id'):
+        raise ManagementError('unauthorized', 'The natural QA intake profile differs from the original owner.')
+    if any(source_context.get(key) != anchor.get(key) for key in
+           ('recipient_tenant_key', 'recipient_open_id', 'sender_open_id') if key in source_context):
+        raise ManagementError('binding_conflict', 'The natural QA intake sender or recipient differs from the frozen source.')
+    if message_id in record.get('dsh_execution', {}).get('control_message_ids', []):
+        raise ManagementError('duplicate', 'The natural QA intake message was already handled.')
+    if record.get('dsh_execution', {}).get('natural_qa_rework_control', {}).get('message_id') == message_id:
+        raise ManagementError('duplicate', 'The natural QA intake message was already handled.')
+    prior_natural = execution.get('natural_qa_rework_control', {})
+    if (execution.get('mode') != 'shared_native' or not _qa_rework_acceptance(execution)
+            or execution.get('first_input') != 'accepted' or execution.get('stop_requested')
+            or execution.get('lifecycle_end')
+            or prior_natural.get('status') in {'intent', 'accepted', 'unknown', 'renewal_intent', 'renewed'}
+            or _human_pending(execution)):
+        raise ManagementError('outcome_unknown', 'Only one idle unmet browser acceptance may queue QA rework.')
+    acceptance = execution['acceptance']
+    card = _card(intake, record)
+    if card['status'] not in {'blocked', 'triage'} or card.get('current_run_id') is not None or card.get('worker_pid') is not None:
+        raise ManagementError('outcome_unknown', 'The browser acceptance rework card is not idle.')
+    worker = _worker_end(intake, record)
+    configuration, _ = execution_configuration(record['target'])
+    if configuration['reference_sha256'] != execution.get('reference_sha256'):
+        raise ManagementError('binding_conflict', 'The original shared execution reference changed.')
+    configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
+                         generation=execution['generation'], workspace_id=execution.get('workspace_id'))
+    budget_file = ledger_path(configuration, execution['session_id'])
+    budget_before = private_file(budget_file).read_bytes()
+    adopting = execution.get('natural_qa_rework_control', {}).get('status') == 'maintenance_required'
+    maintenance = execution.get('natural_qa_rework_control', {}).get('checkpoint', {})
+    ledger_configuration = (dict(configuration, host_lease=maintenance.get('native_identity', {}).get('lease'))
+        if adopting else configuration)
+    budget = read_ledger(ledger_configuration, execution)
+    source = repository_source_state(record['target'])
+    if (source.get('head') != acceptance.get('source_commit')
+            or source.get('source_digest') != acceptance.get('source_digest')
+            or source.get('workspace_status') != acceptance.get('workspace_status')):
+        raise ManagementError('binding_conflict', 'The accepted delivery source no longer matches the repository.')
+    baseline = _source_core(execution.get('baseline'))
+    current = _source_core(source)
+    if baseline is None or current is None or baseline == current:
+        raise ManagementError('binding_conflict', 'The delivered source was not promoted from the original baseline.')
+    current_window = budget.get('renewWindow')
+    expected_lease = maintenance.get('native_identity', {}).get('lease') if adopting else configuration['host_lease']
+    if (not isinstance(current_window, dict) or current_window.get('host_lease') != expected_lease
+            or current_window.get('hook_marker') != 'same-sid-window-v1'):
+        raise ManagementError('outcome_unknown', 'The original renewed window is unavailable.')
+    requested_window = None
+    approved_renewal = False
+    approved_maintenance = False
+    if requested_window is None and 'sealed_unknown_usage' in current_window:
+        raise ManagementError('binding_conflict', 'A current window with sealed unknown usage cannot be reused for QA intake.')
+    if prior_natural.get('status') in {'renewal_required', 'maintenance_required'}:
+        delivery = prior_natural.get('proposal_delivery', {})
+        proposal = prior_natural.get('proposal', {})
+        if (delivery.get('status') != 'delivered' or source_context.get('reply_to_message_id') != delivery.get('message_id')
+                or feedback not in proposal.get('options', [])):
+            raise ManagementError('binding_conflict', 'The natural QA reply does not reference the delivered proposal.')
+        if feedback == '拒绝' or feedback == '取消':
+            execution['natural_qa_rework_control']['status'] = 'declined'
+            intake._save_execution(record, fields=['natural_qa_rework_control'])
+            return {'status': 'declined', 'work_id': record['id']}
+        requested_window = prior_natural.get('window')
+        approved_renewal = prior_natural.get('status') == 'renewal_required'
+        approved_maintenance = prior_natural.get('status') == 'maintenance_required'
+        if adopting:
+            maintenance = execution.get('renewal_window_checkpoint', maintenance)
+            if requested_window is None:
+                requested_window = maintenance.get('window')
+        if adopting and requested_window is None:
+            raise ManagementError('outcome_unknown', 'The natural QA maintenance checkpoint is incomplete.')
+    if prior_natural.get('status') == 'maintenance_required' and requested_window is None:
+        raise ManagementError('outcome_unknown', 'Maintenance-required QA renewal must be retried with its explicit configured window.')
+    renewal_required = False
+    if requested_window is None:
+        if type(current_window.get('started_at_ms')) is not int or current_window['started_at_ms'] <= 0:
+            raise ManagementError('outcome_unknown', 'The original active renewed window is unavailable.')
+        try:
+            _require_window_budget(configuration, budget)
+        except ManagementError:
+            _require_expired_window_budget(configuration, budget)
+            renewal_required = True
+    else:
+        expected_window = {'max_wall_seconds': configuration['budget']['max_wall_seconds'],
+                           'max_model_requests': configuration['budget']['max_model_requests']}
+        if requested_window != expected_window:
+            raise ManagementError('invalid_change', 'Natural QA renewal must use the configured finite window exactly.')
+        _require_expired_window_budget(configuration, budget)
+        renewal_required = prior_natural.get('status') not in {'renewal_required', 'maintenance_required'}
+    prompt_feedback = execution.get('natural_qa_rework_control', {}).get('feedback') if adopting else feedback
+    prompt = _qa_rework_prompt(intake, record, prompt_feedback.strip())
+    request_id = 'qa-rework-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest()
+    carrier = SharedDesktopTransport(configuration)
+    control = None
+    renewal_control = None
+    try:
+        new_identity = carrier.native_identity
+        if requested_window is None and not adopting and not renewal_required and new_identity != execution.get('native_identity'):
+            raise ManagementError('binding_conflict', 'The active natural QA Host identity changed.')
+        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
+            'sessionId': execution['session_id']}, 'maxMessages': 500}})
+        try:
+            before = next(stream)
+        finally:
+            stream.close()
+        header = before.get('header', {})
+        values = before.get('projections', {}).get('values', {})
+        events = [row['event'] for row in before.get('records', [])]
+        starts = [event for event in events if event.get('type') == 'turn/start']
+        ends = [event for event in events if event.get('type') == 'turn/end']
+        if (before.get('hasMore') is not False or header.get('id') != execution['session_id']
+                or header.get('createdAt') != execution.get('session_created_at')
+                or header.get('cwd') != configuration['workspace']
+                or values.get('agentPreset') != configuration['agent_preset']
+                or values.get('permissions') != {'currentValue': 'workspace-write'}
+                or values.get('inbox') != {'next-turn': [], 'next-step': []}
+                or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
+                or ends[-1].get('data', {}).get('reason') != execution.get('terminal_reason')):
+            raise ManagementError('outcome_unknown', 'The original completed browser acceptance evidence is unconfirmed.')
+        report = _report(events)
+        if (report is None or report.get('source_commit') != acceptance.get('source_commit')
+                or 'source_digest' in report and report.get('source_digest') != acceptance.get('source_digest')
+                or 'workspace_status' in report and report.get('workspace_status') != acceptance.get('workspace_status')):
+            raise ManagementError('outcome_unknown', 'The original completed browser acceptance evidence is unconfirmed.')
+        sessions = [row for row in owned_call(carrier, 'session/list', {})['items']
+                    if row.get('sessionId') == execution['session_id']]
+        workspace = owned_call(carrier, 'workspace/create', {'path': configuration['workspace']})
+        account = workspace.get('workspace', {})
+        jobs = carrier.owned_jobs()
+        receipt_configuration = (dict(configuration, host_lease=maintenance.get('native_identity', {}).get('lease'))
+            if adopting else configuration)
+        receipts = shared_receipts(receipt_configuration, execution, '.tools.jsonl')
+        if (workspace.get('created') is not False or account.get('workspaceId') != execution.get('workspace_id')
+                or account.get('path') != configuration['workspace']
+                or account.get('sessionIds', []).count(execution['session_id']) != 1
+                or len(sessions) != 1 or sessions[0].get('cwd') != configuration['workspace']
+                or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
+                or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'}
+                    or job.get('owner', execution['session_id']) != execution['session_id'] for job in jobs)
+                or not _verified_source_chain(execution, execution.get('baseline'), receipts, source, jobs)
+                or private_file(budget_file).read_bytes() != budget_before):
+            raise ManagementError('outcome_unknown', 'The original Session, Workspace, receipts or jobs are not idle.')
+        if not renewal_required and requested_window is None and not adopting:
+            request_id = 'qa-rework-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest()
+            execution['continuation_request_id'] = request_id
+            execution['continuation_control'] = {'kind': 'qa_rework', 'message_id': message_id,
+                'status': 'admitted', 'dispatch_status': 'intent', 'previous_claim': execution['supervisor_claim'],
+                'worker': worker, 'cursor': before['cursor'],
+                'snapshot_sha256': hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
+                'ledger_sha256': hashlib.sha256(budget_before).hexdigest(), 'qa_feedback': feedback,
+                'qa_proposal': prior_natural.get('proposal'),
+                'workspace': {'workspace_id': account['workspaceId'], 'session_ids': account['sessionIds']}}
+            execution['state'] = 'continuation_pending'
+            execution['natural_qa_rework_control'] = {'kind': 'browser_qa_rework', 'status': 'accepted',
+                'message_id': message_id, 'feedback': feedback, 'proposal': prior_natural.get('proposal')}
+            control_ids = execution.setdefault('control_message_ids', [])
+            if message_id not in control_ids:
+                control_ids.append(message_id)
+            intake._save_execution(record, fields=['continuation_request_id', 'continuation_control',
+                'natural_qa_rework_control', 'control_message_ids', 'state'])
+            if card['status'] == 'triage':
+                from hermes_cli import kanban_db as kb
+                from hermes_cli.kanban_db_connect import connect_closing
+                with connect_closing(board=intake.board) as connection:
+                    if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                        raise ManagementError('outcome_unknown', 'QA rework triage dispatch is unconfirmed.')
+            else:
+                intake._kanban('kanban_unblock', {'task_id': record['card_id']})
+            execution['continuation_control']['dispatch_status'] = 'accepted'
+            intake._save_execution(record, fields=['continuation_control'])
+            return {'status': 'accepted', 'work_id': record['id']}
+        if approved_renewal and requested_window is not None and not adopting:
+            prepared = prepare_shared_window_renewal(intake, record, message_id)
+            current = next(item for item in intake.snapshot()['work'] if item['id'] == record['id'])
+            proposal = {'id': 'qa-maintenance-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest(),
+                'kind': 'maintenance', 'options': ['维护完成', '取消'],
+                'text': '请在原生 Launcher 完成 Host 维护后回复“维护完成”或“取消”。'}
+            current['dsh_execution']['natural_qa_rework_control'] = {
+                'kind': 'browser_qa_rework', 'status': 'maintenance_required', 'message_id': message_id,
+                'feedback': current['dsh_execution'].get('natural_qa_rework_control', {}).get('feedback', feedback),
+                'window': current['dsh_execution'].get('natural_qa_rework_control', {}).get('window') or {
+                    'max_wall_seconds': configuration['budget']['max_wall_seconds'],
+                    'max_model_requests': configuration['budget']['max_model_requests']},
+                'proposal': proposal, 'proposal_delivery': {'status': 'intent', 'proposal_id': proposal['id'],
+                    'chat_id': source_context['chat_id'], 'profile_id': source_context['profile_id']},
+                'checkpoint': current['dsh_execution'].get('renewal_window_checkpoint')}
+            intake._save_execution(current, fields=['natural_qa_rework_control'])
+            return {'status': 'maintenance_required', 'work_id': current['id'],
+                'proposal': proposal}
+        if approved_maintenance and adopting:
+            admitted = admit_shared_window_renewal(intake, record, message_id, generation)
+            current = next(item for item in intake.snapshot()['work'] if item['id'] == record['id'])
+            control = current['dsh_execution'].get('continuation_control', {})
+            if control.get('kind') != 'qa_rework' or not isinstance(control.get('qa_feedback'), str) or not control['qa_feedback']:
+                raise ManagementError('outcome_unknown', 'The admitted QA continuation feedback is missing.')
+            return {'status': 'accepted', 'work_id': current['id']}
+        if renewal_required:
+            caps = {'max_wall_seconds': configuration['budget']['max_wall_seconds'],
+                'max_model_requests': configuration['budget']['max_model_requests']}
+            proposal = {'id': 'qa-window-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest(),
+                'kind': 'window', 'limits': caps, 'options': ['同意', '拒绝'],
+                'text': '请确认同一原生 Session 的一次有限浏览器 QA 窗口：'
+                    + str(caps['max_wall_seconds']) + ' 秒、' + str(caps['max_model_requests']) + ' 次模型请求。'}
+            execution['natural_qa_rework_control'] = {'kind': 'browser_qa_rework',
+                'status': 'renewal_required', 'message_id': message_id,
+                'feedback': feedback, 'window': caps, 'proposal': proposal,
+                'proposal_delivery': {'status': 'intent', 'proposal_id': proposal['id'],
+                    'chat_id': source_context['chat_id'], 'profile_id': source_context['profile_id']}}
+            intake._save_execution(record, fields=['natural_qa_rework_control'])
+            return {'status': 'renewal_required', 'work_id': record['id'], 'proposal': proposal}
+        raise ManagementError('outcome_unknown', 'The natural QA continuation could not be admitted.')
     finally:
         carrier.close()
 
@@ -859,22 +1228,28 @@ def _renewal_history_sha256(execution):
 
 def prepare_shared_window_renewal(intake, record, message_id):
     """Freeze the one authorized expired renewed window before normal maintenance."""
-    from .repository_acceptance import DELIVERY_MARKER, repository_source_state
+    from .repository_acceptance import DELIVERY_MARKER, _report, repository_source_state
     from .repository_control import _card, _worker_end
     from .repository_supervision import owned_call
     execution = record['dsh_execution']
     acceptance = execution.get('acceptance', {})
     previous_checkpoint = execution.get('renewal_window_checkpoint', {})
     repeat = _repeat_budget_stopped_window(execution)
+    qa_case = (execution.get('state') == 'awaiting_acceptance'
+        and execution.get('terminal_reason') == {'kind': 'completed'}
+        and acceptance.get('status') == 'unmet' and acceptance.get('delivered') is False
+        and 'delivery_report_missing' not in acceptance.get('unmet', []))
     completed = (execution.get('state') == 'awaiting_acceptance'
-        and execution.get('terminal_reason') == {'kind': 'completed'} and not previous_checkpoint)
+        and execution.get('terminal_reason') == {'kind': 'completed'} and not previous_checkpoint
+        and ('delivery_report_missing' in acceptance.get('unmet', []) or qa_case))
     if (execution.get('mode') != 'shared_native' or not (completed or repeat)
             or execution.get('first_input') != 'accepted' or execution.get('stop_requested') or execution.get('lifecycle_end')
             or repeat and (previous_checkpoint.get('status') != 'admitted'
                 or execution.get('renewal_window_adoption') != 'accepted'
                 or execution.get('continuation_control', {}).get('status') != 'accepted')
             or acceptance.get('status') != 'unmet'
-            or acceptance.get('delivered') is not False or 'delivery_report_missing' not in acceptance.get('unmet', [])):
+            or acceptance.get('delivered') is not False
+            or ('delivery_report_missing' not in acceptance.get('unmet', []) and not qa_case)):
         raise ManagementError('outcome_unknown', 'Only the original undelivered completed or wall-stopped window may prepare renewal.')
     _card(intake, record)
     worker = _worker_end(intake, record, allow_later_terminal=True)
@@ -922,13 +1297,20 @@ def prepare_shared_window_renewal(intake, record, message_id):
                 or len(sessions) != 1 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
                 or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
                 or ends[-1]['data'].get('reason') != execution['terminal_reason']
-                or len(settlements) != row['state']['requests'] or delivery
-                or not repeat and not _rejected_bash_window_evidence(events, receipts)
+                or len(settlements) != row['state']['requests']
+                or (not qa_case and delivery)
+                or not repeat and not qa_case and not _rejected_bash_window_evidence(events, receipts)
                 or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'} for job in owned_jobs)
                 or repeat and (execution.get('tool_receipts') != receipts or execution.get('jobs') != [
                     {'id': job['id'], 'status': job['status']} for job in owned_jobs])
                 or private_file(budget_file).read_bytes() != raw):
             raise ManagementError('outcome_unknown', 'The expired window has unverified delivery, tool, job or budget activity.')
+        if qa_case:
+            report = _report(events)
+            if (report is None or report.get('source_commit') != acceptance.get('source_commit')
+                    or 'source_digest' in report and report.get('source_digest') != acceptance.get('source_digest')
+                    or 'workspace_status' in report and report.get('workspace_status') != acceptance.get('workspace_status')):
+                raise ManagementError('outcome_unknown', 'The QA delivery report no longer matches acceptance source evidence.')
         backup = budget_file.with_name(budget_file.name + '.renewal-window-' + hashlib.sha256(raw).hexdigest())
         if not backup.exists():
             with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as output:
@@ -948,6 +1330,7 @@ def prepare_shared_window_renewal(intake, record, message_id):
             execution['renewal_window_adoption'] = None
         execution['renewal_window_checkpoint'] = {'status': 'prepared', 'message_id': message_id, 'scope': scope,
             'repeat_budget_stopped': repeat, 'terminal_reason': deepcopy(execution['terminal_reason']),
+            'qa_rework': qa_case,
             'jobs': [{'id': job['id'], 'status': job['status']} for job in owned_jobs],
             'history_sha256': _renewal_history_sha256(execution),
             'native_identity': execution['native_identity'], 'worker': worker, 'ledger_backup': str(backup),
@@ -956,6 +1339,8 @@ def prepare_shared_window_renewal(intake, record, message_id):
             'workspace': {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']},
             'receipts': proofs, 'source': source, 'previous_state': deepcopy(row['state']),
             'previous_renew_window': deepcopy(row['renewWindow'])}
+        if qa_case:
+            execution['renewal_window_checkpoint']['sealed_unknown_usage'] = _sealed_unknown_usage(events, row['renewWindow'])
         fields = ['renewal_window_checkpoint']
         if repeat:
             fields += ['renewal_window_checkpoint_history', 'renewal_window_adoption']
@@ -1066,15 +1451,21 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
         execution.setdefault('renewal_window_history', []).append({'message_id': checkpoint['message_id'],
             'ledger_backup': checkpoint['ledger_backup'], 'renew_window': checkpoint['previous_renew_window']})
         execution['continuation_request_id'] = 'continue-' + uuid.uuid4().hex
-        execution['continuation_control'] = {'kind': 'renew_window', 'message_id': message_id, 'status': 'rebind_intent',
+        qa_rework = checkpoint.get('qa_rework') is True
+        natural_control = execution.get('natural_qa_rework_control', {})
+        execution['continuation_control'] = {'kind': 'qa_rework' if qa_rework else 'renew_window', 'message_id': message_id, 'status': 'rebind_intent',
             'dispatch_status': 'intent', 'previous_claim': execution['supervisor_claim'], 'worker': checkpoint['worker'],
             'cursor': snapshot['cursor'], 'workspace': checkpoint['workspace'],
             'snapshot_sha256': hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
-            'original_failure': {key: execution[key] for key in ('state', 'terminal_reason', 'last_failure') if key in execution}}
+            'original_failure': {key: execution[key] for key in ('state', 'terminal_reason', 'last_failure') if key in execution},
+            **({'qa_feedback': natural_control.get('feedback'), 'qa_proposal': natural_control.get('proposal')}
+               if qa_rework else {})}
         intake._save_execution(record, fields=['continuation_history', 'renewal_window_history', 'continuation_request_id', 'continuation_control'])
         row['renewWindow'] = {'id': 'window-' + uuid.uuid4().hex, 'message_id': message_id, 'host_lease': new['lease'],
             'request_base': row['state']['requests'], 'original_state': dict(row['state']), 'original_host_lease': old['lease'],
             'started_at_ms': None, 'stop_reason': None, 'hook_marker': None}
+        if qa_rework:
+            row['renewWindow']['sealed_unknown_usage'] = checkpoint['sealed_unknown_usage']
         row['host_lease'] = new['lease']
         row['state']['binding_sha256'] = _window_fingerprint(row)
         temporary = budget_file.with_name(budget_file.name + '.' + uuid.uuid4().hex)
@@ -1994,6 +2385,44 @@ def _prompt(intake, record):
           'Outer Kanban acceptance belongs to the supervisor.')
 
 
+def record_shared_natural_qa_proposal(intake, record, proposal_id, delivery_context):
+    """Record exactly one verified transport delivery for a natural QA proposal."""
+    descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        current = next((item for item in intake.snapshot().get('work', []) if item.get('id') == record.get('id')), None)
+        if current is None:
+            raise ManagementError('outcome_unknown', 'The natural QA work record disappeared before proposal delivery.')
+        execution = current['dsh_execution']
+        proposal = execution.get('natural_qa_rework_control', {}).get('proposal', {})
+        if proposal.get('id') != proposal_id or execution.get('natural_qa_rework_control', {}).get('status') not in {
+                'renewal_required', 'maintenance_required'}:
+            raise ManagementError('binding_conflict', 'The natural QA proposal is not current.')
+        if (not isinstance(delivery_context, dict)
+                or set(delivery_context) not in ({'status', 'message_id', 'chat_id', 'profile_id'},
+                    {'status', 'chat_id', 'profile_id'})
+                or delivery_context.get('status') not in {'delivered', 'unknown', 'failed'}
+                or delivery_context.get('status') == 'delivered' and not isinstance(delivery_context.get('message_id'), str)
+                or not all(isinstance(value, str) and value for key, value in delivery_context.items()
+                           if key not in {'status', 'message_id'})
+                or delivery_context['chat_id'] != current.get('source_anchor', {}).get('chat_id')
+                or delivery_context['profile_id'] != current.get('profile_id')):
+            raise ManagementError('binding_conflict', 'The natural QA proposal delivery identity differs.')
+        prior = execution['natural_qa_rework_control'].get('proposal_delivery')
+        if prior is None or prior.get('status') != 'intent' or prior.get('proposal_id') != proposal_id:
+            raise ManagementError('duplicate', 'The natural QA proposal is no longer awaiting delivery.')
+        if prior.get('status') != 'intent':
+            if all(prior.get(key) == value for key, value in delivery_context.items()):
+                return {'status': 'duplicate', 'work_id': current['id']}
+            raise ManagementError('duplicate', 'A different delivery was already recorded for this proposal.')
+        execution['natural_qa_rework_control']['proposal_delivery'] = {'proposal_id': proposal_id, **delivery_context}
+        intake._save_execution(current, fields=['natural_qa_rework_control'])
+        return {'status': 'recorded', 'work_id': current['id']}
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier):
     import psutil
     from hermes_cli import kanban_db as kb
@@ -2114,7 +2543,7 @@ async def run_shared_work(ctx, intake, record, generation):
         elif pending_continuation and execution['supervisor_claim']['run_id'] != run_id:
             from hermes_cli.kanban_db_connect import connect_closing
             previous = continuation['previous_claim']
-            checkpoint = continuation if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'} else execution['maintenance_checkpoint']
+            checkpoint = continuation if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'} else execution['maintenance_checkpoint']
             if (execution['supervisor_claim'] != previous or checkpoint['worker']['run_id'] != previous['run_id']
                     or checkpoint['worker']['identity'] != previous['identity'] or checkpoint['worker']['exit_code'] != 0):
                 raise ManagementError('binding_conflict', 'The checkpointed continuation worker claim differs.')
@@ -2145,7 +2574,7 @@ async def run_shared_work(ctx, intake, record, generation):
         if existing and (len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']):
             raise ManagementError('binding_conflict', 'Shared Session registration differs.')
         workspace = await asyncio.to_thread(resolve_shared_workspace, intake, record, carrier)
-        proof = continuation if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'} else execution.get('maintenance_checkpoint', {})
+        proof = continuation if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'} else execution.get('maintenance_checkpoint', {})
         if pending_continuation and {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']} != proof['workspace']:
             raise ManagementError('binding_conflict', 'The admitted original Workspace account changed before dispatch.')
         if not existing:
@@ -2176,19 +2605,19 @@ async def run_shared_work(ctx, intake, record, generation):
         if pending_continuation:
             budget = read_ledger(configuration, execution)
             snapshot_matches = (hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == continuation['snapshot_sha256']
-                if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'} else _maintenance_snapshot_matches(snapshot, execution['maintenance_checkpoint']))
+                if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'} else _maintenance_snapshot_matches(snapshot, execution['maintenance_checkpoint']))
             if continuation.get('kind') == 'max_tokens':
                 _require_max_tokens_budget(configuration, budget['state'], budget.get('renewWindow'))
-            elif continuation.get('kind') in {'renew_window', 'resume_window'}:
+            elif continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'}:
                 _require_window_budget(configuration, budget)
             jobs = carrier.owned_jobs()
             if (not snapshot_matches
                     or hashlib.sha256(private_file(ledger_path(configuration, execution['session_id'])).read_bytes()).hexdigest()
                     != continuation['ledger_sha256']
-                    or continuation.get('kind') not in {'max_tokens', 'renew_window', 'resume_window'} and budget['state'] != {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0,
+                    or continuation.get('kind') not in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'} and budget['state'] != {'started_at_ms': None, 'requests': 0, 'reported_tokens': 0,
                                            'admissions': [], 'stop_reason': None}
                     or (any(job['status'] in {'running', 'stopping'} for job in jobs)
-                        if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'} else bool(jobs))):
+                        if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'} else bool(jobs))):
                 raise ManagementError('binding_conflict', 'The admitted pre-model continuation changed before dispatch.')
         if not execution.get('first_input') and any(row.get('event', {}).get('type') in
                 {'turn/start', 'user/message', 'assistant/message', 'tool/call'} for row in snapshot.get('records', [])):
@@ -2251,7 +2680,7 @@ async def run_shared_work(ctx, intake, record, generation):
         os.close(descriptor)
     try:
         window_start = None
-        if continuation.get('kind') in {'renew_window', 'resume_window'}:
+        if continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'}:
             budget = read_ledger(configuration, execution)
             window_start = budget['renewWindow']['started_at_ms']
             if (not pending_continuation and execution.get('first_input') == 'accepted'
@@ -2283,7 +2712,7 @@ async def run_shared_work(ctx, intake, record, generation):
                 if continuation.get('kind') == 'max_tokens':
                     budget = read_ledger(configuration, execution)
                     _require_max_tokens_budget(configuration, budget['state'], budget.get('renewWindow'))
-                elif continuation.get('kind') in {'renew_window', 'resume_window'}:
+                elif continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'}:
                     _require_window_budget(configuration, read_ledger(configuration, execution))
                 continuation['status'] = 'input_intent'
                 intake._save_execution(record, fields=['continuation_control'])
@@ -2292,7 +2721,11 @@ async def run_shared_work(ctx, intake, record, generation):
                     else 'its pre-model failure and verified maintenance restart')
                 prompt = ('Continue the original accepted task in this Session after ' + reason + '. Keep the original scope, frozen Issue, rules and remaining '
                     'budget. Resume that task in this original Session.\n\n' + _prompt(intake, record))
-                if continuation.get('kind') == 'resume_window':
+                if continuation.get('kind') == 'qa_rework':
+                    prompt = ('Perform the browser acceptance rework using only the persisted owner feedback. '
+                        'Preserve the frozen Issue and run actual tests, then report actual native bash call IDs. '
+                        'Do not merge any PR.\n\n' + continuation.get('qa_feedback', '') + '\n\n' + _prompt(intake, record))
+                elif continuation.get('kind') == 'resume_window':
                     prompt = ('Continue the original accepted task in this same Session after verified normal maintenance. '
                         'The original finite execution window is still active: preserve its existing start time, request base, '
                         'cumulative usage and remaining allowance. Do not create or extend any budget window.\n\n' + _prompt(intake, record))
@@ -2322,7 +2755,7 @@ async def run_shared_work(ctx, intake, record, generation):
         elif execution['first_input'] != 'accepted' or (continuation and continuation.get('status') != 'accepted'):
             raise ManagementError('outcome_unknown', 'Original shared input needs reconciliation; no replay.')
         heartbeat_at = 0
-        if continuation.get('kind') not in {'max_tokens', 'renew_window', 'resume_window'}:
+        if continuation.get('kind') not in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'}:
             budget = read_ledger(configuration, execution)
             started_at_ms = budget['state']['started_at_ms']
             remaining = (configuration['budget']['max_wall_seconds'] if started_at_ms is None else
@@ -2348,13 +2781,13 @@ async def run_shared_work(ctx, intake, record, generation):
             if active_budget['started_at_ms'] is not None:
                 deadline = time.monotonic() + (active_budget['started_at_ms'] + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
                 observation_deadline = min(observation_deadline, deadline)
-            if continuation.get('kind') in {'renew_window', 'resume_window'} and window_start is None and budget['renewWindow']['started_at_ms'] is not None:
+            if continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'} and window_start is None and budget['renewWindow']['started_at_ms'] is not None:
                 window_start = budget['renewWindow']['started_at_ms']
                 deadline = time.monotonic() + (window_start + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
             execution.update(journal_cursor=events[-1]['seq'] if events else -1, usage=projections.get('tokenUsage'),
                 observed_events=execution_event_references(events), shared_budget=budget['state'])
             intake._save_execution(record)
-            cursor = (continuation['cursor'] if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'}
+            cursor = (continuation['cursor'] if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'}
                 else execution['maintenance_checkpoint']['cursor']) if continuation else -1
             if execution.get('owner_context_control', {}).get('status') == 'accepted':
                 cursor = execution['owner_context_control']['cursor']

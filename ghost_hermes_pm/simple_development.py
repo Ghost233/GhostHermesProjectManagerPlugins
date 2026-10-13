@@ -481,8 +481,24 @@ def register_simple_development(ctx):
                               ctx.get_config('simple_development'), ctx.get_config('state_dir'))
     home = get_hermes_home().resolve()
     ctx.on_unload(intake.deactivate)
+    active_adapter = {'value': None}
+    natural_qa_results = {}
+    natural_qa_inflight = {}
+    natural_qa_lock = asyncio.Lock()
 
     class RepositoryFeishuAdapter(OwnedFeishuAdapter):
+        def _remember_natural_qa_source(self, event):
+            """Keep one public ordinary-message body bound to its exact active source."""
+            try:
+                _public_text(event.text, intake.secret_values)
+            except ManagementError:
+                return
+            entries = getattr(self, '_natural_qa_messages', {})
+            entries[event.source.message_id] = (event.source, event.text, event.reply_to_message_id)
+            while len(entries) > 2048:
+                del entries[next(iter(entries))]
+            self._natural_qa_messages = entries
+
         async def _handle_card_action_payload(self, payload):
             from types import SimpleNamespace
             from .repository_approvals import prepare_card_action
@@ -541,6 +557,7 @@ def register_simple_development(ctx):
             prepared = intake.prepare(event, self)
             if prepared is None:
                 if event.source.is_bot is not True:
+                    self._remember_natural_qa_source(event)
                     await self.handle_message(event)
                 return
             runner = self.gateway_runner
@@ -567,6 +584,8 @@ def register_simple_development(ctx):
             adapter = RepositoryFeishuAdapter(config, intake, native_entry, home)
         except ManagementError:
             return None
+        adapter._natural_qa_messages = {}
+        active_adapter['value'] = adapter
         adapter.bind_lifecycle(ctx)
         if not getattr(intake, 'human_observer', None):
             from .repository_supervision import observe_human_requests
@@ -588,5 +607,167 @@ def register_simple_development(ctx):
         schema={'name': 'hermes_pm_snapshot', 'description': 'Read repository work accepted through the verified platform.',
                 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
         handler=snapshot, description='Read native outer card references and frozen Issue scope')
+
+    async def natural_qa_rework(args):
+        allowed = {'feedback', 'work_id'}
+        if not isinstance(args, dict) or set(args) - allowed or not isinstance(args.get('feedback'), str):
+            return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
+        feedback = args['feedback']
+        work_id = args.get('work_id')
+        if (not feedback.strip() or len(feedback) > OWNER_CONTEXT_MAX_CHARS
+                or work_id is not None and (not isinstance(work_id, str) or not re.fullmatch(r'work-[a-f0-9]{32}', work_id))):
+            return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
+        try:
+            _public_text(feedback, intake.secret_values)
+        except ManagementError:
+            return json.dumps({'status': 'rejected', 'code': 'sensitive'})
+
+        adapter = active_adapter['value']
+        source = adapter._command_source.get() if adapter is not None else None
+        entries = getattr(adapter, '_natural_qa_messages', {}) if adapter is not None else {}
+        saved = entries.get(getattr(source, 'message_id', None))
+        if saved is None or saved[0] is not source or saved[1] != feedback.strip():
+            return json.dumps({'status': 'unassociated', 'code': 'missing_current_source'})
+        try:
+            if (intake.closed or adapter._close_requested or not adapter._ordinary_active
+                    or source.is_bot is not False
+                    or getattr(source.platform, 'value', source.platform) != OWNED_PLATFORM
+                    or not isinstance(source.message_id, str) or not source.message_id
+                    or getattr(source, '_transport_adapter_ref')() is not adapter):
+                return json.dumps({'status': 'unassociated', 'code': 'unverified_source'})
+            source_ids = {source.user_id, source.user_id_alt} - {None, ''}
+            bindings = [binding for binding in adapter.bindings
+                        if binding.get('app_id') == adapter._app_id and binding.get('chat_id') == source.chat_id
+                        and source_ids & set(binding.get('owner_native_ids', []))]
+            if len(bindings) != 1:
+                return json.dumps({'status': 'unassociated', 'code': 'unverified_source'})
+            binding = bindings[0]
+            runner = adapter.gateway_runner
+            if (runner._intake_adapter_for(source) is not adapter
+                    or runner._is_user_authorized_for_source(source) is not True
+                    or runner._admit_bot_message_for_source(source) is not True):
+                return json.dumps({'status': 'unassociated', 'code': 'unverified_source'})
+            identity = adapter._canonicalize(source)
+            if identity is None or identity.runtime_profile != binding.get('native_profile'):
+                return json.dumps({'status': 'unassociated', 'code': 'unverified_source'})
+            transport = next((value for owner, value in intake.transports if owner is adapter), None)
+            if transport is None or await transport.verify_identity(binding) != {
+                    'app_id': binding['app_id'], 'open_id': binding['recipient_open_id']}:
+                return json.dumps({'status': 'unassociated', 'code': 'unverified_source'})
+            intake.require_active(intake.generation)
+        except (AttributeError, KeyError, TypeError, ManagementError):
+            return json.dumps({'status': 'unassociated', 'code': 'unverified_source'})
+
+        source_context = {'app_id': binding['app_id'], 'transport_tenant_key': binding['transport_tenant_key'],
+                          'tenant_key': binding['sender_tenant_key'], 'recipient_tenant_key': binding['recipient_tenant_key'],
+                          'recipient_open_id': binding['recipient_open_id'], 'chat_id': binding['chat_id'],
+                          'sender_open_id': binding['owner_open_id'], 'profile_id': binding['profile_id'],
+                          'message_id': source.message_id}
+        if isinstance(saved[2], str) and saved[2]:
+            source_context['reply_to_message_id'] = saved[2]
+        anchor_keys = ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                       'recipient_open_id', 'chat_id', 'sender_open_id')
+
+        def candidates_from_current_snapshot():
+            candidates = []
+            for record in intake.snapshot()['work']:
+                execution = record.get('dsh_execution', {})
+                acceptance = execution.get('acceptance', {}) if isinstance(execution, dict) else {}
+                if (work_id is None or record.get('id') == work_id) and record.get('profile_id') == source_context['profile_id'] \
+                        and all(record.get('source_anchor', {}).get(key) == source_context[key] for key in anchor_keys) \
+                        and execution.get('mode') == 'shared_native' and execution.get('state') == 'awaiting_acceptance' \
+                        and acceptance.get('status') == 'unmet' and acceptance.get('delivered') is False:
+                    candidates.append(record)
+            return candidates
+
+        key = 'natural-qa:' + hashlib.sha256((source_context['app_id'] + '\0' + source_context['message_id']).encode()).hexdigest()
+        async with natural_qa_lock:
+            if key in natural_qa_results:
+                return json.dumps(natural_qa_results[key])
+            candidates = candidates_from_current_snapshot()
+            if not candidates:
+                return json.dumps({'status': 'unassociated', 'code': 'no_matching_work'})
+            if len(candidates) != 1:
+                return json.dumps({'status': 'needs_clarification', 'code': 'ambiguous_work',
+                                   'work_ids': [record['id'] for record in candidates]})
+            pending = natural_qa_inflight.get(key)
+            if pending is None:
+                pending = asyncio.get_running_loop().create_future()
+                natural_qa_inflight[key] = pending
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            return json.dumps(await asyncio.shield(pending))
+        result = None
+        try:
+            from .shared_repository import admit_shared_natural_qa_rework, record_shared_natural_qa_proposal
+            result = await asyncio.to_thread(admit_shared_natural_qa_rework, intake, candidates[0], source_context,
+                                             feedback, None, intake.generation)
+            if not isinstance(result, dict) or not isinstance(result.get('status'), str):
+                raise ManagementError('outcome_unknown', 'The shared browser QA rework result is unverified.')
+            if result['status'] in {'renewal_required', 'maintenance_required'}:
+                proposal = result.get('proposal')
+                expected = {'renewal_required': ('window', ['同意', '拒绝']),
+                            'maintenance_required': ('maintenance', ['维护完成', '取消'])}[result['status']]
+                if (not isinstance(proposal, dict) or set(proposal) - {'id', 'kind', 'limits', 'options', 'text'}
+                        or not isinstance(proposal.get('id'), str) or not proposal['id'] or proposal.get('kind') != expected[0]
+                        or proposal.get('options') != expected[1] or not isinstance(proposal.get('text'), str) or not proposal['text']):
+                    raise ManagementError('outcome_unknown', 'The shared natural QA proposal is unverified.')
+                try:
+                    receipt = await transport.send({'uuid': hashlib.sha256((candidates[0]['id'] + ':' + proposal['id']).encode()).hexdigest()[:32],
+                        'text': proposal['text'], 'chat_id': source_context['chat_id'], 'reply_to': source_context['message_id'],
+                        'thread_id': getattr(source, 'thread_id', None)})
+                except Exception:
+                    receipt = {'status': 'unknown'}
+                status = receipt.get('status') if isinstance(receipt, dict) else 'unknown'
+                if status == 'delivered' and isinstance(receipt.get('message_id'), str) and receipt['message_id']:
+                    delivery = {'status': 'delivered', 'message_id': receipt['message_id'],
+                                'chat_id': source_context['chat_id'], 'profile_id': source_context['profile_id']}
+                else:
+                    delivery = {'status': status if status in {'unknown', 'failed'} else 'unknown',
+                                'chat_id': source_context['chat_id'], 'profile_id': source_context['profile_id']}
+                current = next((record for record in intake.snapshot()['work'] if record.get('id') == candidates[0]['id']), None)
+                if current is None:
+                    raise ManagementError('outcome_unknown', 'The natural QA work disappeared before proposal delivery.')
+                recorded = await asyncio.to_thread(record_shared_natural_qa_proposal, intake, current, proposal['id'], delivery)
+                if not isinstance(recorded, dict) or recorded.get('status') not in {'recorded', 'duplicate'}:
+                    raise ManagementError('outcome_unknown', 'The natural QA proposal delivery is unverified.')
+                result = {**result, 'proposal_delivery': delivery['status']}
+        except ManagementError as error:
+            result = {'status': 'unverified', 'code': error.code}
+        except (OSError, TimeoutError, ValueError, KeyError, TypeError):
+            result = {'status': 'unverified', 'code': 'outcome_unknown'}
+        except asyncio.CancelledError:
+            async with natural_qa_lock:
+                natural_qa_inflight.pop(key, None)
+                if not pending.done():
+                    pending.cancel()
+            raise
+        except BaseException:
+            async with natural_qa_lock:
+                natural_qa_inflight.pop(key, None)
+                if not pending.done():
+                    pending.cancel()
+            raise
+        finally:
+            if result is not None:
+                async with natural_qa_lock:
+                    natural_qa_results[key] = result
+                    natural_qa_inflight.pop(key, None)
+                    if not pending.done():
+                        pending.set_result(result)
+                    while len(natural_qa_results) > 2048:
+                        del natural_qa_results[next(iter(natural_qa_results))]
+        return json.dumps(result)
+
+    ctx.register_tool(name='hermes_pm_repository_rework', toolset='hermes_pm', is_async=True,
+        schema={'name': 'hermes_pm_repository_rework',
+                'description': 'Associate the current verified owner message with one existing browser-QA repository rework. Caller identity, role and repository are never arguments.',
+                'parameters': {'type': 'object', 'properties': {
+                    'feedback': {'type': 'string', 'minLength': 1, 'maxLength': OWNER_CONTEXT_MAX_CHARS},
+                    'work_id': {'type': 'string', 'pattern': '^work-[a-f0-9]{32}$'}},
+                'required': ['feedback'], 'additionalProperties': False}},
+        handler=natural_qa_rework, description='Queue verified natural browser QA feedback for one existing repository work')
     from .repository_supervision import register_repository_supervision
     register_repository_supervision(ctx, intake)
