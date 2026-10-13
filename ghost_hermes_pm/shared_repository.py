@@ -794,7 +794,10 @@ def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=()
                     or not isinstance(job_id, str) or not job_id or not isinstance(owned_jobs, (list, tuple))):
                 return False
             matches = [job for job in owned_jobs if isinstance(job, dict) and job.get('id') == job_id]
-            if owned_jobs == [] and job_receipts:
+            old_lease, current_lease = receipt.get('host_lease'), execution.get('native_identity', {}).get('lease')
+            historical_lease = (isinstance(old_lease, str) and bool(old_lease)
+                and isinstance(current_lease, str) and bool(current_lease) and old_lease != current_lease)
+            if owned_jobs == [] and job_receipts or historical_lease:
                 keys = ('schema', 'generation', 'session_id', 'session_created_at', 'service_ref', 'host_lease',
                         'command_sha256', 'job_id')
                 rows = [row for row in job_receipts if isinstance(row, dict)
@@ -1286,10 +1289,12 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
                 or len(sessions) != 1 or sessions[0].get('cwd') != configuration['workspace']
                 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
                 or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'}
-                    or job.get('owner', execution['session_id']) != execution['session_id'] for job in jobs)
-                or not _verified_source_chain(execution, execution.get('baseline'), receipts, source, jobs,
-                    job_receipts=shared_receipts(receipt_configuration, execution, '.jobs.jsonl'))
-                or private_file(budget_file).read_bytes() != budget_before):
+                    or job.get('owner', execution['session_id']) != execution['session_id'] for job in jobs)):
+            raise ManagementError('outcome_unknown', 'The original Session, Workspace, receipts or jobs are not idle.')
+        if not _verified_source_chain(execution, execution.get('baseline'), receipts, source, jobs,
+                job_receipts=shared_receipts(receipt_configuration, execution, '.jobs.jsonl')):
+            raise ManagementError('outcome_unknown', 'Original source attribution receipts are unverified.')
+        if private_file(budget_file).read_bytes() != budget_before:
             raise ManagementError('outcome_unknown', 'The original Session, Workspace, receipts or jobs are not idle.')
         if completed_qa:
             previous = deepcopy(execution['continuation_control'])

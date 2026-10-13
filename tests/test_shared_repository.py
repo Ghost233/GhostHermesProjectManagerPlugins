@@ -825,10 +825,11 @@ def test_natural_qa_rework_expired_window_requires_maintenance_without_side_effe
     assert ledger_file.read_bytes() == before and not carrier.prompts
 
 
-@pytest.mark.parametrize('case', ['source', 'jobs', 'identity', 'foreign_profile'])
+@pytest.mark.parametrize('case', ['source', 'jobs', 'identity', 'foreign_profile', 'source_receipts'])
 def test_natural_qa_rework_rejects_changed_active_evidence_without_side_effects(tmp_path, monkeypatch, case):
-    from ghost_hermes_pm import repository_acceptance
+    from ghost_hermes_pm import repository_acceptance, shared_repository
     from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    source_chain = shared_repository._verified_source_chain
     record, context, intake, carrier, ledger_file, source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
     before = ledger_file.read_bytes()
     if case == 'source':
@@ -838,11 +839,19 @@ def test_natural_qa_rework_rejects_changed_active_evidence_without_side_effects(
         carrier.owned_jobs = lambda: [{'id': 'foreign-job', 'owner': 'foreign-session', 'status': 'running'}]
     elif case == 'identity':
         carrier.native_identity = {'kind': 'shared_native', 'lease': 'foreign-lease', 'pid': 19, 'created_at': 3}
+    elif case == 'source_receipts':
+        monkeypatch.setattr(shared_repository, '_verified_source_chain', source_chain)
+        receipts = shared_repository.shared_receipts
+        monkeypatch.setattr(shared_repository, 'shared_receipts',
+            lambda *args: [{**row, 'is_error': True} for row in receipts(*args)])
     else:
         record['superior_profile_id'] = 'fixture-superior'
         context['profile_id'] = 'foreign-profile'
-    with pytest.raises(ManagementError):
+    with pytest.raises(ManagementError) as failed:
         admit_shared_natural_qa_rework(intake, record, context, 'Fix synthetic evidence.', None, intake.generation)
+    if case == 'source_receipts':
+        assert failed.value.code == 'outcome_unknown'
+        assert str(failed.value) == 'Original source attribution receipts are unverified.'
     assert ledger_file.read_bytes() == before and not carrier.prompts and intake.card['status'] == 'blocked'
 
 
@@ -1088,7 +1097,7 @@ def test_permission_initializer_requires_original_terminal_birth(change, monkeyp
 
 
 @pytest.mark.parametrize('job_status', ['completed', 'killed', 'failed'])
-@pytest.mark.parametrize('historical', [False, True])
+@pytest.mark.parametrize('historical', [False, True, 'mixed', 'collision'])
 @pytest.mark.parametrize('receipt_kind', ['promoted', 'background'])
 def test_source_chain_attributes_terminal_promoted_job_write(job_status, historical, receipt_kind):
     from ghost_hermes_pm.shared_repository import _verified_source_chain
@@ -1114,6 +1123,10 @@ def test_source_chain_attributes_terminal_promoted_job_write(job_status, histori
         job_receipts = [registered, {**registered, 'type': 'settled', 'status': job_status,
             'finished_at_ms': 20, 'cause': 'kill' if job_status == 'killed' else 'producer', 'awaited': False}]
         owned_jobs = []
+        if historical in {'mixed', 'collision'}:
+            execution['native_identity'] = {'lease': 'fixture-current-lease'}
+            owned_jobs = [{'id': 'fixture-current-job' if historical == 'mixed' else promoted['job_id'],
+                'owner': execution['session_id'], 'status': 'running'}]
     assert _verified_source_chain(execution, baseline, [promoted, foreground], current, owned_jobs,
                                   job_receipts=job_receipts)
 
@@ -1125,6 +1138,9 @@ def test_source_chain_attributes_terminal_promoted_job_write(job_status, histori
     'admission', 'is_error', 'name', 'kind', 'sequence', 'before', 'after', 'current',
     'native_missing', 'native_duplicate', 'native_wrong_owner', 'native_wrong_command',
     'native_wrong_time', 'native_teardown', 'native_running', 'native_partial_roster',
+    'native_old_lease_missing', 'native_old_lease_wrong_owner', 'native_old_lease_wrong_command',
+    'native_old_lease_wrong_time', 'native_old_lease_teardown', 'native_old_lease_running',
+    'native_old_lease_wrong_host', 'native_current_lease',
 ])
 @pytest.mark.parametrize('receipt_kind', ['promoted', 'background'])
 def test_source_chain_rejects_unverified_promoted_job_write(change, receipt_kind):
@@ -1148,6 +1164,12 @@ def test_source_chain_rejects_unverified_promoted_job_write(change, receipt_kind
         settled = {**registered, 'type': 'settled', 'status': 'completed', 'finished_at_ms': 20,
                    'cause': 'producer', 'awaited': False}
         job_receipts, jobs = [registered, settled], []
+        if change.startswith('native_old_lease_'):
+            execution['native_identity'] = {'lease': 'fixture-current-lease'}
+            jobs = [{'id': receipt['job_id'], 'owner': execution['session_id'], 'status': 'completed'}]
+            change = change.replace('native_old_lease_', 'native_', 1)
+        elif change == 'native_current_lease':
+            execution['native_identity'] = {'lease': receipt['host_lease']}
         if change == 'native_missing':
             job_receipts.pop()
         elif change == 'native_duplicate':
@@ -1162,6 +1184,8 @@ def test_source_chain_rejects_unverified_promoted_job_write(change, receipt_kind
             settled['cause'] = 'teardown'
         elif change == 'native_running':
             settled['status'] = 'running'
+        elif change == 'native_wrong_host':
+            settled['host_lease'] = 'fixture-foreign-lease'
         else:
             jobs = [{'id': 'fixture-other-job', 'owner': 'fixture-session', 'status': 'completed'}]
     elif change in {'running', 'stopping', 'unknown'}:
