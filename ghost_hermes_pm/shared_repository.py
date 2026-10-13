@@ -1036,10 +1036,18 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
             stream.close()
         sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
         owned_jobs = carrier.owned_jobs()
+        saved_jobs = checkpoint.get('jobs')
+        if repeat and (not isinstance(saved_jobs, list)
+                or any(not isinstance(job, dict) or not isinstance(job.get('id'), str) or not job['id']
+                    or job.get('status') not in {'completed', 'killed', 'failed'} for job in saved_jobs)
+                or len({job['id'] for job in saved_jobs}) != len(saved_jobs)
+                or not isinstance(owned_jobs, list)):
+            raise ManagementError('binding_conflict', 'The restored expired window, history or jobs differ.')
         if (not _maintenance_snapshot_matches(snapshot, checkpoint) or len(sessions) != 1
                 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
                 or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'} for job in owned_jobs)
-                or repeat and [{'id': job['id'], 'status': job['status']} for job in owned_jobs] != checkpoint.get('jobs')
+                or repeat and (any('owner' in job and job['owner'] != execution['session_id'] for job in owned_jobs)
+                    or owned_jobs and [{'id': job.get('id'), 'status': job['status']} for job in owned_jobs] != saved_jobs)
                 or private_file(budget_file).read_bytes() != raw):
             raise ManagementError('binding_conflict', 'The restored expired window, history or jobs differ.')
         for suffix, proof in checkpoint['receipts'].items():

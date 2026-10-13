@@ -565,6 +565,74 @@ def test_repeat_window_admit_rejects_unconfirmed_delta(change, repeat_window_rea
     assert checkpoint['status'] == 'prepared' and 'session/prompt' not in f.carrier_calls
 
 
+@pytest.mark.parametrize('change', ['partial', 'superset', 'different_id', 'different_status', 'duplicate',
+    'wrong_owner', 'active', 'unknown', 'missing_status', 'malformed', 'unreadable',
+    'checkpoint_active', 'checkpoint_unknown', 'checkpoint_duplicate', 'checkpoint_malformed'])
+def test_repeat_window_restored_roster_rejects_unsealed_or_partial_jobs(change, repeat_window_read_facts):
+    from ghost_hermes_pm.shared_repository import admit_shared_window_renewal, _renewal_history_sha256
+    f = repeat_window_read_facts
+    e = f.record['dsh_execution']
+    e['renewal_window_adoption'] = 'accepted'
+    saved = [{'id': 'fixture-old-job-one', 'status': 'completed'}, {'id': 'fixture-old-job-two', 'status': 'killed'}]
+    checkpoint = {'status': 'prepared', 'repeat_budget_stopped': True, 'message_id': 'fixture-first-grant',
+        'terminal_reason': deepcopy(e['terminal_reason']), 'worker': f.worker, 'native_identity': deepcopy(e['native_identity']),
+        'scope': {'host_lease': e['native_identity']['lease']}, 'previous_state': deepcopy(f.row['state']),
+        'previous_renew_window': deepcopy(f.row['renewWindow']), 'jobs': saved,
+        'snapshot_sha256': hashlib.sha256(json.dumps(f.snapshot, sort_keys=True).encode()).hexdigest()}
+    e['renewal_window_checkpoint'] = checkpoint
+    checkpoint['history_sha256'] = _renewal_history_sha256(e)
+    backup = f.ledger.with_name('fixture-window-backup.json')
+    backup.write_bytes(f.ledger.read_bytes())
+    backup.chmod(0o600)
+    checkpoint.update(ledger_backup=str(backup), ledger_sha256=hashlib.sha256(backup.read_bytes()).hexdigest(),
+        workspace={'workspace_id': e['workspace_id'], 'session_ids': [e['session_id']]})
+    current = [{**job, 'owner': e['session_id']} for job in saved]
+    if change == 'partial':
+        current = current[:1]
+    elif change == 'superset':
+        current.append({'id': 'fixture-extra-job', 'status': 'failed', 'owner': e['session_id']})
+    elif change == 'different_id':
+        current[0]['id'] = 'fixture-different-job'
+    elif change == 'different_status':
+        current[0]['status'] = 'failed'
+    elif change == 'duplicate':
+        current = [current[0], dict(current[0])]
+    elif change == 'wrong_owner':
+        current[0]['owner'] = 'fixture-other-session'
+    elif change in {'active', 'unknown'}:
+        current[0]['status'] = 'running' if change == 'active' else 'unknown'
+    elif change == 'missing_status':
+        current[0].pop('status')
+    elif change == 'malformed':
+        current = [None]
+    elif change == 'unreadable':
+        current = None
+    elif change in {'checkpoint_active', 'checkpoint_unknown'}:
+        saved[0]['status'] = 'running' if change == 'checkpoint_active' else 'unknown'
+        current = []
+    elif change == 'checkpoint_duplicate':
+        checkpoint['jobs'] = [saved[0], dict(saved[0])]
+        current = []
+    elif change == 'checkpoint_malformed':
+        checkpoint['jobs'] = [None]
+        current = []
+    f.jobs = current
+    new = {**f.native, 'lease': 'fixture-new-lease', 'pid': f.native['pid'] + 100000,
+        'created_at': f.native['created_at'] + 1}
+    f.reference.write_text(json.dumps({'host_lease': new['lease']}))
+    f.config['host_lease'] = new['lease']
+    f.native = new
+    ledger_before = f.ledger.read_bytes()
+    checkpoint_before = json.dumps(checkpoint, sort_keys=True).encode()
+    with pytest.raises(ManagementError) as caught:
+        admit_shared_window_renewal(f.intake, f.record, 'fixture-second-grant', 'fixture-generation')
+    assert caught.value.code == 'binding_conflict'
+    assert str(caught.value) == 'The restored expired window, history or jobs differ.'
+    assert f.ledger.read_bytes() == ledger_before and f.saves == []
+    assert json.dumps(checkpoint, sort_keys=True).encode() == checkpoint_before
+    assert f.carrier_calls == ['session/list']
+
+
 @pytest.mark.parametrize('error', [
     'Iteration budget exhausted (7/8) — task could not complete within the allowed iterations',
     'Iteration budget exhausted (8/8) — task could not complete within the allowed iterations; extra suffix',

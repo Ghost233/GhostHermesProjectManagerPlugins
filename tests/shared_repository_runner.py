@@ -850,6 +850,7 @@ async def main():
                 rows.append({'type': 'event', 'event': {'type': 'session/end-seed', 'seq': len(rows), 'time': 7, 'data': {}}})
                 fixture_behavior['header_defaults'] = {'delegationDepth': 0}
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['agentAvailable'] = False
+                fixture_behavior['jobs'] = []
                 await receive(adapter, raw('om_repeat_window_admit', '@_user_1 续预算 ' + latest['id']))
                 latest = record()
                 third_budget = json.loads(budget_file.read_bytes())
