@@ -413,6 +413,158 @@ def test_supervision_takeover_read_boundary_retries_only_exact_recoverable_cause
         assert json.dumps(execution, sort_keys=True, separators=(',', ':')).encode() == before
 
 
+@pytest.fixture
+def repeat_window_read_facts(monkeypatch, tmp_path):
+    """Synthetic maintenance read facts; no real runtime or budget grant."""
+    from types import SimpleNamespace
+    from ghost_hermes_pm import shared_repository as shared, repository_control, repository_acceptance, repository_execution, repository_supervision
+    child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+    import psutil
+    birth = psutil.Process(child.pid).create_time()
+    child.communicate(b'')
+    assert child.returncode == 0 and not psutil.pid_exists(child.pid)
+    native = {'kind': 'shared_native', 'lease': 'fixture-old-lease', 'pid': child.pid, 'created_at': birth}
+    source = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-source'}
+    scope = {'host_lease': native['lease']}
+    reference = tmp_path / 'fixture-reference.json'
+    reference.write_text(json.dumps(scope))
+    reference.chmod(0o600)
+    config = {'workspace': str(tmp_path), 'host_lease': native['lease'], 'service_ref': 'fixture-native',
+        'agent_preset': 'fixture-preset', 'provider': 'fixture', 'model': 'fixture', 'ledger_dir': str(tmp_path),
+        'budget': {'max_wall_seconds': 2, 'max_model_requests': 8}, 'reference_sha256': 'fixture-reference'}
+    admissions = ['fixture-request-' + str(index) for index in range(3)]
+    original_state = {'started_at_ms': int(time.time() * 1000) - 20000, 'requests': len(admissions) - 1,
+        'reported_tokens': 5, 'admissions': admissions[:-1], 'stop_reason': None}
+    row = {'schema': 1, 'session_id': 'fixture-session', 'generation': 'fixture-generation', 'session_created_at': 100,
+        **{key: config[key] for key in ('workspace', 'host_lease', 'service_ref', 'agent_preset', 'provider', 'model', 'budget')},
+        'state': {**original_state, 'requests': len(admissions), 'reported_tokens': 10, 'admissions': admissions},
+        'renewWindow': {'host_lease': native['lease'], 'hook_marker': 'same-sid-window-v1',
+            'started_at_ms': int(time.time() * 1000) - 10000, 'stop_reason': 'shared-work-wall-budget',
+            'request_base': original_state['requests'], 'original_state': original_state}}
+    receipt = {'schema': 1, 'generation': row['generation'], 'session_id': row['session_id'], 'session_created_at': 100,
+        'service_ref': config['service_ref'], 'host_lease': native['lease'], 'name': 'bash', 'kind': 'foreground',
+        'execution_admission': 'admitted', 'is_error': False, 'exit_code': 0, 'timed_out': False, 'aborted': False,
+        'native_session_seq': 1, 'source_before': source, 'source_after': source}
+    execution = {'mode': 'shared_native', 'state': 'budget_stopped', 'terminal_reason': {
+        'kind': 'aborted', 'reason': {'kind': 'hook', 'reason': 'shared-work-wall-budget'}},
+        'first_input': 'accepted', 'session_id': row['session_id'], 'generation': row['generation'],
+        'session_created_at': 100, 'workspace_id': 'fixture-workspace', 'native_identity': native, 'baseline': source,
+        'acceptance': {'status': 'unmet', 'delivered': False, 'unmet': ['delivery_report_missing']},
+        'renewal_window_checkpoint': {'status': 'admitted'}, 'renewal_window_adoption': 'accepted',
+        'continuation_control': {'status': 'accepted'}, 'tool_receipts': [receipt], 'jobs': []}
+    record = {'id': 'fixture-work', 'card_id': 'fixture-card',
+        'target': {'execution_ref': str(reference), 'repo_path': str(tmp_path)}, 'dsh_execution': execution}
+    ledger = shared.ledger_path(config, execution['session_id'])
+    ledger.write_text(json.dumps(row))
+    ledger.chmod(0o600)
+    receipts_path = shared.ledger_path(config, execution['session_id'], '.tools.jsonl')
+    receipts_path.write_text(json.dumps(receipt) + '\n')
+    receipts_path.chmod(0o600)
+    events = [{'type': 'turn/start', 'seq': 0, 'data': {'turn': 1}}]
+    for _ in admissions:
+        events.append({'type': 'assistant/message', 'seq': len(events), 'data': {'message': {'content': []}}})
+    events.append({'type': 'turn/end', 'seq': len(events), 'data': {'reason': execution['terminal_reason']}})
+    snapshot = {'header': {'id': execution['session_id'], 'createdAt': 100, 'cwd': config['workspace']},
+        'hasMore': False, 'cursor': len(events) - 1, 'records': [{'event': event} for event in events],
+        'projections': {'values': {'agentPreset': config['agent_preset'], 'permissions': {'currentValue': 'workspace-write'},
+            'inbox': {'next-turn': [], 'next-step': []}}}}
+    workspace = {'workspaceId': execution['workspace_id'], 'sessionIds': [execution['session_id']]}
+    worker = {'run_id': 17, 'identity': {'pid': child.pid}, 'exit_code': 0}
+    facts = SimpleNamespace(record=record, config=config, row=row, ledger=ledger, reference=reference,
+        source=source, native=native, worker=worker, snapshot=snapshot, jobs=[], saves=[], carrier_calls=[])
+
+    class Carrier:
+        def __init__(self, configuration):
+            self.native_identity = facts.native
+        def stream(self, method, payload):
+            return (item for item in [facts.snapshot])
+        def owned_jobs(self):
+            return facts.jobs
+        def close(self):
+            pass
+
+    monkeypatch.setattr(repository_control, '_card', lambda *args: {'status': 'blocked'})
+    monkeypatch.setattr(repository_control, '_worker_end', lambda *args, **kwargs: worker)
+    monkeypatch.setattr(shared, 'shared_configuration', lambda *args, **kwargs: dict(config))
+    monkeypatch.setattr(repository_execution, 'execution_configuration', lambda *args: (dict(config), {}))
+    monkeypatch.setattr(shared, 'SharedDesktopTransport', Carrier)
+    monkeypatch.setattr(shared, 'resolve_shared_workspace', lambda *args: workspace)
+    monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda *args: source)
+    def owned_call(carrier, method, payload):
+        facts.carrier_calls.append(method)
+        assert method == 'session/list', 'A rejected grant must not adopt or prompt.'
+        return {'items': [{'sessionId': execution['session_id'], 'running': False, 'agentAvailable': True}]}
+    monkeypatch.setattr(repository_supervision, 'owned_call', owned_call)
+    facts.intake = SimpleNamespace(board='fixture-board', _save_execution=lambda *args, **kwargs: facts.saves.append((args, kwargs)))
+    return facts
+
+
+@pytest.mark.parametrize('change', ['awaiting', 'wrong_terminal', 'pending_checkpoint', 'unknown_checkpoint',
+    'pending_adoption', 'unknown_adoption', 'active_job', 'unknown_job', 'saved_receipts', 'saved_jobs'])
+def test_repeat_window_prepare_rejects_unconfirmed_delta(change, repeat_window_read_facts):
+    from ghost_hermes_pm.shared_repository import prepare_shared_window_renewal
+    f = repeat_window_read_facts
+    e = f.record['dsh_execution']
+    if change == 'awaiting':
+        e['state'] = 'awaiting_acceptance'
+    elif change == 'wrong_terminal':
+        e['terminal_reason']['reason']['kind'] = 'user'
+    elif change in {'pending_checkpoint', 'unknown_checkpoint'}:
+        e['renewal_window_checkpoint']['status'] = 'prepared' if change == 'pending_checkpoint' else 'unknown'
+    elif change in {'pending_adoption', 'unknown_adoption'}:
+        e['renewal_window_adoption'] = 'intent' if change == 'pending_adoption' else 'unknown'
+    elif change in {'active_job', 'unknown_job'}:
+        f.jobs = [{'id': 'fixture-other-job', 'owner': e['session_id'], 'status': 'running' if change == 'active_job' else 'unknown'}]
+    elif change == 'saved_receipts':
+        e['tool_receipts'] = []
+    elif change == 'saved_jobs':
+        e['jobs'] = [{'id': 'fixture-other-job', 'status': 'completed'}]
+    before = f.ledger.read_bytes()
+    with pytest.raises(ManagementError):
+        prepare_shared_window_renewal(f.intake, f.record, 'fixture-first-grant')
+    assert f.ledger.read_bytes() == before and f.saves == []
+    assert e['renewal_window_checkpoint']['status'] != 'prepared' or change == 'pending_checkpoint'
+    assert 'session/prompt' not in f.carrier_calls
+
+
+@pytest.mark.parametrize('change', ['same_identity', 'same_lease', 'same_pid', 'same_birth', 'history', 'same_grant', 'unknown_adoption'])
+def test_repeat_window_admit_rejects_unconfirmed_delta(change, repeat_window_read_facts):
+    from ghost_hermes_pm.shared_repository import admit_shared_window_renewal, _renewal_history_sha256
+    f = repeat_window_read_facts
+    e = f.record['dsh_execution']
+    e['renewal_window_adoption'] = None
+    checkpoint = {'status': 'prepared', 'repeat_budget_stopped': True, 'message_id': 'fixture-first-grant',
+        'terminal_reason': deepcopy(e['terminal_reason']), 'worker': f.worker, 'native_identity': deepcopy(e['native_identity']),
+        'scope': {'host_lease': e['native_identity']['lease']}, 'previous_state': deepcopy(f.row['state']),
+        'previous_renew_window': deepcopy(f.row['renewWindow'])}
+    e['renewal_window_checkpoint'] = checkpoint
+    checkpoint['history_sha256'] = _renewal_history_sha256(e)
+    backup = f.ledger.with_name('fixture-window-backup.json')
+    backup.write_bytes(f.ledger.read_bytes())
+    backup.chmod(0o600)
+    checkpoint.update(ledger_backup=str(backup), ledger_sha256=hashlib.sha256(backup.read_bytes()).hexdigest(),
+        workspace={'workspace_id': e['workspace_id'], 'session_ids': [e['session_id']]})
+    new = {**f.native, 'lease': 'fixture-new-lease', 'pid': f.native['pid'] + 100000, 'created_at': f.native['created_at'] + 1}
+    if change == 'same_identity':
+        new = dict(f.native)
+    elif change in {'same_lease', 'same_pid', 'same_birth'}:
+        key = {'same_lease': 'lease', 'same_pid': 'pid', 'same_birth': 'created_at'}[change]
+        new[key] = f.native[key]
+    elif change == 'history':
+        e['continuation_history'] = [{'changed': True}]
+    elif change == 'unknown_adoption':
+        e['renewal_window_adoption'] = 'unknown'
+    f.reference.write_text(json.dumps({'host_lease': new['lease']}))
+    f.config['host_lease'] = new['lease']
+    f.native = new
+    before = f.ledger.read_bytes()
+    message_id = 'fixture-first-grant' if change == 'same_grant' else 'fixture-second-grant'
+    with pytest.raises(ManagementError):
+        admit_shared_window_renewal(f.intake, f.record, message_id, 'fixture-generation')
+    assert f.ledger.read_bytes() == before and f.saves == []
+    assert checkpoint['status'] == 'prepared' and 'session/prompt' not in f.carrier_calls
+
+
 @pytest.mark.parametrize('error', [
     'Iteration budget exhausted (7/8) — task could not complete within the allowed iterations',
     'Iteration budget exhausted (8/8) — task could not complete within the allowed iterations; extra suffix',

@@ -846,6 +846,17 @@ def _require_expired_window_budget(configuration, row):
         raise ManagementError('outcome_unknown', 'The original renewed window is not the known expired window.')
 
 
+def _repeat_budget_stopped_window(execution):
+    return (execution.get('state') == 'budget_stopped' and execution.get('terminal_reason') == {
+        'kind': 'aborted', 'reason': {'kind': 'hook', 'reason': 'shared-work-wall-budget'}})
+
+
+def _renewal_history_sha256(execution):
+    return hashlib.sha256(json.dumps({key: execution.get(key) for key in (
+        'renewal_window_checkpoint_history', 'renewal_window_history', 'continuation_history', 'continuation_control')},
+        sort_keys=True).encode()).hexdigest()
+
+
 def prepare_shared_window_renewal(intake, record, message_id):
     """Freeze the one authorized expired renewed window before normal maintenance."""
     from .repository_acceptance import DELIVERY_MARKER, repository_source_state
@@ -853,12 +864,18 @@ def prepare_shared_window_renewal(intake, record, message_id):
     from .repository_supervision import owned_call
     execution = record['dsh_execution']
     acceptance = execution.get('acceptance', {})
-    if (execution.get('mode') != 'shared_native' or execution.get('state') != 'awaiting_acceptance'
-            or execution.get('terminal_reason') != {'kind': 'completed'} or execution.get('first_input') != 'accepted'
-            or execution.get('stop_requested') or execution.get('lifecycle_end')
-            or execution.get('renewal_window_checkpoint') or acceptance.get('status') != 'unmet'
+    previous_checkpoint = execution.get('renewal_window_checkpoint', {})
+    repeat = _repeat_budget_stopped_window(execution)
+    completed = (execution.get('state') == 'awaiting_acceptance'
+        and execution.get('terminal_reason') == {'kind': 'completed'} and not previous_checkpoint)
+    if (execution.get('mode') != 'shared_native' or not (completed or repeat)
+            or execution.get('first_input') != 'accepted' or execution.get('stop_requested') or execution.get('lifecycle_end')
+            or repeat and (previous_checkpoint.get('status') != 'admitted'
+                or execution.get('renewal_window_adoption') != 'accepted'
+                or execution.get('continuation_control', {}).get('status') != 'accepted')
+            or acceptance.get('status') != 'unmet'
             or acceptance.get('delivered') is not False or 'delivery_report_missing' not in acceptance.get('unmet', [])):
-        raise ManagementError('outcome_unknown', 'Only the original undelivered completed window may prepare its one renewal.')
+        raise ManagementError('outcome_unknown', 'Only the original undelivered completed or wall-stopped window may prepare renewal.')
     _card(intake, record)
     worker = _worker_end(intake, record, allow_later_terminal=True)
     scope = json.loads(private_file(record['target']['execution_ref']).read_text())
@@ -871,6 +888,8 @@ def prepare_shared_window_renewal(intake, record, message_id):
             or row['renewWindow'].get('hook_marker') != 'same-sid-window-v1'):
         raise ManagementError('outcome_unknown', 'The current window is not the authorized expired window.')
     _require_expired_window_budget(configuration, row)
+    if repeat and row['renewWindow'].get('stop_reason') != 'shared-work-wall-budget':
+        raise ManagementError('outcome_unknown', 'The repeated renewal is not the confirmed wall-budget stop.')
     source = repository_source_state(record['target'])
     carrier = SharedDesktopTransport(configuration)
     try:
@@ -903,8 +922,11 @@ def prepare_shared_window_renewal(intake, record, message_id):
                 or len(sessions) != 1 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
                 or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
                 or ends[-1]['data'].get('reason') != execution['terminal_reason']
-                or len(settlements) != row['state']['requests'] or delivery or not _rejected_bash_window_evidence(events, receipts)
-                or any(job['status'] in {'running', 'stopping'} for job in owned_jobs)
+                or len(settlements) != row['state']['requests'] or delivery
+                or not repeat and not _rejected_bash_window_evidence(events, receipts)
+                or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'} for job in owned_jobs)
+                or repeat and (execution.get('tool_receipts') != receipts or execution.get('jobs') != [
+                    {'id': job['id'], 'status': job['status']} for job in owned_jobs])
                 or private_file(budget_file).read_bytes() != raw):
             raise ManagementError('outcome_unknown', 'The expired window has unverified delivery, tool, job or budget activity.')
         backup = budget_file.with_name(budget_file.name + '.renewal-window-' + hashlib.sha256(raw).hexdigest())
@@ -920,14 +942,24 @@ def prepare_shared_window_renewal(intake, record, message_id):
             path = ledger_path(configuration, execution['session_id'], suffix)
             content = private_file(path).read_bytes() if path.exists() else b''
             proofs[suffix] = {'size': len(content), 'sha256': hashlib.sha256(content).hexdigest()}
+        if repeat:
+            execution.setdefault('renewal_window_checkpoint_history', []).append({
+                'checkpoint': deepcopy(previous_checkpoint), 'adoption': execution['renewal_window_adoption']})
+            execution['renewal_window_adoption'] = None
         execution['renewal_window_checkpoint'] = {'status': 'prepared', 'message_id': message_id, 'scope': scope,
+            'repeat_budget_stopped': repeat, 'terminal_reason': deepcopy(execution['terminal_reason']),
+            'jobs': [{'id': job['id'], 'status': job['status']} for job in owned_jobs],
+            'history_sha256': _renewal_history_sha256(execution),
             'native_identity': execution['native_identity'], 'worker': worker, 'ledger_backup': str(backup),
             'ledger_sha256': hashlib.sha256(raw).hexdigest(), 'cursor': snapshot['cursor'],
             'snapshot_sha256': hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
             'workspace': {'workspace_id': workspace['workspaceId'], 'session_ids': workspace['sessionIds']},
             'receipts': proofs, 'source': source, 'previous_state': deepcopy(row['state']),
             'previous_renew_window': deepcopy(row['renewWindow'])}
-        intake._save_execution(record, fields=['renewal_window_checkpoint'])
+        fields = ['renewal_window_checkpoint']
+        if repeat:
+            fields += ['renewal_window_checkpoint_history', 'renewal_window_adoption']
+        intake._save_execution(record, fields=fields)
         return record
     finally:
         carrier.close()
@@ -941,9 +973,16 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
     from .repository_supervision import owned_call
     execution = record['dsh_execution']
     checkpoint = execution.get('renewal_window_checkpoint', {})
+    repeat = checkpoint.get('repeat_budget_stopped') is True
     if (checkpoint.get('status') != 'prepared' or execution.get('mode') != 'shared_native'
-            or execution.get('state') != 'awaiting_acceptance' or execution.get('terminal_reason') != {'kind': 'completed'}
-            or execution.get('stop_requested') or _worker_end(intake, record, allow_later_terminal=True) != checkpoint.get('worker')
+            or (not _repeat_budget_stopped_window(execution) if repeat else
+                execution.get('state') != 'awaiting_acceptance' or execution.get('terminal_reason') != {'kind': 'completed'})
+            or execution.get('first_input') != 'accepted' or execution.get('stop_requested') or execution.get('lifecycle_end')
+            or message_id == checkpoint.get('message_id')
+            or repeat and (checkpoint.get('terminal_reason') != execution.get('terminal_reason')
+                or checkpoint.get('history_sha256') != _renewal_history_sha256(execution)
+                or execution.get('renewal_window_adoption') not in {None, 'intent', 'accepted'})
+            or _worker_end(intake, record, allow_later_terminal=True) != checkpoint.get('worker')
             or execution.get('native_identity') != checkpoint.get('native_identity')):
         raise ManagementError('outcome_unknown', 'Only the prepared expired window may enter its authorized renewal.')
     configuration, _ = execution_configuration(record['target'])
@@ -996,9 +1035,11 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
         finally:
             stream.close()
         sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
+        owned_jobs = carrier.owned_jobs()
         if (not _maintenance_snapshot_matches(snapshot, checkpoint) or len(sessions) != 1
                 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
-                or any(job['status'] in {'running', 'stopping'} for job in carrier.owned_jobs())
+                or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'} for job in owned_jobs)
+                or repeat and [{'id': job['id'], 'status': job['status']} for job in owned_jobs] != checkpoint.get('jobs')
                 or private_file(budget_file).read_bytes() != raw):
             raise ManagementError('binding_conflict', 'The restored expired window, history or jobs differ.')
         for suffix, proof in checkpoint['receipts'].items():
@@ -1428,6 +1469,7 @@ def shared_receipts(configuration, execution, suffix):
         'host_lease': configuration['host_lease']}
     prefixes = []
     for checkpoint in (execution.get('renew_window_checkpoint', {}), execution.get('window_resume_checkpoint', {}),
+                       *(entry['checkpoint'] for entry in execution.get('renewal_window_checkpoint_history', [])),
                        execution.get('renewal_window_checkpoint', {})):
         proof = checkpoint.get('receipts', {}).get(suffix)
         if not proof:
@@ -1436,7 +1478,7 @@ def shared_receipts(configuration, execution, suffix):
         if hashlib.sha256(prefix).hexdigest() != proof['sha256']:
             raise ManagementError('coverage_unverified', 'Original window receipt prefix changed.')
         prefixes.append((len(prefix.splitlines()), checkpoint['native_identity']['lease']))
-    if any(prefixes[index][0] >= prefixes[index + 1][0] for index in range(len(prefixes) - 1)):
+    if any(prefixes[index][0] > prefixes[index + 1][0] for index in range(len(prefixes) - 1)):
         raise ManagementError('coverage_unverified', 'Original window receipt checkpoints are unordered.')
     if any(any(row.get(key) != (next((lease for count, lease in prefixes if index < count), value)
                if key == 'host_lease' else value) for key, value in expected.items()) for index, row in enumerate(rows)):

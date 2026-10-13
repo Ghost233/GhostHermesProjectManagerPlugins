@@ -394,7 +394,14 @@ async def process_control(intake, prepared, generation):
                 if saved.get('message_id') == message_id and 'dispatch_status' in saved:
                     result['dispatch_status'] = saved['dispatch_status']
             elif prepared.command.startswith('续预算 '):
-                if execution.get('renewal_window_checkpoint'):
+                from .shared_repository import _repeat_budget_stopped_window
+                if (execution.get('renewal_window_checkpoint', {}).get('status') == 'admitted'
+                        and _repeat_budget_stopped_window(execution)):
+                    from .shared_repository import prepare_shared_window_renewal
+                    record = await asyncio.to_thread(prepare_shared_window_renewal, intake, record, message_id)
+                    text = '原到期窗口续预算准备已保存；未新增输入、预算或期限。正常维护后须再次明确续预算，原 SID 与旧窗口完整保留。'
+                    result = {'status': 'prepared', 'work_id': record['id']}
+                elif execution.get('renewal_window_checkpoint'):
                     from .shared_repository import admit_shared_window_renewal
                     record = await asyncio.to_thread(admit_shared_window_renewal, intake, record, message_id, generation)
                     text = '原 SID 新有限窗口已受理；旧窗口完整备份保留，实际请求前才开始新窗口，等待原生派发。'

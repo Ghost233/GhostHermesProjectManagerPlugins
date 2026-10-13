@@ -351,6 +351,7 @@ async def main():
         resume_ended = False
         renewal_admitted = False
         renewal_ended = False
+        repeat_window_evidence = None
         expired_window_evidence = None
         takeover_rejection = None
         old_ledger_path = old_ledger = old_history = changed_ledger = None
@@ -776,12 +777,33 @@ async def main():
                 assert budget['renewWindow']['hook_marker'] == 'same-sid-window-v1'
                 sid = latest['dsh_execution']['session_id']
                 rows = peer['journals'][sid]
+                rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 6,
+                    'data': {'turn': 2, 'step': 0, 'usage': {'inputTokens': 10, 'outputTokens': 5},
+                        'message': {'id': 'fixture-repeat-settlement', 'role': 'assistant',
+                            'content': [{'type': 'text', 'text': 'Synthetic renewed-window progress.'}]}, 'stream': []}}})
+                call_id = 'fixture-repeat-bash-rejection'
+                rows.append({'type': 'event', 'event': {'type': 'tool/call', 'seq': len(rows), 'time': 6,
+                    'data': {'turn': 2, 'step': 0, 'callId': call_id, 'name': 'bash', 'arguments': {'command': 'fixture bounded work'}}}})
+                rows.append({'type': 'event', 'event': {'type': 'tool/result', 'seq': len(rows), 'time': 6,
+                    'data': {'turn': 2, 'step': 0, 'message': {'toolCallId': call_id, 'isError': True,
+                        'content': [{'type': 'text', 'text': 'Synthetic ordinary bash rejection.'}]}}}})
+                receipt_path = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.tools.jsonl')
+                with receipt_path.open('a') as output:
+                    output.write(json.dumps({'schema': 1, 'generation': budget['generation'], 'session_id': sid,
+                        'session_created_at': budget['session_created_at'], 'service_ref': 'fixture-native',
+                        'host_lease': budget['host_lease'], 'call_id': call_id, 'name': 'bash', 'is_error': True,
+                        'execution_admission': 'rejected'}) + '\n')
+                fixture_behavior['jobs'] = [{'id': 'fixture-repeat-terminal-job', 'owner': sid, 'status': 'killed'}]
+                budget['renewWindow'].update(started_at_ms=int(time.time() * 1000) - 80000,
+                    stop_reason='shared-work-wall-budget')
+                budget_file.write_text(json.dumps(budget))
                 rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 6,
-                    'data': {'turn': 2, 'reason': {'kind': 'error', 'error': {'code': 'UNKNOWN', 'message': 'Synthetic renewed terminal.'}}}}})
+                    'data': {'turn': 2, 'reason': {'kind': 'aborted',
+                        'reason': {'kind': 'hook', 'reason': 'shared-work-wall-budget'}}}}})
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 renewal_ended = True
             if renew_window_again and renewal_ended and card['status'] in {'blocked', 'triage'}:
-                assert latest['dsh_execution']['state'] == 'execution_failed', latest['dsh_execution']
+                assert latest['dsh_execution']['state'] == 'budget_stopped', latest['dsh_execution']
                 while True:
                     waited, status = os.waitpid(worker['pid'], os.WNOHANG)
                     if waited:
@@ -790,6 +812,67 @@ async def main():
                     await asyncio.sleep(.05)
                 worker = None
                 assert len(peer['prompts']) == 2
+                prior_execution = json.loads(json.dumps(record()['dsh_execution']))
+                repeat_budget_before = budget_file.read_bytes()
+                repeat_history_before = json.loads(json.dumps(peer['journals'][sid]))
+                await receive(adapter, raw('om_repeat_window_prepare', '@_user_1 续预算 ' + latest['id']))
+                latest = record()
+                repeat_checkpoint = latest['dsh_execution'].get('renewal_window_checkpoint', {})
+                assert repeat_checkpoint.get('status') == 'prepared' and repeat_checkpoint.get('message_id') == 'om_repeat_window_prepare', {
+                    'checkpoint': repeat_checkpoint, 'messages': [m.request_body.content for m in sent if m.message_id == 'om_repeat_window_prepare']}
+                assert budget_file.read_bytes() == repeat_budget_before and len(peer['prompts']) == 2
+                assert peer['journals'][sid] == repeat_history_before
+                repeat_window_evidence = {'phase': 'prepared', 'prompt_count': len(peer['prompts']),
+                    'ledger_sha256': hashlib.sha256(repeat_budget_before).hexdigest(),
+                    'requests': json.loads(repeat_budget_before)['state']['requests'],
+                    'checkpoint': repeat_checkpoint, 'prior_checkpoint': prior_execution['renewal_window_checkpoint'],
+                    'prior_adoption': prior_execution.get('renewal_window_adoption')}
+                archived = latest['dsh_execution']['renewal_window_checkpoint_history'][-1]
+                assert archived == {'checkpoint': prior_execution['renewal_window_checkpoint'],
+                    'adoption': prior_execution['renewal_window_adoption']}
+                assert latest['dsh_execution']['renewal_window_history'] == prior_execution['renewal_window_history']
+                assert latest['dsh_execution']['continuation_history'] == prior_execution['continuation_history']
+                assert latest['dsh_execution']['renewal_window_adoption'] is None
+                assert Path(repeat_checkpoint['ledger_backup']).read_bytes() == repeat_budget_before
+                await receive(adapter, raw('om_repeat_window_still_alive', '@_user_1 续预算 ' + latest['id']))
+                assert budget_file.read_bytes() == repeat_budget_before and len(peer['prompts']) == 2
+                assert record()['dsh_execution']['renewal_window_checkpoint']['status'] == 'prepared'
+                host_processes[-1].terminate()
+                assert host_processes[-1].wait(timeout=5) == -15
+                host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                third_receipt = json.loads(receipt.read_text())
+                third_receipt.update(lease='fixture-third-window-lease', pid=host_processes[-1].pid)
+                receipt.write_text(json.dumps(third_receipt))
+                third_scope = json.loads(reference.read_text())
+                third_scope['host_lease'] = third_receipt['lease']
+                reference.write_text(json.dumps(third_scope))
+                rows.append({'type': 'event', 'event': {'type': 'session/end-seed', 'seq': len(rows), 'time': 7, 'data': {}}})
+                fixture_behavior['header_defaults'] = {'delegationDepth': 0}
+                next(row for row in peer['sessions'] if row['sessionId'] == sid)['agentAvailable'] = False
+                await receive(adapter, raw('om_repeat_window_admit', '@_user_1 续预算 ' + latest['id']))
+                latest = record()
+                third_budget = json.loads(budget_file.read_bytes())
+                previous_budget = json.loads(repeat_budget_before)
+                assert latest['dsh_execution']['renewal_window_checkpoint']['status'] == 'admitted', latest['dsh_execution']
+                assert latest['dsh_execution']['renewal_window_adoption'] == 'accepted'
+                assert latest['dsh_execution']['continuation_control']['status'] == 'admitted'
+                assert third_budget['renewWindow']['request_base'] == previous_budget['state']['requests']
+                assert third_budget['renewWindow']['original_state'] == previous_budget['state']
+                assert third_budget['renewWindow']['started_at_ms'] is None
+                assert third_budget['renewWindow']['hook_marker'] is None and third_budget['renewWindow']['stop_reason'] is None
+                assert {key: value for key, value in third_budget['state'].items() if key != 'binding_sha256'} == {
+                    key: value for key, value in previous_budget['state'].items() if key != 'binding_sha256'}
+                assert latest['dsh_execution']['renewal_window_checkpoint_history'][-1] == archived
+                assert latest['dsh_execution']['continuation_history'][:len(prior_execution['continuation_history'])] == prior_execution['continuation_history']
+                assert latest['dsh_execution']['renewal_window_history'][:len(prior_execution['renewal_window_history'])] == prior_execution['renewal_window_history']
+                assert len(peer['prompts']) == 2 and peer['prompts'][0]['sessionId'] == peer['prompts'][1]['sessionId'] == sid
+                assert peer['journals'][sid][:len(repeat_history_before)] == repeat_history_before
+                assert Path(repeat_checkpoint['ledger_backup']).read_bytes() == repeat_budget_before
+                repeat_window_evidence.update(phase='admitted', request_base=third_budget['renewWindow']['request_base'],
+                    cumulative_state_before=previous_budget['state'], window_after=third_budget['renewWindow'],
+                    checkpoint_history=latest['dsh_execution']['renewal_window_checkpoint_history'],
+                    adoption=latest['dsh_execution']['renewal_window_adoption'], prompt_count=len(peer['prompts']))
                 break
             if resume_completed_window and ended and not resume_admitted and card['status'] in {'blocked', 'triage'}:
                 assert latest['dsh_execution']['state'] == 'awaiting_acceptance', latest['dsh_execution']
@@ -1467,6 +1550,8 @@ async def main():
                 result['takeover'] = takeover
                 result['preflight_runs'] = preflight_runs
                 result['new_claim'] = latest['dsh_execution']['supervisor_claim']
+        if renew_window_again:
+            result['repeat_window'] = repeat_window_evidence
         if expired_window:
             result['expired_window'] = expired_window_evidence
         if takeover_rejection is not None:
