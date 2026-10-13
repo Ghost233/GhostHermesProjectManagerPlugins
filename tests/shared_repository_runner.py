@@ -30,10 +30,11 @@ concurrent_claim = shared_scenario == 'continue_claim_race'
 native_restore = shared_scenario == 'continue_native_restore'
 renew_continue = shared_scenario == 'renew_window_continue'
 resume_completed_window = shared_scenario == 'resume_completed_window'
+qa_preinput_retry = shared_scenario == 'qa_preinput_retry'
 owner_maintenance = shared_scenario == 'owner_maintenance'
 owner_context = shared_scenario == 'owner_context' or owner_maintenance
 renew_window_again = shared_scenario == 'renew_window_again' or owner_context
-completed_renewed_window = resume_completed_window or renew_window_again
+completed_renewed_window = resume_completed_window or renew_window_again or qa_preinput_retry
 renew_window = shared_scenario in {'renew_window', 'renew_window_unknown', 'renew_window_continue'}
 max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'continue_tokens_uncapped', 'renew_window', 'renew_window_unknown', 'renew_window_continue'}
 max_tokens_unknown = shared_scenario in {'continue_max_tokens_unknown', 'renew_window_unknown'}
@@ -384,6 +385,7 @@ async def main():
         renewal_ended = False
         repeat_window_evidence = None
         expired_window_evidence = None
+        qa_retry_evidence = None
         takeover_rejection = None
         old_ledger_path = old_ledger = old_history = changed_ledger = None
         supervise_first = None
@@ -404,12 +406,13 @@ async def main():
                 rows = peer['journals'][sid]
                 budget_file = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
                 budget_row = json.loads(budget_file.read_text())
-                started = int(time.time() * 1000) - (61000 if renew_window_again else 1000)
+                started = int(time.time() * 1000) - (61000 if renew_window_again or qa_preinput_retry else 1000)
                 base_requests = 4 if renew_window_again else 3
-                total_requests = 11 if renew_window_again else 9
+                total_requests = 55 if qa_preinput_retry else 11 if renew_window_again else 9
                 original_state = {'started_at_ms': started, 'requests': base_requests,
                                   'reported_tokens': 700 if renew_window_again else 30,
-                                  'admissions': ['fixture-old-' + str(index) for index in range(base_requests)], 'stop_reason': None}
+                                  'admissions': ['fixture-old-' + str(index) for index in range(base_requests)],
+                                  'stop_reason': 'shared-work-wall-budget' if qa_preinput_retry else None}
                 budget_row['state'] = {**original_state, 'requests': total_requests,
                     'reported_tokens': 911 if renew_window_again else 90,
                     'admissions': [*original_state['admissions'],
@@ -429,8 +432,21 @@ async def main():
                     ensure_ascii=False).encode()).hexdigest()
                 budget_file.write_text(json.dumps(budget_row))
                 for index in range(total_requests):
+                    if qa_preinput_retry and index == base_requests - 1:
+                        rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 4,
+                            'data': {'turn': 1, 'step': index, 'message': {'id': 'fixture-interrupted-usage',
+                                'role': 'assistant', 'content': []}}}})
+                        rows.append({'type': 'event', 'event': {'type': 'step/end', 'seq': len(rows), 'time': 4,
+                            'data': {'turn': 1, 'step': index}}})
+                        rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 4,
+                            'data': {'turn': 1, 'reason': {'kind': 'aborted', 'reason': {
+                                'kind': 'hook', 'reason': 'shared-work-wall-budget'}}}}})
+                        rows.append({'type': 'event', 'event': {'type': 'turn/start', 'seq': len(rows), 'time': 4,
+                            'data': {'turn': 2}}})
+                        continue
                     rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 4,
-                        'data': {'turn': 1, 'step': index, 'usage': {'inputTokens': 10, 'outputTokens': 5},
+                        'data': {'turn': 2 if qa_preinput_retry and index >= base_requests else 1,
+                            'step': index, 'usage': {'inputTokens': 10, 'outputTokens': 5},
                             'message': {'id': 'fixture-settlement-' + str(index), 'role': 'assistant',
                                 'content': [{'type': 'text', 'text': 'Synthetic bounded work.'}]}, 'stream': []}}})
                 for index in range(6):
@@ -443,12 +459,33 @@ async def main():
                         'data': {'turn': 1, 'step': index, 'message': {'toolCallId': call_id, 'isError': True,
                             'content': [{'type': 'text', 'text': rejection_text}]}}}})
                 source = {'head': None, 'workspace_status': '', 'source_digest': hashlib.sha256(b'').hexdigest()}
+                promoted = source
+                if qa_preinput_retry:
+                    # Delivery source and receipts belong to the synthetic external DSH boundary.
+                    import importlib
+                    package = adapter.intake.__class__.__module__.rsplit('.', 1)[0]
+                    acceptance_module = importlib.import_module(package + '.repository_acceptance')
+                    (repo / 'qa.test.mjs').write_text("import test from 'node:test'; test('fixture browser receipt', () => {});\n")
+                    subprocess.run(['git', '-C', str(repo), 'add', 'qa.test.mjs'], check=True)
+                    subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture',
+                        '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'Synthetic QA delivery'], check=True)
+                    delivered = acceptance_module.repository_source_state(record()['target'])
+                    promoted = {key: delivered[key] for key in ('head', 'workspace_status', 'source_digest')}
+                    report = {'source_commit': promoted['head'], 'issue_updated_at': initial['issue']['updated_at'],
+                        'criteria': [{'text': 'Implement the requested feature and verify it.',
+                            'test_call_ids': ['fixture-missing-browser-test']}], 'test_files': ['qa.test.mjs'],
+                        'fine_issue_urls': [], 'pr_url': None, 'sync_branches': [], 'leftovers': []}
+                    settlement = next(row['event']['data'] for row in reversed(rows)
+                        if row['event']['type'] == 'assistant/message')
+                    settlement['message']['content'] = [{'type': 'text',
+                        'text': 'HERMES_REPOSITORY_DELIVERY_JSON ' + json.dumps(report)}]
                 receipt_rows = [{'schema': 1, 'generation': budget_row['generation'], 'session_id': sid,
                     'session_created_at': budget_row['session_created_at'], 'service_ref': 'fixture-native',
                     'host_lease': 'fixture-shared-lease', 'call_id': 'fixture-source-' + str(index), 'name': 'bash',
                     'kind': 'foreground', 'execution_admission': 'admitted', 'is_error': False, 'exit_code': 0,
-                    'timed_out': False, 'aborted': False, 'native_session_seq': index + 1, 'source_before': source,
-                    'source_after': source} for index in range(3)] + [{'schema': 1, 'generation': budget_row['generation'], 'session_id': sid,
+                    'timed_out': False, 'aborted': False, 'native_session_seq': index + 1,
+                    'source_before': source if index == 0 else promoted,
+                    'source_after': promoted} for index in range(3)] + [{'schema': 1, 'generation': budget_row['generation'], 'session_id': sid,
                     'session_created_at': budget_row['session_created_at'], 'service_ref': 'fixture-native',
                     'host_lease': 'fixture-shared-lease', 'call_id': 'fixture-rejected-bash-' + str(index), 'name': 'bash',
                     'is_error': True, 'execution_admission': 'rejected'} for index in range(6)]
@@ -459,7 +496,7 @@ async def main():
                 receipt_path.write_text(''.join(json.dumps(row) + '\n' for row in receipt_rows))
                 receipt_path.chmod(0o600)
                 rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 4,
-                    'data': {'turn': 1, 'reason': {'kind': 'completed'}}}})
+                    'data': {'turn': 2 if qa_preinput_retry else 1, 'reason': {'kind': 'completed'}}}})
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
             latest = record()
@@ -641,6 +678,180 @@ async def main():
                 await receive(adapter, raw('om_stop', '@_user_1 停止 ' + latest['id']))
                 latest = record()
             card = json.loads(registry.dispatch('kanban_show', {'task_id': initial['card_id']}))['task']
+            if qa_preinput_retry and ended and card['status'] in {'blocked', 'triage'}:
+                execution = latest['dsh_execution']
+                assert execution['state'] == 'awaiting_acceptance', execution
+                assert execution['acceptance']['status'] == 'unmet'
+                assert 'delivery_report_missing' not in execution['acceptance']['unmet']
+                until = time.monotonic() + 10
+                while time.monotonic() < until:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        worker = None
+                        break
+                    await asyncio.sleep(.05)
+                assert worker is None, 'The original QA delivery worker did not exit.'
+                qa_results = {}
+                qa_events = []
+                import faulthandler
+                qa_trace = (scratch / 'qa-tool-stacks.log').open('w')
+
+                async def qa_tool_handler(event):
+                    from inspect import isawaitable
+                    assert adapter._command_source.get() is event.source
+                    assert adapter.intake.prepare(event, adapter) is None
+                    qa_events.append(event.message_id)
+                    print('natural QA tool entered: ' + event.message_id, file=qa_trace, flush=True)
+                    faulthandler.dump_traceback_later(12, file=qa_trace)
+                    answer = await asyncio.to_thread(registry.dispatch,
+                        'hermes_pm_repository_rework', {'work_id': initial['id']})
+                    if isawaitable(answer):
+                        answer = await answer
+                    faulthandler.cancel_dump_traceback_later()
+                    qa_results[event.message_id] = [json.loads(answer)]
+                    print('natural QA tool returned: ' + event.message_id + ': ' + answer,
+                        file=qa_trace, flush=True)
+                    if event.message_id == 'om_qa_retry':
+                        duplicate = await asyncio.to_thread(registry.dispatch,
+                            'hermes_pm_repository_rework', {'work_id': initial['id']})
+                        if isawaitable(duplicate):
+                            duplicate = await duplicate
+                        qa_results[event.message_id].append(json.loads(duplicate))
+
+                runner._wire_adapter_handlers(adapter, message_handler=qa_tool_handler)
+
+                async def qa_message(message_id, text, parent_id=None):
+                    await receive(adapter, raw(message_id, '@_user_1 ' + text,
+                        **({'parent_id': parent_id} if parent_id else {})))
+                    until = time.monotonic() + 8
+                    while time.monotonic() < until:
+                        if message_id in qa_results:
+                            return qa_results[message_id][0]
+                        await asyncio.sleep(.01)
+                    raise AssertionError('The real natural QA tool did not settle: ' + message_id)
+
+                feedback = 'Repair only the missing synthetic browser QA receipt and run the actual test.'
+                proposal = await qa_message('om_qa_feedback', feedback)
+                assert proposal['status'] == 'renewal_required', proposal
+                control = record()['dsh_execution']['natural_qa_rework_control']
+                assert control['proposal_delivery']['status'] == 'delivered'
+                approval = await qa_message('om_qa_approve', '同意', control['proposal_delivery']['message_id'])
+                assert approval['status'] == 'maintenance_required', approval
+                control = record()['dsh_execution']['natural_qa_rework_control']
+                assert control['proposal_delivery']['status'] == 'delivered'
+                sid = execution['session_id']
+                history_before = json.loads(json.dumps(peer['journals'][sid]))
+                old_ledger_bytes = budget_file.read_bytes()
+                host_processes[0].terminate()
+                assert host_processes[0].wait(timeout=5) == -15
+                host_processes.append(subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                updated = json.loads(receipt.read_text())
+                updated.update(lease='fixture-qa-maintained-lease', pid=host_processes[-1].pid)
+                receipt.write_text(json.dumps(updated))
+                admission = await qa_message('om_qa_maintenance', '维护完成', control['proposal_delivery']['message_id'])
+                assert admission['status'] == 'accepted' and admission['execution_started'] is False, admission
+                admitted = record()['dsh_execution']
+                admitted_control = json.loads(json.dumps(admitted['continuation_control']))
+                request_id = admitted['continuation_request_id']
+                assert admitted_control['kind'] == 'qa_rework' and admitted_control['status'] == 'admitted'
+                assert admitted_control['dispatch_status'] == 'accepted'
+                assert admitted_control['qa_feedback'] == feedback
+                admitted_ledger_bytes = budget_file.read_bytes()
+                admitted_ledger = json.loads(admitted_ledger_bytes)
+                assert admitted_ledger['renewWindow']['request_base'] == admitted_ledger['state']['requests'] == 55
+                assert admitted_ledger['renewWindow']['started_at_ms'] is None
+                assert admitted_ledger['renewWindow']['hook_marker'] is None
+                assert len(peer['prompts']) == 1 and peer['journals'][sid] == history_before
+                checkpoint = admitted['renewal_window_checkpoint']
+                assert Path(checkpoint['ledger_backup']).read_bytes() == old_ledger_bytes
+                # Model a departed original gateway with synthetic persisted identity.
+                departed = record()
+                departed['gateway_controller'] = dict(departed['gateway_controller'], pid=999999,
+                    start_sec=1, start_usec=0)
+                adapter.intake._save(departed)
+                # A failed external response ends this worker before any continuation input.
+                fixture_behavior['reject'] = 'workspace/create'
+                model.worker_steps = 0
+                with connect_closing() as db:
+                    assert dispatch_once(db, max_spawn=1).spawned
+                    worker = remember_worker(db, initial['card_id'])
+                failed_run_id = worker['run_id']
+                until = time.monotonic() + 12
+                while time.monotonic() < until:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        worker = None
+                        break
+                    await asyncio.sleep(.05)
+                assert worker is None, 'The pre-input QA failure worker did not exit.'
+                failed = record()['dsh_execution']
+                assert failed['state'] == 'outcome_unknown', failed
+                failure = failed['last_failure']
+                assert failure == {'phase': 'session_registration', 'code': 'outcome_unknown',
+                    'type': 'ManagementError', 'message': 'Original owned execution response is unconfirmed.'}, failure
+                assert failed['continuation_control']['status'] == 'admitted'
+                assert len(peer['prompts']) == 1 and peer['journals'][sid] == history_before
+                assert budget_file.read_bytes() == admitted_ledger_bytes
+                fixture_behavior.pop('reject')
+                retry = await qa_message('om_qa_retry', '继续原来的 QA 修复，不增加窗口。')
+                assert retry['status'] == 'accepted' and retry['execution_started'] is False, retry
+                assert qa_results['om_qa_retry'] == [retry, retry], qa_results
+                retried = record()['dsh_execution']
+                assert retried['continuation_request_id'] == request_id
+                assert retried['qa_preinput_retry']['previous_failure'] == failure
+                assert retried['continuation_control']['previous_claim']['run_id'] == failed_run_id
+                assert retried['continuation_control']['qa_feedback'] == feedback
+                assert budget_file.read_bytes() == admitted_ledger_bytes and len(peer['prompts']) == 1
+                blocked_duplicate = await qa_message('om_qa_duplicate_new_message', '继续原来的 QA 修复，不增加窗口。')
+                assert blocked_duplicate == {'status': 'unassociated', 'code': 'no_matching_work'}, blocked_duplicate
+                assert budget_file.read_bytes() == admitted_ledger_bytes and len(peer['prompts']) == 1
+                model.worker_steps = 0
+                with connect_closing() as db:
+                    assert dispatch_once(db, max_spawn=1).spawned
+                    worker = remember_worker(db, initial['card_id'])
+                until = time.monotonic() + 20
+                while time.monotonic() < until:
+                    current = record()['dsh_execution']
+                    if len(peer['prompts']) == 2 and current['continuation_control']['status'] == 'accepted':
+                        break
+                    await asyncio.sleep(.05)
+                else:
+                    raise AssertionError('The real QA retry worker did not admit the original prompt: ' + json.dumps(current))
+                assert current['shared_event_observer']['status'] == 'ready', current
+                assert current['supervisor_claim']['run_id'] == worker['run_id'] != failed_run_id
+                assert peer['prompts'][1]['sessionId'] == peer['prompts'][0]['sessionId'] == sid
+                assert peer['prompts'][1]['requestId'] == request_id
+                assert feedback in peer['prompts'][1]['content'][0]['text']
+                assert '不增加窗口' not in peer['prompts'][1]['content'][0]['text']
+                assert budget_file.read_bytes() == admitted_ledger_bytes
+                assert peer['journals'][sid][:len(history_before)] == history_before
+                after_input_duplicate = await qa_message('om_qa_duplicate_after_input', '继续原来的 QA 修复。')
+                assert after_input_duplicate == {'status': 'unassociated', 'code': 'no_matching_work'}, after_input_duplicate
+                assert len(peer['prompts']) == 2 and budget_file.read_bytes() == admitted_ledger_bytes
+                rows = peer['journals'][sid]
+                rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 8,
+                    'data': {'turn': 3, 'reason': {'kind': 'completed'}}}})
+                next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
+                until = time.monotonic() + 12
+                while time.monotonic() < until:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        worker = None
+                        break
+                    await asyncio.sleep(.05)
+                assert worker is None, 'The requeued original QA worker did not exit.'
+                latest = record()
+                qa_retry_evidence = {'failure': failure, 'failed_run_id': failed_run_id,
+                    'new_run_id': latest['dsh_execution']['supervisor_claim']['run_id'],
+                    'request_id': request_id, 'observer': current['shared_event_observer'],
+                    'tool_results': qa_results, 'events': qa_events, 'worker_exit': 0,
+                    'ledger_sha256': hashlib.sha256(admitted_ledger_bytes).hexdigest(),
+                    'window': admitted_ledger['renewWindow']}
+                break
             if shared_scenario == 'question_material' and ended and card['status'] in {'blocked', 'triage'}:
                 for (label, _, answerable), (question, notification) in zip(material_cases, material_observations, strict=True):
                     assert question['answerable'] is answerable, {'case': label, 'answerable': question['answerable'], 'notification': notification}
@@ -1832,6 +2043,8 @@ async def main():
             result['repeat_window'] = repeat_window_evidence
         if expired_window:
             result['expired_window'] = expired_window_evidence
+        if qa_preinput_retry:
+            result['qa_preinput_retry'] = qa_retry_evidence
         if takeover_rejection is not None:
             result.update(case=takeover_case, rejection=takeover_rejection, takeover=takeover,
                 retained_claim=latest['dsh_execution']['supervisor_claim'],
@@ -1842,7 +2055,7 @@ async def main():
             result['concurrent_claim'] = claim_result
         (scratch / 'shared-worker-result.json').write_text(json.dumps(result))
     except BaseException:
-        if supervise_slice or owner_context:
+        if supervise_slice or owner_context or qa_preinput_retry:
             import traceback
             (scratch / 'supervise-failure.json').write_text(json.dumps({
                 'traceback': traceback.format_exc(), 'public_work': record(),
@@ -1852,7 +2065,7 @@ async def main():
         raise
     finally:
         model.worker_request_release.set()
-        if (supervise_slice or expired_window) and worker is not None:
+        if (supervise_slice or expired_window or qa_preinput_retry) and worker is not None:
             # Keep both services alive through the original scoped native cleanup.
             from simple_worker_evidence import cleanup_worker
             cleanup = await asyncio.to_thread(cleanup_worker, worker, scratch / 'home')

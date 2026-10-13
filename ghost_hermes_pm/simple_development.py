@@ -68,7 +68,21 @@ class RepositoryIntake(FeishuEntry):
     def snapshot(self):
         with sqlite3.connect(self.database) as db:
             work = [json.loads(row[0]) for row in db.execute('SELECT data FROM work ORDER BY rowid')]
-        return {'status': 'completed', 'dispatcher': 'native_kanban', 'execution': 'owned_dsh' if any(r.get('dsh_execution') for r in work) else 'not_enabled', 'work': work}
+        current = []
+        for record in work:
+            execution = record.get('dsh_execution', {})
+            continuation = execution.get('continuation_control', {})
+            observer = execution.get('shared_event_observer', {})
+            current.append({'work_id': record['id'], 'state': execution.get('state'),
+                'dsh_input_accepted': (continuation.get('status') == 'accepted' if continuation
+                    else execution.get('first_input') == 'accepted'),
+                'continuation_status': continuation.get('status'),
+                'observer_status': observer.get('status'),
+                'observer_failure': {k: observer.get(k) for k in ('phase', 'code', 'message')}
+                    if observer.get('status') == 'unavailable' else None,
+                'last_failure': execution.get('last_failure')})
+        return {'status': 'completed', 'dispatcher': 'native_kanban', 'work_status': current,
+            'execution': 'owned_dsh' if any(r.get('dsh_execution') for r in work) else 'not_enabled', 'work': work}
 
     def _save(self, record):
         with sqlite3.connect(self.database) as db:
@@ -79,7 +93,7 @@ class RepositoryIntake(FeishuEntry):
         # Each observer owns its fields; a stale worker cannot replace replies.
         execution = record['dsh_execution']
         keys = list(fields) if fields is not None else [key for key in execution
-            if key not in {'questions', 'approvals', 'acceptance', 'delivery_notification', 'stop_requested', 'stop_control', 'control_message_ids'}]
+            if key not in {'questions', 'approvals', 'acceptance', 'delivery_notification', 'stop_requested', 'stop_control', 'control_message_ids', 'shared_event_observer'}]
         if not keys:
             return
         arguments = []

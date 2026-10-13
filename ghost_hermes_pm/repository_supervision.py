@@ -215,6 +215,10 @@ def owned_instance(intake, record):
 
 def _admit_resumed_worker(intake, record, carrier):
     """Only the pinned gateway may admit a proven new claim of this same card."""
+    # Shared observers never transfer control; the claimed worker verifies its
+    # own continuation checkpoint in run_shared_work.
+    if record['dsh_execution'].get('mode') == 'shared_native':
+        return
     from .trusted_controller import controller_identity
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
@@ -318,13 +322,17 @@ async def observe_human_requests(intake):
                             retire_shared(intake, record['id'])
                         continue
                     carrier = carriers.get(record['id'])
+                    phase = 'session_attach'
                     try:
                         if carrier is None:
                             carrier = attach_existing_owned(intake, record)
                             carriers[record['id']] = carrier
+                        phase = 'worker_handoff'
                         await asyncio.to_thread(_admit_resumed_worker, intake, record, carrier)
+                        phase = 'history'
                         events, projections = await asyncio.to_thread(original_history, carrier,
                             execution['session_id'], record['target']['repo_path'])
+                        phase = 'human_requests'
                         await observe_questions(intake, record, carrier, events, projections, intake.generation)
                         await observe_approvals(intake, record, carrier, events, projections, intake.generation)
                     except (ManagementError, ValueError, KeyError, *_TRANSPORT_FAILURES) as error:
@@ -341,7 +349,7 @@ async def observe_human_requests(intake):
                                 message = 'Original observer failure details remain private.'
                             execution['shared_event_observer'] = {'status': 'unavailable',
                                 'session_id': execution['session_id'], 'generation': execution['generation'],
-                                'code': getattr(error, 'code', 'outcome_unknown'), 'message': message}
+                                'phase': phase, 'code': getattr(error, 'code', 'outcome_unknown'), 'message': message}
                             intake._save_execution(record, fields=['shared_event_observer'])
                         carriers.pop(record['id'], None)
             await asyncio.sleep(.25)

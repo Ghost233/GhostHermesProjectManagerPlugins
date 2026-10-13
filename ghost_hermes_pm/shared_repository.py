@@ -2658,6 +2658,21 @@ def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier):
     return True
 
 
+def _record_shared_failure(intake, record, error, phase):
+    from .manager import _public_text
+    message = str(error)
+    for secret in intake.secret_values:
+        if secret:
+            message = message.replace(secret, '[REDACTED_CREDENTIAL]')
+    try:
+        _public_text(message, intake.secret_values)
+    except ManagementError:
+        message = 'Original shared failure details remain private (' + type(error).__name__ + ').'
+    record['dsh_execution']['last_failure'] = {'phase': phase, 'code': getattr(error, 'code', 'outcome_unknown'),
+        'type': type(error).__name__, 'message': message}
+    intake._save_execution(record, fields=['last_failure'])
+
+
 async def run_shared_work(ctx, intake, record, generation):
     from .repository_execution import execution_configuration
     from .repository_supervision import current_worker, native_call, owned_call, original_history, execution_event_references
@@ -2676,6 +2691,7 @@ async def run_shared_work(ctx, intake, record, generation):
     descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
     await asyncio.to_thread(fcntl.flock, descriptor, fcntl.LOCK_EX)
     carrier = None
+    phase = 'worker_claim'
     try:
         intake.require_active(generation)
         record = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])
@@ -2699,10 +2715,12 @@ async def run_shared_work(ctx, intake, record, generation):
             intake._save_execution(record)
         configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
                              generation=execution['generation'])
+        phase = 'session_attach'
         carrier = SharedDesktopTransport(configuration)
         if execution.get('native_identity') and execution['native_identity'] != carrier.native_identity:
             raise ManagementError('binding_conflict', 'Original shared Desktop generation changed.')
         execution['native_identity'] = carrier.native_identity
+        phase = 'worker_handoff'
         if not execution.get('supervisor_claim'):
             execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
                 'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
@@ -2735,6 +2753,7 @@ async def run_shared_work(ctx, intake, record, generation):
             execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
                 'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
             intake._save_execution(record, fields=['supervisor_claim'])
+        phase = 'session_registration'
         listing = await asyncio.to_thread(owned_call, carrier, 'session/list', {})
         existing = [row for row in listing['items'] if row['sessionId'] == execution['session_id']]
         if existing and (len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']):
@@ -2754,6 +2773,7 @@ async def run_shared_work(ctx, intake, record, generation):
                 raise ManagementError('binding_conflict', 'The created ordinary shared Session differs.')
         elif len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']:
             raise ManagementError('binding_conflict', 'Shared Session registration differs.')
+        phase = 'history'
         snapshot_stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
             'sessionId': execution['session_id']}, 'maxMessages': 500}})
         try:
@@ -2768,6 +2788,7 @@ async def run_shared_work(ctx, intake, record, generation):
         if execution.get('session_created_at', header.get('createdAt')) != header.get('createdAt'):
             raise ManagementError('binding_conflict', 'Original shared Session creation identity changed.')
         _take_over_gave_up_claim(intake, record, run_id, configuration, carrier)
+        phase = 'continuation_checkpoint'
         if pending_continuation:
             budget = read_ledger(configuration, execution)
             snapshot_matches = (hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == continuation['snapshot_sha256']
@@ -2790,6 +2811,7 @@ async def run_shared_work(ctx, intake, record, generation):
             raise ManagementError('binding_conflict', 'The newly owned shared Session has unexpected work.')
         execution.update(session_creation='registered', session_created_at=header['createdAt'])
         await asyncio.to_thread(bind_shared_workspace, intake, record, carrier)
+        phase = 'permission'
         if not execution.get('native_permission'):
             catalog = await asyncio.to_thread(owned_call, carrier, 'commands/list', {'agentId': execution['session_id']})
             if not isinstance(catalog, list) or not any(row.get('name') == 'permission' for row in catalog):
@@ -2832,12 +2854,10 @@ async def run_shared_work(ctx, intake, record, generation):
             execution['native_title'] = title
             intake._save_execution(record)
     except Exception as error:
-        if isinstance(error, ManagementError):
-            execution['last_failure'] = {'code': error.code, 'message': str(error)}
-            try:
-                intake._save_execution(record, fields=['last_failure'])
-            except ManagementError:
-                pass
+        try:
+            _record_shared_failure(intake, record, error, phase)
+        except ManagementError:
+            pass
         if carrier is not None:
             carrier.close()
         raise
@@ -2845,6 +2865,7 @@ async def run_shared_work(ctx, intake, record, generation):
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
     try:
+        phase = 'budget'
         window_start = None
         if continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'}:
             budget = read_ledger(configuration, execution)
@@ -2862,6 +2883,7 @@ async def run_shared_work(ctx, intake, record, generation):
             started_at_ms = (budget.get('renewWindow') or budget['state'])['started_at_ms']
             deadline = time.monotonic() + (started_at_ms + configuration['budget']['max_wall_seconds'] * 1000 - time.time() * 1000) / 1000 + 15
         if not execution.get('first_input') or pending_continuation:
+            phase = 'observer'
             observer_deadline = time.monotonic() + 15
             while time.monotonic() < observer_deadline:
                 current = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])['dsh_execution']
@@ -2909,6 +2931,7 @@ async def run_shared_work(ctx, intake, record, generation):
                 execution.update(first_input='intent', state='input_intent')
                 intake._save_execution(record)
                 request_id, prompt = execution['request_id'], _prompt(intake, record)
+            phase = 'prompt_admission'
             answer = await asyncio.to_thread(owned_call, carrier, 'session/prompt',
                 {'sessionId': execution['session_id'], 'requestId': request_id, 'mode': 'queue',
                  'content': [{'type': 'text', 'text': prompt}]})
@@ -2941,7 +2964,9 @@ async def run_shared_work(ctx, intake, record, generation):
                 heartbeat_at = time.monotonic()
             listing = await asyncio.to_thread(owned_call, carrier, 'session/list', {})
             row = next((row for row in listing['items'] if row['sessionId'] == execution['session_id']), None)
+            phase = 'history'
             events, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], configuration['workspace'])
+            phase = 'budget'
             budget = read_ledger(configuration, execution)
             active_budget = budget.get('renewWindow') or budget['state']
             if active_budget['started_at_ms'] is not None:
@@ -2983,6 +3008,7 @@ async def run_shared_work(ctx, intake, record, generation):
                     tool_receipts=shared_receipts(configuration, execution, '.tools.jsonl'))
                 intake._save_execution(record)
                 if state == 'awaiting_acceptance':
+                    phase = 'acceptance'
                     result = await accept_repository_work(intake, record, carrier, events, projections, generation)
                     if result.get('status') == 'accepted':
                         await finish_delivery_range(intake, record, carrier, generation)
@@ -2994,9 +3020,9 @@ async def run_shared_work(ctx, intake, record, generation):
             return {'status': 'running', 'next_action': 'hermes_pm_supervise', 'delivered': False}
         raise ManagementError('outcome_unknown', 'Original shared execution has no confirmed terminal boundary.')
     except (ManagementError, OSError, TimeoutError, ValueError, KeyError) as error:
-        execution.update(state='outcome_unknown', last_failure={'code': getattr(error, 'code', 'outcome_unknown'),
-            'message': 'Original shared execution requires reconciliation (' + type(error).__name__ + ').'})
-        intake._save_execution(record)
+        execution['state'] = 'outcome_unknown'
+        intake._save_execution(record, fields=['state'])
+        _record_shared_failure(intake, record, error, phase)
         if isinstance(error, ManagementError):
             raise
         raise ManagementError('outcome_unknown', 'Original shared execution remains unconfirmed.') from None

@@ -14,6 +14,49 @@ from sdk_source_integrity import source_snapshot
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_worker_save_preserves_current_shared_observer(tmp_path):
+    from copy import deepcopy
+    from ghost_hermes_pm.simple_development import RepositoryIntake
+    intake = RepositoryIntake(None, {}, {'github_account': 'fixture-owner',
+        'github_config_dir': str(tmp_path)}, tmp_path / 'state')
+    record = {'id': 'fixture-work', 'requested_issue_url': 'https://github.com/fixture-user/fixture/issues/1',
+        'dsh_execution': {'generation': 'fixture-generation', 'state': 'continuation_pending',
+            'shared_event_observer': {'status': 'unavailable'}}}
+    intake._save(record)
+    stale_worker = deepcopy(record)
+    record['dsh_execution']['shared_event_observer'] = {'status': 'ready', 'client_id': 'fixture-client'}
+    intake._save_execution(record, fields=['shared_event_observer'])
+    stale_worker['dsh_execution']['state'] = 'running'
+    intake._save_execution(stale_worker)
+    current = intake.snapshot()['work'][0]['dsh_execution']
+    assert current['state'] == 'running'
+    assert current['shared_event_observer'] == {'status': 'ready', 'client_id': 'fixture-client'}
+
+
+def test_shared_observer_never_transfers_a_worker_claim():
+    from ghost_hermes_pm.repository_supervision import _admit_resumed_worker
+    record = {'dsh_execution': {'mode': 'shared_native', 'supervisor_claim': {'run_id': 1}}}
+    # No controller admission or Kanban access is available to this observer.
+    _admit_resumed_worker(None, record, None)
+    assert record['dsh_execution']['supervisor_claim'] == {'run_id': 1}
+
+
+def test_snapshot_exposes_current_qa_input_before_large_history(tmp_path):
+    from ghost_hermes_pm.simple_development import RepositoryIntake
+    intake = RepositoryIntake(None, {}, {'github_account': 'fixture-owner',
+        'github_config_dir': str(tmp_path)}, tmp_path / 'state')
+    record = {'id': 'fixture-work', 'requested_issue_url': 'https://github.com/fixture-user/fixture/issues/1',
+        'history': 'H' * 10000, 'dsh_execution': {'state': 'outcome_unknown', 'first_input': 'accepted',
+            'continuation_control': {'status': 'admitted'}, 'shared_event_observer': {'status': 'unavailable'},
+            'last_failure': {'phase': 'observer', 'code': 'outcome_unknown', 'message': 'Original observer not ready.'}}}
+    intake._save(record)
+    snapshot = intake.snapshot()
+    brief = snapshot['work_status'][0]
+    assert brief['dsh_input_accepted'] is False and brief['state'] == 'outcome_unknown'
+    assert brief['last_failure']['phase'] == 'observer'
+    assert 'Original observer not ready.' in json.dumps(snapshot)[:1500]
+
+
 @pytest.mark.parametrize('scenario', [
     'existing',
     'create_unknown',
