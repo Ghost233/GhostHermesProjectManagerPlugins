@@ -156,6 +156,10 @@ if scenario == 'delegation':
     binding.pop('repository')
     binding.pop('repo_path')
     settings['feishu_intake']['bindings'] = [binding]
+if scenario == 'natural_qa_intake':
+    settings['simple_development']['work_profiles'] = [dict(binding, profile_id='child',
+        native_profile='fixture-child', superior_profile_id='lead')]
+    binding['target_profiles'] = ['child']
 if scenario == 'authority':
     settings['feishu_intake']['registered_bots'] = [{'app_id': 'cli_fixture', 'profile_id': 'steward',
         'identity_ref': 'fixture:steward', 'tenant_key': 'tenant-steward', 'open_id': 'ou_steward',
@@ -329,6 +333,9 @@ async def main():
             if source_context['message_id'] == 'om_oserror':
                 raise OSError('synthetic shared boundary failure')
             if source_context['message_id'] == 'om_qa':
+                record['dsh_execution']['natural_qa_rework_control'] = {
+                    'status': 'renewal_required', 'proposal': window_proposal}
+                intake._save(record)
                 return {'status': 'renewal_required', 'work_id': record['id'], 'proposal': window_proposal}
             if source_context['message_id'] in {'om_wrong_parent', 'om_reject', 'om_renew'}:
                 if source_context.get('reply_to_message_id') != proposal_deliveries.get(window_proposal['id']):
@@ -336,6 +343,9 @@ async def main():
                 if feedback == '拒绝':
                     return {'status': 'declined', 'work_id': record['id']}
                 if feedback == '同意':
+                    record['dsh_execution']['natural_qa_rework_control'] = {
+                        'status': 'maintenance_required', 'proposal': maintenance_proposal}
+                    intake._save(record)
                     return {'status': 'maintenance_required', 'work_id': record['id'], 'proposal': maintenance_proposal}
             if source_context['message_id'] == 'om_maintenance':
                 if (source_context.get('reply_to_message_id') != proposal_deliveries.get(maintenance_proposal['id'])
@@ -350,6 +360,8 @@ async def main():
             proposal_records.append((proposal_id, delivery))
             if delivery['status'] == 'delivered':
                 proposal_deliveries[proposal_id] = delivery['message_id']
+            record['dsh_execution']['natural_qa_rework_control']['proposal_delivery'] = delivery
+            intake._save(record)
             return {'status': 'recorded', 'work_id': record['id']}
 
         for module in shared_modules:
@@ -434,6 +446,19 @@ async def main():
                 item for item in proposal_records if item[0] == window_proposal['id']]) == 1
             assert len(shared_calls) == 2 and not admissions and len(proposal_records) == 1
 
+            current = adapter.intake.snapshot()['work'][0]
+            current['dsh_execution']['questions'] = [{'delivery': {**anchor, 'message_id': 'om_old_question'}}]
+            adapter.intake._save(current)
+            before_calls, before_sent = len(shared_calls), len(sent)
+            await receive(adapter, raw('om_shadow_wrong_parent', text='@_user_1 同意', parent_id='om_wrong'))
+            await receive(adapter, raw('om_shadow_wrong_option', text='@_user_1 始终批准',
+                                       parent_id=proposal_deliveries[window_proposal['id']]))
+            for _ in range(100):
+                if len(sent) >= before_sent + 2:
+                    break
+                await asyncio.sleep(.01)
+            assert len(shared_calls) == before_calls and len(sent) == before_sent + 2
+            assert all('无法唯一关联' in message.request_body.content for message in sent[-2:])
             await receive(adapter, raw('om_reject', text='@_user_1 拒绝', parent_id=proposal_deliveries[window_proposal['id']]))
             for _ in range(100):
                 if len(tool_results) >= 4:

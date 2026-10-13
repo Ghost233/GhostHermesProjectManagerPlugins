@@ -157,6 +157,26 @@ class RepositoryIntake(FeishuEntry):
                 'message_id': message.message_id, 'sender_open_id': ids.open_id,
                 'parent_id': getattr(message, 'parent_id', None), 'root_id': getattr(message, 'root_id', None),
                 'thread_id': getattr(message, 'thread_id', None)}
+            if sender.sender_type == 'user' and envelope['parent_id']:
+                proposals = []
+                for record in self.snapshot()['work']:
+                    execution = record.get('dsh_execution', {})
+                    control = execution.get('natural_qa_rework_control', {})
+                    delivery = control.get('proposal_delivery', {})
+                    if (execution.get('mode') == 'shared_native' and execution.get('state') == 'awaiting_acceptance'
+                            and control.get('status') in {'renewal_required', 'maintenance_required'}
+                            and delivery.get('status') == 'delivered'
+                            and delivery.get('message_id') == envelope['parent_id']
+                            and delivery.get('chat_id') == envelope['chat_id']
+                            and delivery.get('profile_id') == binding['profile_id']
+                            and _qa_profile_matches(record, binding['profile_id'])
+                            and command in control.get('proposal', {}).get('options', [])
+                            and all(record.get('source_anchor', {}).get(key) == envelope[key] for key in
+                                ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                                 'recipient_open_id', 'chat_id', 'sender_open_id'))):
+                        proposals.append(record)
+                if len(proposals) == 1:
+                    return None
             from .repository_approvals import prepare_approval_reply
             human_reply = prepare_approval_reply(self, event, adapter, binding, envelope, command, authorized_profiles)
             if envelope['parent_id']:
