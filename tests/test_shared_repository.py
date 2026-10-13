@@ -214,6 +214,140 @@ def test_natural_qa_rework_active_public_tool_queues_one_same_session_prompt(tmp
     assert len(carrier.prompts) == 0
 
 
+@pytest.mark.parametrize('prior_status', ['accepted', 'maintenance_required'])
+@pytest.mark.parametrize('change', ['valid', 'pending', 'input_intent', 'foreign_source',
+                                  'original_message', 'historical_duplicate', 'seal_changed', 'expired'])
+def test_completed_natural_qa_accepts_new_feedback_in_the_same_active_window(tmp_path, monkeypatch,
+                                                                         prior_status, change):
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    record, context, intake, carrier, ledger_file, _source, request = _natural_qa_fixture(
+        tmp_path, monkeypatch, expired=change == 'expired')
+    execution = record['dsh_execution']
+    prior_continuation = {'kind': 'qa_rework', 'status': 'accepted', 'dispatch_status': 'accepted',
+        'message_id': 'prior-qa-input', 'qa_feedback': 'Previous synthetic QA requirement.'}
+    prior_natural = {'kind': 'browser_qa_rework', 'status': prior_status, 'message_id': 'prior-qa-message',
+        'feedback': 'Previous synthetic QA requirement.',
+        'window': {'max_wall_seconds': 1800, 'max_model_requests': 80},
+        'proposal': {'id': 'prior-maintenance-proposal', 'kind': 'maintenance', 'options': ['维护完成', '取消']},
+        'proposal_delivery': {'status': 'delivered', 'message_id': 'prior-maintenance-reply'}}
+    execution.update(continuation_control=deepcopy(prior_continuation),
+        continuation_request_id='prior-continuation-request',
+        natural_qa_rework_control=deepcopy(prior_natural), renewal_window_adoption='accepted',
+        renewal_window_checkpoint={'status': 'admitted'})
+    # The old interrupted usage seal remains historical evidence in this active window.
+    ledger = json.loads(ledger_file.read_text())
+    if change == 'expired':
+        stream = carrier.stream('session/follow', {})
+        snapshot = next(stream)
+        stream.close()
+        snapshot['records'].insert(1, {'type': 'event', 'event': {'type': 'assistant/attempt',
+            'seq': 1, 'time': 1, 'data': {'turn': 1, 'step': 0, 'usage': {'outputTokens': 1}}}})
+        for index, row in enumerate(snapshot['records']):
+            row['event']['seq'] = index
+        snapshot['cursor'] += 1
+        ledger['state'].update(requests=3, admissions=['request-0', 'request-1', 'request-2'])
+        ledger['renewWindow']['request_base'] = 2
+        ledger['renewWindow']['original_state'].update(requests=2, admissions=['request-0', 'request-1'])
+    ledger['renewWindow']['sealed_unknown_usage'] = {'ordinal': 1, 'event_sha256': 'f' * 64,
+                                                   'prior_window_id': 'earlier-qa-window'}
+    if change == 'expired':
+        started = int(time.time() * 1000) - 1_801_000
+        for state in (ledger['state'], ledger['renewWindow']['original_state'], ledger['renewWindow']):
+            state.update(started_at_ms=started, stop_reason='shared-work-wall-budget')
+    execution['renewal_window_checkpoint'].update(
+        previous_state=deepcopy(ledger['renewWindow']['original_state']),
+        sealed_unknown_usage=deepcopy(ledger['renewWindow']['sealed_unknown_usage']))
+    if change == 'seal_changed':
+        ledger['renewWindow']['sealed_unknown_usage']['event_sha256'] = '0' * 64
+    ledger_file.write_text(json.dumps(ledger))
+    context = {**context, 'message_id': 'new-completed-qa-feedback'}
+    if change == 'pending':
+        execution['state'] = 'continuation_pending'
+        execution['continuation_control']['status'] = 'admitted'
+    elif change == 'input_intent':
+        execution['state'] = 'outcome_unknown'
+        execution['continuation_control']['status'] = 'input_intent'
+    elif change == 'foreign_source':
+        context['chat_id'] = 'foreign-synthetic-chat'
+    elif change == 'original_message':
+        context['message_id'] = prior_natural['message_id']
+    elif change == 'historical_duplicate':
+        previous = {**prior_natural, 'message_id': 'archived-qa-message'}
+        execution['continuation_history'] = [{**prior_continuation,
+            'request_id': 'earlier-continuation-request', 'message_id': 'earlier-qa-input',
+            'natural_qa_rework_control': previous}]
+        execution['control_message_ids'].append(previous['message_id'])
+        context['message_id'] = previous['message_id']
+    record_before = deepcopy(record)
+    ledger_before = ledger_file.read_bytes()
+    feedback = 'Correct the next synthetic browser QA problem and report the actual native test call IDs.'
+    if change not in {'valid', 'expired'}:
+        with pytest.raises(ManagementError):
+            admit_shared_natural_qa_rework(intake, record, context, feedback, None, intake.generation)
+        assert record == record_before and intake.saved == []
+    else:
+        result = admit_shared_natural_qa_rework(intake, record, context, feedback, None, intake.generation)
+        if change == 'expired':
+            assert result['status'] == 'renewal_required' and result['work_id'] == record['id']
+            assert result['proposal']['limits'] == {'max_wall_seconds': 1800, 'max_model_requests': 80}
+            assert execution['natural_qa_rework_control']['feedback'] == feedback
+            assert execution['state'] == 'awaiting_acceptance' and intake.card['status'] == 'blocked'
+            assert execution['continuation_control'] == prior_continuation
+        else:
+            assert result == {'status': 'accepted', 'work_id': record['id']}
+            assert execution['state'] == 'continuation_pending' and intake.card['status'] == 'ready'
+            assert execution['continuation_control']['kind'] == 'qa_rework'
+            assert execution['continuation_control']['message_id'] == context['message_id']
+            assert execution['continuation_control']['qa_feedback'] == feedback
+        assert execution['continuation_history'][-1] == {**prior_continuation,
+            'request_id': 'prior-continuation-request', 'natural_qa_rework_control': prior_natural}
+        with pytest.raises(ManagementError):
+            admit_shared_natural_qa_rework(intake, record, context, feedback, None, intake.generation)
+    if change == 'expired':
+        from ghost_hermes_pm.shared_repository import record_shared_natural_qa_proposal
+        history = deepcopy(execution['continuation_history'])
+        record_shared_natural_qa_proposal(intake, record, result['proposal']['id'], {
+            'status': 'delivered', 'message_id': 'new-expired-window-proposal',
+            'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
+        reply_context = {**context, 'message_id': 'new-expired-window-approval',
+            'reply_to_message_id': 'new-expired-window-proposal'}
+        approved = admit_shared_natural_qa_rework(intake, record, reply_context,
+            '同意', None, intake.generation)
+        assert approved['status'] == 'maintenance_required', approved
+        assert execution['natural_qa_rework_control']['status'] == 'maintenance_required'
+        assert execution['continuation_history'] == history
+        assert execution['renewal_window_checkpoint']['status'] == 'prepared'
+        assert Path(execution['renewal_window_checkpoint']['ledger_backup']).read_bytes() == ledger_before
+        assert ledger_file.read_bytes() == ledger_before
+        record_shared_natural_qa_proposal(intake, record, approved['proposal']['id'], {
+            'status': 'delivered', 'message_id': 'new-expired-maintenance-proposal',
+            'chat_id': context['chat_id'], 'profile_id': context['profile_id']})
+        carrier.native_identity = {'kind': 'shared_native', 'lease': 'lease-new', 'pid': 14, 'created_at': 2}
+        Path(intake.config['desktop_receipt']).write_text(json.dumps({'lease': 'lease-new'}))
+        intake.config['host_lease'] = 'lease-new'
+        maintenance_context = {**context, 'message_id': 'new-expired-maintenance-complete',
+            'reply_to_message_id': 'new-expired-maintenance-proposal'}
+        adopted = admit_shared_natural_qa_rework(intake, record, maintenance_context,
+            '维护完成', None, intake.generation)
+        assert adopted == {'status': 'accepted', 'work_id': record['id']}
+        renewed = json.loads(ledger_file.read_text())
+        old = json.loads(ledger_before)
+        assert renewed['session_id'] == execution['session_id'] == old['session_id']
+        assert renewed['renewWindow']['id'] != old['renewWindow']['id']
+        assert renewed['renewWindow']['request_base'] == renewed['state']['requests'] == old['state']['requests']
+        assert renewed['renewWindow']['original_state'] == old['state']
+        assert {key: value for key, value in renewed['state'].items() if key != 'binding_sha256'} == {
+            key: value for key, value in old['state'].items() if key != 'binding_sha256'}
+        assert all(renewed['renewWindow'][key] is None for key in ('started_at_ms', 'hook_marker', 'stop_reason'))
+        assert execution['continuation_control']['kind'] == 'qa_rework'
+        assert execution['continuation_control']['status'] == 'admitted'
+        assert execution['continuation_control']['qa_feedback'] == feedback
+        assert execution['continuation_history'][:len(history)] == history
+    else:
+        assert ledger_file.read_bytes() == ledger_before
+    assert carrier.prompts == [] and request == {}
+
+
 def test_sealed_unknown_usage_counts_attempt_before_interrupted_message():
     from ghost_hermes_pm.shared_repository import _sealed_unknown_usage
     events = [

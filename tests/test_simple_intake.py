@@ -55,6 +55,66 @@ def test_snapshot_exposes_current_qa_input_before_large_history(tmp_path):
     assert brief['dsh_input_accepted'] is False and brief['state'] == 'outcome_unknown'
     assert brief['last_failure']['phase'] == 'observer'
     assert 'Original observer not ready.' in json.dumps(snapshot)[:1500]
+    record['dsh_execution'].update(state='running', continuation_control={'status': 'accepted'})
+    intake._save(record)
+    current = intake.snapshot()['work_status'][0]
+    assert current['dsh_input_accepted'] is True and current['last_failure'] is None
+    assert current['historical_failure']['phase'] == 'observer'
+
+
+@pytest.mark.parametrize('case', ['missing', 'present_changed', 'foreign_account'])
+def test_shared_github_refresh_keeps_the_original_scope(tmp_path, monkeypatch, case):
+    from types import SimpleNamespace
+    from ghost_hermes_pm import shared_repository, repository_github
+    from ghost_hermes_pm.manager import ManagementError
+    directory = Path(tempfile.mkdtemp(prefix='hpm-shared-gh-', dir='/tmp')).resolve()
+    reference = {'generation': 'fixture-generation', 'account': 'fixture-owner', 'repository': 'fixture-user/fixture',
+        'config_dir': str(directory / 'home/tmp/github'), 'device': 1, 'inode': 2, 'account_verified': True}
+    record = {'target': {'repository': reference['repository']}, 'dsh_execution': {
+        'generation': reference['generation'], 'github_private_dir': str(directory), 'github_reference': dict(reference)}}
+    saves, calls = [], []
+    intake = SimpleNamespace(github=SimpleNamespace(account='fixture-owner'),
+        _save_execution=lambda value, fields=None: saves.append(fields))
+    prepared = {**reference, 'inode': 3}
+    def prepare(*args):
+        calls.append(args)
+        return {'reference': prepared}
+    monkeypatch.setattr(repository_github, 'prepare_github_execution', prepare)
+    try:
+        if case == 'present_changed':
+            Path(reference['config_dir']).mkdir(parents=True)
+        elif case == 'foreign_account':
+            record['dsh_execution']['github_reference']['account'] = 'other-owner'
+        if case != 'missing':
+            with pytest.raises(ManagementError):
+                shared_repository.prepare_shared_github(intake, record)
+            assert not saves and 'github_reference_history' not in record['dsh_execution']
+            if case == 'foreign_account':
+                assert not calls
+        else:
+            assert shared_repository.prepare_shared_github(intake, record) == prepared
+            assert record['dsh_execution']['github_reference_history'] == [reference]
+    finally:
+        shutil.rmtree(directory)
+
+
+def test_shared_prompt_reports_original_ids_and_current_budget():
+    from ghost_hermes_pm.shared_repository import _prompt
+    criterion = 'Verify the synthetic public behavior.'
+    record = {'issue': {'url': 'https://github.com/fixture-user/fixture/issues/1', 'title': 'Fixture',
+        'body': '- [ ] ' + criterion + '\nHistorical 8192 token limit.'}, 'target': {'repository': 'fixture-user/fixture'},
+        'dsh_execution': {'session_id': 'fixture-session', 'generation': 'fixture-generation',
+            'github_reference': {'config_dir': '/private/tmp/fixture-scope', 'account': 'fixture-owner'},
+            'acceptance': {'source_digest': 'fixture-digest'}, 'tool_receipts': [
+                {'call_id': 'native-test-call', 'name': 'bash', 'exit_code': 0, 'is_error': False,
+                    'generation': 'fixture-generation', 'session_id': 'fixture-session',
+                    'source_after': {'source_digest': 'fixture-digest'}},
+                {'call_id': 'foreign-call', 'name': 'bash', 'exit_code': 0, 'is_error': False,
+                    'generation': 'other', 'session_id': 'fixture-session', 'source_after': {'source_digest': 'fixture-digest'}}]}}
+    prompt = _prompt(None, record)
+    assert 'no plugin output-token' in prompt and 'historical and does not apply' in prompt
+    assert 'native-test-call' in prompt and 'foreign-call' not in prompt
+    assert 'Copy each frozen acceptance criterion verbatim' in prompt and criterion in prompt
 
 
 @pytest.mark.parametrize('scenario', [

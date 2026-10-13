@@ -1024,6 +1024,21 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     if record.get('dsh_execution', {}).get('natural_qa_rework_control', {}).get('message_id') == message_id:
         raise ManagementError('duplicate', 'The natural QA intake message was already handled.')
     prior_natural = execution.get('natural_qa_rework_control', {})
+    previous_qa_completed = (execution.get('state') == 'awaiting_acceptance'
+        and execution.get('terminal_reason') == {'kind': 'completed'}
+        and execution.get('continuation_control', {}).get('kind') == 'qa_rework'
+        and execution['continuation_control'].get('status') == 'accepted'
+        and execution['continuation_control'].get('dispatch_status') == 'accepted')
+    completed_qa = previous_qa_completed and not any(
+        control.get('request_id') == execution.get('continuation_request_id')
+        for control in execution.get('continuation_history', [])
+        if 'natural_qa_rework_control' in control)
+    if completed_qa:
+        previous_ids = {control.get('message_id') for control in execution.get('continuation_history', [])}
+        previous_ids.add(execution['continuation_control'].get('message_id'))
+        if message_id in previous_ids:
+            raise ManagementError('duplicate', 'The completed QA message was already handled.')
+        prior_natural = {}
     if (execution.get('mode') != 'shared_native' or not _qa_rework_acceptance(execution)
             or execution.get('first_input') != 'accepted' or execution.get('stop_requested')
             or execution.get('lifecycle_end')
@@ -1046,7 +1061,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
                          generation=execution['generation'], workspace_id=execution.get('workspace_id'))
     budget_file = ledger_path(configuration, execution['session_id'])
     budget_before = private_file(budget_file).read_bytes()
-    adopting = execution.get('natural_qa_rework_control', {}).get('status') == 'maintenance_required'
+    adopting = prior_natural.get('status') == 'maintenance_required'
     maintenance = execution.get('natural_qa_rework_control', {}).get('checkpoint', {})
     ledger_configuration = (dict(configuration, host_lease=maintenance.get('native_identity', {}).get('lease'))
         if adopting else configuration)
@@ -1068,8 +1083,6 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     requested_window = None
     approved_renewal = False
     approved_maintenance = False
-    if requested_window is None and 'sealed_unknown_usage' in current_window:
-        raise ManagementError('binding_conflict', 'A current window with sealed unknown usage cannot be reused for QA intake.')
     if prior_natural.get('status') in {'renewal_required', 'maintenance_required'}:
         delivery = prior_natural.get('proposal_delivery', {})
         proposal = prior_natural.get('proposal', {})
@@ -1091,6 +1104,13 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
             raise ManagementError('outcome_unknown', 'The natural QA maintenance checkpoint is incomplete.')
     if prior_natural.get('status') == 'maintenance_required' and requested_window is None:
         raise ManagementError('outcome_unknown', 'Maintenance-required QA renewal must be retried with its explicit configured window.')
+    if requested_window is None and 'sealed_unknown_usage' in current_window:
+        checkpoint = execution.get('renewal_window_checkpoint', {})
+        if (not previous_qa_completed or execution.get('renewal_window_adoption') != 'accepted'
+                or checkpoint.get('status') != 'admitted'
+                or checkpoint.get('sealed_unknown_usage') != current_window['sealed_unknown_usage']
+                or checkpoint.get('previous_state') != current_window.get('original_state')):
+            raise ManagementError('binding_conflict', 'A current window with sealed unknown usage cannot be reused for QA intake.')
     renewal_required = False
     if requested_window is None:
         if type(current_window.get('started_at_ms')) is not int or current_window['started_at_ms'] <= 0:
@@ -1161,6 +1181,12 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
                     job_receipts=shared_receipts(receipt_configuration, execution, '.jobs.jsonl'))
                 or private_file(budget_file).read_bytes() != budget_before):
             raise ManagementError('outcome_unknown', 'The original Session, Workspace, receipts or jobs are not idle.')
+        if completed_qa:
+            previous = deepcopy(execution['continuation_control'])
+            previous.update(request_id=execution.get('continuation_request_id'),
+                natural_qa_rework_control=deepcopy(execution.get('natural_qa_rework_control')))
+            execution.setdefault('continuation_history', []).append(previous)
+            intake._save_execution(record, fields=['continuation_history'])
         if not renewal_required and requested_window is None and not adopting:
             request_id = 'qa-rework-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest()
             execution['continuation_request_id'] = request_id
@@ -1178,7 +1204,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
             if message_id not in control_ids:
                 control_ids.append(message_id)
             intake._save_execution(record, fields=['continuation_request_id', 'continuation_control',
-                'natural_qa_rework_control', 'control_message_ids', 'state'])
+                'natural_qa_rework_control', 'control_message_ids', 'state', *(['continuation_history'] if completed_qa else [])])
             if card['status'] == 'triage':
                 from hermes_cli import kanban_db as kb
                 from hermes_cli.kanban_db_connect import connect_closing
@@ -2456,9 +2482,20 @@ def prepare_shared_github(intake, record):
     directory = Path(execution['github_private_dir'])
     if directory.parent != Path('/tmp').resolve() or not directory.name.startswith('hpm-shared-gh-'):
         raise ManagementError('binding_conflict', 'Shared GitHub preparation must stay in its original native tmp directory.')
+    previous = execution.get('github_reference')
+    if previous and any(previous.get(k) != value for k, value in {
+            'generation': execution['generation'], 'account': intake.github.account,
+            'repository': record['target']['repository'], 'config_dir': str(directory / 'home/tmp/github')}.items()):
+        raise ManagementError('binding_conflict', 'The original shared GitHub scope differs.')
+    missing = bool(previous and not Path(previous['config_dir']).exists()
+        and not Path(previous['config_dir']).is_symlink())
     prepared = prepare_github_execution(intake.github, record['target'], directory, execution['generation'])
-    if execution.get('github_reference') and execution['github_reference'] != prepared['reference']:
-        raise ManagementError('binding_conflict', 'The original shared GitHub generation reference changed.')
+    if previous and previous != prepared['reference']:
+        if not missing or any(previous.get(k) != prepared['reference'].get(k)
+                for k in ('generation', 'account', 'repository', 'config_dir')):
+            raise ManagementError('binding_conflict', 'The original shared GitHub generation reference changed.')
+        execution.setdefault('github_reference_history', []).append(deepcopy(previous))
+        intake._save_execution(record, fields=['github_reference_history'])
     execution['github_reference'] = prepared['reference']
     intake._save_execution(record, fields=['github_reference'])
     return prepared['reference']
@@ -2526,7 +2563,15 @@ def prepare_shared_verification(intake, record, configuration):
 
 
 def _prompt(intake, record):
-    return ('Work only in this bound repository. Use the installed Matt skills to host requirement discussion, '
+    from .delivery import acceptance_criteria
+    execution = record['dsh_execution']
+    candidates = [row['call_id'] for row in execution.get('tool_receipts', [])
+        if row.get('name') == 'bash' and row.get('is_error') is False and row.get('exit_code') == 0
+        and row.get('generation') == execution.get('generation') and row.get('session_id') == execution.get('session_id')
+        and row.get('source_after', {}).get('source_digest') == execution.get('acceptance', {}).get('source_digest')]
+    return ('The active budget uses only the configured wall-time and request limits; there is no plugin output-token '
+        'or cumulative-token quota. Old token quota text in the frozen Issue is historical and does not apply.\n'
+        'Work only in this bound repository. Use the installed Matt skills to host requirement discussion, '
         'fine Issue breakdown, TDD, development and tests. Ask ordinary questions through ask_user_question; '
         'execution approvals use the native approval request. Never change other repositories or start a new DSH.\n'
         + 'Frozen Issue: ' + record['issue']['url'] + '\n' + record['issue']['title'] + '\n' + record['issue']['body']
@@ -2546,6 +2591,9 @@ def _prompt(intake, record):
           'Report with HERMES_REPOSITORY_DELIVERY_JSON followed by one JSON object with source_commit, '
           'issue_updated_at, criteria [{text,test_call_ids}], test_files, fine_issue_urls, pr_url, '
           'sync_branches, leftovers. Reference exact successful native bash test call IDs. '
+        + 'Copy each frozen acceptance criterion verbatim and in order: ' + json.dumps(acceptance_criteria(record['issue']['body']), ensure_ascii=False)
+        + '. Original successful bash receipt IDs for the current source bytes (not all are test calls): '
+        + json.dumps(candidates[-40:]) + '. Match IDs to actual tests; never replace IDs with narrative descriptions. '
           'Outer Kanban acceptance belongs to the supervisor.')
 
 
@@ -2896,6 +2944,10 @@ async def run_shared_work(ctx, intake, record, generation):
                 await asyncio.sleep(.1)
             else:
                 raise ManagementError('outcome_unknown', 'The original gateway human observer is not ready; no model input sent.')
+            phase = 'execution_resources'
+            await asyncio.to_thread(prepare_shared_github, intake, record)
+            execution['verification_prefix'] = prepare_shared_verification(intake, record, configuration)
+            intake._save_execution(record, fields=['verification_prefix'])
             if pending_continuation:
                 if continuation.get('kind') == 'max_tokens':
                     budget = read_ledger(configuration, execution)
@@ -2924,9 +2976,6 @@ async def run_shared_work(ctx, intake, record, generation):
                         'These current instructions override all old budget and token quota text in the frozen Issue: no plugin output-token or cumulative-token quota. '
                         'Native model limits still apply. Preserve the original game scope, history and cumulative usage.\n\n' + _prompt(intake, record))
             else:
-                await asyncio.to_thread(prepare_shared_github, intake, record)
-                execution['verification_prefix'] = prepare_shared_verification(intake, record, configuration)
-                intake._save_execution(record, fields=['verification_prefix'])
                 execution['baseline'] = await asyncio.to_thread(repository_source_state, record['target'])
                 execution.update(first_input='intent', state='input_intent')
                 intake._save_execution(record)

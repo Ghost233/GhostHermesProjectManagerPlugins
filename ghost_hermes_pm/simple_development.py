@@ -80,7 +80,8 @@ class RepositoryIntake(FeishuEntry):
                 'observer_status': observer.get('status'),
                 'observer_failure': {k: observer.get(k) for k in ('phase', 'code', 'message')}
                     if observer.get('status') == 'unavailable' else None,
-                'last_failure': execution.get('last_failure')})
+                'last_failure': execution.get('last_failure') if execution.get('state') in {'outcome_unknown', 'execution_failed'} else None,
+                'historical_failure': execution.get('last_failure') if execution.get('state') not in {'outcome_unknown', 'execution_failed'} else None})
         return {'status': 'completed', 'dispatcher': 'native_kanban', 'work_status': current,
             'execution': 'owned_dsh' if any(r.get('dsh_execution') for r in work) else 'not_enabled', 'work': work}
 
