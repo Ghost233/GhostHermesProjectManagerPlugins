@@ -255,12 +255,32 @@ export default function sharedNativeHook(ctx, config) {
   const expired = record => (record.row.renewWindow ?? record.row.state).started_at_ms !== null
     && (Date.now() - (record.row.renewWindow ?? record.row.state).started_at_ms >= record.row.budget.max_wall_seconds * 1000
       || performance.now() >= (admitted.get(record.row.session_id)?.deadline ?? Infinity));
-  const validateSettlements = session => {
+  const validateSettlements = (session, record) => {
+    let settlements = 0;
+    let interrupted = false;
     for (let index = 0; index < session.seq; index++) {
       const event = session.eventAt(index);
       if (!['assistant/message', 'assistant/attempt'].includes(event.type)) continue;
+      settlements++;
       const value = event.data.usage ?? event.data.stream?.findLast(record => record.type === 'chunk'
         && record.chunk?.type === 'usage')?.chunk.usage;
+      if (value === undefined && event.data.usage === undefined && !interrupted && event.type === 'assistant/message'
+          && event.data.interrupted === true && integer(event.data.turn) && integer(event.data.step)
+          && !event.data.stream?.some(record => record.type === 'chunk' && record.chunk?.type === 'usage')
+          && record.row.renewWindow?.original_state.stop_reason === 'shared-work-wall-budget'
+          && settlements === record.row.renewWindow.request_base && index + 2 < session.seq) {
+        const stepEnd = session.eventAt(index + 1);
+        const turnEnd = session.eventAt(index + 2);
+        const reason = turnEnd.data?.reason;
+        if (stepEnd.type === 'step/end' && stepEnd.data?.turn === event.data.turn && stepEnd.data.step === event.data.step
+            && turnEnd.type === 'turn/end' && turnEnd.data?.turn === event.data.turn
+            && reason?.kind === 'aborted' && Object.keys(reason).length === 2
+            && reason.reason?.kind === 'hook' && reason.reason.reason === 'shared-work-wall-budget'
+            && Object.keys(reason.reason).length === 2) {
+          interrupted = true;
+          continue; // The sealed old request stays reserved without inventing reported usage.
+        }
+      }
       if (!value || !['inputTokens', 'outputTokens'].every(key => integer(value[key]))
           || !['cacheReadTokens', 'cacheWriteTokens'].every(key => integer(value[key] ?? 0))) {
         throw new Error('Shared work native settlement usage is unknown.');
@@ -384,7 +404,7 @@ export default function sharedNativeHook(ctx, config) {
     signal.throwIfAborted();
     const record = ledgerFor(agent);
     const {state} = record.row;
-    validateSettlements(agent.session);
+    validateSettlements(agent.session, record);
     usage(agent, record);
     const active = record.row.renewWindow ?? state;
     if (active.stop_reason || expired(record)) throw stop(agent, record, 'shared-work-wall-budget');

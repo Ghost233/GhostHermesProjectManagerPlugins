@@ -21,6 +21,90 @@ import pytest
 from ghost_hermes_pm.manager import ManagementError
 
 
+@pytest.mark.parametrize('case', ['wrong_sender', 'bot_sender', 'wrong_profile', 'wrong_chat', 'no_newline',
+    'empty', 'too_long', 'sensitive', 'wrong_state', 'stop_requested', 'lifecycle_end', 'checkpoint_unknown',
+    'continuation_pending', 'duplicate_intent', 'duplicate_unknown', 'duplicate_accepted',
+    'new_message_after_intent', 'new_message_after_unknown', 'new_message_after_accepted'])
+def test_owner_context_public_rejections_never_replay_or_reach_native(tmp_path, monkeypatch, case):
+    from types import SimpleNamespace as NS
+    from ghost_hermes_pm.simple_development import RepositoryIntake
+    from ghost_hermes_pm import shared_repository
+    from ghost_hermes_pm.messages import OWNED_PLATFORM
+    work_id = 'work-' + 'a' * 32
+    anchor = {'app_id': 'fixture-app', 'transport_tenant_key': 'fixture-app-tenant',
+        'tenant_key': 'fixture-owner-tenant', 'recipient_tenant_key': 'fixture-bot-tenant',
+        'recipient_open_id': 'fixture-bot', 'chat_id': 'fixture-chat', 'sender_open_id': 'fixture-owner'}
+    binding = dict(anchor, sender_tenant_key=anchor['tenant_key'], owner_open_id=anchor['sender_open_id'],
+        profile_id='fixture-profile', native_profile='fixture-native', verification_ref='fixture-proof')
+    intake = RepositoryIntake(None, {'enabled': True, 'verification_ref': 'fixture-proof', 'bindings': [binding]},
+        {'github_account': 'fixture-account', 'github_config_dir': str(tmp_path)}, tmp_path / 'state')
+    sent = []
+    class Transport:
+        async def send(self, message):
+            sent.append(message)
+    adapter = NS(registered_bots=[{'open_id': 'fixture-bot-sender', 'tenant_key': 'fixture-owner-tenant',
+        'native_ids': ['fixture-bot-sender'], 'dispatch_profiles': ['fixture-profile']}])
+    intake.attach_transport(adapter, Transport())
+    execution = {'mode': 'shared_native', 'state': 'outcome_unknown', 'first_input': 'accepted',
+        'last_failure': {'code': 'outcome_unknown'}, 'renewal_window_checkpoint': {'status': 'admitted'},
+        'renewal_window_adoption': 'accepted', 'continuation_control': {'kind': 'renew_window', 'status': 'accepted',
+            'dispatch_status': 'accepted', 'snapshot_sha256': 'fixture-snapshot', 'ledger_sha256': 'fixture-ledger'}}
+    record = {'id': work_id, 'profile_id': 'fixture-profile', 'source_anchor': dict(anchor),
+        'target': {'profile_id': 'fixture-profile'}, 'dsh_execution': execution}
+    command = '补充 ' + work_id + '\nVerify synthetic scope.'
+    sender = 'fixture-owner'
+    is_bot = False
+    if case == 'wrong_sender':
+        sender = 'fixture-stranger'
+    elif case == 'bot_sender':
+        sender, is_bot = 'fixture-bot-sender', True
+    elif case == 'wrong_profile':
+        record['profile_id'] = 'fixture-other-profile'
+    elif case == 'wrong_chat':
+        record['source_anchor']['chat_id'] = 'fixture-other-chat'
+    elif case == 'no_newline':
+        command = '补充 ' + work_id
+    elif case == 'empty':
+        command = '补充 ' + work_id + '\n   '
+    elif case == 'too_long':
+        command = '补充 ' + work_id + '\n' + 'x' * 4001
+    elif case == 'sensitive':
+        command = '补充 ' + work_id + '\napi_key=sk-abcdefghijklmnopqrstuvwxyz'
+    elif case == 'wrong_state':
+        execution['state'] = 'running'
+    elif case in {'stop_requested', 'lifecycle_end'}:
+        execution[case] = True
+    elif case == 'checkpoint_unknown':
+        execution['renewal_window_checkpoint']['status'] = 'unknown'
+    elif case == 'continuation_pending':
+        execution['continuation_control']['status'] = 'admitted'
+    elif case.startswith(('duplicate_', 'new_message_')):
+        status = case.rsplit('_', 1)[1]
+        execution['owner_context_control'] = {'message_id': 'fixture-message', 'request_id': 'fixture-request', 'status': status}
+        if case.startswith('duplicate_'):
+            execution['control_message_ids'] = ['fixture-message']
+    intake._save(record)
+    mid = 'fixture-new-message' if case.startswith('new_message_') else 'fixture-message'
+    message = NS(chat_type='group', message_type='text', chat_id=anchor['chat_id'], message_id=mid,
+        content=json.dumps({'text': '@fixture ' + command}), mentions=[NS(key='@fixture', mentioned_type='bot',
+            tenant_key=anchor['recipient_tenant_key'], id=NS(open_id=anchor['recipient_open_id']))])
+    event = NS(message_id=mid, source=NS(platform=OWNED_PLATFORM, user_id=sender, chat_id=anchor['chat_id'],
+        is_bot=is_bot, message_id=mid), raw_message=NS(header=NS(event_type='im.message.receive_v1',
+        app_id=anchor['app_id'], tenant_key=anchor['transport_tenant_key']), event=NS(message=message,
+        sender=NS(sender_type='bot' if is_bot else 'user', tenant_key=anchor['tenant_key'], sender_id=NS(open_id=sender)))))
+    def forbidden_native(*args, **kwargs):
+        pytest.fail('A rejected or replayed public message must not contact Native.')
+    monkeypatch.setattr(shared_repository, 'SharedDesktopTransport', forbidden_native)
+    prepared = intake.prepare(event, adapter)
+    if case == 'wrong_sender':
+        assert prepared is None
+        return
+    assert prepared is not None and prepared.action == 'control'
+    result = asyncio.run(intake.process_prepared(prepared))
+    assert result['status'] in {'rejected', 'unverified', 'duplicate'}
+    assert sent and intake.snapshot()['work'][0]['dsh_execution'].get('owner_context_control') == execution.get('owner_context_control')
+
+
 @pytest.mark.parametrize('change', ['noncanonical', 'in_workspace', 'unsafe_permissions', 'not_executable', 'wrong_python', 'wrong_node'])
 def test_shared_runtime_path_version_and_permissions_refuse_unsafe_entries(tmp_path, change):
     from ghost_hermes_pm.shared_repository import _trusted_binary
@@ -527,6 +611,20 @@ def test_repeat_window_prepare_rejects_unconfirmed_delta(change, repeat_window_r
     assert 'session/prompt' not in f.carrier_calls
 
 
+def test_owner_context_refuses_incomplete_receipt_checkpoint(repeat_window_read_facts):
+    from types import SimpleNamespace
+    from ghost_hermes_pm.shared_repository import admit_shared_owner_context
+    f = repeat_window_read_facts
+    execution = f.record['dsh_execution']
+    execution.update(state='outcome_unknown', last_failure={'code': 'outcome_unknown'},
+        continuation_control={'kind': 'renew_window', 'status': 'accepted', 'dispatch_status': 'accepted',
+            'snapshot_sha256': 'fixture-snapshot', 'ledger_sha256': 'fixture-ledger'})
+    execution['renewal_window_checkpoint']['receipts'] = {'.tools.jsonl': {'size': 0, 'sha256': 'fixture-missing-jobs'}}
+    with pytest.raises(ManagementError, match='receipt checkpoints are incomplete'):
+        admit_shared_owner_context(f.intake, f.record, SimpleNamespace(command='补充 fixture-work\nVerify fixture scope.'), 0)
+    assert f.saves == [] and f.carrier_calls == []
+
+
 @pytest.mark.parametrize('change', ['same_identity', 'same_lease', 'same_pid', 'same_birth', 'history', 'same_grant', 'unknown_adoption'])
 def test_repeat_window_admit_rejects_unconfirmed_delta(change, repeat_window_read_facts):
     from ghost_hermes_pm.shared_repository import admit_shared_window_renewal, _renewal_history_sha256
@@ -1028,7 +1126,7 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata'])
+@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])

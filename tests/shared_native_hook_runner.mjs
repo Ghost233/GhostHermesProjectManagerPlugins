@@ -39,8 +39,13 @@ class Model extends LlmAdapter {
     initialDelayMs: 0, maxDelayMs: 0, jitterRatio: 0}; }
   async *stream(options) {
     calls.push(options);
-    if (options.model === 'fixture-wait' || options.model === 'fixture-window-wait'
+    if (options.model === 'fixture-wait' || options.model === 'fixture-window-interrupted'
+        && calls.filter(call => call.model === 'fixture-window-interrupted').length === 1 || options.model === 'fixture-window-wait'
         && calls.filter(call => call.model === 'fixture-window-wait').length > 1) {
+      if (options.model === 'fixture-window-interrupted') {
+        yield {type: 'block-start', index: 0, blockType: 'text'};
+        yield {type: 'text-delta', index: 0, text: 'Interrupted native response.'};
+      }
       await new Promise((resolve, reject) => {
         const timer = setTimeout(resolve, 5000);
         options.signal.addEventListener('abort', () => {clearTimeout(timer); reject(options.signal.reason);}, {once: true});
@@ -68,6 +73,7 @@ const names = ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output'
 const teamNames = ['interrupt_agent', 'list_agents', 'send_message', 'spawn_teammate',
   'team_task_create', 'team_task_get', 'team_task_list', 'team_task_update', 'wait_agent'];
 let teamEvidence;
+let settlementEvidence;
 try {
   for (const name of ['dsh-session', 'dsh-session-projection', 'dsh-token-meter',
     'dsh-system-prompt', 'dsh-sandbox-policy', 'dsh-tools', 'dsh-jobs-local', 'dsh-llm', 'dsh-agent', 'dsh-agent-loop']) {
@@ -143,7 +149,7 @@ try {
         : crypto.createHash('sha256').update(fs.readFileSync(reader)).digest('hex')};
   }
   const removePreset = await ctx.agentPresets.register(declaration);
-  if (scenario === 'late_host' || scenario === 'renew_window') {
+  if (scenario === 'late_host' || scenario === 'renew_window' || scenario === 'renew_interrupted') {
     const configs = {'dsh-storage-json': {root: path.join(scratch, 'domain')},
       'dsh-storage-domain': {backend: 'json'},
       'dsh-session-persistence-jsonl': {root: path.join(scratch, 'sessions')},
@@ -467,7 +473,77 @@ try {
     await missing.dispose();
     await blocked.dispose();
     await manual.dispose();
-  } else if (scenario === 'renew_window') {
+  } else if (scenario === 'settlement_history') {
+    const original = await create('fixture-history-source');
+    const registration = register(original.agent, {model: 'fixture-window-interrupted'});
+    registration.budget.max_wall_seconds = 1;
+    fs.writeFileSync(ledgerPath(original.agent.session.id), JSON.stringify(registration));
+    await prompt(original.agent);
+    const history = {meta: {...original.agent.session.header},
+      events: Array.from({length: original.agent.session.seq}, (_, index) => structuredClone(original.agent.session.eventAt(index)))};
+    assert.deepEqual(history.events.slice(-3).map(event => event.type), ['assistant/message', 'step/end', 'turn/end']);
+    await original.dispose();
+    const variants = [
+      ['exact', () => {}],
+      ['not-interrupted', events => {events.at(-3).data.interrupted = false;}],
+      ['attempt', events => {events.at(-3).type = 'assistant/attempt'; delete events.at(-3).surfaceOp;}],
+      ['missing-step-end', events => {events.splice(-2, 1);}],
+      ['wrong-step', events => {events.at(-2).data.step++;}],
+      ['wrong-step-turn', events => {events.at(-2).data.turn++;}],
+      ['wrong-turn', events => {events.at(-1).data.turn++;}],
+      ['missing-turn-end', events => {events.pop();}],
+      ['wrong-reason', events => {events.at(-1).data.reason.reason.reason = 'shared-work-usage-unknown';}],
+      ['wrong-reason-kind', events => {events.at(-1).data.reason.kind = 'completed';}],
+      ['non-hook', events => {events.at(-1).data.reason.reason.kind = 'user';}],
+      ['extra-reason', events => {events.at(-1).data.reason.extra = true;}],
+      ['extra-hook-reason', events => {events.at(-1).data.reason.reason.extra = true;}],
+      ['two-unknown', events => {events.push(...structuredClone(events.slice(-3)));}],
+      ['unsealed-window', () => {}],
+      ['current-window', () => {}],
+    ];
+    for (const [name, mutate] of variants) {
+      const restored = structuredClone(history);
+      mutate(restored.events);
+      restored.events.forEach((event, index) => {event.seq = index;});
+      const owned = await create('fixture-history-' + name, 'fixture-managed', restored);
+      assert.deepEqual(Array.from({length: restored.events.length}, (_, index) => owned.agent.session.eventAt(index)), restored.events,
+        'The original Session must retain the fixture history before executing its real Hook.');
+      const requests = name === 'two-unknown' ? 2 : 1;
+      const row = register(owned.agent, {state: {started_at_ms: Date.now() - 2000, requests, reported_tokens: 0,
+        admissions: Array.from({length: requests}, (_, index) => 'fixture-old-' + index), stop_reason: 'shared-work-wall-budget'}});
+      if (name !== 'current-window') row.renewWindow = {id: 'fixture-window-' + name, message_id: 'fixture-owner-' + name,
+        host_lease: currentHostLease, request_base: requests, original_state: structuredClone(row.state),
+        original_host_lease: 'fixture-pre-maintenance-lease', started_at_ms: null, stop_reason: null, hook_marker: null};
+      if (name === 'unsealed-window') {
+        row.state.stop_reason = null;
+        row.renewWindow.original_state.stop_reason = null;
+      }
+      row.state.binding_sha256 = crypto.createHash('sha256').update(JSON.stringify({
+        ...Object.fromEntries(['schema', 'service_ref', 'host_lease', 'agent_preset', 'session_id', 'session_created_at',
+          'generation', 'workspace', 'provider', 'model', 'budget'].map(key => [key, row[key]])),
+        ...(row.renewWindow ? {renewWindow: Object.fromEntries(Object.entries(row.renewWindow)
+          .filter(([key]) => !['started_at_ms', 'stop_reason', 'hook_marker'].includes(key)))} : {})})).digest('hex');
+      fs.writeFileSync(ledgerPath(owned.agent.session.id), JSON.stringify(row));
+      const before = calls.length;
+      await prompt(owned.agent);
+      const after = JSON.parse(fs.readFileSync(ledgerPath(owned.agent.session.id)));
+      if (name === 'exact') {
+        assert.equal(calls.length, before + 1);
+        assert.equal(after.state.requests, 2);
+        assert.equal(after.state.reported_tokens, 20);
+        assert.equal(after.renewWindow.hook_marker, 'same-sid-window-v1');
+      } else {
+        assert.equal(calls.length, before, name + ' must fail before model dispatch.');
+        assert.deepEqual(after.state, row.state, name + ' must preserve the old reservation and tokens.');
+        const turnEnd = owned.agent.session.eventAt(owned.agent.session.seq - 1);
+        assert.equal(turnEnd.type, 'turn/end');
+        assert.equal(turnEnd.data.reason.kind, 'error');
+        assert.ok(JSON.stringify(turnEnd.data.reason).includes('Shared work native settlement usage is unknown.'), name);
+      }
+      await owned.dispose();
+    }
+    settlementEvidence = {accepted: ['exact'], rejected: variants.slice(1).map(([name]) => name)};
+  } else if (scenario === 'renew_window' || scenario === 'renew_interrupted') {
     const renew = async (id, model = 'fixture-route') => {
       const original = await create(id);
       const registration = register(original.agent, {model});
@@ -479,6 +555,19 @@ try {
       const row = JSON.parse(raw);
       assert.equal(row.state.stop_reason, 'shared-work-wall-budget');
       const oldEvents = Array.from({length: original.agent.session.seq}, (_, index) => structuredClone(original.agent.session.eventAt(index)));
+      if (scenario === 'renew_interrupted') {
+        assert.deepEqual(oldEvents.slice(-3).map(event => event.type), ['assistant/message', 'step/end', 'turn/end']);
+        const [message, stepEnd, turnEnd] = oldEvents.slice(-3);
+        assert.equal(message.data.interrupted, true);
+        assert.equal(message.data.usage, undefined);
+        assert.ok(!message.data.stream?.some(record => record.type === 'chunk' && record.chunk?.type === 'usage'));
+        assert.equal(stepEnd.data.turn, message.data.turn);
+        assert.equal(stepEnd.data.step, message.data.step);
+        assert.equal(turnEnd.data.turn, message.data.turn);
+        assert.deepEqual(turnEnd.data.reason, {kind: 'aborted', reason: {kind: 'hook', reason: 'shared-work-wall-budget'}});
+        assert.equal(row.state.requests, 1);
+        assert.equal(row.state.reported_tokens, 0, 'The interrupted request has no reported token proof.');
+      }
       const createdAt = original.agent.session.header.createdAt;
       await original.dispose();
       fs.writeFileSync(ledgerPath(id) + '.old-window', raw, {mode: 0o600});
@@ -505,10 +594,21 @@ try {
       assert.equal(after.state.started_at_ms, row.state.started_at_ms);
       assert.equal(after.state.stop_reason, row.state.stop_reason);
       assert.equal(after.state.requests, row.state.requests + 1);
+      if (scenario === 'renew_interrupted') {
+        assert.equal(after.renewWindow.request_base, 1, 'The uncertain old request remains reserved.');
+        assert.equal(after.state.reported_tokens, 20, 'Only the new completed request reports tokens.');
+        assert.deepEqual(after.state.admissions.slice(0, 1), row.state.admissions);
+        assert.equal(calls.length, 2, 'The first new beforeRequest reserves exactly one additional request.');
+        settlementEvidence = {history: oldEvents.slice(-3), old_state: row.state,
+          resumed_state: after.state, window: after.renewWindow};
+      }
       assert.deepEqual(after.renewWindow.original_state, row.renewWindow.original_state);
       assert.deepEqual(fs.readFileSync(ledgerPath(id) + '.old-window'), raw);
       return current;
     };
+    if (scenario === 'renew_interrupted') {
+      await renew('fixture-window-interrupted', 'fixture-window-interrupted');
+    } else {
     const counted = await renew('fixture-window-count');
     await prompt(counted);
     await prompt(counted);
@@ -523,6 +623,7 @@ try {
     assert.equal(timedRow.renewWindow.stop_reason, 'shared-work-wall-budget');
     assert.equal(timedRow.state.stop_reason, 'shared-work-wall-budget');
     assert.equal(calls.length, 5, 'The new wall stop cancels the fifth external request.');
+    }
   } else if (scenario === 'limits') {
     const tokens = await create('fixture-token-limit');
     const row = register(tokens.agent, {model: 'fixture-large-usage'});
@@ -609,7 +710,8 @@ try {
   }
   await removePreset();
   if (removeManual) await removeManual();
-  process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: calls.length, ...(teamEvidence ? {team: teamEvidence} : {})}));
+  process.stdout.write(JSON.stringify({native_shared_hook: 'passed', requests: calls.length,
+    ...(teamEvidence ? {team: teamEvidence} : {}), ...(settlementEvidence ? {settlements: settlementEvidence} : {})}));
   }
 } finally {
   await ctx.fiber.dispose();

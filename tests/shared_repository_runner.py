@@ -27,7 +27,8 @@ concurrent_claim = shared_scenario == 'continue_claim_race'
 native_restore = shared_scenario == 'continue_native_restore'
 renew_continue = shared_scenario == 'renew_window_continue'
 resume_completed_window = shared_scenario == 'resume_completed_window'
-renew_window_again = shared_scenario == 'renew_window_again'
+owner_context = shared_scenario == 'owner_context'
+renew_window_again = shared_scenario == 'renew_window_again' or owner_context
 completed_renewed_window = resume_completed_window or renew_window_again
 renew_window = shared_scenario in {'renew_window', 'renew_window_unknown', 'renew_window_continue'}
 max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'continue_tokens_uncapped', 'renew_window', 'renew_window_unknown', 'renew_window_continue'}
@@ -97,7 +98,7 @@ service_source = service_source.replace("state['prompts'].append(args['request']
                     budget_path.write_text(json.dumps(budget_row))
                     behavior['last_slot_budget'] = budget_path.read_bytes()
                 if ((renew_window and not max_tokens_unknown and len(state['prompts']) >= 3)
-                        or (renew_window_again and len(state['prompts']) >= 2)):
+                        or (renew_window_again and len(state['prompts']) >= 2 and not (owner_context and len(state['prompts']) >= 3))):
                     budget_path = ledger / (hashlib.sha256(args['request']['sessionId'].encode()).hexdigest() + '.json')
                     budget_row = json.loads(budget_path.read_bytes())
                     budget_row['renewWindow'].update(started_at_ms=int(time.time() * 1000), hook_marker='same-sid-window-v1')
@@ -107,7 +108,28 @@ service_source = service_source.replace("state['prompts'].append(args['request']
                     budget_path.write_text(json.dumps(budget_row))
                     behavior['renew_budget_after'] = budget_path.read_bytes()""")
 service_source = service_source.replace("if behavior.get('admit_prompt'):",
-    """if shared_scenario in {'continue_restart', 'continue_unknown'} and len(state['prompts']) == 1:
+    """if owner_context and len(state['prompts']) >= 3:
+                    submission = args['request']
+                    if len(state['prompts']) == 4:
+                        durable = record()['dsh_execution']['owner_context_control']
+                        assert durable['status'] == 'intent' and durable['request_id'] == submission['requestId']
+                        assert set(record()['dsh_execution']['renewal_window_checkpoint']['receipts']) == {'.tools.jsonl', '.jobs.jsonl'}
+                        behavior['owner_context_intent'] = dict(durable)
+                    journal = state['journals'][submission['sessionId']]
+                    turn = 3 if len(state['prompts']) == 3 else 4
+                    data = [('agent/inbox/spliced', {'target': 'next-turn', 'start': 0, 'inserted': [
+                        {'id': 'message-' + submission['requestId'], 'role': 'user', 'content': submission['content'],
+                         'source': {'kind': 'user', 'rpcId': submission['requestId']}}]}),
+                        ('turn/start', {'turn': turn})]
+                    if len(state['prompts']) == 3:
+                        data += [('agent/inbox/spliced', {'target': 'next-turn', 'start': 0, 'removedCount': 1, 'inserted': []}),
+                            ('step/start', {'turn': turn, 'step': 1}), ('step/end', {'turn': turn, 'step': 1}),
+                            ('turn/end', {'turn': turn, 'reason': {'kind': 'error', 'error': {
+                                'message': 'Shared work native settlement usage is unknown.', 'code': 'UNKNOWN'}}})]
+                    for kind, payload in data:
+                        journal.append({'type': 'event', 'event': {'type': kind, 'seq': len(journal), 'time': 10, 'data': payload}})
+                    next(row for row in state['sessions'] if row['sessionId'] == submission['sessionId'])['running'] = False
+                elif shared_scenario in {'continue_restart', 'continue_unknown'} and len(state['prompts']) == 1:
                     submission = args['request']
                     journal = state['journals'][submission['sessionId']]
                     item = {'id': 'message-' + submission['requestId'], 'role': 'user',
@@ -139,6 +161,7 @@ service_source = service_source.replace("elif method == 'session/cancel':\n     
                     'time': 4, 'data': {'turn': 1, 'reason': {'kind': 'aborted', 'reason': {'kind': 'user'}}}}})
                 value""")
 service_namespace = {'permission_contract': permission_contract, 'shared_scenario': shared_scenario,
+    'owner_context': owner_context,
     'max_tokens_unknown': max_tokens_unknown, 'max_tokens_last_slot': max_tokens_last_slot, 'renew_window': renew_window,
     'renew_window_again': renew_window_again, 'time': time}
 exec(compile(service_source, str(ROOT / 'tests/dsh_fixture_server.py'), 'exec'), service_namespace)
@@ -263,6 +286,7 @@ async def main():
         await receive(adapter, raw('om_shared'))
         def record():
             return json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+        service_namespace['record'] = record
         initial = record()
         assert initial['dsh_execution']['mode'] == 'shared_native', initial
         if triage_continuation:
@@ -874,6 +898,123 @@ async def main():
                     cumulative_state_before=previous_budget['state'], window_after=third_budget['renewWindow'],
                     checkpoint_history=latest['dsh_execution']['renewal_window_checkpoint_history'],
                     adoption=latest['dsh_execution']['renewal_window_adoption'], prompt_count=len(peer['prompts']))
+                if owner_context:
+                    model.worker_steps = 0
+                    with connect_closing() as db:
+                        assert dispatch_once(db, max_spawn=1).spawned
+                        worker = remember_worker(db, latest['card_id'])
+                    until = time.monotonic() + 20
+                    while time.monotonic() < until:
+                        waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                        if waited:
+                            assert os.waitstatus_to_exitcode(status) == 0
+                            worker = None
+                            break
+                        await asyncio.sleep(.05)
+                    assert worker is None
+                    latest = record()
+                    assert latest['dsh_execution']['state'] == 'outcome_unknown', latest['dsh_execution']
+                    assert len(peer['prompts']) == 3 and budget_file.read_bytes() == json.dumps(third_budget).encode()
+                    preserved = {key: latest['dsh_execution'][key] for key in (
+                        'last_failure', 'continuation_control', 'renewal_window_history', 'continuation_history')}
+                    creates = sum(call['method'] == 'session/create' for call in peer['calls'])
+                    for case in ('started_at_ms', 'hook_marker', 'stop_reason', 'request_base'):
+                        altered = json.loads(budget_file.read_bytes())
+                        altered['renewWindow'][case] = 1 if case != 'hook_marker' else 'same-sid-window-v1'
+                        budget_file.write_text(json.dumps(altered))
+                        await receive(adapter, raw('om_owner_ledger_' + case, '@_user_1 补充 ' + latest['id'] + '\nVerify synthetic scope.'))
+                        assert len(peer['prompts']) == 3 and not record()['dsh_execution'].get('owner_context_control')
+                        budget_file.write_text(json.dumps(third_budget))
+                    failed_events = json.loads(json.dumps(peer['journals'][sid]))
+                    for case in ('wrong_error', 'wrong_request', 'assistant/message', 'request/header', 'tool/call'):
+                        changed = json.loads(json.dumps(failed_events))
+                        if case == 'wrong_error':
+                            changed[-1]['event']['data']['reason']['error']['message'] += '!'
+                        elif case == 'wrong_request':
+                            changed[-6]['event']['data']['inserted'][0]['source']['rpcId'] = 'foreign-request'
+                        else:
+                            changed.append({'type': 'event', 'event': {'type': case, 'seq': len(changed), 'time': 11,
+                                'data': {'turn': 3, 'step': 1, 'usage': {'inputTokens': 1, 'outputTokens': 1}}}})
+                        peer['journals'][sid] = changed
+                        await receive(adapter, raw('om_owner_events_' + case, '@_user_1 补充 ' + latest['id'] + '\nVerify synthetic scope.'))
+                        assert len(peer['prompts']) == 3 and not record()['dsh_execution'].get('owner_context_control')
+                        peer['journals'][sid] = json.loads(json.dumps(failed_events))
+                    for case in ('running', 'unknown'):
+                        fixture_behavior['jobs'] = [{'id': 'fixture-owner-job', 'owner': sid, 'status': case}]
+                        await receive(adapter, raw('om_owner_job_' + case, '@_user_1 补充 ' + latest['id'] + '\nVerify synthetic scope.'))
+                        assert len(peer['prompts']) == 3 and not record()['dsh_execution'].get('owner_context_control')
+                    fixture_behavior['jobs'] = []
+                    fixture_behavior['inbox'] = {'next-turn': [{'id': 'fixture-other-input', 'role': 'user'}], 'next-step': []}
+                    await receive(adapter, raw('om_owner_pending', '@_user_1 补充 ' + latest['id'] + '\nVerify synthetic scope.'))
+                    assert len(peer['prompts']) == 3
+                    fixture_behavior['inbox'] = {'next-turn': [], 'next-step': []}
+                    for index, command in enumerate(('补充 ' + latest['id'], '补充 ' + latest['id'] + '\n',
+                            '补充 ' + latest['id'] + '\napi_key=sk-abcdefghijklmnopqrstuvwxyz',
+                            '补充 ' + latest['id'] + '\n' + 'x' * 4001)):
+                        await receive(adapter, raw('om_owner_invalid_' + str(index), '@_user_1 ' + command))
+                        assert len(peer['prompts']) == 3
+                    body = 'Before implementation, verify the two synthetic acceptance requirements.\nPreserve the authorized finite window.'
+                    await receive(adapter, raw('om_owner_context', '@_user_1 补充 ' + latest['id'] + '\n' + body))
+                    latest = record()
+                    saved = latest['dsh_execution'].get('owner_context_control', {})
+                    assert saved.get('status') == 'accepted', {'saved': saved, 'messages': [m.request_body.content for m in sent if m.message_id == 'om_owner_context']}
+                    assert saved['dispatch_status'] == 'accepted' and saved['turn'] == 4
+                    assert peer['prompts'][-1] == {'sessionId': sid, 'requestId': saved['request_id'], 'mode': 'queue',
+                        'content': [{'type': 'text', 'text': body}]}
+                    assert saved['text_sha256'] == hashlib.sha256(body.encode()).hexdigest()
+                    assert fixture_behavior['owner_context_intent']['status'] == 'intent'
+                    assert fixture_behavior['owner_context_intent']['text_sha256'] == saved['text_sha256']
+                    assert len(peer['prompts']) == 4 and latest['dsh_execution']['state'] == 'running'
+                    assert all(latest['dsh_execution'][key] == value for key, value in preserved.items())
+                    assert budget_file.read_bytes() == json.dumps(third_budget).encode()
+                    assert sum(call['method'] == 'session/create' for call in peer['calls']) == creates
+                    card = json.loads(registry.dispatch('kanban_show', {'task_id': latest['card_id']}))['task']
+                    assert card['status'] == 'ready' and card.get('current_run_id') is None
+                    await receive(adapter, raw('om_owner_context', '@_user_1 补充 ' + latest['id'] + '\n' + body))
+                    await receive(adapter, raw('om_owner_context_second', '@_user_1 补充 ' + latest['id'] + '\n' + body))
+                    assert len(peer['prompts']) == 4
+                    assert any(m.message_id == 'om_owner_context' and '补充要求已由原 SID 受理' in m.request_body.content for m in sent)
+                    repeat_window_evidence['owner_context'] = saved
+                    # The original public dispatcher now supervises this accepted
+                    # input; the previous failed turn must not become its result.
+                    next_budget = json.loads(budget_file.read_bytes())
+                    next_budget['renewWindow'].update(started_at_ms=int(time.time() * 1000), hook_marker='same-sid-window-v1')
+                    next_budget['state']['requests'] += 1
+                    next_budget['state']['reported_tokens'] += 15
+                    next_budget['state']['admissions'].append(saved['request_id'])
+                    budget_file.write_text(json.dumps(next_budget))
+                    rows = peer['journals'][sid]
+                    for kind, payload in [('agent/inbox/spliced', {'target': 'next-turn', 'start': 0, 'removedCount': 1, 'inserted': []}),
+                            ('assistant/message', {'turn': 4, 'step': 1, 'usage': {'inputTokens': 10, 'outputTokens': 5},
+                                'message': {'id': 'fixture-owner-settlement', 'role': 'assistant', 'content': [
+                                    {'type': 'text', 'text': 'Synthetic owner context has been read.'}]}, 'stream': []}),
+                            ('turn/end', {'turn': 4, 'reason': {'kind': 'completed'}})]:
+                        rows.append({'type': 'event', 'event': {'type': kind, 'seq': len(rows), 'time': 12, 'data': payload}})
+                    model.worker_steps = 0
+                    with connect_closing() as db:
+                        assert dispatch_once(db, max_spawn=1).spawned
+                        worker = remember_worker(db, latest['card_id'])
+                    claimed_run = worker['run_id']
+                    until = time.monotonic() + 20
+                    while time.monotonic() < until:
+                        waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                        if waited:
+                            assert os.waitstatus_to_exitcode(status) == 0
+                            worker = None
+                            break
+                        await asyncio.sleep(.05)
+                    assert worker is None
+                    latest = record()
+                    assert latest['dsh_execution']['supervisor_claim']['run_id'] == claimed_run
+                    assert latest['dsh_execution']['state'] == 'awaiting_acceptance', latest['dsh_execution']
+                    assert latest['dsh_execution']['terminal_reason'] == {'kind': 'completed'}
+                    assert latest['dsh_execution']['journal_cursor'] == rows[-1]['event']['seq']
+                    assert latest['dsh_execution']['owner_context_control'] == saved
+                    assert latest['dsh_execution']['last_failure'] == preserved['last_failure']
+                    assert len(peer['prompts']) == 4 and sum(call['method'] == 'session/create' for call in peer['calls']) == creates
+                    repeat_window_evidence['owner_context_claim'] = {'run_id': claimed_run, 'cursor': saved['cursor'],
+                        'request_id': saved['request_id'], 'terminal_reason': latest['dsh_execution']['terminal_reason'],
+                        'prompt_count': len(peer['prompts']), 'journal_cursor': latest['dsh_execution']['journal_cursor']}
                 break
             if resume_completed_window and ended and not resume_admitted and card['status'] in {'blocked', 'triage'}:
                 assert latest['dsh_execution']['state'] == 'awaiting_acceptance', latest['dsh_execution']
@@ -1509,7 +1650,7 @@ async def main():
             await asyncio.sleep(.05)
         else:
             raise AssertionError('Original public shared worker did not settle: ' + json.dumps(record()))
-        assert len(peer['prompts']) == (1 if supervise_slice else 4 if renew_continue else 3 if max_tokens_continuation else 2 if shared_scenario in continuation_scenarios or completed_renewed_window else 1)
+        assert len(peer['prompts']) == (4 if owner_context else 1 if supervise_slice else 4 if renew_continue else 3 if max_tokens_continuation else 2 if shared_scenario in continuation_scenarios or completed_renewed_window else 1)
         assert latest['dsh_execution']['native_identity']['kind'] == 'shared_native'
         assert latest['dsh_execution']['native_identity']['pid'] == (os.getpid() if supervise_takeover else host_processes[-1].pid if host_processes else os.getpid())
         assert latest['dsh_execution']['native_permission'] == 'workspace-write'
@@ -1565,7 +1706,7 @@ async def main():
             result['concurrent_claim'] = claim_result
         (scratch / 'shared-worker-result.json').write_text(json.dumps(result))
     except BaseException:
-        if supervise_slice:
+        if supervise_slice or owner_context:
             import traceback
             (scratch / 'supervise-failure.json').write_text(json.dumps({
                 'traceback': traceback.format_exc(), 'public_work': record(),

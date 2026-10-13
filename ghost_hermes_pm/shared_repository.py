@@ -1306,6 +1306,195 @@ def admit_shared_window(intake, record, message_id, generation):
         carrier.close()
 
 
+def _owner_context_failed_turn(snapshot, execution):
+    """Only the exact admitted renewal input that failed before its first request."""
+    continuation = execution['continuation_control']
+    cursor = continuation.get('cursor')
+    events = [row['event'] for row in snapshot['records']]
+    reason = {'kind': 'error', 'error': {'message': 'Shared work native settlement usage is unknown.', 'code': 'UNKNOWN'}}
+    if (type(cursor) is not int or cursor < 0 or len(events) != cursor + 7
+            or snapshot.get('cursor') != cursor + 6
+            or any(event.get('seq') != index for index, event in enumerate(events))
+            or events[cursor].get('type') != 'session/end-seed' or events[cursor].get('data') != {}):
+        raise ManagementError('outcome_unknown', 'The original renewal input boundary is unconfirmed.')
+    delta = events[cursor + 1:]
+    if [event['type'] for event in delta] != ['agent/inbox/spliced', 'turn/start', 'agent/inbox/spliced',
+            'step/start', 'step/end', 'turn/end']:
+        raise ManagementError('outcome_unknown', 'The original renewal already has model, tool or unknown activity.')
+    inserted = delta[0]['data']
+    items = inserted.get('inserted', [])
+    turn = delta[1]['data'].get('turn')
+    if (set(inserted) != {'target', 'start', 'inserted'} or inserted.get('target') != 'next-turn'
+            or inserted.get('start') != 0 or len(items) != 1 or items[0].get('role') != 'user'
+            or not isinstance(items[0].get('id'), str) or not items[0]['id']
+            or items[0].get('source') != {'kind': 'user', 'rpcId': execution['continuation_request_id']}
+            or not isinstance(items[0].get('content'), list) or not items[0]['content']
+            or any(not isinstance(block, dict) or block.get('type') != 'text' or not isinstance(block.get('text'), str) or not block['text']
+                for block in items[0]['content'])
+            or type(turn) is not int or turn < 1 or delta[1]['data'] != {'turn': turn}
+            or delta[2]['data'] != {'target': 'next-turn', 'start': 0, 'removedCount': 1, 'inserted': []}
+            or delta[3]['data'] != {'turn': turn, 'step': 1} or delta[4]['data'] != {'turn': turn, 'step': 1}
+            or delta[5]['data'] != {'turn': turn, 'reason': reason}):
+        raise ManagementError('outcome_unknown', 'The exact pre-request native failure is unconfirmed.')
+    return turn
+
+
+def admit_shared_owner_context(intake, record, prepared, generation):
+    """Append one owner message to the admitted, unstarted original renewal window."""
+    from .manager import _public_text
+    from .simple_development import OWNER_CONTEXT_MAX_CHARS
+    from .repository_control import _card, _worker_end
+    from .repository_execution import execution_configuration
+    from .repository_supervision import owned_call
+    from .repository_acceptance import repository_source_state
+    execution = record['dsh_execution']
+    continuation, checkpoint = execution.get('continuation_control', {}), execution.get('renewal_window_checkpoint', {})
+    if (execution.get('mode') != 'shared_native' or execution.get('state') != 'outcome_unknown'
+            or execution.get('first_input') != 'accepted' or execution.get('stop_requested') or execution.get('lifecycle_end')
+            or execution.get('last_failure', {}).get('code') != 'outcome_unknown'
+            or checkpoint.get('status') != 'admitted' or execution.get('renewal_window_adoption') != 'accepted'
+            or continuation.get('kind') != 'renew_window' or continuation.get('status') != 'accepted'
+            or continuation.get('dispatch_status') != 'accepted' or execution.get('owner_context_control')
+            or not continuation.get('snapshot_sha256') or not continuation.get('ledger_sha256')):
+        raise ManagementError('outcome_unknown', 'Only the unstarted original admitted renewal may accept owner context once.')
+    if not isinstance(checkpoint.get('receipts'), dict) or set(checkpoint['receipts']) != {'.tools.jsonl', '.jobs.jsonl'}:
+        raise ManagementError('binding_conflict', 'The original renewal receipt checkpoints are incomplete.')
+    account = continuation.get('workspace')
+    if (not isinstance(account, dict) or account != checkpoint.get('workspace')
+            or account.get('workspace_id') != execution.get('workspace_id')
+            or not isinstance(account.get('session_ids'), list) or execution.get('session_id') not in account['session_ids']):
+        raise ManagementError('binding_conflict', 'The original admitted Workspace account changed.')
+    text = prepared.command.split('\n', 1)[1]
+    _public_text(text, intake.secret_values)
+    if len(text) > OWNER_CONTEXT_MAX_CHARS:
+        raise ManagementError('invalid_change', 'Owner context exceeds its bounded public input limit.')
+    card = _card(intake, record)
+    if card['status'] not in {'blocked', 'triage'}:
+        raise ManagementError('outcome_unknown', 'The original owner-context card must be idle and awaiting input.')
+    worker = _worker_end(intake, record, allow_later_terminal=True)
+    configuration, _ = execution_configuration(record['target'])
+    if configuration['reference_sha256'] != execution['reference_sha256']:
+        raise ManagementError('binding_conflict', 'The original owner-context execution reference changed.')
+    scope = json.loads(private_file(record['target']['execution_ref']).read_text())
+    if scope != dict(checkpoint['scope'], host_lease=configuration['host_lease']):
+        raise ManagementError('binding_conflict', 'The original renewal scope changed beyond its admitted Host lease.')
+    configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
+        generation=execution['generation'], workspace_id=execution['workspace_id'])
+    ledger_file = ledger_path(configuration, execution['session_id'])
+    raw = private_file(ledger_file).read_bytes()
+    row = read_ledger(configuration, execution)
+    window, state = row.get('renewWindow', {}), row['state']
+    previous = checkpoint['previous_state']
+    backup = private_file(checkpoint['ledger_backup']).read_bytes()
+    old = json.loads(backup)
+    if (hashlib.sha256(raw).hexdigest() != continuation['ledger_sha256']
+            or window.get('request_base') != state.get('requests') or window.get('host_lease') != configuration['host_lease']
+            or any(window.get(key, 'missing') is not None for key in ('started_at_ms', 'hook_marker', 'stop_reason'))
+            or window.get('original_state') != previous or old.get('state') != previous
+            or old.get('renewWindow') != checkpoint['previous_renew_window']
+            or hashlib.sha256(backup).hexdigest() != checkpoint['ledger_sha256']
+            or {key: value for key, value in state.items() if key != 'binding_sha256'}
+                != {key: value for key, value in previous.items() if key != 'binding_sha256'}
+            or state.get('binding_sha256') != _window_fingerprint(row)
+            or execution.get('renewal_window_history', [])[-1:] != [{'message_id': checkpoint['message_id'],
+                'ledger_backup': checkpoint['ledger_backup'], 'renew_window': checkpoint['previous_renew_window']}]):
+        raise ManagementError('binding_conflict', 'The unstarted renewal ledger or cumulative state changed.')
+    if repository_source_state(record['target']) != checkpoint['source']:
+        raise ManagementError('binding_conflict', 'The original renewal repository source changed.')
+    for suffix, proof in checkpoint['receipts'].items():
+        path = ledger_path(configuration, execution['session_id'], suffix)
+        content = private_file(path).read_bytes() if path.exists() else b''
+        if len(content) != proof['size'] or hashlib.sha256(content).hexdigest() != proof['sha256']:
+            raise ManagementError('binding_conflict', 'The original renewal native receipts changed.')
+        shared_receipts(configuration, execution, suffix)
+    carrier = SharedDesktopTransport(configuration)
+    try:
+        if carrier.native_identity != execution['native_identity']:
+            raise ManagementError('binding_conflict', 'The original owner-context native identity changed.')
+        def snapshot():
+            stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
+                'sessionId': execution['session_id']}, 'maxMessages': 500}})
+            try:
+                value = next(stream)
+            finally:
+                stream.close()
+            header = value.get('header', {})
+            if (value.get('hasMore') is not False or header.get('id') != execution['session_id']
+                    or header.get('createdAt') != execution['session_created_at'] or header.get('cwd') != configuration['workspace']
+                    or value.get('projections', {}).get('values', {}).get('agentPreset') != configuration['agent_preset']):
+                raise ManagementError('binding_conflict', 'The original owner-context Session changed.')
+            return value
+        before = snapshot()
+        values = before['projections']['values']
+        sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
+        jobs = carrier.owned_jobs()
+        if (len(sessions) != 1 or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
+                or sessions[0].get('cwd') != configuration['workspace']
+                or values.get('permissions') != {'currentValue': 'workspace-write'}
+                or values.get('inbox') != {'next-turn': [], 'next-step': []}
+                or not isinstance(jobs, list)
+                or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'}
+                    or 'owner' in job and job['owner'] != execution['session_id'] for job in jobs)
+                or jobs and [{'id': job.get('id'), 'status': job['status']} for job in jobs] != checkpoint.get('jobs')
+                or private_file(ledger_file).read_bytes() != raw):
+            raise ManagementError('outcome_unknown', 'The original owner-context Session, queue or jobs are not idle.')
+        turn = _owner_context_failed_turn(before, execution)
+        intake.require_active(generation)
+        message_id = prepared.envelope['message_id']
+        request_id = 'owner-context-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest()
+        control = execution['owner_context_control'] = {'message_id': message_id, 'request_id': request_id,
+            'text_sha256': hashlib.sha256(text.encode()).hexdigest(), 'status': 'intent', 'cursor': before['cursor'],
+            'snapshot_sha256': hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
+            'previous_claim': execution['supervisor_claim'], 'worker': worker, 'failed_turn': turn}
+        intake._save_execution(record, fields=['owner_context_control'])
+        try:
+            answer = owned_call(carrier, 'session/prompt', {'sessionId': execution['session_id'], 'requestId': request_id,
+                'mode': 'queue', 'content': [{'type': 'text', 'text': text}]})
+            if not isinstance(answer, dict) or answer.get('accepted') is not True:
+                raise ManagementError('outcome_unknown', 'Owner context admission is unknown; no replay.')
+            until = time.monotonic() + 3
+            while True:
+                intake.require_active(generation)
+                after = snapshot()
+                if any(item['event']['type'] == 'turn/start' and item['event']['seq'] > before['cursor'] for item in after['records']):
+                    break
+                if time.monotonic() >= until:
+                    raise ManagementError('outcome_unknown', 'The owner-context turn has not appeared; no replay.')
+                time.sleep(.05)
+            events = [item['event'] for item in after['records'] if item['event']['seq'] > before['cursor']]
+            inserted = [(event, item) for event in events if event['type'] == 'agent/inbox/spliced'
+                for item in event['data'].get('inserted', [])]
+            starts = [event for event in events if event['type'] == 'turn/start']
+            if (after['records'][:len(before['records'])] != before['records'] or len(inserted) != 1 or len(starts) != 1
+                    or inserted[0][1].get('source') != {'kind': 'user', 'rpcId': request_id}
+                    or inserted[0][1].get('role') != 'user' or inserted[0][1].get('content') != [{'type': 'text', 'text': text}]
+                    or inserted[0][0]['seq'] >= starts[0]['seq'] or starts[0]['data'].get('turn') != turn + 1):
+                raise ManagementError('outcome_unknown', 'The unique original owner-context turn is unconfirmed; no replay.')
+        except (ManagementError, OSError, TimeoutError, ValueError, KeyError):
+            control['status'] = 'unknown'
+            intake._save_execution(record, fields=['owner_context_control'])
+            raise
+        control.update(status='accepted', turn=starts[0]['data']['turn'], turn_start_seq=starts[0]['seq'], dispatch_status='intent')
+        execution['state'] = 'running'
+        intake._save_execution(record, fields=['owner_context_control', 'state'])
+        if card['status'] == 'triage':
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                    raise ManagementError('outcome_unknown', 'Original owner-context card dispatch is unconfirmed.')
+        else:
+            intake._kanban('kanban_unblock', {'task_id': record['card_id']})
+        landed = _card(intake, record)
+        if landed['status'] != 'ready' or landed.get('current_run_id') is not None:
+            raise ManagementError('outcome_unknown', 'Original owner-context card is not ready for native dispatch.')
+        control['dispatch_status'] = 'accepted'
+        intake._save_execution(record, fields=['owner_context_control'])
+        return record
+    finally:
+        carrier.close()
+
+
 def admit_shared_max_tokens(intake, record, message_id, generation):
     """One owner-requested continuation of an idle max-tokens turn, within its original budget."""
     from .repository_control import _card, _worker_end
@@ -1771,6 +1960,22 @@ async def run_shared_work(ctx, intake, record, generation):
             execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
                 'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
             intake._save_execution(record, fields=['supervisor_claim'])
+        elif (execution.get('owner_context_control', {}).get('status') == 'accepted'
+                and execution['owner_context_control'].get('dispatch_status') == 'accepted'
+                and execution['supervisor_claim'] == execution['owner_context_control'].get('previous_claim')
+                and execution['supervisor_claim']['run_id'] != run_id):
+            control = execution['owner_context_control']
+            previous, worker = control['previous_claim'], control['worker']
+            if (execution['supervisor_claim'] != previous or worker.get('run_id') != previous['run_id']
+                    or worker.get('identity') != previous['identity'] or worker.get('exit_code') != 0):
+                raise ManagementError('binding_conflict', 'The original owner-context worker claim differs.')
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                old_run = kb.get_run(connection, previous['run_id'])
+            require_permission_initializer_end(previous, old_run, record['card_id'])
+            execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
+                'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
+            intake._save_execution(record, fields=['supervisor_claim'])
         listing = await asyncio.to_thread(owned_call, carrier, 'session/list', {})
         existing = [row for row in listing['items'] if row['sessionId'] == execution['session_id']]
         if existing and (len(existing) != 1 or existing[0].get('cwd') != configuration['workspace']):
@@ -1987,6 +2192,8 @@ async def run_shared_work(ctx, intake, record, generation):
             intake._save_execution(record)
             cursor = (continuation['cursor'] if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window'}
                 else execution['maintenance_checkpoint']['cursor']) if continuation else -1
+            if execution.get('owner_context_control', {}).get('status') == 'accepted':
+                cursor = execution['owner_context_control']['cursor']
             starts = [event for event in events if event['type'] == 'turn/start' and event['seq'] > cursor]
             ends = [event for event in events if event['type'] == 'turn/end' and event['seq'] > cursor]
             if row and row.get('running') is False and starts and ends and ends[-1]['seq'] > starts[-1]['seq']:
@@ -2063,7 +2270,8 @@ async def stop_shared_work(intake, record, generation):
                 inbox = projections.get('inbox')
                 if not isinstance(inbox, dict) or set(inbox) != {'next-turn', 'next-step'}:
                     raise ManagementError('outcome_unknown', 'Shared pending input coverage is unavailable.')
-                submitted = {execution.get('request_id'), execution.get('continuation_request_id')}
+                submitted = {execution.get('request_id'), execution.get('continuation_request_id'),
+                    execution.get('owner_context_control', {}).get('request_id')}
                 submitted.update(question.get('request_id') for question in execution.get('questions', []))
                 for item in [*inbox['next-turn'], *inbox['next-step']]:
                     source = item.get('source', {})

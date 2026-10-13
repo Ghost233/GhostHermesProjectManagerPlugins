@@ -15,6 +15,9 @@ from .messages import FeishuEntry, OWNED_PLATFORM
 from .simple_github import GitHubWorkSource
 
 
+OWNER_CONTEXT_MAX_CHARS = 4000
+
+
 @dataclass(frozen=True)
 class WorkMessage:
     event: object
@@ -161,11 +164,25 @@ class RepositoryIntake(FeishuEntry):
             except ManagementError:
                 if human_reply is not None:
                     return replace(human_reply, command='', rejected='sensitive')
-                if command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '重试 ', '继续 ', '续预算 ')):
-                    return WorkMessage(event, adapter, transport, binding, envelope, {}, '', None, rejected='sensitive')
+                if command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '重试 ', '继续 ', '续预算 ', '补充 ')):
+                    return WorkMessage(event, adapter, transport, binding, envelope, {}, '', None, rejected='sensitive',
+                        action='control' if command.startswith('补充 ') else 'work')
                 return None
-            if human_reply is not None and not re.fullmatch(r'(停止|重试|继续|续预算) work-[a-f0-9]{32}', command):
+            if human_reply is not None and not command.startswith('补充 ') and not re.fullmatch(r'(停止|重试|继续|续预算) work-[a-f0-9]{32}', command):
                 return human_reply
+            if command.startswith('补充 '):
+                supplement = re.fullmatch(r'补充 (work-[a-f0-9]{32})\n([\s\S]+)', command)
+                record = next((r for r in self.snapshot()['work'] if supplement and r['id'] == supplement.group(1)), None)
+                anchor_fields = ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                    'recipient_open_id', 'chat_id', 'sender_open_id')
+                if (sender.sender_type != 'user' or not supplement or not supplement.group(2).strip()
+                        or len(supplement.group(2)) > OWNER_CONTEXT_MAX_CHARS or record is None
+                        or record['profile_id'] not in authorized_profiles
+                        or any(record.get('source_anchor', {}).get(key) != envelope[key] for key in anchor_fields)):
+                    return WorkMessage(event, adapter, transport, binding, envelope, {}, command, None,
+                        rejected='scope', action='control')
+                return WorkMessage(event, adapter, transport, binding, envelope, record['target'], command, None,
+                    record['id'], action='control')
             control = re.fullmatch(r'(停止|重试|继续|续预算) (work-[a-f0-9]{32})', command)
             if control:
                 record = next((r for r in self.snapshot()['work'] if r['id'] == control.group(2)), None)
@@ -377,7 +394,7 @@ class RepositoryIntake(FeishuEntry):
         if prepared.action != 'work' and prepared.rejected:
             text = ('敏感答复请在原生私有界面处理；本轮没有通过群消息回送。' if prepared.rejected == 'sensitive'
                     else '本次决定未匹配唯一具体审批；请引用当前审批通知或明确审批 ID。原权限和审批结果没有改变。' if prepared.action == 'approval'
-                    else '停止和重试仅接受本人对已登记工作的明确请求；未改变执行或预算。' if prepared.action == 'control'
+                    else '控制命令仅接受本人对已登记工作的明确请求；未改变执行或预算。' if prepared.action == 'control'
                     else '无法唯一关联本次答复与当前原问题。请引用正确轮次的提问消息，并通过平台选择器真实 @ 发问机器人。')
             await prepared.transport.send({'uuid': hashlib.sha256(('private-answer:' + prepared.envelope['message_id']).encode()).hexdigest()[:32],
                 'text': text,
