@@ -925,6 +925,18 @@ def admit_shared_natural_qa_rework(intake, record, source_context, feedback, win
         os.close(descriptor)
 
 
+def _qa_request_only_budget(feedback, row):
+    if '取消30分钟截止，保留80次请求' not in feedback:
+        return None
+    if row.get('budget') != {'max_wall_seconds': 1800, 'max_model_requests': 80}:
+        raise ManagementError('invalid_change', 'Only the original 1800-second/80-request QA policy may drop its wall limit.')
+    window, state = row.get('renewWindow', {}), row['state']
+    used = state['requests'] - window.get('request_base', 0)
+    if not 0 <= used < 80:
+        raise ManagementError('outcome_unknown', 'The original QA request allowance has no confirmed remainder.')
+    return {'max_model_requests': 80 - used}
+
+
 def _refresh_qa_desktop_lease(intake, record, source_context, feedback):
     """Refresh only the Launcher lease after the verified maintenance reply."""
     import psutil
@@ -941,8 +953,13 @@ def _refresh_qa_desktop_lease(intake, record, source_context, feedback):
     raw = reference.read_bytes()
     scope = json.loads(raw)
     original_scope = checkpoint.get('scope', {})
+    policy = _qa_request_only_budget(control.get('feedback', ''), {
+        'budget': original_scope.get('budget'), 'state': checkpoint.get('previous_state', {}),
+        'renewWindow': checkpoint.get('previous_renew_window', {})})
+    revised_scope = dict(original_scope, budget=policy) if policy and checkpoint.get('window') == policy else original_scope
     if (hashlib.sha256(raw).hexdigest() != execution.get('reference_sha256')
-            or scope != dict(original_scope, host_lease=scope.get('host_lease'))):
+            or scope not in (dict(original_scope, host_lease=scope.get('host_lease')),
+                             dict(revised_scope, host_lease=scope.get('host_lease')))):
         raise ManagementError('binding_conflict', 'The original maintenance configuration changed.')
     receipt = json.loads(private_file(scope['desktop_receipt']).read_text())
     lease = receipt.get('lease')
@@ -1127,7 +1144,8 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     budget_before = private_file(budget_file).read_bytes()
     adopting = prior_natural.get('status') == 'maintenance_required'
     maintenance = execution.get('natural_qa_rework_control', {}).get('checkpoint', {})
-    ledger_configuration = (dict(configuration, host_lease=maintenance.get('native_identity', {}).get('lease'))
+    ledger_configuration = (dict(configuration, host_lease=maintenance.get('native_identity', {}).get('lease'),
+        budget=maintenance['scope']['budget'])
         if adopting else configuration)
     budget = read_ledger(ledger_configuration, execution)
     source = repository_source_state(record['target'])
@@ -1149,6 +1167,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     requested_window = None
     approved_renewal = False
     approved_maintenance = False
+    revised_budget = _qa_request_only_budget(prior_natural.get('feedback', feedback), budget)
     if prior_natural.get('status') in {'renewal_required', 'maintenance_required'}:
         delivery = prior_natural.get('proposal_delivery', {})
         proposal = prior_natural.get('proposal', {})
@@ -1182,16 +1201,20 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
         if type(current_window.get('started_at_ms')) is not int or current_window['started_at_ms'] <= 0:
             raise ManagementError('outcome_unknown', 'The original active renewed window is unavailable.')
         try:
-            _require_window_budget(configuration, budget)
+            if revised_budget:
+                _require_expired_window_budget(ledger_configuration, budget)
+                renewal_required = True
+            else:
+                _require_window_budget(configuration, budget)
         except ManagementError:
-            _require_expired_window_budget(configuration, budget)
+            _require_expired_window_budget(ledger_configuration, budget)
             renewal_required = True
     else:
-        expected_window = {'max_wall_seconds': configuration['budget']['max_wall_seconds'],
-                           'max_model_requests': configuration['budget']['max_model_requests']}
+        expected_window = revised_budget or {'max_wall_seconds': configuration['budget']['max_wall_seconds'],
+                                            'max_model_requests': configuration['budget']['max_model_requests']}
         if requested_window != expected_window:
             raise ManagementError('invalid_change', 'Natural QA renewal must use the configured finite window exactly.')
-        _require_expired_window_budget(configuration, budget)
+        _require_expired_window_budget(ledger_configuration, budget)
         renewal_required = prior_natural.get('status') not in {'renewal_required', 'maintenance_required'}
     prompt_feedback = execution.get('natural_qa_rework_control', {}).get('feedback') if adopting else feedback
     prompt = _qa_rework_prompt(intake, record, prompt_feedback.strip())
@@ -1285,6 +1308,9 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
         if approved_renewal and requested_window is not None and not adopting:
             prepared = prepare_shared_window_renewal(intake, record, message_id)
             current = next(item for item in intake.snapshot()['work'] if item['id'] == record['id'])
+            if revised_budget:
+                current['dsh_execution']['renewal_window_checkpoint']['window'] = revised_budget
+                intake._save_execution(current, fields=['renewal_window_checkpoint'])
             proposal = {'id': 'qa-maintenance-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest(),
                 'kind': 'maintenance', 'options': ['维护完成', '取消'],
                 'text': '请在原生 Launcher 完成 Host 维护后回复“维护完成”或“取消”。'}
@@ -1308,12 +1334,14 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
                 raise ManagementError('outcome_unknown', 'The admitted QA continuation feedback is missing.')
             return {'status': 'accepted', 'work_id': current['id']}
         if renewal_required:
-            caps = {'max_wall_seconds': configuration['budget']['max_wall_seconds'],
+            caps = revised_budget or {'max_wall_seconds': configuration['budget']['max_wall_seconds'],
                 'max_model_requests': configuration['budget']['max_model_requests']}
             proposal = {'id': 'qa-window-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest(),
                 'kind': 'window', 'limits': caps, 'options': ['同意', '拒绝'],
-                'text': '请确认同一原生 Session 的一次有限浏览器 QA 窗口：'
-                    + str(caps['max_wall_seconds']) + ' 秒、' + str(caps['max_model_requests']) + ' 次模型请求。'}
+                'text': ('请确认取消30分钟截止；原80次请求已用' + str(80 - caps['max_model_requests'])
+                    + '，剩' + str(caps['max_model_requests']) + '次。原 SID、累计用量及旧窗口保留。'
+                    if revised_budget else '请确认同一原生 Session 的一次有限浏览器 QA 窗口：'
+                    + str(caps['max_wall_seconds']) + ' 秒、' + str(caps['max_model_requests']) + ' 次模型请求。')}
             execution['natural_qa_rework_control'] = {'kind': 'browser_qa_rework',
                 'status': 'renewal_required', 'message_id': message_id,
                 'feedback': feedback, 'window': caps, 'proposal': proposal,
@@ -1630,9 +1658,15 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
         raise ManagementError('outcome_unknown', 'Only the prepared expired window may enter its authorized renewal.')
     configuration, _ = execution_configuration(record['target'])
     scope = json.loads(private_file(record['target']['execution_ref']).read_text())
+    revised_budget = _qa_request_only_budget(execution.get('natural_qa_rework_control', {}).get('feedback', ''), {
+        'budget': checkpoint['scope'].get('budget'), 'state': checkpoint['previous_state'],
+        'renewWindow': checkpoint['previous_renew_window']})
+    if revised_budget and (checkpoint.get('window') != revised_budget
+            or execution.get('natural_qa_rework_control', {}).get('window') != revised_budget):
+        raise ManagementError('binding_conflict', 'The approved remaining QA request allowance changed.')
     expected = json.loads(json.dumps(checkpoint['scope']))
     expected['host_lease'] = scope.get('host_lease')
-    if scope != expected:
+    if scope != expected and (not revised_budget or scope != dict(expected, budget=revised_budget)):
         raise ManagementError('binding_conflict', 'The prepared renewal scope changed beyond its Host lease.')
     old = checkpoint['native_identity']
     if psutil.pid_exists(old['pid']):
@@ -1648,11 +1682,13 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
     if (hashlib.sha256(raw).hexdigest() != checkpoint['ledger_sha256']
             or private_file(checkpoint['ledger_backup']).read_bytes() != raw):
         raise ManagementError('binding_conflict', 'The prepared expired window bytes changed.')
-    row = read_ledger(dict(configuration, host_lease=old['lease']), execution)
+    old_configuration = dict(configuration, host_lease=old['lease'],
+        budget=checkpoint['scope'].get('budget', configuration['budget']))
+    row = read_ledger(old_configuration, execution)
     if (row.get('state') != checkpoint['previous_state']
             or row.get('renewWindow') != checkpoint['previous_renew_window']):
         raise ManagementError('binding_conflict', 'The original expired window state changed.')
-    _require_expired_window_budget(configuration, row)
+    _require_expired_window_budget(old_configuration, row)
     carrier = SharedDesktopTransport(configuration)
     try:
         new = carrier.native_identity
@@ -1719,6 +1755,23 @@ def admit_shared_window_renewal(intake, record, message_id, generation):
             **({'qa_feedback': natural_control.get('feedback'), 'qa_proposal': natural_control.get('proposal')}
                if qa_rework else {})}
         intake._save_execution(record, fields=['continuation_history', 'renewal_window_history', 'continuation_request_id', 'continuation_control'])
+        if revised_budget:
+            # Each file is replaced atomically; the saved intent and old backups retain partial-update evidence.
+            reference = private_file(record['target']['execution_ref'])
+            raw_scope = reference.read_bytes()
+            if json.loads(raw_scope) != scope or hashlib.sha256(raw_scope).hexdigest() != execution['reference_sha256']:
+                raise ManagementError('binding_conflict', 'The approved QA configuration changed before adoption.')
+            updated_scope = dict(scope, budget=revised_budget)
+            shared_configuration(reference, updated_scope, workspace=record['target']['repo_path'])
+            content = (json.dumps(updated_scope, indent=2) + '\n').encode()
+            temporary_scope = reference.with_name(reference.name + '.' + uuid.uuid4().hex)
+            with os.fdopen(os.open(temporary_scope, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary_scope, reference)
+            configuration['reference_sha256'] = hashlib.sha256(content).hexdigest()
+            row['budget'] = revised_budget
         row['renewWindow'] = {'id': 'window-' + uuid.uuid4().hex, 'message_id': message_id, 'host_lease': new['lease'],
             'request_base': row['state']['requests'], 'original_state': dict(row['state']), 'original_host_lease': old['lease'],
             'started_at_ms': None, 'stop_reason': None, 'hook_marker': None}
@@ -3033,6 +3086,15 @@ async def run_shared_work(ctx, intake, record, generation):
                     prompt = ('Perform the browser acceptance rework using only the persisted owner feedback. '
                         'Preserve the frozen Issue and run actual tests, then report actual native bash call IDs. '
                         'Do not merge any PR.\n\n' + continuation.get('qa_feedback', '') + '\n\n' + _prompt(intake, record))
+                    if ('取消30分钟截止，保留80次请求' in continuation.get('qa_feedback', '')
+                            and 'max_wall_seconds' not in configuration['budget']):
+                        row = read_ledger(configuration, execution)
+                        remaining = row['budget']['max_model_requests'] - (
+                            row['state']['requests'] - row['renewWindow']['request_base'])
+                        prompt = ('Current policy: no plugin wall deadline; ' + str(remaining)
+                            + ' model requests remain from the original 80-request allowance. '
+                            'The frozen Issue wall, output-token and cumulative-token budget text is historical; '
+                            'do not apply those old plugin quotas. Keep the remaining request cap.\n\n' + prompt)
                 elif continuation.get('kind') == 'resume_window':
                     prompt = ('Continue the original accepted task in this same Session after verified normal maintenance. '
                         'The original finite execution window is still active: preserve its existing start time, request base, '

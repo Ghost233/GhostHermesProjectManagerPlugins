@@ -31,7 +31,8 @@ concurrent_claim = shared_scenario == 'continue_claim_race'
 native_restore = shared_scenario == 'continue_native_restore'
 renew_continue = shared_scenario == 'renew_window_continue'
 resume_completed_window = shared_scenario == 'resume_completed_window'
-qa_preinput_retry = shared_scenario == 'qa_preinput_retry'
+qa_request_only_resume = shared_scenario == 'qa_request_only_resume'
+qa_preinput_retry = shared_scenario == 'qa_preinput_retry' or qa_request_only_resume
 owner_maintenance = shared_scenario == 'owner_maintenance'
 owner_context = shared_scenario == 'owner_context' or owner_maintenance
 renew_window_again = shared_scenario == 'renew_window_again' or owner_context
@@ -202,7 +203,8 @@ reference.write_text(json.dumps({'schema': 1, 'approved': True, 'mode': 'shared_
     'desktop_receipt': str(receipt), 'host_lease': 'fixture-shared-lease', 'service_ref': 'fixture-native',
     'runtime_package_root': str(sdk), 'node_bin': str(Path(shutil.which('node')).resolve()),
     'agent_preset': 'fixture-shared', 'ledger_dir': str(ledger), 'provider': 'fixture', 'model': 'fixture',
-    'budget': {'max_wall_seconds': 60, 'max_model_requests': 9 if max_tokens_last_slot else 80}, 'tool_receipt_ref': str(proof),
+    'budget': {'max_wall_seconds': 1800 if qa_request_only_resume else 60,
+        'max_model_requests': 9 if max_tokens_last_slot else 80}, 'tool_receipt_ref': str(proof),
     'composition_sha256': 'synthetic-composition', 'source_snapshot': {
         'python': str(Path(sys.executable).resolve()),
         'reader': str(ROOT / 'ghost_hermes_pm/shared_source_reader.py'),
@@ -214,6 +216,10 @@ reference.write_text(json.dumps({'schema': 1, 'approved': True, 'mode': 'shared_
         'runner_sha256': hashlib.sha256((ROOT / 'ghost_hermes_pm/repository_test_runner.py').read_bytes()).hexdigest(),
         'node_sha256': hashlib.sha256(Path(shutil.which('node')).resolve().read_bytes()).hexdigest()}}))
 reference.chmod(0o600)
+if qa_request_only_resume:
+    policy_scope = json.loads(reference.read_text())
+    policy_scope['supervision'] = {'interval_seconds': 3600, 'request_interval': 10}
+    reference.write_text(json.dumps(policy_scope))
 if supervision_checkpoints:
     checkpoint_scope = json.loads(reference.read_text())
     checkpoint_scope.update(budget={}, supervision={'interval_seconds': 1, 'request_interval': 10})
@@ -295,6 +301,9 @@ async def main():
             original_receipt['pid'] = host_processes[0].pid
             receipt.write_text(json.dumps(original_receipt))
         await connect_service(adapter, service)
+        if qa_request_only_resume:
+            (scratch / 'issue-body-override').write_text('Repair synthetic browser QA.\n'
+                'Historical budget: stop after 30 minutes, 80 model requests and 300000 reported tokens.\n')
         await receive(adapter, raw('om_shared'))
         def record():
             return json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
@@ -442,9 +451,10 @@ async def main():
                 rows = peer['journals'][sid]
                 budget_file = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
                 budget_row = json.loads(budget_file.read_text())
-                started = int(time.time() * 1000) - (61000 if renew_window_again or qa_preinput_retry else 1000)
+                started = int(time.time() * 1000) - (1801000 if qa_request_only_resume else
+                    61000 if renew_window_again or qa_preinput_retry else 1000)
                 base_requests = 4 if renew_window_again else 3
-                total_requests = 55 if qa_preinput_retry else 11 if renew_window_again else 9
+                total_requests = base_requests + 1 if qa_request_only_resume else 55 if qa_preinput_retry else 11 if renew_window_again else 9
                 original_state = {'started_at_ms': started, 'requests': base_requests,
                                   'reported_tokens': 700 if renew_window_again else 30,
                                   'admissions': ['fixture-old-' + str(index) for index in range(base_requests)],
@@ -809,9 +819,13 @@ async def main():
                         await asyncio.sleep(.01)
                     raise AssertionError('The real natural QA tool did not settle: ' + message_id)
 
-                feedback = 'Repair only the missing synthetic browser QA receipt and run the actual test.'
+                feedback = ('取消30分钟截止，保留80次请求\n' if qa_request_only_resume else '') \
+                    + 'Repair only the missing synthetic browser QA receipt and run the actual test.'
                 proposal = await qa_message('om_qa_feedback', feedback)
                 assert proposal['status'] == 'renewal_required', proposal
+                if qa_request_only_resume:
+                    assert proposal['proposal']['limits'] == {'max_model_requests': 79}, proposal
+                    assert '取消' in proposal['proposal']['text'] and '79' in proposal['proposal']['text']
                 control = record()['dsh_execution']['natural_qa_rework_control']
                 assert control['proposal_delivery']['status'] == 'delivered'
                 approval = await qa_message('om_qa_approve', '同意', control['proposal_delivery']['message_id'])
@@ -838,7 +852,12 @@ async def main():
                 assert admitted_control['qa_feedback'] == feedback
                 admitted_ledger_bytes = budget_file.read_bytes()
                 admitted_ledger = json.loads(admitted_ledger_bytes)
-                assert admitted_ledger['renewWindow']['request_base'] == admitted_ledger['state']['requests'] == 55
+                assert admitted_ledger['renewWindow']['request_base'] == admitted_ledger['state']['requests'] == (
+                    4 if qa_request_only_resume else 55)
+                if qa_request_only_resume:
+                    assert admitted_ledger['budget'] == {'max_model_requests': 79}
+                    assert json.loads(reference.read_text())['budget'] == {'max_model_requests': 79}
+                    assert json.loads(old_ledger_bytes)['budget'] == {'max_wall_seconds': 1800, 'max_model_requests': 80}
                 assert admitted_ledger['renewWindow']['started_at_ms'] is None
                 assert admitted_ledger['renewWindow']['hook_marker'] is None
                 assert len(peer['prompts']) == 1 and peer['journals'][sid] == history_before
@@ -903,6 +922,10 @@ async def main():
                 assert peer['prompts'][1]['sessionId'] == peer['prompts'][0]['sessionId'] == sid
                 assert peer['prompts'][1]['requestId'] == request_id
                 assert feedback in peer['prompts'][1]['content'][0]['text']
+                if qa_request_only_resume:
+                    actual_prompt = peer['prompts'][1]['content'][0]['text']
+                    assert 'no plugin wall deadline' in actual_prompt and '79 model requests remain' in actual_prompt
+                    assert 'historical' in actual_prompt and '300000 reported tokens' in actual_prompt
                 assert '不增加窗口' not in peer['prompts'][1]['content'][0]['text']
                 assert budget_file.read_bytes() == admitted_ledger_bytes
                 assert peer['journals'][sid][:len(history_before)] == history_before
