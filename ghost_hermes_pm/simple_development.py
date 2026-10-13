@@ -643,8 +643,13 @@ def register_simple_development(ctx):
         handler=snapshot, description='Read native outer card references and frozen Issue scope')
 
     async def natural_qa_rework(args):
-        if not isinstance(args, dict) or set(args) - {'work_id'}:
+        if not isinstance(args, dict):
             return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
+        extra = set(args) - {'work_id'}
+        if extra:
+            return json.dumps({'status': 'rejected', 'code': 'invalid_change',
+                'forbidden_fields': sorted(extra), 'allowed_fields': ['work_id'],
+                'instruction': 'Retry once with only work_id; feedback is automatically read from the current verified owner message.'})
         work_id = args.get('work_id')
         if work_id is not None and (not isinstance(work_id, str) or not re.fullmatch(r'work-[a-f0-9]{32}', work_id)):
             return json.dumps({'status': 'rejected', 'code': 'invalid_change'})

@@ -385,9 +385,11 @@ async def main():
             assert adapter.intake.prepare(event, adapter) is None
             synthetic_events.append(event)
             if event.message_id == 'om_qa':
-                assert await invoke({'feedback': 'Paraphrased browser acceptance report.'}) == {
-                    'status': 'rejected', 'code': 'invalid_change'}
-                tool_results.append(await invoke({}))
+                assert await invoke({'work_id': work_id, 'feedback': 'Paraphrased browser acceptance report.'}) == {
+                    'status': 'rejected', 'code': 'invalid_change', 'forbidden_fields': ['feedback'],
+                    'allowed_fields': ['work_id'],
+                    'instruction': 'Retry once with only work_id; feedback is automatically read from the current verified owner message.'}
+                tool_results.append(await invoke({'work_id': work_id}))
                 tool_results.append(await invoke({}))
                 return
             if event.message_id in {'om_wrong_parent', 'om_reject', 'om_renew', 'om_maintenance'}:
@@ -494,8 +496,14 @@ async def main():
             assert len(synthetic_events) == before and admissions == [work_id]
 
             assert await invoke({}) == {'status': 'unassociated', 'code': 'missing_current_source'}
-            assert await invoke({'feedback': feedback}) == {'status': 'rejected', 'code': 'invalid_change'}
-            assert await invoke({'actor': 'owner'}) == {'status': 'rejected', 'code': 'invalid_change'}
+            assert await invoke({'feedback': feedback}) == {
+                'status': 'rejected', 'code': 'invalid_change', 'forbidden_fields': ['feedback'],
+                'allowed_fields': ['work_id'],
+                'instruction': 'Retry once with only work_id; feedback is automatically read from the current verified owner message.'}
+            assert await invoke({'actor': 'owner'}) == {
+                'status': 'rejected', 'code': 'invalid_change', 'forbidden_fields': ['actor'],
+                'allowed_fields': ['work_id'],
+                'instruction': 'Retry once with only work_id; feedback is automatically read from the current verified owner message.'}
         finally:
             for module, original_admission in original_admissions.items():
                 module.admit_shared_natural_qa_rework = original_admission
