@@ -645,7 +645,7 @@ def _validate_renew_window(window):
         raise ManagementError('binding_conflict', 'The renewed window shape is malformed.')
     original = window.get('original_state')
     state_keys = {'started_at_ms', 'requests', 'reported_tokens', 'admissions', 'stop_reason'}
-    metadata_keys = {'binding_sha256', 'observed_at_ms', 'model_context_window', 'stop_cleanup'}
+    metadata_keys = {'binding_sha256', 'observed_at_ms', 'model_context_window', 'effective_max_output_tokens', 'stop_cleanup'}
     if (not isinstance(original, dict) or not state_keys <= set(original)
             or set(original) - state_keys - metadata_keys
             or original.get('started_at_ms') is not None and type(original['started_at_ms']) is not int
@@ -660,7 +660,9 @@ def _validate_renew_window(window):
             or not re.fullmatch(r'[a-f0-9]{64}', original['binding_sha256']))
             or 'observed_at_ms' in original and (type(original['observed_at_ms']) is not int or original['observed_at_ms'] <= 0)
             or 'model_context_window' in original and (type(original['model_context_window']) is not int
-                or original['model_context_window'] <= 0)):
+                or original['model_context_window'] <= 0)
+            or 'effective_max_output_tokens' in original and (type(original['effective_max_output_tokens']) is not int
+                or original['effective_max_output_tokens'] <= 0)):
         raise ManagementError('binding_conflict', 'The renewed window metadata is malformed.')
     if 'stop_cleanup' in original:
         cleanup = original['stop_cleanup']

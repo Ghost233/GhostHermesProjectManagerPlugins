@@ -228,6 +228,7 @@ def test_renew_window_hook_metadata_is_strict_and_controlled():
         'hook_marker': None, 'original_state': {'started_at_ms': None, 'requests': 2,
             'reported_tokens': 0, 'admissions': ['a', 'b'], 'stop_reason': None,
             'binding_sha256': 'a' * 64, 'observed_at_ms': 1, 'model_context_window': 100,
+            'effective_max_output_tokens': 2048,
             'stop_cleanup': {'kind': 'terminal', 'job_ids': ['job']}}}
     _validate_renew_window(window)
     invalid = dict(window, original_state={**window['original_state'], 'unexpected': True})
@@ -235,6 +236,10 @@ def test_renew_window_hook_metadata_is_strict_and_controlled():
         _validate_renew_window(invalid)
     with pytest.raises(ManagementError):
         _validate_renew_window(dict(window, request_base=0))
+    for value in ('2048', 0, -1, True):
+        with pytest.raises(ManagementError):
+            _validate_renew_window(dict(window, original_state={**window['original_state'],
+                'effective_max_output_tokens': value}))
 
 
 def test_natural_qa_rework_expired_window_renews_once_and_keeps_sealed_usage(tmp_path, monkeypatch):
