@@ -2875,6 +2875,32 @@ def _record_shared_failure(intake, record, error, phase):
     intake._save_execution(record, fields=['last_failure'])
 
 
+def _same_budget_state_observation(before, after):
+    old, new = dict(before), dict(after)
+    old_observed, new_observed = old.pop('observed_at_ms', 0), new.pop('observed_at_ms', 0)
+    return (old == new and type(old_observed) is int and type(new_observed) is int
+        and 0 <= old_observed <= new_observed <= int(time.time() * 1000))
+
+
+def _verified_background_notice(execution, event, item):
+    control = execution.get('stop_control', {})
+    end, proof = control.get('session_end', {}), control.get('proof', {})
+    session, worker = proof.get('session', {}), proof.get('worker', {})
+    source = item.get('source', {})
+    return (control.get('status') == 'background_ended'
+        and isinstance(item.get('id'), str) and bool(item['id'])
+        and control.get('queue_remove', {}).get(item['id']) == 'accepted'
+        and set(source) == {'kind', 'form', 'summary'}
+        and source.get('kind') == 'tool-jobs' and source.get('form') == 'notice'
+        and isinstance(source.get('summary'), str) and bool(source['summary'])
+        and session.get('scope') == 'shared_session' and session.get('host') == execution.get('native_identity')
+        and all(end.get(key) == session.get(key) == execution.get(key) for key in ('session_id', 'generation'))
+        and type(end.get('journal_cursor')) is int and type(event.get('seq')) is int
+        and event['seq'] <= end['journal_cursor'] == session.get('journal_cursor')
+        and bool(proof.get('repository')) and type(worker.get('exit_code')) is int and worker['exit_code'] == 0
+        and bool(worker.get('run_id')) and bool(worker.get('identity')))
+
+
 async def run_shared_work(ctx, intake, record, generation):
     from .repository_execution import execution_configuration
     from .repository_supervision import current_worker, native_call, owned_call, original_history, execution_event_references
@@ -2954,7 +2980,7 @@ async def run_shared_work(ctx, intake, record, generation):
             require_permission_initializer_end(previous, old_run, record['card_id'])
             if (await asyncio.to_thread(shared_range_proof, intake, record, control['session_end']) != control['proof']['session']
                     or await asyncio.to_thread(repository_source_state, record['target']) != control['proof']['repository']
-                    or read_ledger(configuration, execution)['state'] != execution['shared_budget']):
+                    or not _same_budget_state_observation(execution['shared_budget'], read_ledger(configuration, execution)['state'])):
                 raise ManagementError('binding_conflict', 'The completed background scope, source or budget changed before supervision.')
             execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
                 'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
@@ -3218,7 +3244,8 @@ async def run_shared_work(ctx, intake, record, generation):
                 submitted.update(control.get('request_id') for control in execution.get('owner_context_history', []))
                 submitted.update(question.get('request_id') for question in execution.get('questions', []))
                 submitted.discard(None)
-                if any(item.get('source', {}).get('kind') != 'user' or item.get('source', {}).get('rpcId') not in submitted
+                if any((item.get('source', {}).get('kind') != 'user' or item.get('source', {}).get('rpcId') not in submitted)
+                        and not _verified_background_notice(execution, event, item)
                         for event in events if event['type'] == 'agent/inbox/spliced' and event['seq'] > continuation['cursor']
                         for item in event['data'].get('inserted', []) if item.get('role') == 'user'):
                     raise ManagementError('outcome_unknown', 'Foreign input in the original owner-context history was preserved.')
@@ -3307,8 +3334,24 @@ async def end_shared_background(intake, record, message_id, generation):
         budget = read_ledger(carrier.config, execution)
         control = execution.get('stop_control', {})
         if control.get('status') == 'background_ended':
-            if shared_range_proof(intake, record, control['session_end']) != control['proof']['session']:
+            if (shared_range_proof(intake, record, control['session_end']) != control['proof']['session']
+                    or await asyncio.to_thread(repository_source_state, record['target']) != control['proof']['repository']
+                    or not _same_budget_state_observation(execution['shared_budget'], budget['state'])):
                 raise ManagementError('outcome_unknown', 'The original background cleanup proof changed.')
+            if worker is not None:
+                if execution.get('continuation_control') and execution['continuation_control'].get('status') != 'accepted':
+                    raise ManagementError('outcome_unknown', 'The original background continuation remains pending.')
+                control['proof']['worker'] = worker
+                execution.update(state='awaiting_acceptance', shared_budget=budget['state'])
+                intake._save_execution(record, fields=['stop_control', 'state', 'shared_budget'])
+                if card['status'] == 'triage':
+                    from hermes_cli import kanban_db as kb
+                    from hermes_cli.kanban_db_connect import connect_closing
+                    with connect_closing(board=intake.board) as connection:
+                        if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                            raise ManagementError('outcome_unknown', 'Original background supervisor dispatch is unconfirmed.')
+                else:
+                    intake._kanban('kanban_unblock', {'task_id': record['card_id']})
             return record
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -3319,15 +3362,12 @@ async def end_shared_background(intake, record, message_id, generation):
             starts = [event for event in events if event['type'] == 'turn/start']
             ends = [event for event in events if event['type'] == 'turn/end']
             current_budget = read_ledger(carrier.config, execution)
-            before_budget, after_budget = deepcopy(budget), deepcopy(current_budget)
-            old_observed = before_budget['state'].pop('observed_at_ms', 0)
-            new_observed = after_budget['state'].pop('observed_at_ms', 0)
             if (len(sessions) != 1 or sessions[0].get('cwd') != record['target']['repo_path']
                     or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
                     or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
                     or ends[-1]['data'].get('reason') != {'kind': 'completed'}
-                    or before_budget != after_budget or type(old_observed) is not int or type(new_observed) is not int
-                    or not 0 <= old_observed <= new_observed <= int(time.time() * 1000)):
+                    or not _same_budget_state_observation(budget['state'], current_budget['state'])
+                    or {**budget, 'state': current_budget['state']} != current_budget):
                 raise ManagementError('outcome_unknown', 'The completed original foreground, input or budget changed.')
             budget = current_budget
             jobs = await asyncio.to_thread(carrier.owned_jobs)

@@ -22,6 +22,68 @@ import pytest
 from ghost_hermes_pm.manager import ManagementError
 
 
+@pytest.mark.parametrize('changed', [None, 'ordinary_user', 'unknown_source', 'queue_intent',
+    'wrong_sid', 'wrong_generation', 'after_proof', 'not_notice', 'incomplete_proof'])
+def test_verified_background_notice_requires_original_cleanup_proof(changed):
+    from ghost_hermes_pm.shared_repository import _verified_background_notice
+    execution = {'session_id': 'synthetic-session', 'generation': 'synthetic-generation',
+        'native_identity': {'lease': 'synthetic-lease'}, 'stop_control': {'status': 'background_ended',
+        'queue_remove': {'synthetic-notice': 'accepted'},
+        'session_end': {'session_id': 'synthetic-session', 'generation': 'synthetic-generation', 'journal_cursor': 12},
+        'proof': {'session': {'scope': 'shared_session', 'host': {'lease': 'synthetic-lease'},
+            'session_id': 'synthetic-session', 'generation': 'synthetic-generation', 'journal_cursor': 12},
+            'repository': {'source_digest': 'synthetic-source'},
+            'worker': {'run_id': 'synthetic-run', 'identity': {'pid': 123}, 'exit_code': 0}}}}
+    event = {'seq': 11}
+    item = {'id': 'synthetic-notice', 'role': 'user',
+        'source': {'kind': 'tool-jobs', 'form': 'notice', 'summary': 'Synthetic job finished.'}}
+    control = execution['stop_control']
+    if changed == 'ordinary_user':
+        item['source'] = {'kind': 'user', 'rpcId': 'foreign-owner-input'}
+    elif changed == 'unknown_source':
+        item['source']['kind'] = 'unknown'
+    elif changed == 'queue_intent':
+        control['queue_remove'][item['id']] = 'intent'
+    elif changed == 'wrong_sid':
+        control['proof']['session']['session_id'] = 'foreign-session'
+    elif changed == 'wrong_generation':
+        control['session_end']['generation'] = 'foreign-generation'
+    elif changed == 'after_proof':
+        event['seq'] = 13
+    elif changed == 'not_notice':
+        item['source']['form'] = 'message'
+    elif changed == 'incomplete_proof':
+        control['proof'].pop('worker')
+    assert _verified_background_notice(execution, event, item) is (changed is None)
+
+
+@pytest.mark.parametrize('changed', [None, 'requests', 'reported_tokens', 'admissions', 'stop_reason',
+    'backwards', 'boolean', 'future'])
+def test_background_budget_observation_preserves_every_other_state_field(changed):
+    from ghost_hermes_pm.shared_repository import _same_budget_state_observation
+    now = int(time.time() * 1000)
+    before = {'started_at_ms': now - 1000, 'requests': 4, 'reported_tokens': 20,
+        'admissions': ['synthetic-request'], 'stop_reason': None, 'observed_at_ms': now - 500}
+    after = deepcopy(before)
+    after['observed_at_ms'] = now
+    if changed == 'requests':
+        after['requests'] += 1
+    elif changed == 'reported_tokens':
+        after['reported_tokens'] += 1
+    elif changed == 'admissions':
+        after['admissions'].append('foreign-input')
+    elif changed == 'stop_reason':
+        after['stop_reason'] = 'shared-work-request-budget'
+    elif changed == 'backwards':
+        after['observed_at_ms'] = before['observed_at_ms'] - 1
+    elif changed == 'boolean':
+        after['observed_at_ms'] = True
+    elif changed == 'future':
+        after['observed_at_ms'] = now + 10000
+    assert _same_budget_state_observation(before, after) is (changed is None)
+    assert before['observed_at_ms'] == now - 500
+
+
 def _natural_qa_fixture(tmp_path, monkeypatch, *, expired=False, foreign_host=False):
     from ghost_hermes_pm import shared_repository
     from ghost_hermes_pm import repository_acceptance, repository_control, repository_execution, repository_supervision

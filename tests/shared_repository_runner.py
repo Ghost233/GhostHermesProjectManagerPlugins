@@ -683,6 +683,7 @@ async def main():
                     if background_ended_worker:
                         model.review_supervision_checkpoints = False
                         model.worker_steps = 3
+                        model.worker_finish_at = 5
                         until = time.monotonic() + 10
                         while time.monotonic() < until:
                             waited, status = os.waitpid(worker['pid'], os.WNOHANG)
@@ -754,7 +755,19 @@ async def main():
                     if background_ended_worker:
                         assert cleanup['stop_control']['proof']['worker']['run_id'] == old_claim['run_id']
                         assert cleanup['stop_control']['proof']['worker']['exit_code'] == 0
+                        previous_owner = record()
+                        previous_cursor = next(row['event']['seq'] for row in peer['journals'][sid]
+                            if row['event']['type'] == 'turn/start') - 1
+                        previous_owner['dsh_execution'].update(continuation_control={
+                            'kind': 'qa_rework', 'status': 'accepted', 'dispatch_status': 'accepted', 'cursor': previous_cursor},
+                            owner_context_control={'status': 'accepted', 'dispatch_status': 'accepted', 'cursor': previous_cursor,
+                                'request_id': previous_owner['dsh_execution']['request_id']})
+                        adapter.intake._save_execution(previous_owner, fields=['continuation_control', 'owner_context_control'])
+                        observed_budget = json.loads(checkpoint_ledger.read_text())
+                        observed_budget['state']['observed_at_ms'] = int(time.time() * 1000)
+                        checkpoint_ledger.write_text(json.dumps(observed_budget))
                         model.worker_steps = 0
+                        model.worker_finish_at = None
                         model.review_supervision_checkpoints = True
                         with connect_closing() as db:
                             assert dispatch_once(db, max_spawn=1).spawned
@@ -762,6 +775,9 @@ async def main():
                         assert worker['run_id'] != old_claim['run_id']
                     until = time.monotonic() + 10
                     while time.monotonic() < until:
+                        if background_ended_worker:
+                            supervised = record()['dsh_execution']
+                            assert supervised['state'] != 'outcome_unknown', supervised.get('last_failure')
                         waited, status = os.waitpid(worker['pid'], os.WNOHANG)
                         if waited:
                             assert os.waitstatus_to_exitcode(status) == 0
@@ -777,6 +793,44 @@ async def main():
                     assert 'delivery_report_missing' not in latest['dsh_execution']['acceptance']['unmet']
                     assert 'test_evidence_missing' in latest['dsh_execution']['acceptance']['unmet']
                     assert any('验收未满足' in message.request_body.content for message in sent)
+                    if background_ended_worker:
+                        # The prior candidate's unsent supervision failure retains its original range proof.
+                        failed = record()
+                        failed['dsh_execution'].update(state='outcome_unknown', last_failure={
+                            'phase': 'budget', 'code': 'outcome_unknown', 'type': 'ManagementError',
+                            'message': 'Foreign input in the original owner-context history was preserved.'})
+                        adapter.intake._save_execution(failed, fields=['state', 'last_failure'])
+                        completed_claim = failed['dsh_execution']['supervisor_claim']
+                        observed_budget = json.loads(checkpoint_ledger.read_text())
+                        previous_observed = observed_budget['state']['observed_at_ms']
+                        observed_budget['state']['observed_at_ms'] = int(time.time() * 1000)
+                        assert observed_budget['state']['observed_at_ms'] > previous_observed
+                        checkpoint_ledger.write_text(json.dumps(observed_budget))
+                        restore_budget = checkpoint_ledger.read_bytes()
+                        await receive(adapter, raw('om_resume_background_supervision', '@_user_1 结束后台 ' + latest['id']))
+                        assert record()['dsh_execution']['state'] == 'awaiting_acceptance'
+                        assert record()['dsh_execution']['stop_control']['proof']['worker']['run_id'] == completed_claim['run_id']
+                        model.worker_steps = 0
+                        with connect_closing() as db:
+                            assert dispatch_once(db, max_spawn=1).spawned
+                            worker = remember_worker(db, initial['card_id'])
+                        assert worker['run_id'] != completed_claim['run_id']
+                        until = time.monotonic() + 10
+                        while time.monotonic() < until:
+                            assert record()['dsh_execution']['state'] != 'outcome_unknown', record()['dsh_execution'].get('last_failure')
+                            waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                            if waited:
+                                assert os.waitstatus_to_exitcode(status) == 0
+                                worker = None
+                                break
+                            await asyncio.sleep(.05)
+                        assert worker is None, 'The normally restored original supervisor did not exit.'
+                        assert len([call for call in peer['calls'] if call['method'] == 'job/kill']) == 1
+                        assert len([call for call in peer['calls'] if call['method'] == 'session/updateQueue']) == 1
+                        assert len(peer['prompts']) == 1 and checkpoint_ledger.read_bytes() == restore_budget
+                        latest = record()
+                        assert latest['dsh_execution']['acceptance']['status'] == 'unmet'
+                        assert latest['dsh_execution']['last_failure'] == failed['dsh_execution']['last_failure']
                     background_proof = latest['dsh_execution']['stop_control']['proof']
                     assert background_proof['session']['settled_job_ids'] == ['fixture-preview']
                     await receive(adapter, raw('om_checkpoint_stop', '@_user_1 停止 ' + latest['id']))
@@ -2419,6 +2473,7 @@ async def main():
             (scratch / 'supervise-failure.json').write_text(json.dumps({
                 'traceback': traceback.format_exc(), 'public_work': record(),
                 'model_requests': model.requests, 'tool_results': model.worker_tool_results,
+                'journals': peer['journals'],
                 'preflight_runs': preflight_runs,
                 'prompts': peer['prompts']}))
         raise
