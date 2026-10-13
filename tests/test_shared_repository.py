@@ -1089,13 +1089,14 @@ def test_permission_initializer_requires_original_terminal_birth(change, monkeyp
 
 @pytest.mark.parametrize('job_status', ['completed', 'killed', 'failed'])
 @pytest.mark.parametrize('historical', [False, True])
-def test_source_chain_attributes_terminal_promoted_job_write(job_status, historical):
+@pytest.mark.parametrize('receipt_kind', ['promoted', 'background'])
+def test_source_chain_attributes_terminal_promoted_job_write(job_status, historical, receipt_kind):
     from ghost_hermes_pm.shared_repository import _verified_source_chain
     execution = {'generation': 'fixture-generation', 'session_id': 'fixture-session'}
     baseline = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-baseline'}
     promoted_after = {'head': None, 'workspace_status': '?? fixture-output/', 'source_digest': 'fixture-promoted'}
     current = {'head': None, 'workspace_status': '?? fixture-output/\n?? fixture-result', 'source_digest': 'fixture-current'}
-    promoted = {**execution, 'name': 'bash', 'kind': 'promoted', 'execution_admission': 'admitted',
+    promoted = {**execution, 'name': 'bash', 'kind': receipt_kind, 'execution_admission': 'admitted',
         'is_error': False,
         'job_id': 'fixture-promoted-job', 'native_session_seq': 3,
         'source_before': baseline, 'source_after': promoted_after}
@@ -1125,12 +1126,13 @@ def test_source_chain_attributes_terminal_promoted_job_write(job_status, histori
     'native_missing', 'native_duplicate', 'native_wrong_owner', 'native_wrong_command',
     'native_wrong_time', 'native_teardown', 'native_running', 'native_partial_roster',
 ])
-def test_source_chain_rejects_unverified_promoted_job_write(change):
+@pytest.mark.parametrize('receipt_kind', ['promoted', 'background'])
+def test_source_chain_rejects_unverified_promoted_job_write(change, receipt_kind):
     from ghost_hermes_pm.shared_repository import _verified_source_chain
     execution = {'generation': 'fixture-generation', 'session_id': 'fixture-session'}
     baseline = {'head': None, 'workspace_status': '', 'source_digest': 'fixture-baseline'}
     current = {'head': None, 'workspace_status': '?? fixture-output', 'source_digest': 'fixture-current'}
-    receipt = {**execution, 'name': 'bash', 'kind': 'promoted', 'execution_admission': 'admitted',
+    receipt = {**execution, 'name': 'bash', 'kind': receipt_kind, 'execution_admission': 'admitted',
         'is_error': False,
         'job_id': 'fixture-promoted-job', 'native_session_seq': 3,
         'source_before': baseline, 'source_after': current}

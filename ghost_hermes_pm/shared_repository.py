@@ -788,7 +788,7 @@ def _verified_source_chain(execution, baseline, receipts, current, owned_jobs=()
             if (type(receipt.get('exit_code')) is not int or receipt.get('timed_out') is not False
                     or receipt.get('aborted') is not False):
                 return False
-        elif receipt.get('kind') == 'promoted':
+        elif receipt.get('kind') in {'promoted', 'background'}:
             job_id = receipt.get('job_id')
             if (any(key in receipt for key in ('exit_code', 'timed_out', 'aborted'))
                     or not isinstance(job_id, str) or not job_id or not isinstance(owned_jobs, (list, tuple))):
