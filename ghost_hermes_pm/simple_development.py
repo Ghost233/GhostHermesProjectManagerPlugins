@@ -641,13 +641,12 @@ def register_simple_development(ctx):
                          'tenant_key': binding['sender_tenant_key'], 'recipient_tenant_key': binding['recipient_tenant_key'],
                          'recipient_open_id': binding['recipient_open_id'], 'chat_id': binding['chat_id'],
                          'sender_open_id': binding['owner_open_id']}
+        from .shared_repository import _qa_rework_acceptance
         candidates = [record for record in intake.snapshot()['work']
                       if _qa_profile_matches(record, binding['profile_id'])
                       and all(record.get('source_anchor', {}).get(key) == value for key, value in source_anchor.items())
                       and record.get('dsh_execution', {}).get('mode') == 'shared_native'
-                      and record['dsh_execution'].get('state') == 'awaiting_acceptance'
-                      and record['dsh_execution'].get('acceptance', {}).get('status') == 'unmet'
-                      and record['dsh_execution'].get('acceptance', {}).get('delivered') is False]
+                      and _qa_rework_acceptance(record['dsh_execution'])]
         if len(candidates) != 1:
             return None
         return {'tool_name': 'hermes_pm_repository_rework',
@@ -732,14 +731,13 @@ def register_simple_development(ctx):
                        'recipient_open_id', 'chat_id', 'sender_open_id')
 
         def candidates_from_current_snapshot():
+            from .shared_repository import _qa_rework_acceptance
             candidates = []
             for record in intake.snapshot()['work']:
                 execution = record.get('dsh_execution', {})
-                acceptance = execution.get('acceptance', {}) if isinstance(execution, dict) else {}
                 if (work_id is None or record.get('id') == work_id) and _qa_profile_matches(record, source_context['profile_id']) \
                         and all(record.get('source_anchor', {}).get(key) == source_context[key] for key in anchor_keys) \
-                        and execution.get('mode') == 'shared_native' and execution.get('state') == 'awaiting_acceptance' \
-                        and acceptance.get('status') == 'unmet' and acceptance.get('delivered') is False:
+                        and execution.get('mode') == 'shared_native' and _qa_rework_acceptance(execution):
                     candidates.append(record)
             return candidates
 
@@ -769,6 +767,9 @@ def register_simple_development(ctx):
                                              feedback, None, intake.generation)
             if not isinstance(result, dict) or not isinstance(result.get('status'), str):
                 raise ManagementError('outcome_unknown', 'The shared browser QA rework result is unverified.')
+            if result['status'] == 'accepted':
+                result = {**result, 'execution_started': False,
+                    'instruction': 'Only the original Kanban work was queued. DSH input and execution have not been verified; report queued, not started.'}
             if result['status'] in {'renewal_required', 'maintenance_required'}:
                 proposal = result.get('proposal')
                 expected = {'renewal_required': ('window', ['同意', '拒绝']),

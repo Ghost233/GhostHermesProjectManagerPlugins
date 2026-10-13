@@ -383,6 +383,62 @@ def test_natural_qa_maintenance_reply_refreshes_only_the_original_desktop_lease(
     assert json.loads(ledger_file.read_text())['state']['requests'] == 2 and not carrier.prompts
 
 
+@pytest.mark.parametrize('change', [None, 'started', 'ledger_changed', 'snapshot_changed', 'workspace_changed', 'worker_failed', 'repeated'])
+def test_natural_qa_requeues_only_the_same_unstarted_continuation(tmp_path, monkeypatch, change):
+    from ghost_hermes_pm import shared_repository, repository_control
+    record, context, intake, carrier, ledger_file, source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    execution = record['dsh_execution']
+    configuration = dict(intake.config, workspace_id=execution['workspace_id'])
+    stream = carrier.stream('session/follow', {})
+    snapshot = next(stream)
+    stream.close()
+    ledger = json.loads(ledger_file.read_text())
+    ledger['renewWindow'].update(request_base=ledger['state']['requests'], original_state=dict(ledger['state']),
+        started_at_ms=None, stop_reason=None, hook_marker=None)
+    ledger_file.write_text(json.dumps(ledger))
+    execution.update(state='outcome_unknown', renewal_window_adoption='accepted',
+        supervisor_claim={'run_id': 2, 'identity': {'pid': 20}},
+        renewal_window_checkpoint={'status': 'admitted', 'source': source,
+            'previous_state': dict(ledger['state'])},
+        continuation_request_id='original-qa-request',
+        continuation_control={'kind': 'qa_rework', 'status': 'admitted', 'dispatch_status': 'accepted',
+            'previous_claim': {'run_id': 1}, 'worker': {'run_id': 1, 'exit_code': 0},
+            'qa_feedback': 'Original synthetic QA requirement.',
+            'snapshot_sha256': hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
+            'ledger_sha256': hashlib.sha256(ledger_file.read_bytes()).hexdigest(),
+            'workspace': {'workspace_id': execution['workspace_id'], 'session_ids': [execution['session_id']]}})
+    worker = {'run_id': 2, 'identity': {'pid': 20}, 'exit_code': 0}
+    monkeypatch.setattr(repository_control, '_worker_end', lambda *_args, **_kwargs: worker)
+    if change == 'started':
+        ledger['renewWindow']['started_at_ms'] = int(time.time()*1000)
+        ledger_file.write_text(json.dumps(ledger))
+    elif change == 'ledger_changed':
+        ledger['state']['reported_tokens'] += 1
+        ledger_file.write_text(json.dumps(ledger))
+    elif change == 'snapshot_changed':
+        execution['continuation_control']['snapshot_sha256'] = '0' * 64
+    elif change == 'worker_failed':
+        worker['exit_code'] = 1
+    elif change == 'workspace_changed':
+        execution['continuation_control']['workspace']['workspace_id'] = 'foreign-workspace'
+    elif change == 'repeated':
+        execution['qa_preinput_retry'] = {'status': 'accepted'}
+    before = ledger_file.read_bytes()
+    if change:
+        with pytest.raises(ManagementError):
+            shared_repository.admit_shared_natural_qa_rework(intake, record, context, '继续原修复。', None, intake.generation)
+        assert intake.card['status'] == 'blocked' and ledger_file.read_bytes() == before and not carrier.prompts
+        return
+    result = shared_repository.admit_shared_natural_qa_rework(intake, record, context, '继续原修复。', None, intake.generation)
+    assert result == {'status': 'accepted', 'work_id': record['id']}
+    assert execution['continuation_request_id'] == 'original-qa-request'
+    assert execution['continuation_control']['qa_feedback'] == 'Original synthetic QA requirement.'
+    assert execution['continuation_control']['previous_claim'] == execution['supervisor_claim']
+    assert execution['continuation_control']['worker'] == worker
+    assert execution['qa_preinput_retry']['previous_control']['previous_claim'] == {'run_id': 1}
+    assert intake.card['status'] == 'ready' and ledger_file.read_bytes() == before and not carrier.prompts
+
+
 def test_natural_qa_rework_expired_window_requires_maintenance_without_side_effects(tmp_path, monkeypatch):
     from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
     record, context, intake, carrier, ledger_file, _source, _request = _natural_qa_fixture(
@@ -1674,7 +1730,7 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata'])
+@pytest.mark.parametrize('scenario', ['terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])

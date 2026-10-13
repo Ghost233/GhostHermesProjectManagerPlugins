@@ -218,8 +218,6 @@ def _admit_resumed_worker(intake, record, carrier):
     from .trusted_controller import controller_identity
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
-    if controller_identity() != record['gateway_controller']:
-        raise ManagementError('unauthorized', 'Original gateway controller identity changed.')
     execution = record['dsh_execution']
     previous = execution.get('supervisor_claim')
     if not previous:
@@ -230,6 +228,8 @@ def _admit_resumed_worker(intake, record, carrier):
         run = kb.get_run(connection, card.current_run_id) if card and card.current_run_id else None
     if not card or card.status != 'running' or card.current_run_id == previous['run_id']:
         return
+    if controller_identity() != record['gateway_controller']:
+        raise ManagementError('unauthorized', 'Original gateway controller identity changed.')
     replies = [*execution.get('questions', []), *execution.get('approvals', [])]
     resumes = [reply['resume_unblock'] for reply in replies
                if reply.get('reply_status') in {'accepted', 'settled'} and reply.get('admitted_seq')

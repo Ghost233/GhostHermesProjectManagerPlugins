@@ -256,7 +256,9 @@ async def main():
         work_id = 'work-' + 'd' * 32
         adapter.intake._save({'id': work_id, 'profile_id': 'child', 'superior_profile_id': 'lead', 'source_anchor': anchor,
             'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
-                'acceptance': {'status': 'unmet', 'delivered': False}}})
+                'terminal_reason': {'kind': 'completed'},
+                'acceptance': {'status': 'unmet', 'delivered': False, 'source_commit': 'a' * 40,
+                    'source_digest': 'b' * 64, 'workspace_status': ''}}})
         snapshots = []
 
         async def ordinary_snapshot_handler(event):
@@ -281,7 +283,9 @@ async def main():
             'snapshot': {key: snapshot[key] for key in expected}, 'expected': expected}
         adapter.intake._save({'id': 'work-' + 'e' * 32, 'profile_id': 'lead', 'source_anchor': anchor,
             'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
-                'acceptance': {'status': 'unmet', 'delivered': False}}})
+                'terminal_reason': {'kind': 'completed'},
+                'acceptance': {'status': 'unmet', 'delivered': False, 'source_commit': 'a' * 40,
+                    'source_digest': 'b' * 64, 'workspace_status': ''}}})
         await receive(adapter, raw('om_discover_ambiguous', text='@_user_1 Another acceptance rework report.'))
         for _ in range(100):
             if len(snapshots) >= 2:
@@ -353,6 +357,8 @@ async def main():
                     raise ManagementError('binding_conflict', 'Maintenance proposal reference differs.')
                 admissions.append(record['id'])
                 return {'status': 'accepted', 'work_id': record['id']}
+            if source_context['message_id'] == 'om_pending_retry':
+                return {'status': 'accepted', 'work_id': record['id']}
             raise ManagementError('binding_conflict', 'Natural reply is not accepted.')
 
         def record_proposal(intake, record, proposal_id, delivery):
@@ -377,7 +383,8 @@ async def main():
                     'source_anchor': dict(anchor),
                     'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
                                       'first_input': 'accepted', 'terminal_reason': {'kind': 'completed'},
-                                      'acceptance': {'status': 'unmet', 'delivered': False}}}
+                                      'acceptance': {'status': 'unmet', 'delivered': False, 'source_commit': 'a' * 40,
+                                          'source_digest': 'b' * 64, 'workspace_status': ''}}}
 
         adapter.intake._save(record())
 
@@ -417,6 +424,8 @@ async def main():
                 return
             if event.message_id == 'om_foreign_profile':
                 tool_results.append(await invoke({'work_id': 'work-' + 'f' * 32}))
+            if event.message_id == 'om_pending_retry':
+                tool_results.append(await invoke({'work_id': work_id}))
 
         runner._wire_adapter_handlers(adapter, message_handler=ordinary_tool_handler)
         try:
@@ -481,7 +490,8 @@ async def main():
                 if len(tool_results) >= 6:
                     break
                 await asyncio.sleep(.01)
-            assert tool_results[-1] == {'status': 'accepted', 'work_id': work_id} and admissions == [work_id]
+            assert tool_results[-1]['status'] == 'accepted' and tool_results[-1]['work_id'] == work_id
+            assert tool_results[-1]['execution_started'] is False and admissions == [work_id]
 
             calls_before, proposals_before = len(shared_calls), len(proposal_records)
             await receive(adapter, raw('om_oserror', text='@_user_1 保留当前 QA 结果。'))
@@ -530,6 +540,18 @@ async def main():
                 'status': 'rejected', 'code': 'invalid_change', 'forbidden_fields': ['actor'],
                 'allowed_fields': ['work_id'],
                 'instruction': 'Retry once with only work_id; feedback is automatically read from the current verified owner message.'}
+            pending = record()
+            pending['dsh_execution'].update(state='outcome_unknown', continuation_control={
+                'kind': 'qa_rework', 'status': 'admitted', 'dispatch_status': 'accepted'})
+            adapter.intake._save(pending)
+            before = len(tool_results)
+            await receive(adapter, raw('om_pending_retry', text='@_user_1 请继续原修复。'))
+            for _ in range(100):
+                if len(tool_results) > before:
+                    break
+                await asyncio.sleep(.01)
+            assert tool_results[-1]['status'] == 'accepted' and tool_results[-1]['execution_started'] is False
+            assert shared_calls[-1]['source_context']['message_id'] == 'om_pending_retry'
         finally:
             for module, original_admission in original_admissions.items():
                 module.admit_shared_natural_qa_rework = original_admission

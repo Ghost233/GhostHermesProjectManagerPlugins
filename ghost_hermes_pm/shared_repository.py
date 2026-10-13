@@ -583,10 +583,17 @@ def _source_core(value):
     return core
 
 
+def _pending_qa_rework_retry(execution):
+    control = execution.get('continuation_control', {})
+    return (execution.get('state') == 'outcome_unknown' and control.get('kind') == 'qa_rework'
+            and control.get('status') == 'admitted' and control.get('dispatch_status') == 'accepted'
+            and not execution.get('qa_preinput_retry'))
+
+
 def _qa_rework_acceptance(execution):
     acceptance = execution.get('acceptance', {})
     unmet = acceptance.get('unmet', [])
-    return (execution.get('state') == 'awaiting_acceptance'
+    return ((execution.get('state') == 'awaiting_acceptance' or _pending_qa_rework_retry(execution))
             and execution.get('terminal_reason') == {'kind': 'completed'}
             and acceptance.get('status') == 'unmet' and acceptance.get('delivered') is False
             and isinstance(unmet, list) and 'delivery_report_missing' not in unmet
@@ -910,6 +917,70 @@ def _refresh_qa_desktop_lease(intake, record, source_context, feedback):
     intake._save_execution(record, fields=['reference_sha256', 'natural_qa_rework_control'])
 
 
+def _requeue_unstarted_qa(intake, record, source_context, generation, card, worker):
+    from .repository_execution import execution_configuration
+    from .repository_acceptance import repository_source_state
+    from .repository_supervision import owned_call
+    execution = record['dsh_execution']
+    control = execution['continuation_control']
+    checkpoint = execution.get('renewal_window_checkpoint', {})
+    configuration, _ = execution_configuration(record['target'])
+    configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
+                         generation=execution['generation'], workspace_id=execution['workspace_id'])
+    raw = private_file(ledger_path(configuration, execution['session_id'])).read_bytes()
+    budget = read_ledger(configuration, execution)
+    window = budget.get('renewWindow', {})
+    if (execution.get('renewal_window_adoption') != 'accepted' or checkpoint.get('status') != 'admitted'
+            or configuration['reference_sha256'] != execution['reference_sha256']
+            or hashlib.sha256(raw).hexdigest() != control.get('ledger_sha256')
+            or window.get('request_base') != budget['state']['requests']
+            or any(window.get(key, 'missing') is not None for key in ('started_at_ms', 'hook_marker', 'stop_reason'))
+            or window.get('original_state') != checkpoint.get('previous_state')
+            or repository_source_state(record['target']) != checkpoint.get('source')
+            or worker.get('exit_code') != 0 or worker.get('run_id') != execution['supervisor_claim']['run_id']):
+        raise ManagementError('outcome_unknown', 'Only the unchanged unstarted QA continuation may be requeued.')
+    carrier = SharedDesktopTransport(configuration)
+    try:
+        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
+            'sessionId': execution['session_id']}, 'maxMessages': 500}})
+        try:
+            snapshot = next(stream)
+        finally:
+            stream.close()
+        sessions = [row for row in owned_call(carrier, 'session/list', {})['items']
+                    if row.get('sessionId') == execution['session_id']]
+        workspace = owned_call(carrier, 'workspace/create', {'path': configuration['workspace']})
+        account = workspace.get('workspace', {})
+        if (carrier.native_identity != execution['native_identity']
+                or hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() != control['snapshot_sha256']
+                or len(sessions) != 1 or sessions[0].get('running') is not False
+                or sessions[0].get('agentAvailable') is not True or carrier.owned_jobs()
+                or workspace.get('created') is not False or account.get('path') != configuration['workspace']
+                or {'workspace_id': account.get('workspaceId'), 'session_ids': account.get('sessionIds')} != control.get('workspace')
+                or account.get('workspaceId') != execution['workspace_id']
+                or private_file(ledger_path(configuration, execution['session_id'])).read_bytes() != raw):
+            raise ManagementError('outcome_unknown', 'The original QA input or owned execution is not idle.')
+        intake.require_active(generation)
+        execution['qa_preinput_retry'] = {'status': 'intent', 'message_id': source_context['message_id'],
+            'previous_control': deepcopy(control), 'previous_failure': deepcopy(execution.get('last_failure'))}
+        control.update(previous_claim=deepcopy(execution['supervisor_claim']), worker=worker)
+        execution['state'] = 'continuation_pending'
+        intake._save_execution(record, fields=['qa_preinput_retry', 'continuation_control', 'state'])
+        if card['status'] == 'triage':
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                    raise ManagementError('outcome_unknown', 'Original QA redispatch is unconfirmed.')
+        else:
+            intake._kanban('kanban_unblock', {'task_id': record['card_id']})
+        execution['qa_preinput_retry']['status'] = 'accepted'
+        intake._save_execution(record, fields=['qa_preinput_retry'])
+        return {'status': 'accepted', 'work_id': record['id']}
+    finally:
+        carrier.close()
+
+
 def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedback, window, generation):
     """Queue bounded browser acceptance feedback from the public NATURAL-QA-INTAKE tool."""
     import psutil
@@ -956,6 +1027,8 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     if card['status'] not in {'blocked', 'triage'} or card.get('current_run_id') is not None or card.get('worker_pid') is not None:
         raise ManagementError('outcome_unknown', 'The browser acceptance rework card is not idle.')
     worker = _worker_end(intake, record)
+    if _pending_qa_rework_retry(execution):
+        return _requeue_unstarted_qa(intake, record, source_context, generation, card, worker)
     if prior_natural.get('status') == 'maintenance_required' and feedback == '维护完成':
         _refresh_qa_desktop_lease(intake, record, source_context, feedback)
     configuration, _ = execution_configuration(record['target'])

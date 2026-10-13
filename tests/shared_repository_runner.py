@@ -13,6 +13,9 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 scratch = Path(sys.argv[1]).resolve()
 shared_scenario = sys.argv[2]
+observer_restart = shared_scenario == 'observer_restart'
+if observer_restart:
+    shared_scenario = 'terminal'
 supervise_takeover = shared_scenario.startswith('supervise_takeover')
 takeover_case = shared_scenario.removeprefix('supervise_takeover_') if shared_scenario != 'supervise_takeover' else 'valid'
 supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover
@@ -290,6 +293,9 @@ async def main():
         service_namespace['record'] = record
         initial = record()
         assert initial['dsh_execution']['mode'] == 'shared_native', initial
+        if observer_restart:
+            initial['gateway_controller'] = dict(initial['gateway_controller'], pid=999999, start_sec=1, start_usec=0)
+            adapter.intake._save(initial)
         if triage_continuation:
             assert 'error' not in json.loads(registry.dispatch('kanban_block', {
                 'task_id': initial['card_id'], 'kind': 'needs_input', 'reason': 'Original failure still needs explicit continuation.'}))
