@@ -107,7 +107,7 @@ if background_cleanup:
                     value = {'outcome': 'unknown'}
                 else:
                     behavior['jobs'][0]['status'] = 'killed'
-                    settled = dict(behavior['registered_preview'], type='settled', status='killed', cause='cancelled', awaited=True)
+                    settled = dict(behavior['registered_preview'], type='settled', status='killed', cause='kill', awaited=False)
                     with behavior['job_receipts'].open('a') as output:
                         output.write(json.dumps(settled) + '\\n')
                     budget_row = json.loads(behavior['budget_path'].read_text())

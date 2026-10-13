@@ -2606,7 +2606,7 @@ def shared_range_proof(intake, record, session_end):
         settled = [row for row in jobs_log if row['type'] == 'settled']
         if (any(row.get('owner') != execution['session_id'] for row in jobs_log)
             or Counter(row['job_id'] for row in registered) != Counter(row['job_id'] for row in settled)
-            or any(row.get('awaited') is not True or row.get('cause') == 'teardown'
+            or any(type(row.get('awaited')) is not bool or row.get('cause') not in {'producer', 'kill'}
                    or row.get('status') not in {'completed', 'killed', 'failed'} for row in settled)
             or Counter(row['command_sha256'] for row in tools if row['name'] == 'bash' and row.get('execution_admission') != 'rejected')
                 != Counter(row['command_sha256'] for row in registered)):
