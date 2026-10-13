@@ -776,8 +776,9 @@ def register_simple_development(ctx):
         if not leader:
             return json.dumps(await asyncio.shield(pending))
         result = None
+        phase = 'natural_qa_admission'
         try:
-            from .shared_repository import admit_shared_natural_qa_rework, record_shared_natural_qa_proposal
+            from .shared_repository import admit_shared_natural_qa_rework, record_shared_natural_qa_proposal, _record_shared_failure
             result = await asyncio.to_thread(admit_shared_natural_qa_rework, intake, candidates[0], source_context,
                                              feedback, None, intake.generation)
             if not isinstance(result, dict) or not isinstance(result.get('status'), str):
@@ -786,6 +787,7 @@ def register_simple_development(ctx):
                 result = {**result, 'execution_started': False,
                     'instruction': 'Only the original Kanban work was queued. DSH input and execution have not been verified; report queued, not started.'}
             if result['status'] in {'renewal_required', 'maintenance_required'}:
+                phase = 'natural_qa_proposal'
                 proposal = result.get('proposal')
                 expected = {'renewal_required': ('window', ['同意', '拒绝']),
                             'maintenance_required': ('maintenance', ['维护完成', '取消'])}[result['status']]
@@ -794,6 +796,7 @@ def register_simple_development(ctx):
                         or proposal.get('options') != expected[1] or not isinstance(proposal.get('text'), str) or not proposal['text']):
                     raise ManagementError('outcome_unknown', 'The shared natural QA proposal is unverified.')
                 try:
+                    phase = 'natural_qa_proposal_delivery'
                     receipt = await transport.send({'uuid': hashlib.sha256((candidates[0]['id'] + ':' + proposal['id']).encode()).hexdigest()[:32],
                         'text': proposal['text'], 'chat_id': source_context['chat_id'], 'reply_to': source_context['message_id'],
                         'thread_id': getattr(source, 'thread_id', None)})
@@ -806,6 +809,7 @@ def register_simple_development(ctx):
                 else:
                     delivery = {'status': status if status in {'unknown', 'failed'} else 'unknown',
                                 'chat_id': source_context['chat_id'], 'profile_id': source_context['profile_id']}
+                phase = 'natural_qa_proposal_receipt'
                 current = next((record for record in intake.snapshot()['work'] if record.get('id') == candidates[0]['id']), None)
                 if current is None:
                     raise ManagementError('outcome_unknown', 'The natural QA work disappeared before proposal delivery.')
@@ -814,7 +818,9 @@ def register_simple_development(ctx):
                     raise ManagementError('outcome_unknown', 'The natural QA proposal delivery is unverified.')
                 result = {**result, 'proposal_delivery': delivery['status']}
         except ManagementError as error:
-            result = {'status': 'unverified', 'code': error.code}
+            _record_shared_failure(intake, candidates[0], error, phase)
+            failure = candidates[0]['dsh_execution']['last_failure']
+            result = {'status': 'unverified', **{key: failure[key] for key in ('code', 'phase', 'message')}}
         except (OSError, TimeoutError, ValueError, KeyError, TypeError):
             result = {'status': 'unverified', 'code': 'outcome_unknown'}
         except asyncio.CancelledError:

@@ -343,7 +343,7 @@ async def main():
                 return {'status': 'renewal_required', 'work_id': record['id'], 'proposal': window_proposal}
             if source_context['message_id'] in {'om_wrong_parent', 'om_reject', 'om_renew'}:
                 if source_context.get('reply_to_message_id') != proposal_deliveries.get(window_proposal['id']):
-                    raise ManagementError('binding_conflict', 'Proposal reference differs.')
+                    raise ManagementError('binding_conflict', 'Proposal reference differs. synthetic-unused-secret')
                 if feedback == '拒绝':
                     return {'status': 'declined', 'work_id': record['id']}
                 if feedback == '同意':
@@ -446,13 +446,24 @@ async def main():
                 'status': 'delivered', 'message_id': 'om_sent_1', 'chat_id': 'oc_fixture', 'profile_id': 'lead'})]
             assert proposal_deliveries == {window_proposal['id']: 'om_sent_1'}
 
+            before_failure = adapter.intake.snapshot()['work'][0]['dsh_execution']
+            assert 'synthetic-unused-secret' in adapter.intake.secret_values
             await receive(adapter, raw('om_wrong_parent', text='@_user_1 同意', parent_id='om_wrong'))
             for _ in range(100):
                 if len(tool_results) >= 3:
                     break
                 await asyncio.sleep(.01)
-            assert tool_results[-1] == {'status': 'unverified', 'code': 'binding_conflict'} and len([
+            assert tool_results[-1] == {'status': 'unverified', 'code': 'binding_conflict',
+                'phase': 'natural_qa_admission',
+                'message': 'Proposal reference differs. [REDACTED_CREDENTIAL]'} and len([
                 item for item in proposal_records if item[0] == window_proposal['id']]) == 1
+            after_failure = adapter.intake.snapshot()['work'][0]['dsh_execution']
+            assert after_failure.pop('last_failure') == {'phase': 'natural_qa_admission',
+                'code': 'binding_conflict', 'type': 'ManagementError',
+                'message': 'Proposal reference differs. [REDACTED_CREDENTIAL]'}
+            assert after_failure == before_failure
+            assert adapter.intake.database.stat().st_mode & 0o077 == 0
+            assert 'synthetic-unused-secret' not in json.dumps(adapter.intake.snapshot()) + json.dumps(tool_results)
             assert len(shared_calls) == 2 and not admissions and len(proposal_records) == 1
 
             current = adapter.intake.snapshot()['work'][0]

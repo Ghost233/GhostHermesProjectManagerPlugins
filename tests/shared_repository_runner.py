@@ -455,7 +455,7 @@ async def main():
                     budget_row['budget'].update(max_reported_tokens=300000, max_output_tokens_per_request=8192)
                 started = int(time.time() * 1000) - (1801000 if qa_request_only_resume else
                     61000 if renew_window_again or qa_preinput_retry else 1000)
-                base_requests = 4 if renew_window_again else 3
+                base_requests = 4 if renew_window_again or qa_request_only_resume else 3
                 total_requests = base_requests + 1 if qa_request_only_resume else 55 if qa_preinput_retry else 11 if renew_window_again else 9
                 original_state = {'started_at_ms': started, 'requests': base_requests,
                                   'reported_tokens': 700 if renew_window_again else 30,
@@ -480,7 +480,7 @@ async def main():
                     ensure_ascii=False).encode()).hexdigest()
                 budget_file.write_text(json.dumps(budget_row))
                 for index in range(total_requests):
-                    if qa_preinput_retry and index == base_requests - 1:
+                    if qa_preinput_retry and index == base_requests - (2 if qa_request_only_resume else 1):
                         rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 4,
                             'data': {'turn': 1, 'step': index, 'message': {'id': 'fixture-interrupted-usage',
                                 'role': 'assistant', 'content': []}}}})
@@ -493,10 +493,16 @@ async def main():
                             'data': {'turn': 2}}})
                         continue
                     rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 4,
-                        'data': {'turn': 2 if qa_preinput_retry and index >= base_requests else 1,
+                        'data': {'turn': 3 if qa_request_only_resume and index >= base_requests else
+                            2 if qa_preinput_retry and index >= base_requests - (1 if qa_request_only_resume else 0) else 1,
                             'step': index, 'usage': {'inputTokens': 10, 'outputTokens': 5},
                             'message': {'id': 'fixture-settlement-' + str(index), 'role': 'assistant',
                                 'content': [{'type': 'text', 'text': 'Synthetic bounded work.'}]}, 'stream': []}}})
+                    if qa_request_only_resume and index == base_requests - 1:
+                        rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 4,
+                            'data': {'turn': 2, 'reason': {'kind': 'completed'}}}})
+                        rows.append({'type': 'event', 'event': {'type': 'turn/start', 'seq': len(rows), 'time': 4,
+                            'data': {'turn': 3}}})
                 for index in range(6):
                     call_id = 'fixture-rejected-bash-' + str(index)
                     rejection_text = ('Error: Shared work tool ownership is unknown.' if renew_window_again
@@ -544,7 +550,20 @@ async def main():
                 receipt_path.write_text(''.join(json.dumps(row) + '\n' for row in receipt_rows))
                 receipt_path.chmod(0o600)
                 rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 4,
-                    'data': {'turn': 2 if qa_preinput_retry else 1, 'reason': {'kind': 'completed'}}}})
+                    'data': {'turn': 3 if qa_request_only_resume else 2 if qa_preinput_retry else 1,
+                        'reason': {'kind': 'completed'}}}})
+                if qa_request_only_resume:
+                    shared_module = importlib.import_module(package + '.shared_repository')
+                    prior_qa_window = json.loads(json.dumps(budget_row['renewWindow']))
+                    prior_qa_window.update(id='window-prior-sealed-fixture', request_base=base_requests - 1,
+                        original_state={**original_state, 'requests': base_requests - 1,
+                            'admissions': original_state['admissions'][:-1]})
+                    prior_qa_seal = shared_module._sealed_unknown_usage([row['event'] for row in rows], prior_qa_window)
+                    budget_row['renewWindow']['sealed_unknown_usage'] = prior_qa_seal
+                    binding['renewWindow']['sealed_unknown_usage'] = prior_qa_seal
+                    budget_row['state']['binding_sha256'] = hashlib.sha256(json.dumps(binding, separators=(',', ':'),
+                        ensure_ascii=False).encode()).hexdigest()
+                    budget_file.write_text(json.dumps(budget_row))
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
             latest = record()
@@ -782,6 +801,18 @@ async def main():
                         break
                     await asyncio.sleep(.05)
                 assert worker is None, 'The original QA delivery worker did not exit.'
+                if qa_request_only_resume:
+                    prior_qa = record()
+                    prior_qa['dsh_execution'].update(renewal_window_adoption='accepted',
+                        renewal_window_checkpoint={'status': 'admitted', 'qa_rework': True,
+                            'sealed_unknown_usage': prior_qa_seal,
+                            'previous_state': budget_row['renewWindow']['original_state'],
+                            'previous_renew_window': prior_qa_window, 'cursor': rows[-1]['event']['seq']},
+                        continuation_request_id='qa-fixture-previous',
+                        continuation_control={'kind': 'qa_rework', 'status': 'accepted', 'dispatch_status': 'accepted',
+                            'message_id': 'om_prior_qa_completion'})
+                    adapter.intake._save_execution(prior_qa, fields=['renewal_window_adoption',
+                        'renewal_window_checkpoint', 'continuation_request_id', 'continuation_control'])
                 qa_results = {}
                 qa_events = []
                 import faulthandler
@@ -855,7 +886,7 @@ async def main():
                 admitted_ledger_bytes = budget_file.read_bytes()
                 admitted_ledger = json.loads(admitted_ledger_bytes)
                 assert admitted_ledger['renewWindow']['request_base'] == admitted_ledger['state']['requests'] == (
-                    4 if qa_request_only_resume else 55)
+                    5 if qa_request_only_resume else 55)
                 if qa_request_only_resume:
                     assert admitted_ledger['budget'] == {'max_model_requests': 79}
                     assert json.loads(reference.read_text())['budget'] == {'max_model_requests': 79}
@@ -865,6 +896,9 @@ async def main():
                 assert admitted_ledger['renewWindow']['hook_marker'] is None
                 assert len(peer['prompts']) == 1 and peer['journals'][sid] == history_before
                 checkpoint = admitted['renewal_window_checkpoint']
+                if qa_request_only_resume:
+                    assert checkpoint['sealed_unknown_usage'] == admitted_ledger['renewWindow']['sealed_unknown_usage'] == prior_qa_seal
+                    assert admitted['renewal_window_checkpoint_history'][-1]['checkpoint']['sealed_unknown_usage'] == prior_qa_seal
                 assert Path(checkpoint['ledger_backup']).read_bytes() == old_ledger_bytes
                 # Model a departed original gateway with synthetic persisted identity.
                 departed = record()

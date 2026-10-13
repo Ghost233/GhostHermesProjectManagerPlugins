@@ -1647,7 +1647,13 @@ def prepare_shared_window_renewal(intake, record, message_id):
             'receipts': proofs, 'source': source, 'previous_state': deepcopy(row['state']),
             'previous_renew_window': deepcopy(row['renewWindow'])}
         if qa_case:
-            execution['renewal_window_checkpoint']['sealed_unknown_usage'] = _sealed_unknown_usage(events, row['renewWindow'])
+            sealed = row['renewWindow'].get('sealed_unknown_usage')
+            if prior_qa_window and sealed is not None and sealed == previous_checkpoint.get('sealed_unknown_usage'):
+                if _sealed_unknown_usage(events, previous_checkpoint.get('previous_renew_window')) != sealed:
+                    raise ManagementError('outcome_unknown', 'The previously sealed QA usage boundary is unconfirmed.')
+                execution['renewal_window_checkpoint']['sealed_unknown_usage'] = deepcopy(sealed)
+            else:
+                execution['renewal_window_checkpoint']['sealed_unknown_usage'] = _sealed_unknown_usage(events, row['renewWindow'])
         fields = ['renewal_window_checkpoint']
         if repeat or prior_qa_window:
             fields += ['renewal_window_checkpoint_history', 'renewal_window_adoption']

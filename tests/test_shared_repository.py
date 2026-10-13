@@ -365,12 +365,20 @@ def test_completed_natural_qa_accepts_new_feedback_in_the_same_active_window(tmp
         ledger['state'].update(requests=3, admissions=['request-0', 'request-1', 'request-2'])
         ledger['renewWindow']['request_base'] = 2
         ledger['renewWindow']['original_state'].update(requests=2, admissions=['request-0', 'request-1'])
+        previous_window = deepcopy(ledger['renewWindow'])
+        previous_window['id'] = 'earlier-qa-window'
+        ledger['renewWindow']['request_base'] = 3
+        ledger['renewWindow']['original_state'].update(requests=3, admissions=['request-0', 'request-1', 'request-2'])
     ledger['renewWindow']['sealed_unknown_usage'] = {'ordinal': 1, 'event_sha256': 'f' * 64,
                                                    'prior_window_id': 'earlier-qa-window'}
     if change == 'expired':
         started = int(time.time() * 1000) - 1_801_000
         for state in (ledger['state'], ledger['renewWindow']['original_state'], ledger['renewWindow']):
             state.update(started_at_ms=started, stop_reason='shared-work-wall-budget')
+        from ghost_hermes_pm.shared_repository import _sealed_unknown_usage
+        ledger['renewWindow']['sealed_unknown_usage'] = _sealed_unknown_usage(
+            [row['event'] for row in snapshot['records']], previous_window)
+        execution['renewal_window_checkpoint'].update(previous_renew_window=previous_window, qa_rework=True)
     execution['renewal_window_checkpoint'].update(
         previous_state=deepcopy(ledger['renewWindow']['original_state']),
         sealed_unknown_usage=deepcopy(ledger['renewWindow']['sealed_unknown_usage']))
