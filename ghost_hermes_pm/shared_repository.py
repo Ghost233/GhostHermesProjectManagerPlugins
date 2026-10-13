@@ -585,9 +585,10 @@ def _source_core(value):
 
 def _pending_qa_rework_retry(execution):
     control = execution.get('continuation_control', {})
+    retry = execution.get('qa_preinput_retry')
     return (execution.get('state') == 'outcome_unknown' and control.get('kind') == 'qa_rework'
             and control.get('status') == 'admitted' and control.get('dispatch_status') == 'accepted'
-            and not execution.get('qa_preinput_retry'))
+            and (not retry or retry.get('status') == 'accepted'))
 
 
 def _qa_rework_acceptance(execution):
@@ -922,6 +923,10 @@ def _requeue_unstarted_qa(intake, record, source_context, generation, card, work
     from .repository_acceptance import repository_source_state
     from .repository_supervision import owned_call
     execution = record['dsh_execution']
+    previous_retry = execution.get('qa_preinput_retry')
+    retries = [*execution.get('qa_preinput_retry_history', []), *([previous_retry] if previous_retry else [])]
+    if any(retry.get('message_id') == source_context['message_id'] for retry in retries):
+        raise ManagementError('duplicate', 'The original QA retry message was already handled.')
     control = execution['continuation_control']
     checkpoint = execution.get('renewal_window_checkpoint', {})
     configuration, _ = execution_configuration(record['target'])
@@ -961,11 +966,14 @@ def _requeue_unstarted_qa(intake, record, source_context, generation, card, work
                 or private_file(ledger_path(configuration, execution['session_id'])).read_bytes() != raw):
             raise ManagementError('outcome_unknown', 'The original QA input or owned execution is not idle.')
         intake.require_active(generation)
+        history = execution.setdefault('qa_preinput_retry_history', [])
+        if previous_retry:
+            history.append(deepcopy(previous_retry))
         execution['qa_preinput_retry'] = {'status': 'intent', 'message_id': source_context['message_id'],
             'previous_control': deepcopy(control), 'previous_failure': deepcopy(execution.get('last_failure'))}
         control.update(previous_claim=deepcopy(execution['supervisor_claim']), worker=worker)
         execution['state'] = 'continuation_pending'
-        intake._save_execution(record, fields=['qa_preinput_retry', 'continuation_control', 'state'])
+        intake._save_execution(record, fields=['qa_preinput_retry', 'qa_preinput_retry_history', 'continuation_control', 'state'])
         if card['status'] == 'triage':
             from hermes_cli import kanban_db as kb
             from hermes_cli.kanban_db_connect import connect_closing

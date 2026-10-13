@@ -383,7 +383,7 @@ def test_natural_qa_maintenance_reply_refreshes_only_the_original_desktop_lease(
     assert json.loads(ledger_file.read_text())['state']['requests'] == 2 and not carrier.prompts
 
 
-@pytest.mark.parametrize('change', [None, 'started', 'ledger_changed', 'snapshot_changed', 'workspace_changed', 'worker_failed', 'repeated'])
+@pytest.mark.parametrize('change', [None, 'started', 'ledger_changed', 'snapshot_changed', 'workspace_changed', 'worker_failed', 'repeated', 'previous_accepted', 'previous_intent', 'historical_duplicate'])
 def test_natural_qa_requeues_only_the_same_unstarted_continuation(tmp_path, monkeypatch, change):
     from ghost_hermes_pm import shared_repository, repository_control
     record, context, intake, carrier, ledger_file, source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
@@ -422,9 +422,22 @@ def test_natural_qa_requeues_only_the_same_unstarted_continuation(tmp_path, monk
     elif change == 'workspace_changed':
         execution['continuation_control']['workspace']['workspace_id'] = 'foreign-workspace'
     elif change == 'repeated':
-        execution['qa_preinput_retry'] = {'status': 'accepted'}
+        execution['qa_preinput_retry'] = {'status': 'accepted', 'message_id': context['message_id']}
+    elif change in {'previous_accepted', 'previous_intent'}:
+        execution['qa_preinput_retry'] = {'status': 'accepted' if change == 'previous_accepted' else 'intent',
+            'message_id': 'previous-owner-request', 'previous_failure': {'code': 'outcome_unknown'}}
+    previous_retry = deepcopy(execution.get('qa_preinput_retry'))
+    if change == 'historical_duplicate':
+        execution['qa_preinput_retry'] = {'status': 'accepted', 'message_id': 'latest-owner-request'}
+        execution['qa_preinput_retry_history'] = [{'status': 'accepted', 'message_id': context['message_id']}]
+    original_save = intake._save_execution
+    def save_fields(saved_record, fields=None):
+        for key in fields or []:
+            saved_record['dsh_execution'][key]
+        original_save(saved_record, fields)
+    intake._save_execution = save_fields
     before = ledger_file.read_bytes()
-    if change:
+    if change not in {None, 'previous_accepted'}:
         with pytest.raises(ManagementError):
             shared_repository.admit_shared_natural_qa_rework(intake, record, context, '继续原修复。', None, intake.generation)
         assert intake.card['status'] == 'blocked' and ledger_file.read_bytes() == before and not carrier.prompts
@@ -437,6 +450,16 @@ def test_natural_qa_requeues_only_the_same_unstarted_continuation(tmp_path, monk
     assert execution['continuation_control']['worker'] == worker
     assert execution['qa_preinput_retry']['previous_control']['previous_claim'] == {'run_id': 1}
     assert intake.card['status'] == 'ready' and ledger_file.read_bytes() == before and not carrier.prompts
+    if previous_retry:
+        assert execution['qa_preinput_retry_history'] == [previous_retry]
+        execution['state'] = 'outcome_unknown'
+        intake.card['status'] = 'blocked'
+        with pytest.raises(ManagementError):
+            shared_repository.admit_shared_natural_qa_rework(intake, record,
+                {**context, 'message_id': previous_retry['message_id']}, '继续原修复。', None, intake.generation)
+        with pytest.raises(ManagementError):
+            shared_repository.admit_shared_natural_qa_rework(intake, record, context, '继续原修复。', None, intake.generation)
+    assert ledger_file.read_bytes() == before and not carrier.prompts
 
 
 def test_natural_qa_rework_expired_window_requires_maintenance_without_side_effects(tmp_path, monkeypatch):
