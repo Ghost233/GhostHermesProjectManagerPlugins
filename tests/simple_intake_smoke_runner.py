@@ -271,8 +271,8 @@ async def main():
         expected, snapshot = snapshots[0]
         assert list(snapshot)[0] == 'action_hint'
         assert snapshot['action_hint'] == {'tool_name': 'hermes_pm_repository_rework',
-            'arguments': {'feedback': text, 'work_id': work_id},
-            'instruction': 'For this current owner acceptance/rework report, call this tool once with the verbatim feedback. Do not poll the snapshot first.'}
+            'arguments': {'work_id': work_id},
+            'instruction': 'For this current owner acceptance/rework report, call this tool once. The verified owner message is automatically bound. Do not poll the snapshot first.'}
         assert {key: snapshot[key] for key in expected} == expected, {
             'snapshot': {key: snapshot[key] for key in expected}, 'expected': expected}
         adapter.intake._save({'id': 'work-' + 'e' * 32, 'profile_id': 'lead', 'source_anchor': anchor,
@@ -298,7 +298,7 @@ async def main():
         schema = definition.get('schema') if isinstance(definition, dict) else getattr(definition, 'schema', None)
         description = schema.get('description') if isinstance(schema, dict) else None
         assert isinstance(description, str) and 'browser or repository acceptance/rework' in description
-        assert 'verbatim as feedback' in description and 'before polling hermes_pm_snapshot' in description
+        assert 'automatically bound' in description and 'before polling hermes_pm_snapshot' in description
         assert '提示后出牌' not in description and '没选牌' not in description
         assert model.requests == [] and plugins.unload('ghost-hermes-pm')
         (scratch / 'simple-smoke-result').write_text('passed')
@@ -385,24 +385,23 @@ async def main():
             assert adapter.intake.prepare(event, adapter) is None
             synthetic_events.append(event)
             if event.message_id == 'om_qa':
-                assert await invoke({'feedback': event.text, 'window': {'max_wall_seconds': 1800,
-                                                                         'max_model_requests': 80}}) == {
+                assert await invoke({'feedback': 'Paraphrased browser acceptance report.'}) == {
                     'status': 'rejected', 'code': 'invalid_change'}
-                tool_results.append(await invoke({'feedback': event.text}))
-                tool_results.append(await invoke({'feedback': event.text}))
+                tool_results.append(await invoke({}))
+                tool_results.append(await invoke({}))
                 return
             if event.message_id in {'om_wrong_parent', 'om_reject', 'om_renew', 'om_maintenance'}:
-                tool_results.append(await invoke({'feedback': event.text}))
+                tool_results.append(await invoke({}))
                 return
             if event.message_id == 'om_oserror':
-                tool_results.append(await invoke({'feedback': event.text}))
-                tool_results.append(await invoke({'feedback': event.text}))
+                tool_results.append(await invoke({}))
+                tool_results.append(await invoke({}))
                 return
             if event.message_id == 'om_ambiguous':
-                tool_results.append(await invoke({'feedback': event.text}))
+                tool_results.append(await invoke({}))
                 return
             if event.message_id == 'om_foreign_profile':
-                tool_results.append(await invoke({'feedback': event.text, 'work_id': 'work-' + 'f' * 32}))
+                tool_results.append(await invoke({'work_id': 'work-' + 'f' * 32}))
 
         runner._wire_adapter_handlers(adapter, message_handler=ordinary_tool_handler)
         try:
@@ -494,11 +493,9 @@ async def main():
                 'sender_type': 'bot', 'sender_id': {'open_id': 'ou_bot', 'user_id': 'u_bot', 'union_id': 'on_bot'}}))
             assert len(synthetic_events) == before and admissions == [work_id]
 
-            assert await invoke({'feedback': feedback}) == {'status': 'unassociated', 'code': 'missing_current_source'}
-            assert await invoke({'feedback': ''}) == {'status': 'rejected', 'code': 'invalid_change'}
-            assert await invoke({'feedback': feedback, 'window': {'max_wall_seconds': 1800}}) == {
-                'status': 'rejected', 'code': 'invalid_change'}
-            assert await invoke({'feedback': feedback, 'actor': 'owner'}) == {'status': 'rejected', 'code': 'invalid_change'}
+            assert await invoke({}) == {'status': 'unassociated', 'code': 'missing_current_source'}
+            assert await invoke({'feedback': feedback}) == {'status': 'rejected', 'code': 'invalid_change'}
+            assert await invoke({'actor': 'owner'}) == {'status': 'rejected', 'code': 'invalid_change'}
         finally:
             for module, original_admission in original_admissions.items():
                 module.admit_shared_natural_qa_rework = original_admission

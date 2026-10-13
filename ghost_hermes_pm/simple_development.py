@@ -627,8 +627,8 @@ def register_simple_development(ctx):
         if len(candidates) != 1:
             return None
         return {'tool_name': 'hermes_pm_repository_rework',
-                'arguments': {'feedback': saved[1], 'work_id': candidates[0]['id']},
-                'instruction': 'For this current owner acceptance/rework report, call this tool once with the verbatim feedback. Do not poll the snapshot first.'}
+                'arguments': {'work_id': candidates[0]['id']},
+                'instruction': 'For this current owner acceptance/rework report, call this tool once. The verified owner message is automatically bound. Do not poll the snapshot first.'}
 
     def snapshot(args):
         if args:
@@ -643,25 +643,25 @@ def register_simple_development(ctx):
         handler=snapshot, description='Read native outer card references and frozen Issue scope')
 
     async def natural_qa_rework(args):
-        allowed = {'feedback', 'work_id'}
-        if not isinstance(args, dict) or set(args) - allowed or not isinstance(args.get('feedback'), str):
+        if not isinstance(args, dict) or set(args) - {'work_id'}:
             return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
-        feedback = args['feedback']
         work_id = args.get('work_id')
-        if (not feedback.strip() or len(feedback) > OWNER_CONTEXT_MAX_CHARS
-                or work_id is not None and (not isinstance(work_id, str) or not re.fullmatch(r'work-[a-f0-9]{32}', work_id))):
+        if work_id is not None and (not isinstance(work_id, str) or not re.fullmatch(r'work-[a-f0-9]{32}', work_id)):
             return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
-        try:
-            _public_text(feedback, intake.secret_values)
-        except ManagementError:
-            return json.dumps({'status': 'rejected', 'code': 'sensitive'})
 
         adapter = active_adapter['value']
         source = adapter._command_source.get() if adapter is not None else None
         entries = getattr(adapter, '_natural_qa_messages', {}) if adapter is not None else {}
         saved = entries.get(getattr(source, 'message_id', None))
-        if saved is None or saved[0] is not source or saved[1] != feedback.strip():
+        if saved is None or saved[0] is not source:
             return json.dumps({'status': 'unassociated', 'code': 'missing_current_source'})
+        feedback = saved[1]
+        if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > OWNER_CONTEXT_MAX_CHARS:
+            return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
+        try:
+            _public_text(feedback, intake.secret_values)
+        except ManagementError:
+            return json.dumps({'status': 'rejected', 'code': 'sensitive'})
         try:
             if (intake.closed or adapter._close_requested or not adapter._ordinary_active
                     or source.is_bot is not False
@@ -797,11 +797,10 @@ def register_simple_development(ctx):
 
     ctx.register_tool(name='hermes_pm_repository_rework', toolset='hermes_pm', is_async=True,
         schema={'name': 'hermes_pm_repository_rework',
-                'description': 'For a current verified owner browser or repository acceptance/rework report, call once before polling hermes_pm_snapshot. Pass the current owner message verbatim as feedback; work_id only narrows one existing work. Caller identity, role and repository are never arguments.',
+                'description': 'For a current verified owner browser or repository acceptance/rework report, call once before polling hermes_pm_snapshot. The current verified owner message is automatically bound; work_id only narrows one existing work. Caller identity, role and repository are never arguments.',
                 'parameters': {'type': 'object', 'properties': {
-                    'feedback': {'type': 'string', 'minLength': 1, 'maxLength': OWNER_CONTEXT_MAX_CHARS},
                     'work_id': {'type': 'string', 'pattern': '^work-[a-f0-9]{32}$'}},
-                'required': ['feedback'], 'additionalProperties': False}},
+                'additionalProperties': False}},
         handler=natural_qa_rework, description='Queue verified natural browser QA feedback for one existing repository work')
     from .repository_supervision import register_repository_supervision
     register_repository_supervision(ctx, intake)
