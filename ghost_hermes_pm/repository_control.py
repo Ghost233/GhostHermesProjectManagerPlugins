@@ -440,7 +440,17 @@ async def process_control(intake, prepared, generation):
                 text = '已受理独立新一轮执行；沿用原总 Issue 和外层卡，旧会话、预算与失败记录完整保留，等待原生派发。'
                 result = {'status': record['dsh_execution']['state'], 'work_id': record['id']}
             elif prepared.command.startswith('继续 '):
-                if execution.get('terminal_reason', {}).get('kind') == 'max-tokens':
+                if execution.get('owner_context_maintenance_checkpoint'):
+                    from .shared_repository import admit_shared_owner_maintenance
+                    record = await asyncio.to_thread(admit_shared_owner_maintenance, intake, record, message_id, generation)
+                    text = '原 SID 正常维护接纳已核实；原窗口与累计用量保持，卡片保持待处理，尚未发送输入。请明确补充最终要求。'
+                    result = {'status': 'admitted', 'work_id': record['id']}
+                elif len(execution.get('owner_context_history', [])) == 1 and execution.get('owner_context_control'):
+                    from .shared_repository import admit_shared_owner_context
+                    record = await asyncio.to_thread(admit_shared_owner_context, intake, record, prepared, generation, prepare_maintenance=True)
+                    text = '原 SID 最终输入维护准备已保存；未发送输入、派发卡片或改变窗口。正常维护后须用新的继续消息明确接纳。'
+                    result = {'status': 'prepared', 'work_id': record['id']}
+                elif execution.get('terminal_reason', {}).get('kind') == 'max-tokens':
                     from .shared_repository import admit_shared_max_tokens
                     record = await asyncio.to_thread(admit_shared_max_tokens, intake, record, message_id, generation)
                     text = '原任务截断后续接已受理；原 SID、任务、已用量与预算窗口保持，原外层卡等待原生派发。'

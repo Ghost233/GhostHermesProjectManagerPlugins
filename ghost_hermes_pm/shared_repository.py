@@ -1346,7 +1346,7 @@ def _owner_context_failed_turn(snapshot, execution, owner_control=None):
     return turn
 
 
-def admit_shared_owner_context(intake, record, prepared, generation):
+def admit_shared_owner_context(intake, record, prepared, generation, *, prepare_maintenance=False):
     """Append one owner message to the admitted, unstarted original renewal window."""
     from .manager import _public_text
     from .simple_development import OWNER_CONTEXT_MAX_CHARS
@@ -1358,6 +1358,9 @@ def admit_shared_owner_context(intake, record, prepared, generation):
     continuation, checkpoint = execution.get('continuation_control', {}), execution.get('renewal_window_checkpoint', {})
     previous = execution.get('owner_context_control')
     history = execution.get('owner_context_history', [])
+    maintenance = execution.get('owner_context_maintenance_checkpoint', {})
+    final_input = maintenance.get('status') == 'admitted'
+    maintenance_chain = prepare_maintenance or final_input
     message_id = prepared.envelope['message_id']
     if (execution.get('mode') != 'shared_native' or execution.get('state') != 'outcome_unknown'
             or execution.get('first_input') != 'accepted' or execution.get('stop_requested') or execution.get('lifecycle_end')
@@ -1365,13 +1368,16 @@ def admit_shared_owner_context(intake, record, prepared, generation):
             or checkpoint.get('status') != 'admitted' or execution.get('renewal_window_adoption') != 'accepted'
             or continuation.get('kind') != 'renew_window' or continuation.get('status') != 'accepted'
             or continuation.get('dispatch_status') != 'accepted'
-            or not isinstance(history, list) or history
+            or not isinstance(history, list) or len(history) != (1 if maintenance_chain else 0)
+            or prepare_maintenance and maintenance
+            or final_input and hashlib.sha256(json.dumps({'current': previous, 'history': history}, sort_keys=True).encode()).hexdigest()
+                != maintenance.get('owners_sha256')
             or 'owner_context_control' in execution and (not isinstance(previous, dict)
                 or previous.get('status') != 'accepted' or previous.get('dispatch_status') != 'accepted'
                 or not isinstance(previous.get('message_id'), str) or not previous['message_id']
                 or previous['message_id'] == message_id or not previous.get('snapshot_sha256')
                 or type(continuation.get('cursor')) is not int or type(previous.get('cursor')) is not int
-                or previous['cursor'] != continuation['cursor'] + 6
+                or previous['cursor'] != continuation['cursor'] + 6 * (len(history) + 1)
                 or type(previous.get('failed_turn')) is not int or previous.get('turn') != previous['failed_turn'] + 1
                 or previous.get('turn_start_seq') != previous['cursor'] + 2
                 or previous.get('request_id') != 'owner-context-' + hashlib.sha256(
@@ -1385,10 +1391,11 @@ def admit_shared_owner_context(intake, record, prepared, generation):
             or account.get('workspace_id') != execution.get('workspace_id')
             or not isinstance(account.get('session_ids'), list) or execution.get('session_id') not in account['session_ids']):
         raise ManagementError('binding_conflict', 'The original admitted Workspace account changed.')
-    text = prepared.command.split('\n', 1)[1]
-    _public_text(text, intake.secret_values)
-    if len(text) > OWNER_CONTEXT_MAX_CHARS:
-        raise ManagementError('invalid_change', 'Owner context exceeds its bounded public input limit.')
+    text = None if prepare_maintenance else prepared.command.split('\n', 1)[1]
+    if not prepare_maintenance:
+        _public_text(text, intake.secret_values)
+        if len(text) > OWNER_CONTEXT_MAX_CHARS:
+            raise ManagementError('invalid_change', 'Owner context exceeds its bounded public input limit.')
     card = _card(intake, record)
     if card['status'] not in {'blocked', 'triage'}:
         raise ManagementError('outcome_unknown', 'The original owner-context card must be idle and awaiting input.')
@@ -1408,7 +1415,7 @@ def admit_shared_owner_context(intake, record, prepared, generation):
     previous_state = checkpoint['previous_state']
     backup = private_file(checkpoint['ledger_backup']).read_bytes()
     old = json.loads(backup)
-    if (hashlib.sha256(raw).hexdigest() != continuation['ledger_sha256']
+    if (hashlib.sha256(raw).hexdigest() != (maintenance['admitted_ledger_sha256'] if final_input else continuation['ledger_sha256'])
             or window.get('request_base') != state.get('requests') or window.get('host_lease') != configuration['host_lease']
             or any(window.get(key, 'missing') is not None for key in ('started_at_ms', 'hook_marker', 'stop_reason'))
             or window.get('original_state') != previous_state or old.get('state') != previous_state
@@ -1446,6 +1453,11 @@ def admit_shared_owner_context(intake, record, prepared, generation):
                 raise ManagementError('binding_conflict', 'The original owner-context Session changed.')
             return value
         before = snapshot()
+        checked = before
+        if final_input:
+            if not _maintenance_snapshot_matches(before, maintenance):
+                raise ManagementError('binding_conflict', 'The admitted owner maintenance snapshot changed.')
+            checked = dict(before, cursor=maintenance['cursor'], records=before['records'][:maintenance['cursor'] + 1])
         values = before['projections']['values']
         sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
         jobs = carrier.owned_jobs()
@@ -1460,17 +1472,42 @@ def admit_shared_owner_context(intake, record, prepared, generation):
                 or private_file(ledger_file).read_bytes() != raw):
             raise ManagementError('outcome_unknown', 'The original owner-context Session, queue or jobs are not idle.')
         if previous is not None:
-            cursor = previous.get('cursor')
-            if type(cursor) is not int or cursor < 0:
-                raise ManagementError('outcome_unknown', 'The original owner-context cursor is unconfirmed.')
-            prefix = dict(before, cursor=cursor, records=before['records'][:cursor + 1])
-            if _owner_context_failed_turn(prefix, execution) != previous.get('failed_turn'):
+            controls = [*history, previous]
+            first_cursor = controls[0]['cursor']
+            prefix = dict(checked, cursor=first_cursor, records=checked['records'][:first_cursor + 1])
+            if _owner_context_failed_turn(prefix, execution) != controls[0]['failed_turn']:
                 raise ManagementError('outcome_unknown', 'The original renewal-to-owner failure boundary changed.')
-        turn = _owner_context_failed_turn(before, execution, previous)
+            for index, control in enumerate(controls):
+                end = controls[index + 1]['cursor'] if index + 1 < len(controls) else checked['cursor']
+                prefix = dict(checked, cursor=end, records=checked['records'][:end + 1])
+                turn = _owner_context_failed_turn(prefix, execution, control)
+        else:
+            turn = _owner_context_failed_turn(checked, execution)
         intake.require_active(generation)
+        if prepare_maintenance:
+            backup = ledger_file.with_name(ledger_file.name + '.owner-maintenance-' + hashlib.sha256(raw).hexdigest())
+            if not backup.exists():
+                with os.fdopen(os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600), 'wb') as output:
+                    output.write(raw)
+                    output.flush()
+                    os.fsync(output.fileno())
+            if private_file(backup).read_bytes() != raw:
+                raise ManagementError('binding_conflict', 'The owner maintenance original ledger backup differs.')
+            owners = {'current': deepcopy(previous), 'history': deepcopy(history)}
+            maintenance = execution['owner_context_maintenance_checkpoint'] = {'status': 'intent', 'message_id': message_id,
+                'owners': owners, 'owners_sha256': hashlib.sha256(json.dumps(owners, sort_keys=True).encode()).hexdigest(),
+                'native_identity': deepcopy(execution['native_identity']), 'reference_sha256': execution['reference_sha256'],
+                'scope': scope, 'worker': worker, 'workspace': deepcopy(account), 'source': checkpoint['source'],
+                'receipts': deepcopy(checkpoint['receipts']), 'jobs': deepcopy(jobs), 'ledger_backup': str(backup),
+                'ledger_sha256': hashlib.sha256(raw).hexdigest(), 'cursor': before['cursor'],
+                'snapshot_sha256': hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest()}
+            intake._save_execution(record, fields=['owner_context_maintenance_checkpoint'])
+            maintenance['status'] = 'prepared'
+            intake._save_execution(record, fields=['owner_context_maintenance_checkpoint'])
+            return record
         request_id = 'owner-context-' + hashlib.sha256((record['id'] + ':' + message_id).encode()).hexdigest()
         if previous is not None:
-            execution['owner_context_history'] = [deepcopy(previous)]
+            execution['owner_context_history'] = [*deepcopy(history), deepcopy(previous)]
         control = execution['owner_context_control'] = {'message_id': message_id, 'request_id': request_id,
             'text_sha256': hashlib.sha256(text.encode()).hexdigest(), 'status': 'intent', 'cursor': before['cursor'],
             'snapshot_sha256': hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
@@ -1519,6 +1556,104 @@ def admit_shared_owner_context(intake, record, prepared, generation):
             raise ManagementError('outcome_unknown', 'Original owner-context card is not ready for native dispatch.')
         control['dispatch_status'] = 'accepted'
         intake._save_execution(record, fields=['owner_context_control'])
+        return record
+    finally:
+        carrier.close()
+
+
+def admit_shared_owner_maintenance(intake, record, message_id, generation):
+    """Rebind only the prepared owner failure; never dispatch or send input."""
+    import psutil
+    from .repository_control import _card, _worker_end
+    from .repository_execution import execution_configuration
+    from .repository_supervision import owned_call
+    from .repository_acceptance import repository_source_state
+    execution = record['dsh_execution']
+    checkpoint = execution.get('owner_context_maintenance_checkpoint', {})
+    owners = {'current': execution.get('owner_context_control'), 'history': execution.get('owner_context_history')}
+    if (checkpoint.get('status') != 'prepared' or checkpoint.get('message_id') == message_id
+            or execution.get('mode') != 'shared_native' or execution.get('state') != 'outcome_unknown'
+            or execution.get('stop_requested') or execution.get('lifecycle_end')
+            or execution.get('native_identity') != checkpoint.get('native_identity')
+            or execution.get('reference_sha256') != checkpoint.get('reference_sha256')
+            or owners != checkpoint.get('owners') or _worker_end(intake, record, allow_later_terminal=True) != checkpoint['worker']
+            or _card(intake, record)['status'] not in {'blocked', 'triage'}):
+        raise ManagementError('outcome_unknown', 'Only the exact prepared owner failure may enter normal maintenance once.')
+    configuration, _ = execution_configuration(record['target'])
+    scope = json.loads(private_file(record['target']['execution_ref']).read_text())
+    if scope != dict(checkpoint['scope'], host_lease=configuration['host_lease']):
+        raise ManagementError('binding_conflict', 'Only the owner maintenance Host lease may change.')
+    old = checkpoint['native_identity']
+    if psutil.pid_exists(old['pid']):
+        try:
+            if psutil.Process(old['pid']).create_time() == old['created_at']:
+                raise ManagementError('outcome_unknown', 'The original owner maintenance Host is still alive.')
+        except psutil.NoSuchProcess:
+            pass
+    configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
+        generation=execution['generation'], workspace_id=execution['workspace_id'])
+    path = ledger_path(configuration, execution['session_id'])
+    raw = private_file(path).read_bytes()
+    if (hashlib.sha256(raw).hexdigest() != checkpoint['ledger_sha256']
+            or private_file(checkpoint['ledger_backup']).read_bytes() != raw
+            or repository_source_state(record['target']) != checkpoint['source']):
+        raise ManagementError('binding_conflict', 'The prepared owner maintenance ledger or source changed.')
+    row = read_ledger(dict(configuration, host_lease=old['lease']), execution)
+    carrier = SharedDesktopTransport(configuration)
+    try:
+        new = carrier.native_identity
+        if any(new[key] == old[key] for key in ('lease', 'pid', 'created_at')):
+            raise ManagementError('binding_conflict', 'The original owner maintenance restart is unverified.')
+        if checkpoint.get('adoption') == 'intent':
+            raise ManagementError('outcome_unknown', 'Owner maintenance adoption remains unknown; no replay.')
+        if checkpoint.get('adoption') != 'accepted':
+            checkpoint['adoption'] = 'intent'
+            intake._save_execution(record, fields=['owner_context_maintenance_checkpoint'])
+            answer = owned_call(carrier, 'session/create', {'sessionId': execution['session_id'],
+                'workspaceId': execution['workspace_id'], 'agentPreset': configuration['agent_preset']})
+            if answer != {'sessionId': execution['session_id'], 'agentPreset': configuration['agent_preset']}:
+                raise ManagementError('outcome_unknown', 'Same-SID owner maintenance adoption is unconfirmed.')
+            checkpoint['adoption'] = 'accepted'
+            intake._save_execution(record, fields=['owner_context_maintenance_checkpoint'])
+        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
+            'sessionId': execution['session_id']}, 'maxMessages': 500}})
+        try:
+            snapshot = next(stream)
+        finally:
+            stream.close()
+        header = snapshot.get('header', {})
+        values = snapshot.get('projections', {}).get('values', {})
+        sessions = [item for item in owned_call(carrier, 'session/list', {})['items'] if item['sessionId'] == execution['session_id']]
+        if (not _maintenance_snapshot_matches(snapshot, checkpoint) or header.get('id') != execution['session_id']
+                or header.get('cwd') != configuration['workspace'] or header.get('createdAt') != execution['session_created_at']
+                or values.get('agentPreset') != configuration['agent_preset'] or snapshot.get('hasMore') is not False
+                or values.get('inbox') != {'next-turn': [], 'next-step': []}
+                or values.get('permissions') != {'currentValue': 'workspace-write'}
+                or len(sessions) != 1 or sessions[0].get('cwd') != configuration['workspace']
+                or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
+                or carrier.owned_jobs() != checkpoint['jobs'] or private_file(path).read_bytes() != raw):
+            raise ManagementError('binding_conflict', 'The restored owner maintenance Session or history differs.')
+        for suffix, proof in checkpoint['receipts'].items():
+            receipt = ledger_path(configuration, execution['session_id'], suffix)
+            content = private_file(receipt).read_bytes() if receipt.exists() else b''
+            if len(content) != proof['size'] or hashlib.sha256(content).hexdigest() != proof['sha256']:
+                raise ManagementError('binding_conflict', 'Original owner maintenance receipt bytes changed.')
+        intake.require_active(generation)
+        row['host_lease'] = new['lease']
+        row['renewWindow']['host_lease'] = new['lease']
+        row['state']['binding_sha256'] = _window_fingerprint(row)
+        temporary = path.with_name(path.name + '.' + uuid.uuid4().hex)
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'w') as output:
+            json.dump(row, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        read_ledger(configuration, execution)
+        retire_shared(intake, record['id'])
+        execution.update(native_identity=new, reference_sha256=configuration['reference_sha256'])
+        checkpoint.update(status='admitted', admit_message_id=message_id,
+            admitted_ledger_sha256=hashlib.sha256(private_file(path).read_bytes()).hexdigest())
+        intake._save_execution(record, fields=['native_identity', 'reference_sha256', 'owner_context_maintenance_checkpoint'])
         return record
     finally:
         carrier.close()

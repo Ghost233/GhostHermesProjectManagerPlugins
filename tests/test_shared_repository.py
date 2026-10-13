@@ -630,6 +630,88 @@ def test_repeat_window_prepare_rejects_unconfirmed_delta(change, repeat_window_r
     assert 'session/prompt' not in f.carrier_calls
 
 
+@pytest.mark.parametrize('case', ['state', 'history', 'card_worker', 'event_chain', 'active_job',
+    'old_identity', 'scope', 'ledger_business'])
+def test_owner_maintenance_rejects_unverified_read_facts(case, repeat_window_read_facts, monkeypatch):
+    from types import SimpleNamespace
+    from ghost_hermes_pm import shared_repository as shared, repository_control, repository_supervision
+    f = repeat_window_read_facts
+    e = f.record['dsh_execution']
+    old_row = deepcopy(f.row)
+    backup = f.ledger.with_suffix('.owner-backup')
+    backup.write_text(json.dumps(old_row)); backup.chmod(0o600)
+    state = deepcopy(old_row['state'])
+    f.row['renewWindow'] = {'id': 'fixture-owner-window', 'message_id': 'fixture-renew',
+        'host_lease': f.native['lease'], 'request_base': state['requests'], 'original_state': state,
+        'original_host_lease': 'fixture-origin-lease', 'started_at_ms': None, 'hook_marker': None, 'stop_reason': None}
+    f.row['state']['binding_sha256'] = shared._window_fingerprint(f.row)
+    f.ledger.write_text(json.dumps(f.row))
+    receipts = {}
+    for suffix in ('.tools.jsonl', '.jobs.jsonl'):
+        p = shared.ledger_path(f.config, e['session_id'], suffix)
+        raw = p.read_bytes() if p.exists() else b''
+        receipts[suffix] = {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+    account = {'workspace_id': e['workspace_id'], 'session_ids': [e['session_id']]}
+    e.update(state='outcome_unknown', reference_sha256=f.config['reference_sha256'], last_failure={'code': 'outcome_unknown'},
+        supervisor_claim=f.worker, continuation_request_id='fixture-generic-request', continuation_control={
+            'kind': 'renew_window', 'status': 'accepted', 'dispatch_status': 'accepted', 'cursor': 0,
+            'snapshot_sha256': 'fixture-original-snapshot', 'ledger_sha256': hashlib.sha256(f.ledger.read_bytes()).hexdigest(),
+            'workspace': account}, renewal_window_checkpoint={'status': 'admitted', 'message_id': 'fixture-renew',
+            'scope': {'host_lease': f.native['lease']}, 'previous_state': state, 'previous_renew_window': old_row['renewWindow'],
+            'ledger_backup': str(backup), 'ledger_sha256': hashlib.sha256(backup.read_bytes()).hexdigest(),
+            'receipts': receipts, 'source': f.source, 'workspace': account, 'native_identity': f.native},
+        renewal_window_history=[{'message_id': 'fixture-renew', 'ledger_backup': str(backup), 'renew_window': old_row['renewWindow']}])
+    events = [{'type': 'session/end-seed', 'seq': 0, 'data': {}}]
+    controls = []
+    reason = {'kind': 'error', 'error': {'message': 'Shared work native settlement usage is unknown.', 'code': 'UNKNOWN'}}
+    for turn in (5, 6, 7):
+        mid = 'fixture-owner-' + str(turn)
+        request = 'fixture-generic-request' if turn == 5 else 'owner-context-' + hashlib.sha256((f.record['id'] + ':' + mid).encode()).hexdigest()
+        cursor = len(events) - 1
+        for kind, data in [('agent/inbox/spliced', {'target': 'next-turn', 'start': 0, 'inserted': [
+                {'id': mid, 'role': 'user', 'source': {'kind': 'user', 'rpcId': request}, 'content': [{'type': 'text', 'text': 'Verify fixture scope.'}]}]}),
+                ('turn/start', {'turn': turn}), ('agent/inbox/spliced', {'target': 'next-turn', 'start': 0, 'removedCount': 1, 'inserted': []}),
+                ('step/start', {'turn': turn, 'step': 1}), ('step/end', {'turn': turn, 'step': 1}), ('turn/end', {'turn': turn, 'reason': reason})]:
+            events.append({'type': kind, 'seq': len(events), 'data': data})
+        if turn > 5:
+            controls.append({'message_id': mid, 'request_id': request, 'status': 'accepted', 'dispatch_status': 'accepted',
+                'cursor': cursor, 'snapshot_sha256': 'fixture-owner-snapshot', 'failed_turn': turn - 1, 'turn': turn,
+                'turn_start_seq': cursor + 2, 'text_sha256': hashlib.sha256(b'Verify fixture scope.').hexdigest()})
+    e.update(owner_context_history=controls[:1], owner_context_control=controls[1])
+    f.snapshot.update(cursor=len(events) - 1, records=[{'event': event} for event in events])
+    f.intake.secret_values = ()
+    f.intake.require_active = lambda generation: None
+    def owner_read_call(carrier, method, payload):
+        f.carrier_calls.append(method)
+        assert method == 'session/list', 'A rejected maintenance must not perform adoption or input.'
+        return {'items': [{'sessionId': e['session_id'], 'cwd': f.config['workspace'], 'running': False, 'agentAvailable': True}]}
+    monkeypatch.setattr(repository_supervision, 'owned_call', owner_read_call)
+    if case in {'old_identity', 'scope', 'ledger_business'}:
+        e['owner_context_maintenance_checkpoint'] = {'status': 'prepared', 'message_id': 'fixture-first-continue',
+            'native_identity': f.native, 'reference_sha256': e['reference_sha256'], 'worker': f.worker,
+            'owners': {'current': deepcopy(controls[1]), 'history': deepcopy(controls[:1])},
+            'scope': {'host_lease': f.native['lease']}, 'source': f.source, 'ledger_backup': str(f.ledger),
+            'ledger_sha256': hashlib.sha256(f.ledger.read_bytes()).hexdigest()}
+        if case == 'scope':
+            f.reference.write_text(json.dumps({'host_lease': f.native['lease'], 'unexpected': 'fixture'}))
+        elif case == 'ledger_business':
+            altered = deepcopy(f.row); altered['state']['requests'] += 1
+            f.ledger.write_text(json.dumps(altered))
+    elif case == 'state': e['state'] = 'running'
+    elif case == 'history': e['owner_context_history'] = []
+    elif case == 'card_worker': monkeypatch.setattr(repository_control, '_card', lambda *args: {'status': 'running'})
+    elif case == 'event_chain': f.snapshot['records'][-1]['event']['data']['reason'] = {'kind': 'completed'}
+    elif case == 'active_job': f.jobs = [{'id': 'fixture-active-job', 'status': 'running'}]
+    before = f.ledger.read_bytes()
+    with pytest.raises(ManagementError):
+        if case in {'old_identity', 'scope', 'ledger_business'}:
+            shared.admit_shared_owner_maintenance(f.intake, f.record, 'fixture-second-continue', 0)
+        else:
+            shared.admit_shared_owner_context(f.intake, f.record, SimpleNamespace(command='继续 fixture-work',
+                envelope={'message_id': 'fixture-first-continue'}), 0, prepare_maintenance=True)
+    assert f.ledger.read_bytes() == before and f.saves == [] and 'session/create' not in f.carrier_calls
+
+
 def test_owner_context_refuses_incomplete_receipt_checkpoint(repeat_window_read_facts):
     from types import SimpleNamespace
     from ghost_hermes_pm.shared_repository import admit_shared_owner_context
@@ -1146,7 +1228,7 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata'])
+@pytest.mark.parametrize('scenario', ['terminal', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])
