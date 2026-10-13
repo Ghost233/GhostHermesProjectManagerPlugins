@@ -264,7 +264,10 @@ async def main():
         async def ordinary_snapshot_handler(event):
             assert adapter._command_source.get() is event.source
             assert adapter.intake.prepare(event, adapter) is None
-            snapshots.append((adapter.intake.snapshot(), json.loads(registry.dispatch('hermes_pm_snapshot', {}))))
+            encoded = registry.dispatch('hermes_pm_snapshot', {})
+            current = json.loads(encoded)
+            assert encoded == json.dumps(current, ensure_ascii=False, separators=(',', ':'))
+            snapshots.append((adapter.intake.snapshot(), current))
 
         runner._wire_adapter_handlers(adapter, message_handler=ordinary_snapshot_handler)
         text = 'The browser acceptance needs repository rework.'
@@ -279,8 +282,8 @@ async def main():
         assert snapshot['action_hint'] == {'tool_name': 'hermes_pm_repository_rework',
             'arguments': {'work_id': work_id},
             'instruction': 'For this current owner acceptance/rework report, call this tool once. The verified owner message is automatically bound. Do not poll the snapshot first.'}
-        assert {key: snapshot[key] for key in expected} == expected, {
-            'snapshot': {key: snapshot[key] for key in expected}, 'expected': expected}
+        assert snapshot['work'] == [{'id': work_id, 'state': 'awaiting_acceptance'}]
+        assert len(json.dumps(snapshot)) < 1500 and 'dsh_execution' not in json.dumps(snapshot)
         adapter.intake._save({'id': 'work-' + 'e' * 32, 'profile_id': 'lead', 'source_anchor': anchor,
             'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
                 'terminal_reason': {'kind': 'completed'},
@@ -292,7 +295,9 @@ async def main():
                 break
             await asyncio.sleep(.01)
         ambiguous_expected, ambiguous_snapshot = snapshots[-1]
-        assert 'action_hint' not in ambiguous_snapshot and ambiguous_snapshot == ambiguous_expected
+        assert 'action_hint' not in ambiguous_snapshot
+        assert len(ambiguous_snapshot['work']) == len(ambiguous_expected['work']) == 2
+        assert len(json.dumps(ambiguous_snapshot)) < 1500
         before = len(snapshots)
         await receive(adapter, raw('om_discover_foreign', text='@_user_1 Foreign report.', sender={
             'sender_id': {'open_id': 'ou_foreign', 'user_id': 'u_foreign', 'union_id': 'on_foreign'}}))
@@ -575,7 +580,7 @@ async def main():
         await receive(adapter, raw('om_configuration'))
         assert len(sent) == 1 and sent[0].message_id == 'om_configuration'
         assert '配置' in sent[0].request_body.content and '未受理' in sent[0].request_body.content
-        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == []
+        assert adapter.intake.snapshot()['work'] == []
         assert not (scratch / 'gh-calls').exists()
         from tools import kanban_tools  # noqa: F401
         assert json.loads(registry.dispatch('kanban_list', {}))['count'] == 0
@@ -609,7 +614,7 @@ async def main():
             assert sent == [], 'An ended plugin generation cannot emit failure replies.'
         else:
             await receive(adapter, raw('om_work'))
-            record = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            record = adapter.intake.snapshot()['work'][0]
             assert record['card_id'] is None
             assert len(sent) == 1 and sent[0].message_id == 'om_work'
             assert record['id'] in sent[0].request_body.content
@@ -618,7 +623,7 @@ async def main():
                         if call[:2] == ['issue', 'view']]) == 1, 'Failure does not trigger an automatic read retry.'
             (scratch / 'issue-source-recovered').write_text('recovered')
             await receive(adapter, raw('om_reconcile', '@_user_1 核对 ' + record['id']))
-            recovered = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work']
+            recovered = adapter.intake.snapshot()['work']
             assert len(recovered) == 1 and recovered[0]['id'] == record['id']
             assert recovered[0]['card_id'] and recovered[0]['issue']['url'].endswith('/7')
             assert len(sent) == 2 and sent[-1].message_id == 'om_reconcile'
@@ -652,7 +657,7 @@ async def main():
             duplicate = json.loads(registry.dispatch('kanban_create', dict(arguments, idempotency_key='other-key')))
             assert duplicate['ok'] and duplicate['task_id'] != preexisting['task_id']
         await receive(adapter, raw('om_work'))
-        record = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+        record = adapter.intake.snapshot()['work'][0]
         assert record['state'] == 'card_unknown' and record['card_id'] is None, record
         assert '已受理' not in sent[0].request_body.content
         card = json.loads(registry.dispatch('kanban_show', {'task_id': preexisting['task_id']}))['task']
@@ -664,14 +669,14 @@ async def main():
         return
     if scenario == 'changed_card':
         await receive(adapter, raw('om_work'))
-        record = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+        record = adapter.intake.snapshot()['work'][0]
         card_id = record['card_id']
         assert card_id
         from hermes_cli.kanban import run_slash
         edited = run_slash('edit ' + card_id + ' --body ' + shlex.quote('Changed scope after acceptance.'))
         assert 'error' not in edited.lower(), edited
         await receive(adapter, raw('om_changed'))
-        changed = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+        changed = adapter.intake.snapshot()['work'][0]
         assert changed['state'] == 'card_unknown' and changed['card_id'] is None
         assert changed['issue'] == record['issue']
         assert len(sent) == 2 and '已受理' not in sent[-1].request_body.content
@@ -682,14 +687,14 @@ async def main():
         return
     if scenario == 'create_unknown':
         await receive(adapter, raw('om_work', '@_user_1 工作 Add the requested feature\nVerify the bounded acceptance.'))
-        uncertain = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+        uncertain = adapter.intake.snapshot()['work'][0]
         assert uncertain['state'] == 'issue_unknown' and uncertain['card_id'] is None
         await receive(adapter, raw('om_reconcile', '@_user_1 核对 ' + uncertain['id']))
         calls = [json.loads(line) for line in (scratch / 'gh-calls').read_text().splitlines()]
         assert len([call for call in calls if '--method' in call]) == 1, 'Unknown Issue creation must only reconcile.'
     elif scenario == 'private_issue':
         await receive(adapter, raw('om_secret', '@_user_1 工作 Feature\napi_key=sk-abcdefghijklmnopqrstuvwxyz'))
-        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == []
+        assert adapter.intake.snapshot()['work'] == []
         assert not (scratch / 'gh-calls').exists(), 'Sensitive requests must never reach GitHub.'
         await receive(adapter, raw('om_work', '@_user_1 工作 Feature\nVerify ' + str(repo) + ' for ou_owner in oc_fixture.'))
         published = json.loads((scratch / 'created-issue').read_text())
@@ -714,7 +719,7 @@ async def main():
         await receive(adapter, raw('om_bot_outside', '@_user_1 派发 outside https://github.com/fixture-user/other/issues/8',
             sender={'sender_type': 'app', 'tenant_key': 'tenant-steward',
                     'sender_id': {'open_id': 'ou_steward', 'user_id': 'u_steward'}}))
-        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == []
+        assert adapter.intake.snapshot()['work'] == []
         assert not (scratch / 'gh-calls').exists(), 'Forged or out-of-duty requests cannot touch GitHub.'
         await receive(adapter, raw('om_work', sender={'sender_type': 'app', 'tenant_key': 'tenant-steward',
             'sender_id': {'open_id': 'ou_steward', 'user_id': 'u_steward'}}))
@@ -722,16 +727,16 @@ async def main():
             'tenant_key': 'tenant-steward', 'sender_id': {'open_id': 'ou_steward', 'user_id': 'u_steward'}}))
     elif scenario == 'responsibility_conflict':
         await receive(adapter, raw('om_work', '@_user_1 派发 lead https://github.com/fixture-user/fixture/issues/7'))
-        before = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work']
+        before = adapter.intake.snapshot()['work']
         await receive(adapter, raw('om_conflict', '@_user_1 派发 other-lead https://github.com/fixture-user/fixture/issues/7'))
-        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == before
+        assert adapter.intake.snapshot()['work'] == before
         assert len(sent) == 2 and sent[-1].message_id == 'om_conflict' and '职责' in sent[-1].request_body.content
     else:
         await receive(adapter, raw('om_work'))
         await receive(adapter, raw('om_work'))
         os.environ['SYNTHETIC_GH_BODY'] = 'A later edit must not expand the accepted scope.'
         await receive(adapter, raw('om_later_same_issue'))
-    snapshot = json.loads(registry.dispatch('hermes_pm_snapshot', {}))
+    snapshot = adapter.intake.snapshot()
     assert snapshot['status'] == 'completed' and len(snapshot['work']) == 1, snapshot
     record = snapshot['work'][0]
     if scenario == 'worker_required':
@@ -739,13 +744,13 @@ async def main():
         assert refused.get('status') == 'rejected' and refused.get('code') == 'worker_required', refused
         forged = json.loads(registry.dispatch('hermes_pm_supervise', {'actor': 'owner', 'repo_path': str(repo)}))
         assert forged.get('status') == 'rejected'
-        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == [record]
+        assert adapter.intake.snapshot()['work'] == [record]
     if scenario == 'authority':
-        controlled = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work']
+        controlled = adapter.intake.snapshot()['work']
         bot = {'sender_type': 'app', 'tenant_key': 'tenant-steward', 'sender_id': {'open_id': 'ou_steward', 'user_id': 'u_steward'}}
         await receive(adapter, raw('om_bot_stop', '@_user_1 停止 ' + record['id'], sender=bot))
         await receive(adapter, raw('om_bot_retry', '@_user_1 重试 ' + record['id'], sender=bot))
-        assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'] == controlled
+        assert adapter.intake.snapshot()['work'] == controlled
         assert not any('独立新一轮' in message.request_body.content or '停止已核实' in message.request_body.content for message in sent), 'Bot control is rejected by native authorization or the owner-only plugin entry.'
     expected_body = 'Create native-delivery.txt' if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_reaped', 'worker_stop_native_front', 'worker_stop_native_background', 'worker_stop_native_live', 'worker_stop_native_promoted', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} else 'Verify the bounded acceptance.' if scenario == 'create_unknown' else 'Verify [binding:' if scenario in {'private_issue', 'private_all_bindings'} else 'Implement the requested feature and verify it.'
     assert expected_body in record['issue']['body']
@@ -789,7 +794,7 @@ async def main():
             directory = state / 'owned-work' / record['id']
             until = time.monotonic() + 15
             while time.monotonic() < until:
-                current = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                current = adapter.intake.snapshot()['work'][0]
                 if current['dsh_execution']['state'] == ('running' if scenario == 'worker_stop_native_live' else 'outcome_unknown'):
                     break
                 await asyncio.sleep(.025)
@@ -797,7 +802,7 @@ async def main():
             original_execution = current['dsh_execution']
             budget_before = (directory / 'home/.hermes-budget.json').read_bytes()
             await receive(adapter, raw('om_stop_service', text='@_user_1 停止 ' + record['id']))
-            stopped = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            stopped = adapter.intake.snapshot()['work'][0]
             assert stopped['dsh_execution']['state'] == 'stopped', {'work': stopped, 'reply': sent[-1].request_body.content}
             assert stopped['card_id'] == record['card_id']
             if scenario == 'worker_stop_native_live':
@@ -823,7 +828,7 @@ async def main():
             configured['budget']['max_reported_tokens'] = 1000
             Path(binding['execution_ref']).write_text(json.dumps(configured))
             await receive(adapter, raw('om_retry_service', text='@_user_1 重试 ' + record['id']))
-            retry = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            retry = adapter.intake.snapshot()['work'][0]
             assert retry['card_id'] == record['card_id'] and retry['dsh_execution']['state'] == 'admitted', retry
             with connect_closing() as db:
                 next_run = dispatch_once(db, max_spawn=1)
@@ -831,7 +836,7 @@ async def main():
                 known_workers.append(remember_worker(db, record['card_id']))
             until = time.monotonic() + 25
             while time.monotonic() < until:
-                latest = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                latest = adapter.intake.snapshot()['work'][0]
                 if latest['dsh_execution']['state'] == 'awaiting_acceptance':
                     break
                 await asyncio.sleep(.025)
@@ -848,14 +853,14 @@ async def main():
             until = time.monotonic() + 20
             notice = None
             while time.monotonic() < until:
-                current = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                current = adapter.intake.snapshot()['work'][0]
                 notice = next((row for row in current['dsh_execution'].get(field, []) if row.get('delivery', {}).get('message_id')), None)
                 if notice:
                     break
                 await asyncio.sleep(.025)
             assert notice, current
             await receive(adapter, raw('om_stop_human', text='@_user_1 停止 ' + record['id']))
-            stopped_human = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            stopped_human = adapter.intake.snapshot()['work'][0]
             assert stopped_human['dsh_execution']['stop_requested'] is True
             assert (repo / 'native-delivery.txt').read_text() == 'native-worker\n'
             assert stopped_human['dsh_execution']['state'] == 'stopped', stopped_human
@@ -863,12 +868,12 @@ async def main():
             answer = '@_user_1 colour：Blue'
             original_calls = len(model.requests)
             await receive(adapter, raw('om_late_human', text=answer, parent_id=parent))
-            latest = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            latest = adapter.intake.snapshot()['work'][0]
             assert latest['dsh_execution'].get('stop_requested') is True
             assert not next(row for row in latest['dsh_execution'][field] if row.get('id', row.get('approval_id')) == notice.get('id', notice.get('approval_id'))).get('reply_message_id')
             assert len(model.requests) == original_calls, 'Late human replies cannot enter ordinary model processing or resend native work.'
             await receive(adapter, raw('om_retry_human', text='@_user_1 重试 ' + record['id']))
-            retried_human = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            retried_human = adapter.intake.snapshot()['work'][0]
             assert retried_human['dsh_execution']['state'] == 'admitted', retried_human
             await receive(adapter, raw('om_late_history', text=answer, parent_id=parent))
             await receive(adapter, raw('om_ordinary_canary', text='@_user_1 请回复普通会话测试。'))
@@ -878,7 +883,7 @@ async def main():
             assert any(request.message_id == 'om_ordinary_canary' for request in sent), 'Native ordinary processing must cross the external model boundary before evaluating historical rejection.'
             assert model.requests[original_calls:] and all(row['ordinary_canary'] and not row['historical_question_reply'] for row in model.requests[original_calls:]), 'Only the canary conversation may use the model; historical question replies must be rejected.'
             assert any(request.message_id == 'om_late_history' and '无法唯一关联' in request.request_body.content for request in sent)
-            assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution']['state'] == 'admitted'
+            assert adapter.intake.snapshot()['work'][0]['dsh_execution']['state'] == 'admitted'
             assert plugins.unload('ghost-hermes-pm')
             (scratch / 'simple-smoke-result').write_text('passed')
             return
@@ -886,7 +891,7 @@ async def main():
             import psutil
             until = time.monotonic() + 20
             while time.monotonic() < until:
-                current = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                current = adapter.intake.snapshot()['work'][0]
                 if model.dsh_ready.is_set() and current['dsh_execution'].get('journal_cursor'):
                     break
                 await asyncio.sleep(.02)
@@ -894,7 +899,7 @@ async def main():
             assert (repo / 'native-delivery.txt').read_text() == 'native-worker\n'
             await receive(adapter, raw('om_stop_live', text='@_user_1 停止 ' + record['id']))
             model.dsh_release.set()
-            current = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            current = adapter.intake.snapshot()['work'][0]
             assert current['dsh_execution']['state'] == 'stopped', {'work': current, 'reply': sent[-1].request_body.content}
             assert current['dsh_execution']['stop_control']['cancel_status'] == 'accepted'
             assert current['dsh_execution']['stop_control']['proof']['worker']['exit_code'] == 0
@@ -909,7 +914,7 @@ async def main():
             import psutil
             until = time.monotonic() + 20
             while time.monotonic() < until:
-                original_work = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                original_work = adapter.intake.snapshot()['work'][0]
                 original_execution = original_work['dsh_execution']
                 if model.dsh_ready.is_set() and original_execution.get('state') == 'running' and 'journal_cursor' in original_execution:
                     break
@@ -927,7 +932,7 @@ async def main():
             try:
                 until = time.monotonic() + 25
                 while time.monotonic() < until:
-                    unknown_work = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                    unknown_work = adapter.intake.snapshot()['work'][0]
                     unknown = unknown_work['dsh_execution']
                     if unknown['state'] == 'outcome_unknown':
                         break
@@ -969,7 +974,7 @@ async def main():
             assert all('hermes_pm_supervise' in r['tool_names'] and all(n.startswith('kanban_') or n == 'hermes_pm_supervise' for n in r['tool_names']) for r in model.requests if r['worker'])
             await receive(adapter, raw('om_unknown_status', text='@_user_1 核对 ' + record['id']))
             assert '原执行结果未知，保留仓库占用' in sent[-1].request_body.content
-            assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution']['state'] == 'outcome_unknown'
+            assert adapter.intake.snapshot()['work'][0]['dsh_execution']['state'] == 'outcome_unknown'
             assert len(list((state / 'owned-work').rglob('native-configuration.json'))) == 1
             (scratch / 'worker-unknown-evidence.json').write_text(json.dumps({'state': 'outcome_unknown',
                 'generation': unknown['generation'], 'session_id': unknown['session_id'], 'request_id': unknown['request_id'],
@@ -984,7 +989,7 @@ async def main():
             while not model.query_ready.is_set() and time.monotonic() < until:
                 await asyncio.sleep(.01)
             assert model.query_ready.is_set()
-            before_query = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution']
+            before_query = adapter.intake.snapshot()['work'][0]['dsh_execution']
             await receive(adapter, raw('om_live_status', text='@_user_1 核对 ' + record['id']))
             import importlib
             supervision = next(m for n, m in sys.modules.items() if n.endswith('.ghost_hermes_pm.repository_supervision'))
@@ -1004,7 +1009,7 @@ async def main():
                         break
                     await asyncio.sleep(.05)
                 assert ends[-1]['data']['reason']['kind'] == 'completed' and terminal.status == 'blocked'
-                current = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                current = adapter.intake.snapshot()['work'][0]
                 assert current['notification_claimed'] is True
                 assert all(current['dsh_execution'][k] == before_query[k] for k in ('generation', 'session_id', 'request_id', 'first_input'))
                 assert current['dsh_execution']['state'] == 'awaiting_acceptance', {'card_status': terminal.status,
@@ -1013,7 +1018,7 @@ async def main():
                 observed.close()
         until = time.monotonic() + (180 if real_model else 60)
         while time.monotonic() < until:
-            current = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            current = adapter.intake.snapshot()['work'][0]
             if current['dsh_execution']['state'] in {'awaiting_acceptance', 'budget_stopped', 'outcome_unknown'}:
                 break
             if current['dsh_execution']['state'] == 'admitted':
@@ -1063,10 +1068,10 @@ async def main():
         if scenario == 'worker_retry_observer':
             assert delivery_entered.is_set(), 'Original acceptance notification must reach the external send boundary.'
             await receive(adapter, raw('om_stop_observer', text='@_user_1 停止 ' + record['id']))
-            stopped_observer = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            stopped_observer = adapter.intake.snapshot()['work'][0]
             assert stopped_observer['dsh_execution']['state'] == 'stopped', stopped_observer
             await receive(adapter, raw('om_retry_observer', text='@_user_1 重试 ' + record['id']))
-            admitted_observer = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            admitted_observer = adapter.intake.snapshot()['work'][0]
             assert admitted_observer['dsh_execution']['state'] == 'admitted' and admitted_observer['dsh_execution']['attempt'] == 2
             assert 'generation' not in admitted_observer['dsh_execution'] and 'delivery_notification' not in admitted_observer['dsh_execution']
             delivery_release.set()
@@ -1077,7 +1082,7 @@ async def main():
             # The old original observer must either finish its old write or reject it,
             # then read the newly admitted row; it has no new native instance to attach.
             await asyncio.sleep(.35)
-            reconciled = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            reconciled = adapter.intake.snapshot()['work'][0]
             assert 'delivery_notification' not in reconciled['dsh_execution'], reconciled
             assert reconciled['dsh_execution'] == admitted_observer['dsh_execution']
             assert reconciled['execution_attempts'] == admitted_observer['execution_attempts']
@@ -1092,7 +1097,7 @@ async def main():
             assert 'sleep' in child.name() and child.is_running()
             assert current['dsh_execution']['jobs'] == []
             await receive(adapter, raw('om_stop_group', text='@_user_1 停止 ' + record['id']))
-            stopped_group = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            stopped_group = adapter.intake.snapshot()['work'][0]
             assert stopped_group['dsh_execution']['state'] == 'stopped', stopped_group
             assert stopped_group['dsh_execution']['stop_control']['proof']['coverage']['scope'] == 'darwin_process_group'
             assert stopped_group['card_id'] == record['card_id']
@@ -1118,7 +1123,7 @@ async def main():
                 os.kill(process.pid, signal.SIGSTOP)
                 try:
                     await receive(adapter, raw('om_stop_unknown', text='@_user_1 停止 ' + record['id']))
-                    unknown_stop = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                    unknown_stop = adapter.intake.snapshot()['work'][0]
                     assert unknown_stop['dsh_execution']['state'] != 'stopped' and unknown_stop['dsh_execution']['stop_requested']
                     assert unknown_stop['dsh_execution']['stop_control']['status'] == 'unverified'
                     assert '保留仓库占用' in sent[-1].request_body.content
@@ -1131,7 +1136,7 @@ async def main():
                     os.kill(paused_original['pid'], signal.SIGCONT)
                     paused_original = None
             await receive(adapter, raw('om_stop', text='@_user_1 停止 ' + record['id']))
-            stopped = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            stopped = adapter.intake.snapshot()['work'][0]
             assert stopped['dsh_execution']['state'] == 'stopped', {'state': stopped, 'reply': sent[-1].request_body.content}
             assert '停止已核实' in sent[-1].request_body.content and '保留' in sent[-1].request_body.content
             assert stopped['card_id'] == record['card_id'] and stopped['source_anchor'] == record['source_anchor']
@@ -1145,14 +1150,14 @@ async def main():
             model_calls = len(model.requests)
             await receive(adapter, raw('om_stop', text='@_user_1 停止 ' + record['id']))
             await receive(adapter, raw('om_late_dispatch'))
-            assert {key: value for key, value in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
+            assert {key: value for key, value in adapter.intake.snapshot()['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
             assert len(model.requests) == model_calls
             card = json.loads(registry.dispatch('kanban_show', {'task_id': record['card_id']}))['task']
             assert card['status'] == 'blocked'
             if scenario == 'worker_retry_message_history':
                 await receive(adapter, raw('om_stop_additional', text='@_user_1 停止 ' + record['id']))
                 assert '停止已核实' in sent[-1].request_body.content
-                assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution']['state'] == 'stopped'
+                assert adapter.intake.snapshot()['work'][0]['dsh_execution']['state'] == 'stopped'
             if scenario in {'worker_retry_terminal', 'worker_stop_native_front', 'worker_stop_native_background', 'worker_stop_native_live', 'worker_stop_native_promoted', 'worker_retry_message_history', 'worker_retry_failed', 'worker_retry_observer'}:
                 original_files = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
                 reference = Path(binding['execution_ref'])
@@ -1164,20 +1169,20 @@ async def main():
                 model.worker_steps, model.dsh_steps = 0, 0
                 (scratch / 'issue-body-override').write_text(record['issue']['body'] + '\nChanged outside the accepted scope.')
                 await receive(adapter, raw('om_retry_changed', text='@_user_1 重试 ' + record['id']))
-                assert {key: value for key, value in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
+                assert {key: value for key, value in adapter.intake.snapshot()['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
                 (scratch / 'issue-body-override').write_text(record['issue']['body'])
                 assert json.loads(registry.dispatch('kanban_unblock', {'task_id': foreign_card}))['ok'] is True
                 await receive(adapter, raw('om_retry_queued', text='@_user_1 重试 ' + record['id']))
-                assert {key: value for key, value in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
+                assert {key: value for key, value in adapter.intake.snapshot()['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
                 assert json.loads(registry.dispatch('kanban_block', {'task_id': foreign_card, 'kind': 'needs_input', 'reason': 'Synthetic queue probe completed without dispatch.'}))['ok'] is True
                 configured['approved'] = False
                 reference.write_text(json.dumps(configured))
                 await receive(adapter, raw('om_retry_unapproved', text='@_user_1 重试 ' + record['id']))
-                assert {key: value for key, value in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
+                assert {key: value for key, value in adapter.intake.snapshot()['work'][0]['dsh_execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
                 configured['approved'] = True
                 reference.write_text(json.dumps(configured))
                 await receive(adapter, raw('om_retry',  text='@_user_1 重试 ' + record['id']))
-                retried = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                retried = adapter.intake.snapshot()['work'][0]
                 assert retried['dsh_execution']['state'] == 'admitted', {'work': retried, 'reply': sent[-1].request_body.content}
                 assert {key: value for key, value in retried['execution_attempts'][0]['execution'].items() if key != 'control_message_ids'} == {key: value for key, value in stopped['dsh_execution'].items() if key != 'control_message_ids'}
                 assert {'om_stop', 'om_retry_changed', 'om_retry_queued', 'om_retry_unapproved', 'om_retry'} <= set(retried['execution_attempts'][0]['execution']['control_message_ids'])
@@ -1186,10 +1191,10 @@ async def main():
                 assert retried['card_id'] == record['card_id'] and retried['source_anchor'] == record['source_anchor']
                 assert '独立新一轮' in sent[-1].request_body.content
                 await receive(adapter, raw('om_retry', text='@_user_1 重试 ' + record['id']))
-                assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0] == retried
+                assert adapter.intake.snapshot()['work'][0] == retried
                 if scenario == 'worker_retry_message_history':
                     await receive(adapter, raw('om_retry_additional', text='@_user_1 重试 ' + record['id']))
-                    retried = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                    retried = adapter.intake.snapshot()['work'][0]
                     assert retried['dsh_execution']['state'] == 'admitted' and retried['dsh_execution']['attempt'] == 2
                     assert 'om_retry_additional' in retried['dsh_execution']['control_message_ids']
 
@@ -1201,7 +1206,7 @@ async def main():
                     known_workers.append(remember_worker(db, record['card_id']))
                 until = time.monotonic() + 40
                 while time.monotonic() < until:
-                    latest = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                    latest = adapter.intake.snapshot()['work'][0]
                     if latest['dsh_execution']['state'] == 'awaiting_acceptance':
                         break
                     await asyncio.sleep(.05)
@@ -1216,7 +1221,7 @@ async def main():
                     actual_codes = re.findall(r'\[kanban-worker-exit\] rc=(-?\d+)', current_log)
                     assert len(actual_codes) == 2 and actual_codes[0] == '0' and actual_codes[1] != '0', {'process_exit': code, 'native_exit_codes': actual_codes}
                     await receive(adapter, raw('om_stop_failed_worker', text='@_user_1 停止 ' + record['id']))
-                    refused = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                    refused = adapter.intake.snapshot()['work'][0]
                     assert refused['dsh_execution']['state'] != 'stopped'
                     assert refused['dsh_execution']['stop_control']['status'] == 'unverified'
                     assert '保留仓库占用' in sent[-1].request_body.content
@@ -1235,9 +1240,9 @@ async def main():
                 await asyncio.to_thread(psutil.Process(known_workers[-1]['pid']).wait, timeout=30)
                 assert json.loads(registry.dispatch('kanban_show', {'task_id': record['card_id']}))['task']['status'] == 'triage', 'Native repeated-block policy must remain effective.'
                 await receive(adapter, raw('om_retried_query', text='@_user_1 核对 ' + record['id']))
-                assert json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]['card_id'] == record['card_id']
+                assert adapter.intake.snapshot()['work'][0]['card_id'] == record['card_id']
                 assert len(list((state / 'owned-work').rglob('native-configuration.json'))) == 2
-                assert len([w for w in json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work']]) == 1
+                assert len([w for w in adapter.intake.snapshot()['work']]) == 1
                 if scenario == 'worker_retry_message_history':
                     for index in range(2050):
                         await receive(adapter, raw('om_cache_eviction_' + str(index), text='@_user_1 停止 work-ffffffffffffffffffffffffffffffff'))
@@ -1248,12 +1253,12 @@ async def main():
                 runner._wire_adapter_handlers(replacement)
                 await connect_service(replacement, native)
                 adapter = replacement
-                before_duplicate = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                before_duplicate = adapter.intake.snapshot()['work'][0]
                 new_budget_bytes = (new_directory / 'home/.hermes-budget.json').read_bytes()
                 await receive(adapter, raw('om_stop_additional' if scenario == 'worker_retry_message_history' else 'om_stop', text='@_user_1 停止 ' + record['id']))
                 if scenario == 'worker_retry_message_history':
                     assert any(request.message_id == 'om_stop_additional' and ('前轮' in request.request_body.content or '停止已核实' in request.request_body.content) for request in sent[-2:]), 'Old m2 must reach the control consumer after native cache eviction/reload.'
-                after_duplicate = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                after_duplicate = adapter.intake.snapshot()['work'][0]
                 if scenario == 'worker_retry_message_history':
                     (scratch / 'control-message-replay-evidence.json').write_text(json.dumps({'before': {key: before_duplicate['dsh_execution'].get(key) for key in ('state', 'generation', 'session_id', 'request_id', 'stop_requested')},
                         'after': {key: after_duplicate['dsh_execution'].get(key) for key in ('state', 'generation', 'session_id', 'request_id', 'stop_requested')},
@@ -1266,7 +1271,7 @@ async def main():
                 assert (new_directory / 'home/.hermes-budget.json').read_bytes() == new_budget_bytes
                 assert after_duplicate['card_id'] == record['card_id'] and after_duplicate['source_anchor'] == record['source_anchor']
                 await receive(adapter, raw('om_stop_second', text='@_user_1 停止 ' + record['id']))
-                stopped_second = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                stopped_second = adapter.intake.snapshot()['work'][0]
                 assert stopped_second['dsh_execution']['state'] == 'stopped', stopped_second
                 assert stopped_second['dsh_execution']['generation'] == latest['dsh_execution']['generation']
                 assert (new_directory / 'home/.hermes-budget.json').read_bytes() == new_budget_bytes
@@ -1281,11 +1286,11 @@ async def main():
                     await connect_service(replacement, native)
                     adapter = replacement
                     await receive(adapter, raw('om_retry_additional', text='@_user_1 重试 ' + record['id']))
-                    replayed_retry = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                    replayed_retry = adapter.intake.snapshot()['work'][0]
                     assert replayed_retry['dsh_execution']['state'] == 'stopped' and replayed_retry['dsh_execution']['attempt'] == 2
                     assert '原结果仍按记录核对' in sent[-1].request_body.content and sent[-1].message_id == 'om_retry_additional'
                 await receive(adapter, raw('om_retry_third', text='@_user_1 重试 ' + record['id']))
-                third = json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+                third = adapter.intake.snapshot()['work'][0]
                 assert third['dsh_execution']['state'] == 'admitted' and third['dsh_execution']['attempt'] == 3, third
                 assert third['card_id'] == record['card_id'] and len(third['execution_attempts']) == 2
                 assert json.loads(registry.dispatch('kanban_show', {'task_id': record['card_id']}))['task']['status'] == 'ready'
@@ -1358,7 +1363,7 @@ async def main():
     assert not adapter.is_connected and adapter.intake.closed
     plugins.discover_and_load(force=True)
     assert platform_registry.get('hermes_feishu_pm') is not None
-    reloaded = json.loads(registry.dispatch('hermes_pm_snapshot', {}))
+    reloaded = adapter.intake.snapshot()
     assert len(reloaded['work']) == 1 and reloaded['work'][0]['card_id'] == record['card_id']
     assert plugins.unload('ghost-hermes-pm')
     (scratch / 'simple-smoke-result').write_text('passed')

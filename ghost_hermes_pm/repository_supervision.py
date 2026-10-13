@@ -132,6 +132,18 @@ def execution_event_references(events):
     return references
 
 
+def _current_budget_text(window):
+    if window is None:
+        return '\n当前窗口额度：未核验，不沿用旧预算描述。'
+    limits = window['limits']
+    return ('\n当前窗口：请求基数 ' + str(window['request_base']) + '；已用 ' + str(window['requests_used'])
+        + ('；额度 ' + str(limits['max_model_requests']) + '；剩余 ' + str(window['requests_remaining'])
+            if 'max_model_requests' in limits else '；未设置请求上限')
+        + ('；累计 ' + str(window['requests_total']) if 'requests_total' in window else '')
+        + ('；时限剩余 ' + str(round(window['wall_seconds_remaining'], 1)) + ' 秒'
+            if 'max_wall_seconds' in limits else '；无插件时限') + '；无插件 token 配额。')
+
+
 def acceptance_text(record):
     acceptance = record['dsh_execution']['acceptance']
     text = ('交付已通过总 Issue 验收。' if record['dsh_execution']['state'] == 'released'
@@ -147,6 +159,18 @@ def acceptance_text(record):
         text += '\n未满足项：' + '、'.join(acceptance['unmet'])
     if isinstance(acceptance.get('leftovers'), list):
         text += '\n遗留项：' + str(len(acceptance['leftovers'])) + ' 项'
+    if record['dsh_execution'].get('mode') == 'shared_native':
+        files = acceptance.get('changed_files')
+        text += '\n变更文件：' + ('、'.join(files) if files else '无') if isinstance(files, list) else '\n变更文件：未核验'
+        receipts = acceptance.get('test_evidence', {}).get('runner_receipts', [])
+        if receipts:
+            for index, receipt in enumerate(receipts, 1):
+                text += ('\n原生 Node 测试（运行 ' + str(index) + '）：' + str(receipt['executed_tests']) + ' passed；'
+                    + str(receipt['failed_tests']) + ' failed；' + str(receipt['skipped_tests']) + ' skipped；退出 '
+                    + str(receipt['exit_code']))
+        else:
+            text += '\n测试统计：未核验'
+        text += _current_budget_text(acceptance.get('current_budget'))
     return text
 
 
@@ -157,7 +181,7 @@ async def notify_acceptance(intake, record, generation):
     if not acceptance:
         return
     signature = hashlib.sha256(json.dumps({key: acceptance.get(key) for key in
-        ('status', 'source_commit', 'pr_status', 'review_status', 'unmet')}
+        ('status', 'source_commit', 'pr_status', 'review_status', 'unmet', 'changed_files', 'current_budget', 'test_evidence')}
         | {'released': execution.get('state') == 'released'}, sort_keys=True).encode()).hexdigest()
     if execution.get('delivery_notification', {}).get('signature') == signature:
         return
@@ -223,15 +247,7 @@ async def notify_checkpoint(intake, record, generation):
     intake.require_active(generation)
     checkpoint['delivery'] = {'status': 'intent'}
     intake._save_execution(record, fields=['supervision_checkpoint'])
-    window = checkpoint.get('budget')
-    budget_text = '\n当前窗口额度：未核验，不沿用旧预算描述。'
-    if window is not None:
-        limits = window['limits']
-        budget_text = ('\n当前窗口：请求基数 ' + str(window['request_base']) + '；已用 ' + str(window['requests_used'])
-            + ('；额度 ' + str(limits['max_model_requests']) + '；剩余 ' + str(window['requests_remaining'])
-                if 'max_model_requests' in limits else '；未设置请求上限')
-            + ('；时限剩余 ' + str(round(window['wall_seconds_remaining'], 1)) + ' 秒'
-                if 'max_wall_seconds' in limits else '；无插件时限') + '；无插件 token 配额。')
+    budget_text = _current_budget_text(checkpoint.get('budget'))
     text = ('进度检查（截至 ' + time.strftime('%H:%M:%S', time.localtime(checkpoint['observed_at'])) + '）：'
         + '\n执行状态：' + checkpoint['observed_state'] + '\n本段模型请求：' + str(checkpoint['request_delta'])
         + '；累计：' + str(checkpoint['requests']) + '\n待答问题：' + str(checkpoint['questions_pending'])

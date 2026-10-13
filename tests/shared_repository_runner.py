@@ -350,7 +350,7 @@ async def main():
                 'Historical budget: stop after 30 minutes, 80 model requests and 300000 reported tokens.\n')
         await receive(adapter, raw('om_shared'))
         def record():
-            return json.loads(registry.dispatch('hermes_pm_snapshot', {}))['work'][0]
+            return adapter.intake.snapshot()['work'][0]
         service_namespace['record'] = record
         def checkpoint_progress(requests):
             sid = record()['dsh_execution']['session_id']
@@ -377,6 +377,9 @@ async def main():
             os.replace(temporary, path)
             return path
         initial = record()
+        compact = json.loads(registry.dispatch('hermes_pm_snapshot', {'work_id': initial['id'], 'section': 'overview'}))
+        assert compact['work_id'] == initial['id'] and len(json.dumps(compact)) < 1500
+        assert 'dsh_execution' not in compact and 'history' not in compact
         assert initial['dsh_execution']['mode'] == 'shared_native', initial
         if observer_restart:
             initial['gateway_controller'] = dict(initial['gateway_controller'], pid=999999, start_sec=1, start_usec=0)

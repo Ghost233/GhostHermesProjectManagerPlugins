@@ -14,6 +14,144 @@ from sdk_source_integrity import source_snapshot
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('case', ['current', 'history', 'pending', 'intent', 'not_requested', 'unknown_quote',
+    'wrong_sid', 'wrong_generation', 'wrong_anchor', 'wrong_profile', 'duplicate', 'question', 'approval'])
+def test_only_delivered_checkpoint_owner_quotes_enter_ordinary_discussion(tmp_path, case):
+    from copy import deepcopy
+    from types import SimpleNamespace as NS
+    from ghost_hermes_pm.simple_development import RepositoryIntake
+    from ghost_hermes_pm.messages import OWNED_PLATFORM
+    anchor = {'app_id': 'fixture-app', 'transport_tenant_key': 'fixture-transport', 'tenant_key': 'fixture-owner-tenant',
+        'recipient_tenant_key': 'fixture-bot-tenant', 'recipient_open_id': 'fixture-bot', 'chat_id': 'fixture-chat',
+        'sender_open_id': 'fixture-owner'}
+    binding = {**anchor, 'owner_open_id': 'fixture-owner', 'sender_tenant_key': 'fixture-owner-tenant',
+        'profile_id': 'lead', 'target_profiles': ['lead', 'steward'], 'verification_ref': 'fixture-verification'}
+    intake = RepositoryIntake(None, {'enabled': True, 'verification_ref': 'fixture-verification', 'bindings': [binding]},
+        {'github_account': 'fixture-owner', 'github_config_dir': str(tmp_path)}, tmp_path / 'state')
+    adapter, transport = NS(registered_bots=[]), object()
+    intake.transports = [(adapter, transport)]
+    checkpoint = {'id': 'fixture-checkpoint', 'status': 'reviewed', 'notify_owner': True,
+        'session_id': 'fixture-session', 'generation': 'fixture-generation',
+        'delivery': {'status': 'delivered', 'message_id': 'fixture-cp-message'}}
+    question = {'id': 'fixture-old-question', 'state': 'settled', 'answerable': False,
+        'delivery': {**anchor, 'message_id': 'fixture-question-message'}}
+    execution = {'mode': 'shared_native', 'state': 'running', 'session_id': 'fixture-session',
+        'generation': 'fixture-generation', 'questions': [question], 'supervision_checkpoint': checkpoint}
+    record = {'id': 'work-' + 'a' * 32, 'requested_issue_url': 'https://github.com/fixture-user/fixture/issues/1',
+        'profile_id': 'lead', 'superior_profile_id': 'steward', 'source_anchor': dict(anchor),
+        'target': {'repo_path': str(tmp_path)}, 'dsh_execution': execution}
+    parent, text = 'fixture-cp-message', '@_user_1 请纠正总结中的旧预算。'
+    if case == 'history':
+        execution['supervision_history'] = [checkpoint]
+        execution['supervision_checkpoint'] = {**checkpoint, 'delivery': {'status': 'not_requested'}}
+    elif case in {'pending', 'intent', 'not_requested'}:
+        checkpoint['delivery']['status'] = case
+    elif case == 'unknown_quote':
+        parent = 'fixture-unknown-message'
+    elif case == 'wrong_sid':
+        checkpoint['session_id'] = 'foreign-session'
+    elif case == 'wrong_generation':
+        checkpoint['generation'] = 'foreign-generation'
+    elif case == 'wrong_anchor':
+        record['source_anchor']['sender_open_id'] = 'foreign-owner'
+    elif case == 'wrong_profile':
+        binding['profile_id'] = 'foreign-profile'
+    elif case == 'question':
+        parent = question['delivery']['message_id']
+    elif case == 'approval':
+        parent, text = 'fixture-unknown-approval', '@_user_1 批准一次'
+        execution['approvals'] = [{'approval_id': 'fixture-approval', 'request_message_id': 'fixture-approval-message',
+            'delivery': dict(anchor)}]
+    intake._save(record)
+    if case == 'duplicate':
+        other = deepcopy(record)
+        other.update(id='work-' + 'b' * 32, requested_issue_url='https://github.com/fixture-user/fixture/issues/2')
+        intake._save(other)
+    source = NS(platform=OWNED_PLATFORM, user_id='fixture-owner-user', is_bot=False,
+        chat_id=anchor['chat_id'], message_id='fixture-feedback')
+    sender = NS(sender_type='user', tenant_key=anchor['tenant_key'],
+        sender_id=NS(open_id=anchor['sender_open_id'], user_id=source.user_id))
+    message = NS(chat_type='group', message_type='text', chat_id=source.chat_id, message_id=source.message_id,
+        content=json.dumps({'text': text}), parent_id=parent, root_id=None, thread_id=None,
+        mentions=[NS(id=NS(open_id=anchor['recipient_open_id']), tenant_key=anchor['recipient_tenant_key'],
+            mentioned_type='bot', key='@_user_1')])
+    event = NS(source=source, message_id=source.message_id,
+        raw_message=NS(header=NS(event_type='im.message.receive_v1', app_id=anchor['app_id'], tenant_key=anchor['transport_tenant_key']),
+            event=NS(sender=sender, message=message)))
+    before = intake.snapshot()
+    prepared = intake.prepare(event, adapter)
+    if case in {'current', 'history'}:
+        assert prepared is None, 'Verified checkpoint feedback was diverted into question handling.'
+    else:
+        assert prepared is not None
+        assert prepared.action == ('approval' if case == 'approval' else 'question')
+        if case != 'question':
+            assert prepared.rejected
+    assert intake.snapshot() == before
+
+
+@pytest.mark.parametrize('verified', [True, False])
+def test_shared_acceptance_notification_reports_only_verified_files_tests_and_budget(verified):
+    from ghost_hermes_pm.repository_supervision import acceptance_text
+    acceptance = {'status': 'accepted', 'pr_status': 'awaiting_review', 'review_status': 'pending', 'leftovers': []}
+    if verified:
+        acceptance.update(changed_files=['feature.mjs', 'feature.test.mjs'],
+            current_budget={'limits': {'max_model_requests': 40}, 'request_base': 20, 'requests_total': 27,
+                'requests_used': 7, 'requests_remaining': 33, 'wall_seconds_remaining': None},
+            test_evidence={'runner': 'original_shared_dsh_bash', 'runner_receipts': [
+                {'executed_tests': 40, 'failed_tests': 0, 'skipped_tests': 0, 'exit_code': 0}]})
+    record = {'issue': {'url': 'https://github.com/fixture-user/fixture/issues/1'},
+        'dsh_execution': {'mode': 'shared_native', 'state': 'released', 'acceptance': acceptance}}
+    text = acceptance_text(record)
+    if verified:
+        assert 'feature.mjs' in text and 'feature.test.mjs' in text
+        assert '40 passed' in text and '0 failed' in text and '0 skipped' in text
+        assert '已用 7' in text and '额度 40' in text and '剩余 33' in text and '累计 27' in text
+        assert '无插件时限' in text and '无插件 token 配额' in text
+    else:
+        assert '变更文件：未核验' in text and '测试统计：未核验' in text and '当前窗口额度：未核验' in text
+
+
+@pytest.mark.parametrize('section', [None, 'overview', 'delivery', 'budget', 'files'])
+def test_current_snapshot_is_compact_and_uses_only_bound_current_facts(tmp_path, monkeypatch, section):
+    from ghost_hermes_pm.simple_development import RepositoryIntake
+    from ghost_hermes_pm import repository_execution, repository_acceptance, shared_repository
+    intake = RepositoryIntake(None, {}, {'github_account': 'fixture-owner', 'github_config_dir': str(tmp_path)}, tmp_path / 'state')
+    record = {'id': 'work-' + 'a' * 32, 'requested_issue_url': 'https://github.com/fixture-user/fixture/issues/1',
+        'profile_id': 'lead', 'target': {'native_profile': 'fixture-native', 'repo_path': str(tmp_path), 'execution_ref': 'bound-reference'},
+        'issue': {'url': 'https://github.com/fixture-user/fixture/issues/1', 'body': 'private issue body' * 20000},
+        'dsh_execution': {'mode': 'shared_native', 'state': 'released', 'session_id': 'fixture-session',
+            'generation': 'fixture-generation', 'reference_sha256': 'bound-reference-hash', 'history': 'private history' * 20000,
+            'baseline': {'file_digests': {'feature.mjs': 'old'}},
+            'acceptance': {'status': 'accepted', 'delivered': True, 'source_commit': 'a' * 40,
+                'source_digest': 'current-digest', 'workspace_status': '', 'pr_status': 'awaiting_review', 'review_status': 'pending',
+                'pr': {'url': 'https://github.com/fixture-user/fixture/pull/2'}, 'unmet': [], 'sync': [], 'fine_issues': [],
+                'test_evidence': {'original_call_ids': ['fixture-test'], 'runner_receipts': [{
+                    'test_files': ['feature.test.mjs'], 'executed_tests': 40, 'failed_tests': 0, 'skipped_tests': 0, 'exit_code': 0}]}}}}
+    intake._save(record)
+    config = {'mode': 'shared_native', 'reference_sha256': 'bound-reference-hash', 'budget': {'max_model_requests': 40}}
+    monkeypatch.setattr(repository_execution, 'execution_configuration', lambda target: (dict(config), {}))
+    monkeypatch.setattr(shared_repository, 'read_ledger', lambda cfg, execution: {
+        'state': {'requests': 27, 'started_at_ms': 1}, 'renewWindow': {'request_base': 20, 'started_at_ms': 1}})
+    monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda target: {
+        'head': 'a' * 40, 'source_digest': 'current-digest', 'workspace_status': '', 'file_digests': {'feature.test.mjs': 'new'}})
+    args = {'work_id': record['id'], 'section': section} if section else {}
+    before = intake.snapshot()
+    view = intake.current_snapshot('fixture-native', args)
+    encoded = json.dumps(view, ensure_ascii=False)
+    assert len(encoded) < 1500 and 'private history' not in encoded and 'private issue body' not in encoded
+    if section in {'overview', 'budget'}:
+        assert view['budget']['requests_total'] == 27 and view['budget']['requests_remaining'] == 33
+    elif section == 'delivery':
+        assert view['tests'][0]['executed_tests'] == 40 and view['pr']['url'].endswith('/pull/2')
+    elif section == 'files':
+        assert view['changed_files'] == ['feature.mjs', 'feature.test.mjs']
+        assert view['test_files'] == ['feature.test.mjs']
+    assert intake.current_snapshot('foreign-native', {'work_id': record['id']}) == {'status': 'rejected', 'code': 'unauthorized'}
+    assert intake.current_snapshot('fixture-native', {'path': '/private/foreign'}) == {'status': 'rejected', 'code': 'invalid_change'}
+    assert intake.snapshot() == before
+
+
 def test_worker_save_preserves_current_shared_observer(tmp_path):
     from copy import deepcopy
     from ghost_hermes_pm.simple_development import RepositoryIntake
@@ -98,22 +236,25 @@ def test_shared_github_refresh_keeps_the_original_scope(tmp_path, monkeypatch, c
         shutil.rmtree(directory)
 
 
-def test_shared_prompt_reports_original_ids_and_current_budget():
+def test_shared_prompt_reports_original_ids_and_current_budget(tmp_path, monkeypatch):
+    from ghost_hermes_pm import shared_repository, repository_execution
     from ghost_hermes_pm.shared_repository import _prompt
     criterion = 'Verify the synthetic public behavior.'
     record = {'issue': {'url': 'https://github.com/fixture-user/fixture/issues/1', 'title': 'Fixture',
         'body': '- [ ] ' + criterion + '\nHistorical 8192 token limit.', 'updated_at': '2026-10-10T00:00:00Z'},
-        'target': {'repository': 'fixture-user/fixture'},
-        'dsh_execution': {'session_id': 'fixture-session', 'generation': 'fixture-generation',
+        'target': {'repository': 'fixture-user/fixture', 'repo_path': str(tmp_path)},
+        'dsh_execution': {'session_id': 'fixture-session', 'generation': 'fixture-generation', 'first_input': 'accepted',
             'github_reference': {'config_dir': '/private/tmp/fixture-scope', 'account': 'fixture-owner'},
-            'acceptance': {'source_digest': 'fixture-digest'}, 'tool_receipts': [
+            'acceptance': {'source_digest': 'fixture-digest', 'eligible_test_calls': ['native-test-call'], 'test_files': []}, 'tool_receipts': [
                 {'call_id': 'native-test-call', 'name': 'bash', 'exit_code': 0, 'is_error': False,
                     'generation': 'fixture-generation', 'session_id': 'fixture-session',
                     'source_after': {'source_digest': 'fixture-digest'}},
                 {'call_id': 'foreign-call', 'name': 'bash', 'exit_code': 0, 'is_error': False,
                     'generation': 'other', 'session_id': 'fixture-session', 'source_after': {'source_digest': 'fixture-digest'}}]}}
+    monkeypatch.setattr(repository_execution, 'execution_configuration', lambda target: ({'budget': {}, 'ledger_dir': str(tmp_path)}, {}))
+    monkeypatch.setattr(shared_repository, 'read_ledger', lambda cfg, execution: {'state': {'requests': 1, 'started_at_ms': None}})
     prompt = _prompt(None, record)
-    assert 'no plugin output-token' in prompt and 'historical and does not apply' in prompt
+    assert 'no plugin output-token' in prompt and 'overrides historical budget text' in prompt
     assert 'native-test-call' in prompt and 'foreign-call' not in prompt
     assert 'Copy each frozen acceptance criterion verbatim' in prompt and criterion in prompt
 

@@ -2305,6 +2305,7 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
     repo = tmp_path / 'repository'
     repo.mkdir()
     subprocess.run(['git', 'init', '-q', '-b', 'fixture-delivery', str(repo)], check=True)
+    baseline = repository_source_state({'repo_path': str(repo)})
     test_file = 'feature.test.mjs'
     (repo / test_file).write_text("console.log('900 passed');\n" if change == 'zero_tests' else
         "import test from 'node:test'; import assert from 'node:assert/strict';\n"
@@ -2399,11 +2400,13 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
     record = {'id': 'fixture-work', 'card_id': 'fixture-card', 'issue': issue,
         'target': {'repo_path': str(repo), 'repository': 'fixture-user/fixture'},
         'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance', 'generation': 'fixture-generation',
-            'session_id': 'fixture-session', 'baseline': source, 'tool_receipts': tool_receipts, 'jobs': [],
+            'session_id': 'fixture-session', 'baseline': baseline, 'tool_receipts': tool_receipts, 'jobs': [],
             'verification': execution['verification']}}
     intake._save(record)
+    current_budget = {'limits': {'max_model_requests': 40}, 'request_base': 20, 'requests_total': 27,
+        'requests_used': 7, 'requests_remaining': 33, 'wall_seconds_remaining': None}
     result = asyncio.run(accept_repository_work(intake, record, carrier, events,
-        {'inbox': {'next-turn': [], 'next-step': []}}, intake.generation))
+        {'inbox': {'next-turn': [], 'next-step': []}}, intake.generation, current_budget=current_budget))
     assert (result['status'] == 'accepted') == (change == 'none'), json.dumps(result)
     if change in {'source_changed', 'wrong_report_call'}:
         assert 'test_source_unconfirmed' in result['unmet']
@@ -2413,3 +2416,5 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
         assert 'test_evidence_missing' in result['unmet']
     assert result['eligible_test_calls'] == (['fixture-test'] if change in {'none', 'wrong_report_call'} else [])
     assert result['test_files'] == ([] if change == 'missing_test' else test_files)
+    assert result['changed_files'] == [test_file]
+    assert result['current_budget'] == current_budget

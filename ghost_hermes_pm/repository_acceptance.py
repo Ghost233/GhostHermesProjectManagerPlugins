@@ -133,7 +133,7 @@ def _eligible_shared_test_calls(configuration, execution, target, current, test_
     return eligible
 
 
-async def accept_repository_work(intake, record, carrier, events, projections, generation):
+async def accept_repository_work(intake, record, carrier, events, projections, generation, *, current_budget=None):
     intake.require_active(generation)
     execution = record['dsh_execution']
     report = _report(events)
@@ -141,6 +141,8 @@ async def accept_repository_work(intake, record, carrier, events, projections, g
     result = {'status': 'unmet', 'delivered': False, 'card_id': record['card_id'],
               'session_id': execution['session_id'], 'pr_status': 'none', 'review_status': 'not_provided',
               'next_action': 'kanban_block', 'block_kind': 'needs_input'}
+    if current_budget is not None:
+        result['current_budget'] = current_budget
     if report is None:
         unmet.append('delivery_report_missing')
     receipts = execution.get('tool_receipts', [])
@@ -205,6 +207,9 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
                 test_ids.append(identifier)
     current = await asyncio.to_thread(repository_source_state, target)
     baseline = execution.get('baseline') or {}
+    if isinstance(baseline.get('file_digests'), dict) and isinstance(current.get('file_digests'), dict):
+        result['changed_files'] = sorted(path for path in baseline['file_digests'].keys() | current['file_digests'].keys()
+            if baseline['file_digests'].get(path) != current['file_digests'].get(path))
     fixed = report.get('source_commit')
     result.update(source_commit=fixed, source_digest=current['source_digest'], workspace_status=current['workspace_status'])
     if not isinstance(fixed, str) or not re.fullmatch('[a-f0-9]{40}', fixed) or fixed != current['head']:

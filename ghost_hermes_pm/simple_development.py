@@ -65,6 +65,77 @@ class RepositoryIntake(FeishuEntry):
         if not self.closed:
             super().deactivate()
 
+    def current_snapshot(self, native_profile, args):
+        if (not isinstance(args, dict) or set(args) - {'work_id', 'section'}
+                or args.get('section', 'overview') not in {'overview', 'delivery', 'budget', 'files'}
+                or args.get('work_id') is not None and (not isinstance(args['work_id'], str)
+                    or not re.fullmatch(r'work-[a-f0-9]{32}', args['work_id']))):
+            return {'status': 'rejected', 'code': 'invalid_change'}
+        profiles = {row.get('profile_id') for row in [*self.settings.get('bindings', []),
+            *self.configuration.get('work_profiles', [])] if row.get('native_profile') == native_profile}
+        visible = [row for row in self.snapshot()['work'] if native_profile and (
+            row.get('target', {}).get('native_profile') == native_profile
+            or any(_qa_profile_matches(row, profile) for profile in profiles))]
+        work_id = args.get('work_id')
+        if work_id is None:
+            return {'work': [{'id': row['id'], 'state': row.get('dsh_execution', {}).get('state', row.get('state'))}
+                for row in visible[:10]], 'total_work': len(visible),
+                'instruction': 'Select one work_id and section: overview, delivery, budget or files. History is retained internally.'}
+        record = next((row for row in visible if row['id'] == work_id), None)
+        if record is None:
+            return {'status': 'rejected', 'code': 'unauthorized'}
+        execution, section = record.get('dsh_execution', {}), args.get('section', 'overview')
+        acceptance = execution.get('acceptance', {})
+        value = {'work_id': work_id, 'section': section, 'state': execution.get('state', record.get('state'))}
+        receipts = acceptance.get('test_evidence', {}).get('runner_receipts', [])
+        test_files = acceptance.get('test_files')
+        if test_files is None and receipts and all(row.get('test_files') == receipts[0].get('test_files') for row in receipts):
+            test_files = receipts[0].get('test_files')
+        if section in {'overview', 'budget'}:
+            from .repository_execution import execution_configuration
+            from .shared_repository import read_ledger, _active_budget_snapshot
+            value['budget'] = {'status': 'unknown'}
+            try:
+                configuration, _ = execution_configuration(record['target'])
+                if (configuration.get('mode') != 'shared_native'
+                        or configuration.get('reference_sha256') != execution.get('reference_sha256')):
+                    raise ManagementError('binding_conflict', 'The visible work reference changed.')
+                configuration['workspace'] = record['target']['repo_path']
+                value['budget'] = _active_budget_snapshot(configuration, read_ledger(configuration, execution))
+            except (ManagementError, KeyError, TypeError, ValueError, OSError):
+                pass
+        if section in {'overview', 'delivery'}:
+            value.update(issue_url=record.get('issue', {}).get('url'), source_commit=acceptance.get('source_commit'),
+                acceptance_status=acceptance.get('status', 'unknown'), unmet=acceptance.get('unmet'),
+                pr={'url': acceptance.get('pr', {}).get('url'), 'status': acceptance.get('pr_status'),
+                    'review_status': acceptance.get('review_status')})
+        if section == 'delivery':
+            value.update(sync=acceptance.get('sync'), fine_issues=[{key: row.get(key) for key in ('url', 'state')}
+                for row in acceptance.get('fine_issues', [])], test_files=test_files,
+                tests=[{key: row.get(key) for key in ('executed_tests', 'failed_tests', 'skipped_tests', 'exit_code')}
+                    for row in receipts], leftovers=acceptance.get('leftovers'))
+        if section == 'files':
+            changed = acceptance.get('changed_files')
+            if changed is None:
+                from .repository_acceptance import repository_source_state
+                from .repository_execution import execution_configuration
+                try:
+                    configuration, _ = execution_configuration(record['target'])
+                    if configuration.get('reference_sha256') != execution.get('reference_sha256'):
+                        raise ManagementError('binding_conflict', 'The visible work reference changed.')
+                    current = repository_source_state(record['target'])
+                    baseline = execution.get('baseline', {}).get('file_digests')
+                    if (acceptance.get('status') == 'accepted' and isinstance(baseline, dict)
+                            and isinstance(current.get('file_digests'), dict)
+                            and (current.get('head'), current.get('source_digest'), current.get('workspace_status'))
+                                == (acceptance.get('source_commit'), acceptance.get('source_digest'), acceptance.get('workspace_status'))):
+                        changed = sorted(path for path in baseline.keys() | current['file_digests'].keys()
+                            if baseline.get(path) != current['file_digests'].get(path))
+                except (ManagementError, KeyError, TypeError, ValueError, OSError):
+                    pass
+            value.update(changed_files=changed if changed is not None else 'unknown', test_files=test_files)
+        return value
+
     def snapshot(self):
         with sqlite3.connect(self.database) as db:
             work = [json.loads(row[0]) for row in db.execute('SELECT data FROM work ORDER BY rowid')]
@@ -196,6 +267,23 @@ class RepositoryIntake(FeishuEntry):
             human_reply = prepare_approval_reply(self, event, adapter, binding, envelope, command, authorized_profiles)
             if envelope['parent_id']:
                 if human_reply is None:
+                    checkpoint_quotes = [record for record in self.snapshot()['work']
+                        if record['profile_id'] in authorized_profiles and _qa_profile_matches(record, binding['profile_id'])
+                        and all(record.get('source_anchor', {}).get(key) == envelope[key] for key in
+                            ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                             'recipient_open_id', 'chat_id', 'sender_open_id'))
+                        for checkpoint in [record.get('dsh_execution', {}).get('supervision_checkpoint', {}),
+                            *record.get('dsh_execution', {}).get('supervision_history', [])]
+                        if record.get('dsh_execution', {}).get('mode') == 'shared_native'
+                        and record['dsh_execution'].get('session_id') and record['dsh_execution'].get('generation')
+                        and checkpoint.get('session_id') == record['dsh_execution']['session_id']
+                        and checkpoint.get('generation') == record['dsh_execution']['generation']
+                        and checkpoint.get('status') == 'reviewed' and checkpoint.get('notify_owner') is True
+                        and checkpoint.get('delivery', {}).get('status') == 'delivered'
+                        and checkpoint.get('delivery', {}).get('message_id') == envelope['parent_id']]
+                    if (sender.sender_type == 'user' and len(checkpoint_quotes) == 1
+                            and not command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '结束后台 ', '重试 ', '继续 ', '续预算 ', '补充 '))):
+                        return None
                     from .repository_questions import prepare_reply
                     human_reply = prepare_reply(self, event, adapter, binding, envelope, command, authorized_profiles)
             try:
@@ -674,16 +762,16 @@ def register_simple_development(ctx):
                 'instruction': 'For this current owner acceptance/rework report, call this tool once. The verified owner message is automatically bound. Do not poll the snapshot first.'}
 
     def snapshot(args):
-        if args:
-            return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
-        value = intake.snapshot()
+        value = intake.current_snapshot(ctx.profile_name, args)
         hint = snapshot_hint()
-        return json.dumps({'action_hint': hint, **value} if hint is not None else value)
+        return json.dumps({'action_hint': hint, **value} if hint is not None else value,
+            ensure_ascii=False, separators=(',', ':'))
 
     ctx.register_tool(name='hermes_pm_snapshot', toolset='hermes_pm',
-        schema={'name': 'hermes_pm_snapshot', 'description': 'Read repository work accepted through the verified platform.',
-                'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
-        handler=snapshot, description='Read native outer card references and frozen Issue scope')
+        schema={'name': 'hermes_pm_snapshot', 'description': 'Read compact current facts for work visible to this Profile; no raw history. Select work_id and overview, delivery, budget or files for complete current detail.',
+                'parameters': {'type': 'object', 'properties': {'work_id': {'type': 'string', 'pattern': '^work-[a-f0-9]{32}$'},
+                    'section': {'type': 'string', 'enum': ['overview', 'delivery', 'budget', 'files']}}, 'additionalProperties': False}},
+        handler=snapshot, description='Read compact current work, delivery evidence and remaining budget')
 
     async def natural_qa_rework(args):
         if not isinstance(args, dict):

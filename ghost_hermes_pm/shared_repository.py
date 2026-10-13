@@ -3319,7 +3319,8 @@ async def run_shared_work(ctx, intake, record, generation):
                     phase = 'acceptance'
                     review = (events[-1]['seq'], tuple((job['id'], job['status']) for job in jobs))
                     if not active_jobs or review != foreground_review:
-                        result = await accept_repository_work(intake, record, carrier, events, projections, generation)
+                        result = await accept_repository_work(intake, record, carrier, events, projections, generation,
+                            current_budget=_active_budget_snapshot(configuration, budget))
                         foreground_review = review
                     if not active_jobs:
                         if result.get('status') == 'accepted':
