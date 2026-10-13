@@ -214,6 +214,123 @@ def test_natural_qa_rework_active_public_tool_queues_one_same_session_prompt(tmp
     assert len(carrier.prompts) == 0
 
 
+@pytest.mark.asyncio
+async def test_cancelled_claimed_supervisor_does_not_late_acquire_or_leak_intake_lock(tmp_path, monkeypatch):
+    import fcntl
+    import threading
+    from types import MethodType
+    monkeypatch.syspath_prepend(os.environ['HERMES_TEST_SDK_ROOT'])
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from hermes_cli.kanban_db_dispatch import adopt_worker_pid
+    from ghost_hermes_pm.simple_development import RepositoryIntake
+    from ghost_hermes_pm.repository_supervision import current_worker
+    from ghost_hermes_pm.shared_repository import run_shared_work
+    record, _context, intake, carrier, _ledger, _source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    native_home = tmp_path / 'native-home'
+    native_home.mkdir(mode=0o700)
+    monkeypatch.setenv('HERMES_HOME', str(native_home))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(native_home))
+    intake.board = kb.DEFAULT_BOARD
+    monkeypatch.setenv('HERMES_KANBAN_BOARD', kb.DEFAULT_BOARD)
+    monkeypatch.setenv('HERMES_KANBAN_DB', str(native_home / 'kanban.db'))
+    intake._card_body = MethodType(RepositoryIntake._card_body, intake)
+    record['target']['native_profile'] = 'default'
+    with connect_closing(board=intake.board) as db:
+        card_id = kb.create_task(db, title=record['issue']['title'], body=intake._card_body(record),
+            assignee='default', workspace_kind='dir', workspace_path=record['target']['repo_path'])
+        claim = kb.claim_task(db, card_id)
+        assert claim is not None
+        assert adopt_worker_pid(db, card_id, claim.current_run_id, os.getpid())
+    record['card_id'] = card_id
+    monkeypatch.setenv('HERMES_KANBAN_TASK', card_id)
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID', str(claim.current_run_id))
+    monkeypatch.setenv('HERMES_KANBAN_CLAIM_LOCK', claim.claim_lock)
+    ctx = SimpleNamespace(profile_name='default')
+    assert current_worker(ctx, intake, record) == claim.current_run_id
+    original_flock = fcntl.flock
+    holder = os.open(intake.lock_path, os.O_RDWR)
+    original_flock(holder, fcntl.LOCK_EX)
+    attempted, acquired = threading.Event(), threading.Event()
+    waiting = []
+
+    def observed_flock(fd, operation):
+        if operation & fcntl.LOCK_EX and fd != holder:
+            if not waiting:
+                waiting.append(fd)
+            attempted.set()
+        result = original_flock(fd, operation)
+        if waiting and fd == waiting[0] and operation & fcntl.LOCK_EX:
+            acquired.set()
+        return result
+
+    monkeypatch.setattr(fcntl, 'flock', observed_flock)
+    task = asyncio.create_task(run_shared_work(ctx, intake, record, intake.generation))
+    try:
+        until = time.monotonic() + 2
+        while not attempted.is_set() and not task.done() and time.monotonic() < until:
+            await asyncio.sleep(.01)
+        assert attempted.is_set(), task.exception() if task.done() else 'The real claimed supervisor did not attempt its lock.'
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        original_flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+        holder = None
+        try:
+            os.fstat(waiting[0])
+            leaked = True
+        except OSError:
+            leaked = False
+        if leaked:
+            until = time.monotonic() + 2
+            while not acquired.is_set() and time.monotonic() < until:
+                await asyncio.sleep(.01)
+        assert not leaked, 'The cancelled claimed supervisor retained its FD and acquired the intake lock after cancellation.'
+        probe = os.open(intake.lock_path, os.O_RDWR)
+        try:
+            original_flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+        assert intake.saved == [] and carrier.prompts == []
+    finally:
+        if holder is not None:
+            original_flock(holder, fcntl.LOCK_UN)
+            os.close(holder)
+        if waiting:
+            try:
+                os.close(waiting[0])
+            except OSError:
+                pass
+
+
+def test_natural_qa_lock_contention_returns_without_admission(tmp_path, monkeypatch):
+    import fcntl
+    from ghost_hermes_pm import shared_repository
+    record, context, intake, carrier, ledger, _source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(shared_repository, 'SHARED_INTAKE_LOCK_TIMEOUT_SECONDS', .05)
+    before, budget_before = deepcopy(record), ledger.read_bytes()
+    holder = os.open(intake.lock_path, os.O_RDWR)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    started = time.monotonic()
+    try:
+        with pytest.raises(ManagementError) as caught:
+            shared_repository.admit_shared_natural_qa_rework(intake, record, context,
+                'Keep the original synthetic QA scope.', None, intake.generation)
+        assert caught.value.code == 'repository_busy'
+        assert time.monotonic() - started < 1
+        assert record == before and ledger.read_bytes() == budget_before
+        assert intake.saved == [] and carrier.prompts == []
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+    probe = os.open(intake.lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(probe)
+
+
 @pytest.mark.parametrize('prior_status', ['accepted', 'maintenance_required'])
 @pytest.mark.parametrize('change', ['valid', 'pending', 'input_intent', 'foreign_source',
                                   'original_message', 'historical_duplicate', 'seal_changed', 'expired'])

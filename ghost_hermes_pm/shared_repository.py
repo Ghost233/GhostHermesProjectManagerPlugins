@@ -911,11 +911,32 @@ def prepare_shared_window_resume(intake, record, message_id):
         carrier.close()
 
 
+SHARED_INTAKE_LOCK_TIMEOUT_SECONDS = 5
+
+
+def _try_shared_intake_lock(intake, descriptor, generation, deadline):
+    intake.require_active(generation)
+    if time.monotonic() >= deadline:
+        raise ManagementError('repository_busy', 'Original repository intake is busy; no operation was admitted.')
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    intake.require_active(generation)
+    return True
+
+
+def _acquire_shared_intake_lock(intake, descriptor, generation):
+    deadline = time.monotonic() + SHARED_INTAKE_LOCK_TIMEOUT_SECONDS
+    while not _try_shared_intake_lock(intake, descriptor, generation, deadline):
+        time.sleep(.02)
+
+
 def admit_shared_natural_qa_rework(intake, record, source_context, feedback, window, generation):
     """Serialize one public QA intake and execute it against a fresh record snapshot."""
     descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _acquire_shared_intake_lock(intake, descriptor, generation)
         current = next((item for item in intake.snapshot().get('work', []) if item.get('id') == record.get('id')), None)
         if current is None:
             raise ManagementError('outcome_unknown', 'The natural QA work record disappeared before admission.')
@@ -928,7 +949,7 @@ def admit_shared_natural_qa_rework(intake, record, source_context, feedback, win
 def _qa_request_only_budget(feedback, row):
     if '取消30分钟截止，保留80次请求' not in feedback:
         return None
-    if row.get('budget') != {'max_wall_seconds': 1800, 'max_model_requests': 80}:
+    if {key: value for key, value in row.get('budget', {}).items() if key in CAPS} != {'max_wall_seconds': 1800, 'max_model_requests': 80}:
         raise ManagementError('invalid_change', 'Only the original 1800-second/80-request QA policy may drop its wall limit.')
     window, state = row.get('renewWindow', {}), row['state']
     used = state['requests'] - window.get('request_base', 0)
@@ -2722,7 +2743,7 @@ def record_shared_natural_qa_proposal(intake, record, proposal_id, delivery_cont
     """Record exactly one verified transport delivery for a natural QA proposal."""
     descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _acquire_shared_intake_lock(intake, descriptor, intake.generation)
         current = next((item for item in intake.snapshot().get('work', []) if item.get('id') == record.get('id')), None)
         if current is None:
             raise ManagementError('outcome_unknown', 'The natural QA work record disappeared before proposal delivery.')
@@ -2857,11 +2878,13 @@ async def run_shared_work(ctx, intake, record, generation):
     pending_continuation = continuation.get('status') == 'admitted' and continuation.get('dispatch_status') == 'accepted'
     if execution.get('stop_requested') or execution['state'] in {'budget_stopped', 'stopped'} or execution['state'] == 'execution_failed' and not pending_continuation:
         return {'status': execution['state'], 'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
-    descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
-    await asyncio.to_thread(fcntl.flock, descriptor, fcntl.LOCK_EX)
     carrier = None
     phase = 'worker_claim'
+    descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
     try:
+        lock_deadline = time.monotonic() + SHARED_INTAKE_LOCK_TIMEOUT_SECONDS
+        while not _try_shared_intake_lock(intake, descriptor, generation, lock_deadline):
+            await asyncio.sleep(.02)
         intake.require_active(generation)
         record = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])
         execution = record['dsh_execution']

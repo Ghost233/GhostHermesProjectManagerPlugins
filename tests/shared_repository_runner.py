@@ -451,6 +451,8 @@ async def main():
                 rows = peer['journals'][sid]
                 budget_file = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
                 budget_row = json.loads(budget_file.read_text())
+                if qa_request_only_resume:
+                    budget_row['budget'].update(max_reported_tokens=300000, max_output_tokens_per_request=8192)
                 started = int(time.time() * 1000) - (1801000 if qa_request_only_resume else
                     61000 if renew_window_again or qa_preinput_retry else 1000)
                 base_requests = 4 if renew_window_again else 3
@@ -857,7 +859,8 @@ async def main():
                 if qa_request_only_resume:
                     assert admitted_ledger['budget'] == {'max_model_requests': 79}
                     assert json.loads(reference.read_text())['budget'] == {'max_model_requests': 79}
-                    assert json.loads(old_ledger_bytes)['budget'] == {'max_wall_seconds': 1800, 'max_model_requests': 80}
+                    assert json.loads(old_ledger_bytes)['budget'] == {'max_wall_seconds': 1800,
+                        'max_model_requests': 80, 'max_reported_tokens': 300000, 'max_output_tokens_per_request': 8192}
                 assert admitted_ledger['renewWindow']['started_at_ms'] is None
                 assert admitted_ledger['renewWindow']['hook_marker'] is None
                 assert len(peer['prompts']) == 1 and peer['journals'][sid] == history_before
