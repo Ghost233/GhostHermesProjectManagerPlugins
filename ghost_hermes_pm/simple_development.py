@@ -598,10 +598,44 @@ def register_simple_development(ctx):
                           allowed_users_env='HERMES_PM_FEISHU_ALLOWED_USERS', allow_all_env='', max_message_length=8000)
     ctx.register_hook('pre_gateway_dispatch', native_entry)
 
+    def snapshot_hint():
+        adapter = active_adapter['value']
+        source = adapter._command_source.get() if adapter is not None else None
+        entries = getattr(adapter, '_natural_qa_messages', {}) if adapter is not None else {}
+        saved = entries.get(getattr(source, 'message_id', None))
+        if (saved is None or saved[0] is not source or source.is_bot is not False
+                or getattr(source.platform, 'value', source.platform) != OWNED_PLATFORM):
+            return None
+        source_ids = {source.user_id, source.user_id_alt} - {None, ''}
+        bindings = [binding for binding in adapter.bindings
+                    if binding.get('app_id') == adapter._app_id and binding.get('chat_id') == source.chat_id
+                    and source_ids & set(binding.get('owner_native_ids', []))]
+        if len(bindings) != 1:
+            return None
+        binding = bindings[0]
+        source_anchor = {'app_id': binding['app_id'], 'transport_tenant_key': binding['transport_tenant_key'],
+                         'tenant_key': binding['sender_tenant_key'], 'recipient_tenant_key': binding['recipient_tenant_key'],
+                         'recipient_open_id': binding['recipient_open_id'], 'chat_id': binding['chat_id'],
+                         'sender_open_id': binding['owner_open_id']}
+        candidates = [record for record in intake.snapshot()['work']
+                      if record.get('profile_id') == binding['profile_id']
+                      and all(record.get('source_anchor', {}).get(key) == value for key, value in source_anchor.items())
+                      and record.get('dsh_execution', {}).get('mode') == 'shared_native'
+                      and record['dsh_execution'].get('state') == 'awaiting_acceptance'
+                      and record['dsh_execution'].get('acceptance', {}).get('status') == 'unmet'
+                      and record['dsh_execution'].get('acceptance', {}).get('delivered') is False]
+        if len(candidates) != 1:
+            return None
+        return {'tool_name': 'hermes_pm_repository_rework',
+                'arguments': {'feedback': saved[1], 'work_id': candidates[0]['id']},
+                'instruction': 'For this current owner acceptance/rework report, call this tool once with the verbatim feedback. Do not poll the snapshot first.'}
+
     def snapshot(args):
         if args:
             return json.dumps({'status': 'rejected', 'code': 'invalid_change'})
-        return json.dumps(intake.snapshot())
+        value = intake.snapshot()
+        hint = snapshot_hint()
+        return json.dumps({'action_hint': hint, **value} if hint is not None else value)
 
     ctx.register_tool(name='hermes_pm_snapshot', toolset='hermes_pm',
         schema={'name': 'hermes_pm_snapshot', 'description': 'Read repository work accepted through the verified platform.',
@@ -763,7 +797,7 @@ def register_simple_development(ctx):
 
     ctx.register_tool(name='hermes_pm_repository_rework', toolset='hermes_pm', is_async=True,
         schema={'name': 'hermes_pm_repository_rework',
-                'description': 'Associate the current verified owner message with one existing browser-QA repository rework. Caller identity, role and repository are never arguments.',
+                'description': 'For a current verified owner browser or repository acceptance/rework report, call once before polling hermes_pm_snapshot. Pass the current owner message verbatim as feedback; work_id only narrows one existing work. Caller identity, role and repository are never arguments.',
                 'parameters': {'type': 'object', 'properties': {
                     'feedback': {'type': 'string', 'minLength': 1, 'maxLength': OWNER_CONTEXT_MAX_CHARS},
                     'work_id': {'type': 'string', 'pattern': '^work-[a-f0-9]{32}$'}},

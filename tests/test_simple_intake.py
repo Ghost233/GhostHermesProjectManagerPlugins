@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
     'responsibility_conflict',
     'worker_required',
     'natural_qa_intake',
+    'natural_qa_discoverability',
     pytest.param('worker_dispatch', marks=pytest.mark.retired_independent_runtime),
     pytest.param('worker_query_race', marks=pytest.mark.retired_independent_runtime),
     pytest.param('worker_transport_timeout', marks=pytest.mark.retired_independent_runtime),
@@ -66,9 +67,9 @@ def test_simple_repository_intake_uses_original_sdk_public_entries(scenario):
     sdk = Path(configured).resolve(strict=True)
     before = source_snapshot(sdk)
     dsh_before = source_snapshot(os.environ['DSH_TEST_SDK_ROOT']) if scenario in {'worker_dispatch', 'worker_query_race', 'worker_transport_timeout', 'worker_stop_terminal', 'worker_stop_reaped', 'worker_stop_native_front', 'worker_stop_native_background', 'worker_stop_native_live', 'worker_stop_native_promoted', 'worker_stop_running', 'worker_stop_uncovered', 'worker_retry_terminal', 'worker_retry_message_history', 'worker_stop_question', 'worker_stop_unknown', 'worker_retry_failed', 'worker_retry_observer'} else None
-    scratch_root = Path('/private/tmp/hermes-shared-dsh-20261012') if scenario == 'natural_qa_intake' else Path('/tmp')
+    scratch_root = Path('/private/tmp/hermes-shared-dsh-20261012') if scenario in {'natural_qa_intake', 'natural_qa_discoverability'} else Path('/tmp')
     scratch_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix='natural-qa-intake-' if scenario == 'natural_qa_intake' else 'hpm-simple-',
+    scratch = Path(tempfile.mkdtemp(prefix='natural-qa-intake-' if scenario in {'natural_qa_intake', 'natural_qa_discoverability'} else 'hpm-simple-',
                                    dir=scratch_root)).resolve()
     cleaned = False
     passed = False

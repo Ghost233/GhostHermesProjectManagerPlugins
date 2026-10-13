@@ -245,6 +245,64 @@ async def main():
             'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     native.im.v1.message.reply = reply
     await connect_service(adapter, native)
+    if scenario == 'natural_qa_discoverability':
+        anchor = {'app_id': 'cli_fixture', 'transport_tenant_key': 'tenant-app', 'tenant_key': 'tenant-owner',
+                  'recipient_tenant_key': 'tenant-bot', 'recipient_open_id': 'ou_lead',
+                  'chat_id': 'oc_fixture', 'sender_open_id': 'ou_owner'}
+        work_id = 'work-' + 'd' * 32
+        adapter.intake._save({'id': work_id, 'profile_id': 'lead', 'source_anchor': anchor,
+            'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
+                'acceptance': {'status': 'unmet', 'delivered': False}}})
+        snapshots = []
+
+        async def ordinary_snapshot_handler(event):
+            assert adapter._command_source.get() is event.source
+            assert adapter.intake.prepare(event, adapter) is None
+            snapshots.append((adapter.intake.snapshot(), json.loads(registry.dispatch('hermes_pm_snapshot', {}))))
+
+        runner._wire_adapter_handlers(adapter, message_handler=ordinary_snapshot_handler)
+        text = 'The browser acceptance needs repository rework.'
+        await receive(adapter, raw('om_discover', text='@_user_1 ' + text))
+        for _ in range(100):
+            if snapshots:
+                break
+            await asyncio.sleep(.01)
+        assert len(snapshots) == 1
+        expected, snapshot = snapshots[0]
+        assert list(snapshot)[0] == 'action_hint'
+        assert snapshot['action_hint'] == {'tool_name': 'hermes_pm_repository_rework',
+            'arguments': {'feedback': text, 'work_id': work_id},
+            'instruction': 'For this current owner acceptance/rework report, call this tool once with the verbatim feedback. Do not poll the snapshot first.'}
+        assert {key: snapshot[key] for key in expected} == expected, {
+            'snapshot': {key: snapshot[key] for key in expected}, 'expected': expected}
+        adapter.intake._save({'id': 'work-' + 'e' * 32, 'profile_id': 'lead', 'source_anchor': anchor,
+            'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance',
+                'acceptance': {'status': 'unmet', 'delivered': False}}})
+        await receive(adapter, raw('om_discover_ambiguous', text='@_user_1 Another acceptance rework report.'))
+        for _ in range(100):
+            if len(snapshots) >= 2:
+                break
+            await asyncio.sleep(.01)
+        ambiguous_expected, ambiguous_snapshot = snapshots[-1]
+        assert 'action_hint' not in ambiguous_snapshot and ambiguous_snapshot == ambiguous_expected
+        before = len(snapshots)
+        await receive(adapter, raw('om_discover_foreign', text='@_user_1 Foreign report.', sender={
+            'sender_id': {'open_id': 'ou_foreign', 'user_id': 'u_foreign', 'union_id': 'on_foreign'}}))
+        await receive(adapter, raw('om_discover_bot', text='@_user_1 Bot report.', sender={
+            'sender_type': 'bot', 'sender_id': {'open_id': 'ou_bot', 'user_id': 'u_bot', 'union_id': 'on_bot'}}))
+        assert len(snapshots) == before
+        definitions = [entry for scope in registry._scoped_tools.values() if isinstance(scope, dict)
+                       for name, entry in scope.items() if name == 'hermes_pm_repository_rework']
+        assert len(definitions) == 1
+        definition = definitions[0]
+        schema = definition.get('schema') if isinstance(definition, dict) else getattr(definition, 'schema', None)
+        description = schema.get('description') if isinstance(schema, dict) else None
+        assert isinstance(description, str) and 'browser or repository acceptance/rework' in description
+        assert 'verbatim as feedback' in description and 'before polling hermes_pm_snapshot' in description
+        assert '提示后出牌' not in description and '没选牌' not in description
+        assert model.requests == [] and plugins.unload('ghost-hermes-pm')
+        (scratch / 'simple-smoke-result').write_text('passed')
+        return
     if scenario == 'natural_qa_intake':
         import importlib
         from inspect import isawaitable
