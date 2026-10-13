@@ -203,11 +203,11 @@ class RepositoryIntake(FeishuEntry):
             except ManagementError:
                 if human_reply is not None:
                     return replace(human_reply, command='', rejected='sensitive')
-                if command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '重试 ', '继续 ', '续预算 ', '补充 ')):
+                if command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '结束后台 ', '重试 ', '继续 ', '续预算 ', '补充 ')):
                     return WorkMessage(event, adapter, transport, binding, envelope, {}, '', None, rejected='sensitive',
                         action='control' if command.startswith('补充 ') else 'work')
                 return None
-            if human_reply is not None and not command.startswith('补充 ') and not re.fullmatch(r'(停止|重试|继续|续预算) work-[a-f0-9]{32}', command):
+            if human_reply is not None and not command.startswith('补充 ') and not re.fullmatch(r'(停止|结束后台|重试|继续|续预算) work-[a-f0-9]{32}', command):
                 return human_reply
             if command.startswith('补充 '):
                 supplement = re.fullmatch(r'补充 (work-[a-f0-9]{32})\n([\s\S]+)', command)
@@ -222,10 +222,15 @@ class RepositoryIntake(FeishuEntry):
                         rejected='scope', action='control')
                 return WorkMessage(event, adapter, transport, binding, envelope, record['target'], command, None,
                     record['id'], action='control')
-            control = re.fullmatch(r'(停止|重试|继续|续预算) (work-[a-f0-9]{32})', command)
+            control = re.fullmatch(r'(停止|结束后台|重试|继续|续预算) (work-[a-f0-9]{32})', command)
             if control:
                 record = next((r for r in self.snapshot()['work'] if r['id'] == control.group(2)), None)
                 if sender.sender_type != 'user' or record is None or record['profile_id'] not in authorized_profiles:
+                    return WorkMessage(event, adapter, transport, binding, envelope, {}, command, None,
+                        rejected='scope', action='control')
+                if control.group(1) == '结束后台' and any(record.get('source_anchor', {}).get(key) != envelope[key]
+                        for key in ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                                    'recipient_open_id', 'chat_id', 'sender_open_id')):
                     return WorkMessage(event, adapter, transport, binding, envelope, {}, command, None,
                         rejected='scope', action='control')
                 return WorkMessage(event, adapter, transport, binding, envelope, record['target'], command, None,

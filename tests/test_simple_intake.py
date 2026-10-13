@@ -102,7 +102,8 @@ def test_shared_prompt_reports_original_ids_and_current_budget():
     from ghost_hermes_pm.shared_repository import _prompt
     criterion = 'Verify the synthetic public behavior.'
     record = {'issue': {'url': 'https://github.com/fixture-user/fixture/issues/1', 'title': 'Fixture',
-        'body': '- [ ] ' + criterion + '\nHistorical 8192 token limit.'}, 'target': {'repository': 'fixture-user/fixture'},
+        'body': '- [ ] ' + criterion + '\nHistorical 8192 token limit.', 'updated_at': '2026-10-10T00:00:00Z'},
+        'target': {'repository': 'fixture-user/fixture'},
         'dsh_execution': {'session_id': 'fixture-session', 'generation': 'fixture-generation',
             'github_reference': {'config_dir': '/private/tmp/fixture-scope', 'account': 'fixture-owner'},
             'acceptance': {'source_digest': 'fixture-digest'}, 'tool_receipts': [

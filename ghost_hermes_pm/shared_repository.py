@@ -2739,9 +2739,15 @@ def _prompt(intake, record):
           'Report with HERMES_REPOSITORY_DELIVERY_JSON followed by one JSON object with source_commit, '
           'issue_updated_at, criteria [{text,test_call_ids}], test_files, fine_issue_urls, pr_url, '
           'sync_branches, leftovers. Reference exact successful native bash test call IDs. '
+        + 'issue_updated_at must be the frozen value ' + record['issue']['updated_at']
+        + '; comment timestamps do not replace it. Each criteria item has only text and test_call_ids, no note or other keys. '
+          'sync_branches is an array of branch names, not an object. fine_issue_urls requires GitHub native sub-issue relationships; body links alone do not count. '
         + 'Copy each frozen acceptance criterion verbatim and in order: ' + json.dumps(acceptance_criteria(record['issue']['body']), ensure_ascii=False)
         + '. Original successful bash receipt IDs for the current source bytes (not all are test calls): '
         + json.dumps(candidates[-40:]) + '. Match IDs to actual tests; never replace IDs with narrative descriptions. '
+          "Never infer receipt meaning from list order. Use only the actual trusted test command's own native call ID; "
+          'Git/other IDs do not belong in test_call_ids; test_files are exactly that command\'s explicit Node test file list, '
+          'formal pytest evidence separately in prose. '
           'Outer Kanban acceptance belongs to the supervisor.')
 
 
@@ -2932,6 +2938,24 @@ async def run_shared_work(ctx, intake, record, generation):
             with connect_closing(board=intake.board) as connection:
                 old_run = kb.get_run(connection, previous['run_id'])
             require_permission_initializer_end(previous, old_run, record['card_id'])
+            execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
+                'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
+            intake._save_execution(record, fields=['supervisor_claim'])
+        elif (execution.get('stop_control', {}).get('status') == 'background_ended'
+                and execution.get('stop_control', {}).get('proof', {}).get('worker')
+                and execution['supervisor_claim']['run_id'] != run_id):
+            control = execution['stop_control']
+            previous, worker = execution['supervisor_claim'], control['proof']['worker']
+            if worker != {'run_id': previous['run_id'], 'identity': previous['identity'], 'exit_code': 0}:
+                raise ManagementError('binding_conflict', 'The original background supervisor exit differs.')
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                old_run = kb.get_run(connection, previous['run_id'])
+            require_permission_initializer_end(previous, old_run, record['card_id'])
+            if (await asyncio.to_thread(shared_range_proof, intake, record, control['session_end']) != control['proof']['session']
+                    or await asyncio.to_thread(repository_source_state, record['target']) != control['proof']['repository']
+                    or read_ledger(configuration, execution)['state'] != execution['shared_budget']):
+                raise ManagementError('binding_conflict', 'The completed background scope, source or budget changed before supervision.')
             execution['supervisor_claim'] = {'run_id': run_id, 'identity': controller_identity(),
                 'exit_log_offset': kb.worker_log_path(record['card_id'], board=intake.board).stat().st_size}
             intake._save_execution(record, fields=['supervisor_claim'])
@@ -3158,6 +3182,7 @@ async def run_shared_work(ctx, intake, record, generation):
             deadline = time.monotonic() + remaining + 15
         observation_deadline = min(deadline, time.monotonic() + SUPERVISE_OBSERVATION_SLICE_SECONDS)
         observed = False
+        foreground_review = None
         while not observed or time.monotonic() < observation_deadline:
             observed = True
             intake.require_active(generation)
@@ -3205,9 +3230,13 @@ async def run_shared_work(ctx, intake, record, generation):
                 if projections.get('inbox') != {'next-turn': [], 'next-step': []}:
                     raise ManagementError('outcome_unknown', 'The shared Session retains pending input.')
                 jobs = await asyncio.to_thread(carrier.owned_jobs)
-                if any(job['status'] in {'running', 'stopping'} for job in jobs):
-                    raise ManagementError('outcome_unknown', 'Owned shared background jobs remain active.')
                 reason = ends[-1]['data'].get('reason', {})
+                active_jobs = any(job['status'] in {'running', 'stopping'} for job in jobs)
+                if active_jobs:
+                    registered = {receipt['job_id'] for receipt in shared_receipts(configuration, execution, '.jobs.jsonl')
+                        if receipt['type'] == 'registered' and receipt.get('owner') == execution['session_id']}
+                    if reason.get('kind') != 'completed' or any(job['id'] not in registered for job in jobs):
+                        raise ManagementError('outcome_unknown', 'Original active background job coverage is unconfirmed.')
                 stop_reason = (budget.get('renewWindow') or execution['shared_budget']).get('stop_reason')
                 state = 'awaiting_acceptance' if reason.get('kind') == 'completed' else 'budget_stopped' if stop_reason else 'execution_failed'
                 execution.update(state=state, terminal_reason=reason, jobs=[{'id': job['id'], 'status': job['status']} for job in jobs],
@@ -3215,12 +3244,17 @@ async def run_shared_work(ctx, intake, record, generation):
                 intake._save_execution(record)
                 if state == 'awaiting_acceptance':
                     phase = 'acceptance'
-                    result = await accept_repository_work(intake, record, carrier, events, projections, generation)
-                    if result.get('status') == 'accepted':
-                        await finish_delivery_range(intake, record, carrier, generation)
-                        await asyncio.to_thread(cleanup_shared_github, intake, record)
-                    return result
-                return {'status': state, 'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
+                    review = (events[-1]['seq'], tuple((job['id'], job['status']) for job in jobs))
+                    if not active_jobs or review != foreground_review:
+                        result = await accept_repository_work(intake, record, carrier, events, projections, generation)
+                        foreground_review = review
+                    if not active_jobs:
+                        if result.get('status') == 'accepted':
+                            await finish_delivery_range(intake, record, carrier, generation)
+                            await asyncio.to_thread(cleanup_shared_github, intake, record)
+                        return result
+                else:
+                    return {'status': state, 'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
             checkpoint = supervision_checkpoint(intake, record, configuration, budget, events)
             if checkpoint is not None:
                 return {'status': 'review_required', 'next_action': 'hermes_pm_supervise',
@@ -3241,6 +3275,111 @@ async def run_shared_work(ctx, intake, record, generation):
     finally:
         if carrier is not None:
             carrier.close()
+
+
+async def end_shared_background(intake, record, message_id, generation):
+    """End registered background jobs after foreground completion; retain the work."""
+    from .repository_control import _card, _worker_end
+    from .repository_supervision import owned_call, original_history
+    from .repository_acceptance import repository_source_state
+    from .trusted_controller import controller_identity
+    execution = record['dsh_execution']
+    if (execution.get('mode') != 'shared_native' or execution.get('first_input') != 'accepted'
+            or execution.get('stop_requested') or execution.get('lifecycle_end')
+            or execution.get('state') not in {'running', 'awaiting_acceptance', 'outcome_unknown'}):
+        raise ManagementError('outcome_unknown', 'Only the original completed work may end its background jobs.')
+    card = _card(intake, record)
+    claim = execution.get('supervisor_claim', {})
+    worker = None
+    if card['status'] == 'running':
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
+        with connect_closing(board=intake.board) as connection:
+            active = kb.get_task(connection, record['card_id'])
+        if (active is None or active.status != 'running' or active.current_run_id != claim.get('run_id')
+                or active.worker_pid != claim.get('identity', {}).get('pid')
+                or controller_identity(active.worker_pid) != claim['identity']):
+            raise ManagementError('binding_conflict', 'The original background supervisor claim changed.')
+    else:
+        worker = _worker_end(intake, record)
+    carrier = shared_attach(intake, record, observe=False)
+    try:
+        budget_file = ledger_path(carrier.config, execution['session_id'])
+        budget_before = private_file(budget_file).read_bytes()
+        budget = read_ledger(carrier.config, execution)
+        control = execution.get('stop_control', {})
+        if control.get('status') == 'background_ended':
+            if shared_range_proof(intake, record, control['session_end']) != control['proof']['session']:
+                raise ManagementError('outcome_unknown', 'The original background cleanup proof changed.')
+            return record
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            intake.require_active(generation)
+            listing = await asyncio.to_thread(owned_call, carrier, 'session/list', {})
+            sessions = [row for row in listing['items'] if row['sessionId'] == execution['session_id']]
+            events, projections = await asyncio.to_thread(original_history, carrier, execution['session_id'], record['target']['repo_path'])
+            starts = [event for event in events if event['type'] == 'turn/start']
+            ends = [event for event in events if event['type'] == 'turn/end']
+            if (len(sessions) != 1 or sessions[0].get('cwd') != record['target']['repo_path']
+                    or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
+                    or projections.get('inbox') != {'next-turn': [], 'next-step': []}
+                    or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
+                    or ends[-1]['data'].get('reason') != {'kind': 'completed'}
+                    or private_file(budget_file).read_bytes() != budget_before):
+                raise ManagementError('outcome_unknown', 'The completed original foreground, input or budget changed.')
+            jobs = await asyncio.to_thread(carrier.owned_jobs)
+            receipts = shared_receipts(carrier.config, execution, '.tools.jsonl')
+            background = {row.get('job_id') for row in receipts if row.get('name') == 'bash'
+                and row.get('kind') in {'background', 'promoted'} and row.get('execution_admission') == 'admitted'}
+            registered = {row['job_id'] for row in shared_receipts(carrier.config, execution, '.jobs.jsonl')
+                if row['type'] == 'registered' and row.get('owner') == execution['session_id']}
+            active = [job for job in jobs if job['status'] in {'running', 'stopping'}]
+            if any(job['id'] not in registered or job['id'] not in background for job in active):
+                raise ManagementError('coverage_unverified', 'An unregistered original background job was preserved.')
+            control.update(message_id=message_id, prior_state=execution['state'], status='intent')
+            execution['stop_control'] = control
+            intake._save_execution(record, fields=['stop_control'])
+            for job in active:
+                cancelled = control.setdefault('job_cancel', {})
+                if cancelled.get(job['id']) == 'intent':
+                    raise ManagementError('outcome_unknown', 'Original background cancellation is unconfirmed; no replay.')
+                if job['id'] not in cancelled:
+                    cancelled[job['id']] = 'intent'
+                    intake._save_execution(record, fields=['stop_control'])
+                    answer = await asyncio.to_thread(owned_call, carrier, 'job/kill',
+                        {'sessionId': execution['session_id'], 'jobId': job['id']})
+                    if answer.get('outcome') not in {'requested', 'already-finished'}:
+                        raise ManagementError('outcome_unknown', 'Owned background cancellation admission is unknown.')
+                    cancelled[job['id']] = 'accepted'
+                    intake._save_execution(record, fields=['stop_control'])
+            if not active:
+                end = {'session_id': execution['session_id'], 'generation': execution['generation'],
+                    'journal_cursor': events[-1]['seq'],
+                    'tool_calls': [{'id': event['data']['callId'], 'name': event['data']['name']}
+                        for event in events if event['type'] == 'tool/call'],
+                    'jobs': [{'id': job['id'], 'status': job['status']} for job in jobs]}
+                proof = await asyncio.to_thread(shared_range_proof, intake, record, end)
+                source = await asyncio.to_thread(repository_source_state, record['target'])
+                control.update(status='background_ended', session_end=end, proof={'session': proof, 'repository': source})
+                if worker is not None:
+                    control['proof']['worker'] = worker
+                execution.update(state='awaiting_acceptance', terminal_reason={'kind': 'completed'},
+                    jobs=end['jobs'], tool_receipts=receipts, shared_budget=budget['state'])
+                intake._save_execution(record, fields=['stop_control', 'state', 'terminal_reason', 'jobs', 'tool_receipts', 'shared_budget'])
+                if worker is not None:
+                    if card['status'] == 'triage':
+                        from hermes_cli import kanban_db as kb
+                        from hermes_cli.kanban_db_connect import connect_closing
+                        with connect_closing(board=intake.board) as connection:
+                            if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                                raise ManagementError('outcome_unknown', 'Original background supervisor dispatch is unconfirmed.')
+                    else:
+                        intake._kanban('kanban_unblock', {'task_id': record['card_id']})
+                return record
+            await asyncio.sleep(.05)
+        raise ManagementError('outcome_unknown', 'Original background termination remains unconfirmed.')
+    finally:
+        carrier.close()
 
 
 async def stop_shared_work(intake, record, generation):

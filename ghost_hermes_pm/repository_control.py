@@ -390,7 +390,7 @@ async def process_control(intake, prepared, generation):
                 saved = saved_owner
                 text = '这条补充控制消息已登记；不会重送要求或新增预算。原 SID 受理结果仍按记录核对。'
                 result = {'status': 'duplicate', 'work_id': record['id'], 'original_status': saved.get('status', 'unverified')}
-            elif duplicate and (prepared.command.startswith(('重试 ', '继续 ', '续预算 ')) or execution.get('state') == 'stopped'):
+            elif duplicate and (prepared.command.startswith(('结束后台 ', '重试 ', '继续 ', '续预算 ')) or execution.get('state') == 'stopped'):
                 field = ('continuation_control' if execution.get('continuation_control', {}).get('message_id') == message_id
                     else 'window_resume_checkpoint' if execution.get('window_resume_checkpoint', {}).get('message_id') == message_id
                     else 'renewal_window_checkpoint' if execution.get('renewal_window_checkpoint', {}).get('message_id') == message_id
@@ -401,6 +401,11 @@ async def process_control(intake, prepared, generation):
                     'original_status': saved.get('status', 'unverified') if saved.get('message_id') == message_id else 'unverified'}
                 if saved.get('message_id') == message_id and 'dispatch_status' in saved:
                     result['dispatch_status'] = saved['dispatch_status']
+            elif prepared.command.startswith('结束后台 '):
+                from .shared_repository import end_shared_background
+                record = await end_shared_background(intake, record, message_id, generation)
+                text = '原工作已登记后台作业已核实终结；外层任务、原 SID 与预算保留，原报告仍按实际验收核对。'
+                result = {'status': 'background_ended', 'work_id': record['id'], 'delivered': False}
             elif prepared.command.startswith('补充 '):
                 from .shared_repository import admit_shared_owner_context
                 record = await asyncio.to_thread(admit_shared_owner_context, intake, record, prepared, generation)
@@ -479,8 +484,9 @@ async def process_control(intake, prepared, generation):
             else:
                 if not execution.get('stop_requested'):
                     _card(intake, record)
-                    execution.update(stop_requested=True, stop_control={'message_id': prepared.envelope['message_id'],
-                        'prior_state': execution['state'], 'status': 'intent'})
+                    control = execution.get('stop_control', {})
+                    control.update(message_id=prepared.envelope['message_id'], prior_state=execution['state'], status='intent')
+                    execution.update(stop_requested=True, stop_control=control)
                     intake._save_execution(record, fields=['stop_requested', 'stop_control'])
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 record = await _stop(intake, record, generation)
@@ -490,12 +496,16 @@ async def process_control(intake, prepared, generation):
             intake.require_active(generation)
             record = _record(intake, prepared.work_id)
             execution = record.get('dsh_execution', {})
-            if prepared.command.startswith('停止 ') and execution.get('stop_control'):
+            if prepared.command.startswith(('停止 ', '结束后台 ')):
+                from .shared_repository import _record_shared_failure
+                _record_shared_failure(intake, record, error,
+                    'background_cleanup' if prepared.command.startswith('结束后台 ') else 'whole_stop')
+            if prepared.command.startswith(('停止 ', '结束后台 ')) and execution.get('stop_control'):
                 execution['stop_control'].update(status='unverified',
-                    last_failure={'code': error.code if isinstance(error, ManagementError) else 'outcome_unknown',
-                        'type': type(error).__name__, 'message': str(error) if isinstance(error, ManagementError) else 'Original cleanup remains unconfirmed.'})
+                    last_failure={key: execution['last_failure'][key] for key in ('code', 'type', 'message')})
                 intake._save_execution(record, fields=['stop_control'])
-            text = ('补充要求未核实受理；原 SID、仓库占用与预算保留，不会重发，请核对原记录。' if prepared.command.startswith('补充 ')
+            text = ('后台结束尚未核实；保留原工作、仓库占用与预算，不重发未知取消。' if prepared.command.startswith('结束后台 ')
+                else '补充要求未核实受理；原 SID、仓库占用与预算保留，不会重发，请核对原记录。' if prepared.command.startswith('补充 ')
                 else '继续未受理；原 SID、历史与预算保留，先核对原失败、维护重载及连接身份。' if prepared.command.startswith(('继续 ', '续预算 '))
                 else '重试未受理；原工作与记录保留，先核对停止、当前配置、Issue 和仓库队列。' if prepared.command.startswith('重试 ')
                 else '停止尚未核实；保留仓库占用，不启动重试或后续工作。原记录与改动保留。')

@@ -130,7 +130,7 @@ class WorkerModelService:
                             review = {'checkpoint_id': last['checkpoint']['id'],
                                 'summary': 'Synthetic checkpoint review ' + str(len(service.checkpoint_review_calls) + 1)
                                     + '. Verified original DSH progress.',
-                                'notify_owner': bool(service.checkpoint_review_calls)}
+                                'notify_owner': bool(service.checkpoint_review_calls) or getattr(service, 'notify_first_checkpoint', False)}
                             service.checkpoint_review_calls.append(review)
                             call = ('hermes_pm_supervise', review)
                         elif last.get('status') == 'reviewed' and len(service.checkpoint_review_calls) == 2 \
@@ -139,6 +139,8 @@ class WorkerModelService:
                             call = ('hermes_pm_supervise', service.checkpoint_review_calls[-1])
                         elif last.get('status') in {'stopped', 'stop_requested'}:
                             call = ('kanban_block', {'kind': 'needs_input', 'reason': 'Owner stopped the original shared work.'})
+                        elif last.get('status') == 'unmet':
+                            call = ('kanban_block', {'kind': 'needs_input', 'reason': 'Original delivery evidence remains unmet.'})
                         elif last.get('status') in {'blocked', 'triage'} \
                                 or last.get('task', {}).get('status') in {'blocked', 'triage'}:
                             call = None

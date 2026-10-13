@@ -19,7 +19,11 @@ if observer_restart:
 supervise_takeover = shared_scenario.startswith('supervise_takeover')
 takeover_case = shared_scenario.removeprefix('supervise_takeover_') if shared_scenario != 'supervise_takeover' else 'valid'
 supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover
-supervision_checkpoints = shared_scenario == 'supervision_checkpoints'
+background_ended_worker = shared_scenario == 'background_cleanup_ended_worker'
+background_secret = shared_scenario == 'background_cleanup_secret_stop'
+background_unknown = shared_scenario == 'background_cleanup_unknown_stop' or background_secret
+background_cleanup = shared_scenario == 'background_cleanup' or background_ended_worker or background_unknown
+supervision_checkpoints = shared_scenario == 'supervision_checkpoints' or background_cleanup
 expired_window = shared_scenario == 'supervise_expired_window'
 if expired_window:
     shared_scenario = 'renew_window'
@@ -94,6 +98,19 @@ service_source = service_source.replace("elif method == 'session/cancel':", """e
                 behavior['inbox'] = permission_contract['projections']['inbox']
                 value = None if shared_scenario == 'reconcile_intent' else permission_contract['response']
             elif method == 'session/cancel':""")
+if background_cleanup:
+    service_source = service_source.replace("elif method == 'commands/list':", """elif method == 'job/kill':
+                job_request = args['request']
+                assert job_request == {'sessionId': behavior['jobs'][0]['owner'], 'jobId': 'fixture-preview'}
+                if behavior.get('unknown_background_cleanup'):
+                    value = {'outcome': 'unknown'}
+                else:
+                    behavior['jobs'][0]['status'] = 'killed'
+                    settled = dict(behavior['registered_preview'], type='settled', status='killed', cause='cancelled', awaited=True)
+                    with behavior['job_receipts'].open('a') as output:
+                        output.write(json.dumps(settled) + '\\n')
+                    value = {'outcome': 'requested'}
+            elif method == 'commands/list':""", 1)
 service_source = service_source.replace("state['prompts'].append(args['request'])", """state['prompts'].append(args['request'])
                 behavior['inbox'] = {'next-turn': [], 'next-step': []}
                 if max_tokens_last_slot and len(state['prompts']) == 3:
@@ -222,7 +239,8 @@ if qa_request_only_resume:
     reference.write_text(json.dumps(policy_scope))
 if supervision_checkpoints:
     checkpoint_scope = json.loads(reference.read_text())
-    checkpoint_scope.update(budget={}, supervision={'interval_seconds': 1, 'request_interval': 10})
+    checkpoint_scope.update(budget={'max_model_requests': 53} if background_cleanup else {},
+        supervision={'interval_seconds': 1, 'request_interval': 10})
     reference.write_text(json.dumps(checkpoint_scope))
 if runtime_metadata:
     metadata = json.loads(reference.read_text())
@@ -243,6 +261,7 @@ if supervise_slice:
     model.repeat_supervise = True
 if supervision_checkpoints:
     model.review_supervision_checkpoints = True
+    model.notify_first_checkpoint = background_cleanup
 service_client, connect_service, receive, raw, ReplyMessageResponse = (namespace[name] for name in
     ('service_client', 'connect_service', 'receive', 'raw', 'ReplyMessageResponse'))
 
@@ -437,6 +456,55 @@ async def main():
             if supervision_checkpoints and peer['prompts'] and checkpoint_ledger is None:
                 checkpoint_ledger = checkpoint_progress(1)
                 checkpoint_first_budget = checkpoint_ledger.read_bytes()
+                if background_cleanup:
+                    sid = peer['prompts'][0]['sessionId']
+                    fixture_behavior['jobs'] = [{'id': 'fixture-preview', 'owner': sid, 'status': 'running'}]
+                    rows = peer['journals'][sid]
+                    call_id = 'fixture-preview-call'
+                    rows.append({'type': 'event', 'event': {'type': 'tool/call', 'seq': len(rows), 'time': 5,
+                        'data': {'turn': 1, 'step': 1, 'callId': call_id, 'name': 'bash',
+                            'arguments': {'command': 'fixture-preview'}}}})
+                    rows.append({'type': 'event', 'event': {'type': 'tool/result', 'seq': len(rows), 'time': 5,
+                        'data': {'turn': 1, 'step': 1, 'message': {'toolCallId': call_id, 'isError': False,
+                            'content': [{'type': 'text', 'text': 'Synthetic background preview registered.'}]}}}})
+                    rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows), 'time': 5,
+                        'data': {'turn': 1, 'reason': {'kind': 'completed'}}}})
+                    registered = {key: json.loads(checkpoint_first_budget)[key] for key in
+                        ('schema', 'generation', 'session_id', 'session_created_at', 'service_ref', 'host_lease')}
+                    registered.update(type='registered', owner=sid, job_id='fixture-preview',
+                        kind='background', command_sha256=hashlib.sha256(b'fixture-preview').hexdigest())
+                    job_receipts = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.jobs.jsonl')
+                    job_receipts.write_text(json.dumps(registered) + '\n')
+                    job_receipts.chmod(0o600)
+                    fixture_behavior.update(registered_preview=registered, job_receipts=job_receipts)
+                    fixture_behavior['unknown_background_cleanup'] = background_unknown
+                    source = record()['dsh_execution']['baseline']
+                    import importlib
+                    acceptance_criteria = importlib.import_module(type(adapter.intake).__module__.rsplit('.', 1)[0] + '.delivery').acceptance_criteria
+                    if background_secret:
+                        shared_module = importlib.import_module(type(adapter.intake).__module__.rsplit('.', 1)[0] + '.shared_repository')
+                        original_ender = shared_module.end_shared_background
+                        Error = importlib.import_module(type(adapter.intake).__module__.rsplit('.', 1)[0] + '.manager').ManagementError
+                        async def sensitive_failure(*args):
+                            try:
+                                return await original_ender(*args)
+                            except Error as error:
+                                raise Error(error.code, str(error) + ' synthetic-unused-secret') from None
+                        shared_module.end_shared_background = sensitive_failure
+                    report = {'source_commit': source['head'], 'issue_updated_at': initial['issue']['updated_at'],
+                        'criteria': [{'text': text, 'test_call_ids': [call_id], 'note': 'Unsupported synthetic note'}
+                            for text in acceptance_criteria(initial['issue']['body'])], 'test_files': [],
+                        'fine_issue_urls': [], 'pr_url': None, 'sync_branches': {'fixture': 'unsupported'}, 'leftovers': []}
+                    settlement = next(row['event']['data'] for row in reversed(rows) if row['event']['type'] == 'assistant/message')
+                    settlement['message']['content'] = [{'type': 'text', 'text': 'HERMES_REPOSITORY_DELIVERY_JSON ' + json.dumps(report)}]
+                    tool_receipt = {**registered, 'name': 'bash', 'call_id': call_id, 'job_id': 'fixture-preview',
+                        'kind': 'background', 'execution_admission': 'admitted', 'is_error': False, 'exit_code': 0,
+                        'source_before': source, 'source_after': source, 'native_session_seq': 1}
+                    tool_receipt.pop('type')
+                    tool_path = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.tools.jsonl')
+                    tool_path.write_text(json.dumps(tool_receipt) + '\n')
+                    tool_path.chmod(0o600)
+                    next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
             if peer['prompts'] and not ended and shared_scenario in {'terminal', 'reconcile_intent', 'prepare_continue', *continuation_scenarios}:
                 sid = peer['prompts'][0]['sessionId']
                 rows = peer['journals'][sid]
@@ -567,8 +635,111 @@ async def main():
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
             latest = record()
+            if background_cleanup:
+                assert latest['dsh_execution']['state'] != 'outcome_unknown', latest['dsh_execution'].get('last_failure')
             if supervision_checkpoints:
                 checkpoint = latest['dsh_execution'].get('supervision_checkpoint', {})
+                if (background_cleanup and checkpoint.get('delivery', {}).get('status') == 'delivered'
+                        and checkpoint.get('observed_state') == 'awaiting_acceptance'
+                        and latest['dsh_execution'].get('acceptance', {}).get('status') == 'unmet'):
+                    actual_prompt = peer['prompts'][0]['content'][0]['text']
+                    assert initial['issue']['updated_at'] in actual_prompt
+                    assert 'only text and test_call_ids' in actual_prompt and 'array of branch names' in actual_prompt
+                    assert 'native sub-issue relationships' in actual_prompt and 'body links alone do not count' in actual_prompt
+                    assert 'Never infer receipt meaning from list order' in actual_prompt
+                    assert latest['dsh_execution']['state'] == 'awaiting_acceptance'
+                    assert latest['dsh_execution']['jobs'] == [{'id': 'fixture-preview', 'status': 'running'}]
+                    assert latest['dsh_execution']['acceptance']['status'] == 'unmet'
+                    notices = [message for message in sent if checkpoint['summary'] in message.request_body.content]
+                    assert len(notices) == 1 and notices[0].message_id == 'om_shared'
+                    if background_ended_worker:
+                        model.review_supervision_checkpoints = False
+                        model.worker_steps = 3
+                        until = time.monotonic() + 10
+                        while time.monotonic() < until:
+                            waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                            if waited:
+                                assert os.waitstatus_to_exitcode(status) == 0
+                                old_claim = record()['dsh_execution']['supervisor_claim']
+                                worker = None
+                                break
+                            await asyncio.sleep(.05)
+                        assert worker is None, 'The original preview supervisor did not normally block and exit.'
+                    await receive(adapter, raw('om_foreign_end', '@_user_1 结束后台 ' + latest['id'], sender={
+                        'sender_id': {'open_id': 'ou_foreign', 'user_id': 'u_foreign', 'union_id': 'on_foreign'}}))
+                    assert not any(call['method'] == 'job/kill' for call in peer['calls'])
+                    await receive(adapter, raw('om_end_preview', '@_user_1 结束后台 ' + latest['id']))
+                    cleanup = record()['dsh_execution']
+                    if background_unknown:
+                        assert cleanup['stop_control']['status'] == 'unverified'
+                        assert cleanup['stop_control']['job_cancel'] == {'fixture-preview': 'intent'}
+                        assert cleanup['last_failure']['code'] == 'outcome_unknown'
+                        if background_secret:
+                            assert 'synthetic-unused-secret' not in json.dumps(record()), 'Registered credential escaped control diagnostics.'
+                            assert '[REDACTED_CREDENTIAL]' in cleanup['stop_control']['last_failure']['message']
+                        await receive(adapter, raw('om_unknown_whole_stop', '@_user_1 停止 ' + latest['id']))
+                        stopped = record()['dsh_execution']
+                        assert len([call for call in peer['calls'] if call['method'] == 'job/kill']) == 1, 'Whole stop replayed an unknown background cancellation.'
+                        assert stopped['stop_control']['job_cancel'] == {'fixture-preview': 'intent'}
+                        assert stopped['stop_requested'] and stopped['state'] != 'stopped'
+                        assert stopped['acceptance'] == cleanup['acceptance'] and stopped['acceptance']['delivered'] is False
+                        assert stopped['jobs'] == [{'id': 'fixture-preview', 'status': 'running'}]
+                        assert len(peer['prompts']) == 1 and checkpoint_ledger.read_bytes() == checkpoint_first_budget
+                        assert 'synthetic-unused-secret' not in json.dumps(record())
+                        until = time.monotonic() + 10
+                        while time.monotonic() < until:
+                            waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                            if waited:
+                                assert os.waitstatus_to_exitcode(status) == 0
+                                worker = None
+                                break
+                            await asyncio.sleep(.05)
+                        assert worker is None
+                        checkpoint_evidence = {'unknown_cleanup_preserved': True, 'job_kill_count': 1,
+                            'worker_exit': 0, 'budget_unchanged': True, 'input_count': 1, 'credential_filtered': background_secret}
+                        break
+                    assert cleanup.get('stop_control', {}).get('status') == 'background_ended', cleanup.get('last_failure')
+                    await receive(adapter, raw('om_end_preview', '@_user_1 结束后台 ' + latest['id']))
+                    assert len([call for call in peer['calls'] if call['method'] == 'job/kill']) == 1
+                    assert len(peer['prompts']) == 1 and checkpoint_ledger.read_bytes() == checkpoint_first_budget
+                    assert not record()['dsh_execution'].get('stop_requested')
+                    if background_ended_worker:
+                        assert cleanup['stop_control']['proof']['worker']['run_id'] == old_claim['run_id']
+                        assert cleanup['stop_control']['proof']['worker']['exit_code'] == 0
+                        model.worker_steps = 0
+                        model.review_supervision_checkpoints = True
+                        with connect_closing() as db:
+                            assert dispatch_once(db, max_spawn=1).spawned
+                            worker = remember_worker(db, initial['card_id'])
+                        assert worker['run_id'] != old_claim['run_id']
+                    until = time.monotonic() + 10
+                    while time.monotonic() < until:
+                        waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                        if waited:
+                            assert os.waitstatus_to_exitcode(status) == 0
+                            worker = None
+                            break
+                        await asyncio.sleep(.05)
+                    assert worker is None, 'The original completed preview worker did not exit.'
+                    latest = record()
+                    if background_ended_worker:
+                        assert latest['dsh_execution']['supervisor_claim']['run_id'] != old_claim['run_id']
+                    assert latest['dsh_execution']['acceptance']['status'] == 'unmet'
+                    assert latest['dsh_execution']['acceptance']['delivered'] is False
+                    assert 'delivery_report_missing' not in latest['dsh_execution']['acceptance']['unmet']
+                    assert 'test_evidence_missing' in latest['dsh_execution']['acceptance']['unmet']
+                    assert any('验收未满足' in message.request_body.content for message in sent)
+                    background_proof = latest['dsh_execution']['stop_control']['proof']
+                    assert background_proof['session']['settled_job_ids'] == ['fixture-preview']
+                    await receive(adapter, raw('om_checkpoint_stop', '@_user_1 停止 ' + latest['id']))
+                    latest = record()
+                    assert latest['dsh_execution']['state'] == 'stopped'
+                    assert latest['dsh_execution']['stop_control']['proof']['worker']['exit_code'] == 0
+                    checkpoint_evidence = {'notified': checkpoint, 'background_proof': background_proof,
+                        'worker_exit': 0, 'input_count': 1, 'budget_unchanged': True, 'foreign_rejected': True, 'duplicate': True}
+                    if background_ended_worker:
+                        checkpoint_evidence['normal_worker_restore'] = True
+                    break
                 if checkpoint.get('status') == 'reviewed' and checkpoint.get('notify_owner') is False and checkpoint_quiet is None:
                     checkpoint_quiet = json.loads(json.dumps(checkpoint))
                     assert checkpoint_quiet['trigger'] == ['time'], checkpoint_quiet
