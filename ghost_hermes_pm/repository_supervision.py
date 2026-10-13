@@ -223,10 +223,22 @@ async def notify_checkpoint(intake, record, generation):
     intake.require_active(generation)
     checkpoint['delivery'] = {'status': 'intent'}
     intake._save_execution(record, fields=['supervision_checkpoint'])
+    window = checkpoint.get('budget')
+    budget_text = '\n当前窗口额度：未核验，不沿用旧预算描述。'
+    if window is not None:
+        limits = window['limits']
+        budget_text = ('\n当前窗口：请求基数 ' + str(window['request_base']) + '；已用 ' + str(window['requests_used'])
+            + ('；额度 ' + str(limits['max_model_requests']) + '；剩余 ' + str(window['requests_remaining'])
+                if 'max_model_requests' in limits else '；未设置请求上限')
+            + ('；时限剩余 ' + str(round(window['wall_seconds_remaining'], 1)) + ' 秒'
+                if 'max_wall_seconds' in limits else '；无插件时限') + '；无插件 token 配额。')
     text = ('进度检查（截至 ' + time.strftime('%H:%M:%S', time.localtime(checkpoint['observed_at'])) + '）：'
         + '\n执行状态：' + checkpoint['observed_state'] + '\n本段模型请求：' + str(checkpoint['request_delta'])
         + '；累计：' + str(checkpoint['requests']) + '\n待答问题：' + str(checkpoint['questions_pending'])
-        + '；待批操作：' + str(checkpoint['approvals_pending']) + '\n\n' + checkpoint['summary'])
+        + '；待批操作：' + str(checkpoint['approvals_pending']) + budget_text
+        + '\n当前验收状态：' + checkpoint.get('acceptance_status', 'unverified')
+        + ('\n最近进度文字来自旧轮次，仅供参考。' if checkpoint.get('latest_progress', {}).get('from_current_turn') is False else '')
+        + '\n\n' + checkpoint['summary'])
     result = await transport.send({'uuid': hashlib.sha256((record['id'] + ':checkpoint:' + checkpoint['id']).encode()).hexdigest()[:32],
         'text': text, 'chat_id': binding['chat_id'], 'reply_to': record['source_anchor']['message_id'],
         'thread_id': record['source_anchor'].get('thread_id')})

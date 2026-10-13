@@ -84,6 +84,113 @@ def test_background_budget_observation_preserves_every_other_state_field(changed
     assert before['observed_at_ms'] == now - 500
 
 
+@pytest.mark.parametrize('limits, remaining', [({}, None), ({'max_model_requests': 40}, 33),
+    ({'max_wall_seconds': 600}, None), ({'max_wall_seconds': 600, 'max_model_requests': 40}, 33)])
+@pytest.mark.parametrize('fresh_progress', [False, True])
+def test_supervision_checkpoint_reports_current_allowance_and_historical_progress(limits, remaining, fresh_progress):
+    from ghost_hermes_pm.shared_repository import supervision_checkpoint
+    started = int(time.time() * 1000) - 301000
+    execution = {'session_id': 'synthetic-session', 'generation': 'synthetic-generation', 'state': 'running',
+        'journal_cursor': 10, 'questions': [{'state': 'settled', 'answerable': False, 'reply_status': None}],
+        'approvals': [{'state': 'settled', 'operation_state': 'settled', 'reply_status': None}],
+        'acceptance': {'status': 'accepted', 'delivered': True}}
+    record = {'id': 'synthetic-work', 'dsh_execution': execution}
+    intake = SimpleNamespace(secret_values=[], snapshot=lambda: {'work': [record]},
+        _save_execution=lambda _record, fields: None)
+    configuration = {'budget': limits,
+        'supervision': {'interval_seconds': 300, 'request_interval': 10}}
+    budget = {'state': {'requests': 27, 'reported_tokens': 100, 'started_at_ms': started},
+        'renewWindow': {'request_base': 20, 'started_at_ms': started}}
+    events = [{'type': 'turn/start', 'seq': 1, 'data': {'turn': 1}},
+        {'type': 'assistant/message', 'seq': 4, 'data': {'turn': 1,
+            'message': {'content': [{'type': 'text', 'text': 'Old synthetic report and preview.'}]}}},
+        {'type': 'turn/start', 'seq': 10, 'data': {'turn': 2}}]
+    if fresh_progress:
+        events.append({'type': 'assistant/message', 'seq': 11, 'data': {'turn': 2,
+            'message': {'content': [{'type': 'text', 'text': 'Current synthetic progress.'}]}}})
+    checkpoint = supervision_checkpoint(intake, record, configuration, budget, events)
+    assert checkpoint['questions_pending'] == checkpoint['approvals_pending'] == 0
+    assert checkpoint['budget']['limits'] == limits
+    assert checkpoint['budget']['request_base'] == 20 and checkpoint['budget']['requests_used'] == 7
+    assert checkpoint['budget']['requests_remaining'] == remaining
+    if 'max_wall_seconds' in limits:
+        assert 0 < checkpoint['budget']['wall_seconds_remaining'] <= 600
+    else:
+        assert checkpoint['budget']['wall_seconds_remaining'] is None
+    assert checkpoint['current_turn'] == {'turn': 2, 'start_seq': 10}
+    assert checkpoint['latest_progress']['from_current_turn'] is fresh_progress
+    assert checkpoint['acceptance_status'] == 'unverified'
+    assert checkpoint['latest_progress']['text'] == ('Current synthetic progress.' if fresh_progress
+        else 'Old synthetic report and preview.')
+
+
+@pytest.mark.parametrize('question, approval, expected', [
+    ({'state': 'open'}, {'state': 'pending'}, (1, 1)),
+    ({'state': 'continued', 'reply_status': 'accepted'}, {'operation_state': 'pending'}, (0, 1)),
+    ({'state': 'continued', 'reply_status': 'settled'}, {'state': 'settled'}, (1, 0)),
+    ({'state': 'settled', 'reply_status': None}, {'state': 'approved', 'operation_state': 'settled'}, (0, 0))])
+def test_supervision_checkpoint_pending_counts_follow_acceptance(question, approval, expected):
+    from ghost_hermes_pm.shared_repository import supervision_checkpoint
+    execution = {'session_id': 'synthetic-session', 'generation': 'synthetic-generation', 'state': 'running'}
+    record = {'id': 'synthetic-work', 'dsh_execution': execution}
+    saved = {**record, 'dsh_execution': {**execution, 'questions': [question], 'approvals': [approval]}}
+    intake = SimpleNamespace(secret_values=[], snapshot=lambda: {'work': [saved]},
+        _save_execution=lambda _record, fields: None)
+    budget = {'state': {'requests': 1, 'reported_tokens': 1, 'started_at_ms': int(time.time() * 1000) - 301000}}
+    checkpoint = supervision_checkpoint(intake, record, {'budget': {}}, budget)
+    assert (checkpoint['questions_pending'], checkpoint['approvals_pending']) == expected
+
+
+def test_shared_prompt_uses_current_ledger_and_verified_test_mapping(tmp_path, monkeypatch):
+    from ghost_hermes_pm.shared_repository import _prompt, verification_command
+    record, _context, intake, _carrier, ledger_file, _source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    intake.config['budget'] = {'max_model_requests': 40}
+    row = json.loads(ledger_file.read_text())
+    row['budget'] = intake.config['budget']
+    ledger_file.write_text(json.dumps(row))
+    record['issue']['body'] += '\nHistorical budget: 30 minutes and 80 requests.'
+    execution = record['dsh_execution']
+    root = Path(__file__).resolve().parents[1]
+    paths = {'python': str(Path(sys.executable).resolve()), 'node': str(Path(shutil.which('node')).resolve()),
+        'runner': str(root / 'ghost_hermes_pm/repository_test_runner.py')}
+    intake.config['verification'] = {**paths, **{key + '_sha256': hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for key, path in paths.items()}}
+    (Path(record['target']['repo_path']) / 'synthetic.test.mjs').write_text('import test from "node:test";\n')
+    execution['verification'] = {'artifact_root': str(tmp_path / 'artifacts'), 'nonce': 'synthetic-nonce'}
+    execution['acceptance'].update(eligible_test_calls=['verified-native-call'], test_files=['synthetic.test.mjs'])
+    execution['tool_receipts'] = [{'call_id': 'ineligible-git-call', 'name': 'bash', 'is_error': False,
+        'exit_code': 0, 'generation': execution['generation'], 'session_id': execution['session_id'],
+        'source_after': {'source_digest': execution['acceptance']['source_digest']}}]
+    before = ledger_file.read_bytes()
+    prompt = _prompt(intake, record)
+    declaration = json.JSONDecoder().raw_decode(prompt.split('original ledger: ', 1)[1])[0]
+    assert declaration == {'limits': {'max_model_requests': 40}, 'request_base': 1, 'requests_total': 5,
+        'requests_used': 4, 'requests_remaining': 36, 'wall_seconds_remaining': None}
+    assert 'overrides historical budget text' in prompt and 'no plugin output-token or cumulative-token quota' in prompt
+    assert 'verified-native-call' in prompt and 'synthetic.test.mjs' in prompt and 'ineligible-git-call' not in prompt
+    canonical = verification_command(intake.config, execution, record['target']['repo_path'], ['synthetic.test.mjs'])
+    assert 'Complete canonical trusted test command for the declared test files: ' + canonical in prompt
+    assert 'Do not prepend cd/env' in prompt
+    assert ledger_file.read_bytes() == before
+
+
+@pytest.mark.parametrize('accepted', [False, True])
+def test_shared_prompt_without_ledger_never_claims_usage_or_adds_a_grant(tmp_path, monkeypatch, accepted):
+    from ghost_hermes_pm.shared_repository import _prompt
+    record, _context, intake, _carrier, ledger_file, _source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    ledger_file.unlink()
+    if accepted:
+        with pytest.raises(FileNotFoundError):
+            _prompt(intake, record)
+    else:
+        record['dsh_execution'].pop('first_input')
+        record['dsh_execution']['state'] = 'startup_intent'
+        prompt = _prompt(intake, record)
+        assert 'usage is uninitialized' in prompt and 'requests_used' not in prompt
+        assert 'Current authoritative budget from the original ledger' not in prompt
+    assert not ledger_file.exists() and not intake.saved
+
+
 def _natural_qa_fixture(tmp_path, monkeypatch, *, expired=False, foreign_host=False):
     from ghost_hermes_pm import shared_repository
     from ghost_hermes_pm import repository_acceptance, repository_control, repository_execution, repository_supervision
@@ -2159,7 +2266,7 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
     assert json.loads((tmp_path / 'shared-worker-result.json').read_text())['status'] == 'passed'
 
 
-@pytest.mark.parametrize('change', ['none', 'source_changed', 'failed_test', 'wrong_command', 'non_test', 'true', 'missing_test', 'failing', 'zero_tests'])
+@pytest.mark.parametrize('change', ['none', 'source_changed', 'failed_test', 'wrong_command', 'non_test', 'true', 'missing_test', 'failing', 'zero_tests', 'wrong_report_call'])
 def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_path, monkeypatch, change):
     from ghost_hermes_pm.simple_development import RepositoryIntake
     from ghost_hermes_pm.repository_acceptance import accept_repository_work, repository_source_state
@@ -2241,18 +2348,36 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
         {'seq': 3, 'type': 'assistant/message', 'data': {'turn': 1, 'message': {'content': [{'type': 'text',
             'text': 'HERMES_REPOSITORY_DELIVERY_JSON ' + json.dumps(report)}]}}},
         {'seq': 4, 'type': 'turn/end', 'data': {'turn': 1, 'reason': {'kind': 'completed'}}}]
+    tool_receipts = [receipt]
+    if change == 'wrong_report_call':
+        old = {**receipt, 'call_id': 'fixture-old-test', 'source_before': {**snapshot, 'source_digest': 'old-source'}}
+        git_command = 'git status --short'
+        git = {**receipt, 'call_id': 'fixture-git', 'command_sha256': hashlib.sha256(git_command.encode()).hexdigest()}
+        tool_receipts = [old, git, receipt]
+        report['criteria'][0]['test_call_ids'] = [old['call_id']]
+        events[3]['data']['message']['content'][0]['text'] = 'HERMES_REPOSITORY_DELIVERY_JSON ' + json.dumps(report)
+        history = []
+        for identifier, actual_command in [(old['call_id'], command), (git['call_id'], git_command)]:
+            history.extend([{'type': 'tool/call', 'data': {'callId': identifier, 'name': 'bash',
+                'arguments': {'command': actual_command}}}, {'type': 'tool/result', 'data': {'message': {
+                'toolCallId': identifier, 'isError': False, 'content': [{'type': 'text', 'text': actual_test.stdout}]}}}])
+        events[1:1] = history
+        for index, event in enumerate(events):
+            event['seq'] = index
     record = {'id': 'fixture-work', 'card_id': 'fixture-card', 'issue': issue,
         'target': {'repo_path': str(repo), 'repository': 'fixture-user/fixture'},
         'dsh_execution': {'mode': 'shared_native', 'state': 'awaiting_acceptance', 'generation': 'fixture-generation',
-            'session_id': 'fixture-session', 'baseline': source, 'tool_receipts': [receipt], 'jobs': [],
+            'session_id': 'fixture-session', 'baseline': source, 'tool_receipts': tool_receipts, 'jobs': [],
             'verification': execution['verification']}}
     intake._save(record)
     result = asyncio.run(accept_repository_work(intake, record, carrier, events,
         {'inbox': {'next-turn': [], 'next-step': []}}, intake.generation))
     assert (result['status'] == 'accepted') == (change == 'none'), json.dumps(result)
-    if change == 'source_changed':
+    if change in {'source_changed', 'wrong_report_call'}:
         assert 'test_source_unconfirmed' in result['unmet']
     elif change in {'non_test', 'true', 'zero_tests'}:
         assert 'test_runner_unconfirmed' in result['unmet']
     elif change != 'none':
         assert 'test_evidence_missing' in result['unmet']
+    assert result['eligible_test_calls'] == (['fixture-test'] if change in {'none', 'wrong_report_call'} else [])
+    assert result['test_files'] == ([] if change == 'missing_test' else test_files)

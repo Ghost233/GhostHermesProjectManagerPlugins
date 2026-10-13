@@ -846,6 +846,9 @@ async def main():
                     checkpoint_quiet = json.loads(json.dumps(checkpoint))
                     assert checkpoint_quiet['trigger'] == ['time'], checkpoint_quiet
                     assert checkpoint_quiet['requests'] == 1 and checkpoint_quiet['request_delta'] == 1
+                    assert checkpoint_quiet['budget'] == {'limits': {}, 'request_base': 0, 'requests_used': 1,
+                        'requests_total': 1, 'requests_remaining': None, 'wall_seconds_remaining': None}
+                    assert checkpoint_quiet['acceptance_status'] == 'unverified'
                     assert checkpoint_quiet['delivery']['status'] == 'not_requested'
                     assert not any(checkpoint_quiet['summary'] in message.request_body.content for message in sent)
                     assert checkpoint_ledger.read_bytes() == checkpoint_first_budget
@@ -858,9 +861,16 @@ async def main():
                     assert checkpoint['id'] != checkpoint_quiet['id']
                     assert 'requests' in checkpoint['trigger'] and checkpoint['request_delta'] == 10, checkpoint
                     assert checkpoint['requests'] == 11 and checkpoint['reported_tokens'] == 220
+                    assert checkpoint['budget']['requests_used'] == 11 and checkpoint['budget']['requests_remaining'] is None
+                    assert checkpoint['latest_progress']['from_current_turn'] is True
+                    instructions = [item['instruction'] for item in results if item.get('status') == 'review_required']
+                    assert instructions and all('authoritative current facts' in text and 'from_current_turn=false' in text
+                        and 'no plugin token quota' in text for text in instructions)
                     assert latest['dsh_execution']['supervision_history'][-1] == checkpoint_quiet
                     notices = [message for message in sent if checkpoint['summary'] in message.request_body.content]
                     assert len(notices) == 1 and notices[0].message_id == 'om_shared'
+                    assert '未设置请求上限' in notices[0].request_body.content and '无插件时限' in notices[0].request_body.content
+                    assert '待答问题：0' in notices[0].request_body.content and '当前验收状态：unverified' in notices[0].request_body.content
                     assert checkpoint['delivery']['status'] == 'delivered'
                     assert checkpoint_ledger.read_bytes() == checkpoint_budget
                     assert latest['dsh_execution']['state'] == 'running' and len(peer['prompts']) == 1

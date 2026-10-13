@@ -68,6 +68,71 @@ def _human_pending(execution):
                    for a in execution.get('approvals', [])))
 
 
+def _test_call_matches(execution, target, receipt, call, settlement):
+    arguments = call.get('arguments', {}) if call else {}
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
+    return not (not receipt or not call or not settlement or receipt.get('generation') != execution['generation']
+        or receipt.get('session_id') != execution['session_id'] or receipt.get('name') != call.get('name')
+        or receipt.get('name') != 'bash'
+        or (receipt.get('command_sha256') != hashlib.sha256(arguments.get('command', '').encode()).hexdigest()
+            if execution.get('mode') == 'shared_native' else receipt.get('command') != arguments.get('command'))
+        or receipt.get('cwd') != target['repo_path'] or receipt.get('is_error') is not False
+        or type(receipt.get('exit_code')) is not int or receipt['exit_code'] != 0
+        or receipt.get('timed_out') is not False or receipt.get('aborted') is not False
+        or settlement.get('isError') is not False)
+
+
+def _shared_runner_receipt(configuration, execution, target, current, test_files, receipt, call, settlement):
+    from .shared_repository import verification_command
+    arguments = call['arguments']
+    arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+    if arguments['command'] != verification_command(configuration, execution, target['repo_path'], test_files):
+        return None
+    content = settlement.get('content', [])
+    if len(content) != 1 or content[0].get('type') != 'text':
+        return None
+    text = content[0].get('text', '')
+    output = receipt.get('stdout', {})
+    if (output.get('truncated') is not False or output.get('sha256') != hashlib.sha256(text.encode()).hexdigest()
+            or output.get('byte_length') != len(text.encode()) or receipt.get('stderr', {}).get('byte_length') != 0):
+        return None
+    verified = json.loads(text)
+    if (verified.get('schema') != 1 or verified.get('runner') != 'node:test'
+            or verified.get('binding') != {'session_id': execution['session_id'], 'generation': execution['generation'],
+                'nonce': execution['verification']['nonce']}
+            or verified.get('test_files') != test_files or verified.get('exit_code') != 0
+            or type(verified.get('exit_code')) is not int or type(verified.get('executed_tests')) is not int
+            or verified['executed_tests'] < 1 or verified.get('skipped_tests') != 0 or verified.get('failed_tests') != 0
+            or verified.get('before_source_digest') != current['source_digest']
+            or verified.get('after_source_digest') != current['source_digest']
+            or verified.get('artifact_roots') != [execution['verification']['artifact_root']]
+            or verified.get('source_access') != 'workspace-write' or verified.get('git_access') != 'workspace-write'):
+        return None
+    return verified
+
+
+def _eligible_shared_test_calls(configuration, execution, target, current, test_files, receipts, calls, settled):
+    from .shared_repository import _source_core
+    eligible = []
+    for identifier, receipt in receipts.items():
+        call, settlement = calls.get(identifier), settled.get(identifier)
+        try:
+            if (not _test_call_matches(execution, target, receipt, call, settlement)
+                    or receipt.get('kind') != 'foreground' or receipt.get('execution_admission') != 'admitted'
+                    or receipt.get('sandbox', {}).get('mode') != 'workspace-write'
+                    or receipt.get('sandbox', {}).get('denied') is True or receipt.get('sandbox', {}).get('runnerFailed') is True
+                    or any(not isinstance(receipt.get(key), dict)
+                        or set(receipt[key]) != {'head', 'source_digest', 'workspace_status'}
+                        or receipt[key] != _source_core(current) for key in ('source_before', 'source_after'))):
+                continue
+            if _shared_runner_receipt(configuration, execution, target, current, test_files, receipt, call, settlement):
+                eligible.append(identifier)
+        except (ManagementError, KeyError, ValueError, TypeError, OSError):
+            continue
+    return eligible
+
+
 async def accept_repository_work(intake, record, carrier, events, projections, generation):
     intake.require_active(generation)
     execution = record['dsh_execution']
@@ -126,18 +191,7 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
             continue
         for identifier in ids:
             receipt, call, settlement = receipts.get(identifier), calls.get(identifier), settled.get(identifier)
-            arguments = call.get('arguments', {}) if call else {}
-            if isinstance(arguments, str):
-                arguments = json.loads(arguments)
-            if (not receipt or not call or not settlement or receipt.get('generation') != execution['generation']
-                or receipt.get('session_id') != execution['session_id'] or receipt.get('name') != call.get('name')
-                or receipt.get('name') != 'bash'
-                or (receipt.get('command_sha256') != hashlib.sha256(arguments.get('command', '').encode()).hexdigest()
-                    if execution.get('mode') == 'shared_native' else receipt.get('command') != arguments.get('command'))
-                or receipt.get('cwd') != target['repo_path'] or receipt.get('is_error') is not False
-                or type(receipt.get('exit_code')) is not int or receipt['exit_code'] != 0
-                or receipt.get('timed_out') is not False or receipt.get('aborted') is not False
-                or settlement.get('isError') is not False):
+            if not _test_call_matches(execution, target, receipt, call, settlement):
                 unmet.append('test_evidence_missing')
             else:
                 if execution.get('mode') == 'shared_native':
@@ -173,39 +227,25 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
                     # equality above is required in addition to Git ancestry.
                     _git(target['repo_path'], 'merge-base', '--is-ancestor', snapshot['head'], fixed)
     test_files = report.get('test_files')
+    if execution.get('mode') == 'shared_native':
+        from .shared_repository import verification_command
+        valid_files = False
+        try:
+            verification_command(getattr(carrier, 'config', {}), execution, target['repo_path'], test_files)
+            valid_files = True
+        except (ManagementError, KeyError, ValueError, TypeError, OSError):
+            pass
+        eligible = (_eligible_shared_test_calls(getattr(carrier, 'config', {}), execution, target, current,
+            test_files, receipts, calls, settled) if carrier and valid_files else [])
+        result.update(eligible_test_calls=eligible, test_files=test_files if valid_files else [])
     if not carrier or not isinstance(test_files, list) or not test_files or not test_ids:
         unmet.append('test_evidence_missing')
     elif not unmet and execution.get('mode') == 'shared_native':
-        from .shared_repository import verification_command
         runner_receipts = []
         for identifier in dict.fromkeys(test_ids):
-            receipt = receipts[identifier]
-            arguments = calls[identifier]['arguments']
-            arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
-            if arguments['command'] != verification_command(getattr(carrier, 'config', {}), execution, target['repo_path'], test_files):
-                unmet.append('test_runner_unconfirmed')
-                continue
-            content = settled[identifier].get('content', [])
-            if len(content) != 1 or content[0].get('type') != 'text':
-                unmet.append('test_runner_unconfirmed')
-                continue
-            text = content[0].get('text', '')
-            output = receipt.get('stdout', {})
-            if (output.get('truncated') is not False or output.get('sha256') != hashlib.sha256(text.encode()).hexdigest()
-                or output.get('byte_length') != len(text.encode()) or receipt.get('stderr', {}).get('byte_length') != 0):
-                unmet.append('test_runner_unconfirmed')
-                continue
-            verified = json.loads(text)
-            if (verified.get('schema') != 1 or verified.get('runner') != 'node:test'
-                or verified.get('binding') != {'session_id': execution['session_id'], 'generation': execution['generation'],
-                    'nonce': execution['verification']['nonce']}
-                or verified.get('test_files') != test_files or verified.get('exit_code') != 0
-                or type(verified.get('exit_code')) is not int or type(verified.get('executed_tests')) is not int
-                or verified['executed_tests'] < 1 or verified.get('skipped_tests') != 0 or verified.get('failed_tests') != 0
-                or verified.get('before_source_digest') != current['source_digest']
-                or verified.get('after_source_digest') != current['source_digest']
-                or verified.get('artifact_roots') != [execution['verification']['artifact_root']]
-                or verified.get('source_access') != 'workspace-write' or verified.get('git_access') != 'workspace-write'):
+            verified = _shared_runner_receipt(getattr(carrier, 'config', {}), execution, target, current,
+                test_files, receipts[identifier], calls[identifier], settled[identifier])
+            if verified is None:
                 unmet.append('test_runner_unconfirmed')
                 continue
             runner_receipts.append(verified)

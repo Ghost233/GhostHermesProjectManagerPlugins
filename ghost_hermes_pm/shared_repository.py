@@ -534,8 +534,21 @@ def _wall_remaining(configuration, started):
     return limit if started is None else limit - (time.time() * 1000 - started) / 1000
 
 
+def _active_budget_snapshot(configuration, budget):
+    active = budget.get('renewWindow') or budget['state']
+    limits = {key: configuration['budget'][key] for key in ('max_wall_seconds', 'max_model_requests')
+        if key in configuration['budget']}
+    request_base = (budget.get('renewWindow') or {}).get('request_base', 0)
+    used = budget['state']['requests'] - request_base
+    return {'limits': limits, 'request_base': request_base, 'requests_total': budget['state']['requests'],
+        'requests_used': used,
+        'requests_remaining': limits['max_model_requests'] - used if 'max_model_requests' in limits else None,
+        'wall_seconds_remaining': _wall_remaining(configuration, active.get('started_at_ms')) if 'max_wall_seconds' in limits else None}
+
+
 def supervision_checkpoint(intake, record, configuration, budget, events=()):
     from .manager import _public_text
+    from .repository_acceptance import _human_pending
     execution = record['dsh_execution']
     latest = next(row for row in intake.snapshot()['work'] if row['id'] == record['id'])['dsh_execution']
     prior = latest.get('supervision_checkpoint', {})
@@ -558,13 +571,18 @@ def supervision_checkpoint(intake, record, configuration, budget, events=()):
         reasons.append('requests')
     if not reasons:
         return None
+    starts = [event for event in events if event['type'] == 'turn/start']
+    current_turn = {'turn': starts[-1]['data'].get('turn'), 'start_seq': starts[-1]['seq']} if starts else None
     checkpoint = {'id': uuid.uuid4().hex, 'status': 'pending', 'observed_at': now,
         'session_id': execution['session_id'], 'generation': execution['generation'],
         'requests': budget['state']['requests'], 'request_delta': budget['state']['requests'] - baseline_requests,
         'reported_tokens': budget['state']['reported_tokens'], 'trigger': reasons,
         'observed_state': execution['state'], 'journal_cursor': execution.get('journal_cursor'),
-        'questions_pending': sum(q.get('reply_status') not in {'accepted', 'settled'} for q in execution.get('questions', [])),
-        'approvals_pending': sum(q.get('reply_status') not in {'accepted', 'settled'} for q in execution.get('approvals', []))}
+        'questions_pending': sum(_human_pending({'questions': [q]}) for q in latest.get('questions', [])),
+        'approvals_pending': sum(_human_pending({'approvals': [a]}) for a in latest.get('approvals', [])),
+        'budget': _active_budget_snapshot(configuration, budget),
+        'current_turn': current_turn, 'acceptance_status': latest.get('acceptance', {}).get('status', 'unverified')
+            if execution['state'] == 'awaiting_acceptance' else 'unverified'}
     messages = [event for event in events if event['type'] == 'assistant/message']
     if messages:
         text = '\n'.join(part.get('text', '') for part in messages[-1]['data'].get('message', {}).get('content', [])
@@ -574,6 +592,7 @@ def supervision_checkpoint(intake, record, configuration, budget, events=()):
             checkpoint['latest_progress'] = {'seq': messages[-1]['seq'], 'text': text}
         except ManagementError:
             checkpoint['latest_progress'] = {'seq': messages[-1]['seq'], 'text': 'Progress details remain in the original private Session.'}
+        checkpoint['latest_progress']['from_current_turn'] = bool(starts and messages[-1]['seq'] > starts[-1]['seq'])
     checkpoint['recent_tool_results'] = [{'seq': event['seq'], 'is_error': event['data'].get('message', {}).get('isError')}
         for event in events if event['type'] == 'tool/result'][-10:]
     if prior:
@@ -2717,13 +2736,27 @@ def prepare_shared_verification(intake, record, configuration):
 
 def _prompt(intake, record):
     from .delivery import acceptance_criteria
+    from .repository_execution import execution_configuration
     execution = record['dsh_execution']
-    candidates = [row['call_id'] for row in execution.get('tool_receipts', [])
-        if row.get('name') == 'bash' and row.get('is_error') is False and row.get('exit_code') == 0
-        and row.get('generation') == execution.get('generation') and row.get('session_id') == execution.get('session_id')
-        and row.get('source_after', {}).get('source_digest') == execution.get('acceptance', {}).get('source_digest')]
-    return ('The active budget uses only the configured wall-time and request limits; there is no plugin output-token '
-        'or cumulative-token quota. Old token quota text in the frozen Issue is historical and does not apply.\n'
+    configuration, _ = execution_configuration(record['target'])
+    configuration['workspace'] = record['target']['repo_path']
+    path = ledger_path(configuration, execution['session_id'])
+    if not path.exists() and not execution.get('first_input') and not execution.get('continuation_control'):
+        budget_declaration = ('Current configured limits; original ledger usage is uninitialized: '
+            + json.dumps({'limits': configuration['budget']}) + '. ')
+    else:
+        active_budget = _active_budget_snapshot(configuration, read_ledger(configuration, execution))
+        budget_declaration = 'Current authoritative budget from the original ledger: ' + json.dumps(active_budget) + '. '
+    evidence = {key: execution.get('acceptance', {}).get(key, []) for key in ('eligible_test_calls', 'test_files')}
+    canonical = None
+    if evidence['test_files']:
+        try:
+            canonical = verification_command(configuration, execution, record['target']['repo_path'], evidence['test_files'])
+        except (ManagementError, KeyError, ValueError, TypeError, OSError):
+            pass
+    return (budget_declaration
+        + 'Limits absent from this declaration are not configured. There is no plugin output-token or cumulative-token quota. '
+        'This declaration overrides historical budget text in the frozen Issue; do not reuse old limits or request counts.\n'
         'Work only in this bound repository. Use the installed Matt skills to host requirement discussion, '
         'fine Issue breakdown, TDD, development and tests. Ask ordinary questions through ask_user_question; '
         'execution approvals use the native approval request. Never change other repositories or start a new DSH.\n'
@@ -2748,8 +2781,14 @@ def _prompt(intake, record):
         + '; comment timestamps do not replace it. Each criteria item has only text and test_call_ids, no note or other keys. '
           'sync_branches is an array of branch names, not an object. fine_issue_urls requires GitHub native sub-issue relationships; body links alone do not count. '
         + 'Copy each frozen acceptance criterion verbatim and in order: ' + json.dumps(acceptance_criteria(record['issue']['body']), ensure_ascii=False)
-        + '. Original successful bash receipt IDs for the current source bytes (not all are test calls): '
-        + json.dumps(candidates[-40:]) + '. Match IDs to actual tests; never replace IDs with narrative descriptions. '
+        + '. Verified eligible original native test evidence for the exact current source: '
+        + json.dumps(evidence) + '. These call IDs match the fixed trusted test command and these explicit files. '
+          'An empty list provides no eligible test evidence; run the trusted command and use its actual receipt. '
+        + ('Complete canonical trusted test command for the declared test files: ' + canonical
+            + '. Send this exact string unchanged as one separate native bash call. Do not prepend cd/env, '
+              'reorder arguments, append commands or wrap the command. '
+            if canonical else 'No valid explicit test file list is available for a complete canonical command yet. ')
+        + 'Never replace IDs with narrative descriptions. '
           "Never infer receipt meaning from list order. Use only the actual trusted test command's own native call ID; "
           'Git/other IDs do not belong in test_call_ids; test_files are exactly that command\'s explicit Node test file list, '
           'formal pytest evidence separately in prose. '
@@ -3153,14 +3192,13 @@ async def run_shared_work(ctx, intake, record, generation):
             await asyncio.to_thread(prepare_shared_github, intake, record)
             execution['verification_prefix'] = prepare_shared_verification(intake, record, configuration)
             intake._save_execution(record, fields=['verification_prefix'])
+            phase = 'prompt_preparation'
             if pending_continuation:
                 if continuation.get('kind') == 'max_tokens':
                     budget = read_ledger(configuration, execution)
                     _require_max_tokens_budget(configuration, budget['state'], budget.get('renewWindow'))
                 elif continuation.get('kind') in {'renew_window', 'resume_window', 'qa_rework'}:
                     _require_window_budget(configuration, read_ledger(configuration, execution))
-                continuation['status'] = 'input_intent'
-                intake._save_execution(record, fields=['continuation_control'])
                 request_id = execution['continuation_request_id']
                 reason = ('its max-tokens turn boundary' if continuation.get('kind') == 'max_tokens'
                     else 'its pre-model failure and verified maintenance restart')
@@ -3190,9 +3228,13 @@ async def run_shared_work(ctx, intake, record, generation):
                         'Native model limits still apply. Preserve the original game scope, history and cumulative usage.\n\n' + _prompt(intake, record))
             else:
                 execution['baseline'] = await asyncio.to_thread(repository_source_state, record['target'])
+                request_id, prompt = execution['request_id'], _prompt(intake, record)
+            if pending_continuation:
+                continuation['status'] = 'input_intent'
+                intake._save_execution(record, fields=['continuation_control'])
+            else:
                 execution.update(first_input='intent', state='input_intent')
                 intake._save_execution(record)
-                request_id, prompt = execution['request_id'], _prompt(intake, record)
             phase = 'prompt_admission'
             answer = await asyncio.to_thread(owned_call, carrier, 'session/prompt',
                 {'sessionId': execution['session_id'], 'requestId': request_id, 'mode': 'queue',
@@ -3292,6 +3334,12 @@ async def run_shared_work(ctx, intake, record, generation):
                 return {'status': 'review_required', 'next_action': 'hermes_pm_supervise',
                     'checkpoint': checkpoint, 'delivered': False,
                     'instruction': 'Summarize the verified checkpoint and decide whether immediate owner feedback is needed. '
+                        'Use checkpoint budget, pending counts and acceptance_status as the authoritative current facts. '
+                        'Limits absent from budget.limits are not configured; no plugin token quota applies. '
+                        'Progress with from_current_turn=false is historical reference, not this turn\'s acceptance or active preview evidence. '
+                        'A running turn is unverified; do not reuse old report prose as current acceptance. '
+                        'Explain progress, blockers and next steps only; the deterministic header supplies budget and pending counts. '
+                        'Do not restate or guess those numbers or infer an active preview without current-turn evidence. '
                         'Call this same tool with checkpoint_id, summary and notify_owner. Do not stop DSH, renew a budget or send another prompt.'}
             await asyncio.sleep(.25)
         if time.monotonic() < deadline:
