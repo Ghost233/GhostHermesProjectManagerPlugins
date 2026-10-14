@@ -526,6 +526,100 @@ def test_normal_load_refreshes_only_runner_version_and_keeps_queued_work_unstart
     assert intake.card['status'] == 'blocked'
 
 
+def test_normal_registration_maintains_pending_shared_refs_and_preserves_terminal_and_other_copy_history(tmp_path, monkeypatch):
+    from ghost_hermes_pm import simple_development
+    from test_plugin_entry import Context
+    monkeypatch.syspath_prepend(os.environ['HERMES_TEST_SDK_ROOT'])
+    record, _context, intake, carrier, ledger, reference, raw, _source, _request = _verification_version_fixture(tmp_path, monkeypatch)
+    stopped = deepcopy(record)
+    stopped['id'] = 'work-stopped'
+    stopped['dsh_execution'].update(state='stopped', session_id='stopped-session', stop_requested=True)
+    released_reference = tmp_path / 'released-reference'
+    released_reference.write_bytes(raw)
+    released_reference.chmod(0o600)
+    released = deepcopy(record)
+    released['id'] = 'work-released'
+    released['target']['execution_ref'] = str(released_reference)
+    released['dsh_execution'].update(state='released', lifecycle_end={'status': 'ended'})
+    queued = {'id': 'work-queued', 'target': deepcopy(record['target']), 'dsh_execution': {
+        'mode': 'shared_native', 'state': 'admitted', 'reference_sha256': hashlib.sha256(raw).hexdigest()}}
+    foreign_reference = tmp_path / 'foreign-reference'
+    foreign_configuration = json.loads(raw)
+    foreign_runner = tmp_path / 'other-profile' / 'repository_test_runner.py'
+    foreign_runner.parent.mkdir()
+    foreign_runner.write_text('"""Synthetic retained runner from another Profile copy."""\n')
+    foreign_configuration['verification'].update(runner=str(foreign_runner),
+        runner_sha256=hashlib.sha256(foreign_runner.read_bytes()).hexdigest())
+    foreign_raw = (json.dumps(foreign_configuration, indent=2) + '\n').encode()
+    foreign_reference.write_bytes(foreign_raw)
+    foreign_reference.chmod(0o600)
+    foreign = deepcopy(record)
+    foreign['id'] = 'work-other-copy'
+    foreign['target']['execution_ref'] = str(foreign_reference)
+    foreign['dsh_execution']['reference_sha256'] = hashlib.sha256(foreign_raw).hexdigest()
+    intake.records = [released, record, stopped, queued, foreign]
+    intake.deactivate = lambda: None
+    saved = []
+    intake._save_execution = lambda item, fields=None: saved.append((item['id'], fields))
+    terminal_before, foreign_before = deepcopy([released, stopped]), deepcopy(foreign)
+    budget_before, queued_before = ledger.read_bytes(), deepcopy(queued['dsh_execution'])
+    monkeypatch.setattr(simple_development, 'RepositoryIntake', lambda *_args: intake)
+    ctx = Context({})
+    ctx.register_system_prompt_section = lambda *_args: None
+
+    simple_development.register_simple_development(ctx)
+
+    assert 'hermes_pm_repository_rework' in ctx.tools and 'hermes_pm_supervise' in ctx.tools
+    assert [released, stopped] == terminal_before and foreign == foreign_before
+    assert released_reference.read_bytes() == raw and foreign_reference.read_bytes() == foreign_raw
+    new_digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    assert record['dsh_execution']['reference_sha256'] == queued['dsh_execution']['reference_sha256'] == new_digest
+    for item in (record, queued):
+        history = item['dsh_execution']['verification_version_history']
+        assert len(history) == 1 and Path(history[0]['backup']).read_bytes() == raw
+        assert history[0]['old_reference_sha256'] == hashlib.sha256(raw).hexdigest()
+    queued_before['reference_sha256'] = new_digest
+    assert {key: value for key, value in queued['dsh_execution'].items() if key != 'verification_version_history'} == queued_before
+    assert {item[0] for item in saved} == {record['id'], queued['id']}
+    assert ledger.read_bytes() == budget_before and not carrier.prompts and intake.card['status'] == 'blocked'
+
+
+@pytest.mark.parametrize('change', ['unapproved', 'unknown_mode', 'unfrozen_hash', 'inside_repository', 'symlink', 'missing_file'])
+def test_other_copy_reference_skip_requires_original_authorization_and_safe_binding(tmp_path, monkeypatch, change):
+    from ghost_hermes_pm.shared_repository import refresh_shared_verification_versions
+    record, _context, intake, carrier, ledger, reference, raw, _source, _request = _verification_version_fixture(tmp_path, monkeypatch)
+    runner = tmp_path / 'other-runner.py'
+    runner.write_text('"""Synthetic other-copy runner."""\n')
+    configuration = json.loads(raw)
+    configuration['verification'].update(runner=str(runner), runner_sha256=hashlib.sha256(runner.read_bytes()).hexdigest())
+    if change == 'unapproved':
+        configuration['approved'] = False
+    elif change == 'inside_repository':
+        runner = Path(record['target']['repo_path']) / 'repository_test_runner.py'
+        runner.write_text('"""Synthetic repository-owned runner."""\n')
+        configuration['verification']['runner'] = str(runner)
+    elif change == 'symlink':
+        alias = tmp_path / 'runner-alias.py'
+        alias.symlink_to(runner)
+        configuration['verification']['runner'] = str(alias)
+    elif change == 'missing_file':
+        runner.unlink()
+    reference.write_text(json.dumps(configuration, indent=2) + '\n')
+    record['dsh_execution']['reference_sha256'] = hashlib.sha256(reference.read_bytes()).hexdigest()
+    if change == 'unknown_mode':
+        record['dsh_execution']['mode'] = 'unknown-executor'
+    elif change == 'unfrozen_hash':
+        record['dsh_execution']['reference_sha256'] = 'f' * 64
+    before, raw_before, budget_before = deepcopy(record), reference.read_bytes(), ledger.read_bytes()
+
+    with pytest.raises(ManagementError) as rejected:
+        refresh_shared_verification_versions(intake)
+
+    assert rejected.value.code == 'binding_conflict'
+    assert record == before and reference.read_bytes() == raw_before and ledger.read_bytes() == budget_before
+    assert not intake.saved and not carrier.prompts
+
+
 @pytest.mark.parametrize('change', ['task_hash', 'other_scope', 'runner_path', 'active_turn', 'running_session',
     'active_job', 'queue', 'foreign_identity', 'foreign_sid', 'native_question', 'worker', 'other_record_hash', 'source'])
 def test_runner_version_maintenance_rejects_scope_or_original_lifecycle_changes(tmp_path, monkeypatch, change):

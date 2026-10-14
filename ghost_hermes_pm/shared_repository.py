@@ -2724,22 +2724,36 @@ def refresh_shared_verification_versions(intake):
             if reference:
                 groups.setdefault(reference, []).append(record)
         for name, records in groups.items():
+            records = [record for record in records if record.get('dsh_execution', {}).get('state') not in {'stopped', 'released'}]
+            if not records:
+                continue
             reference = private_file(name)
             raw = reference.read_bytes()
             original = json.loads(raw)
             verification = original.get('verification', {})
             if original.get('mode') != 'shared_native' or verification.get('runner_sha256') == runner_digest:
                 continue
-            if verification.get('runner') != str(runner) or not re.fullmatch(r'[a-f0-9]{64}', verification.get('runner_sha256', '')):
-                raise ManagementError('binding_conflict', 'Only the currently loaded original test runner version may refresh.')
             old_digest = hashlib.sha256(raw).hexdigest()
+            for record in records:
+                value = record.get('dsh_execution', {}).get('reference_sha256')
+                if value is not None and value != old_digest:
+                    raise ManagementError('binding_conflict', 'The original work reference changed before runner version maintenance.')
+            if not re.fullmatch(r'[a-f0-9]{64}', verification.get('runner_sha256', '')):
+                raise ManagementError('binding_conflict', 'Only the currently loaded original test runner version may refresh.')
+            if verification.get('runner') != str(runner):
+                other = Path(verification.get('runner', ''))
+                if (original.get('approved') is not True or original.get('schema') != 1 or not other.is_absolute()
+                        or not other.is_file() or str(other.resolve(strict=True)) != str(other)
+                        or any(other.is_relative_to(Path(record['target']['repo_path']).resolve(strict=True))
+                            or record.get('dsh_execution', {}).get('mode') != 'shared_native'
+                            or record.get('dsh_execution', {}).get('reference_sha256') != old_digest for record in records)):
+                    raise ManagementError('binding_conflict', 'The original other-copy runner reference is unverified.')
+                continue
             updated = deepcopy(original)
             updated['verification']['runner_sha256'] = runner_digest
             proofs = []
             for record in records:
                 execution = record.get('dsh_execution', {})
-                if execution.get('reference_sha256') is not None and execution.get('reference_sha256') != old_digest:
-                    raise ManagementError('binding_conflict', 'The original work reference changed before runner version maintenance.')
                 configuration = shared_configuration(reference, updated, workspace=record['target']['repo_path'])
                 if not execution.get('session_id'):
                     if any(execution.get(key) for key in ('generation', 'first_input', 'native_identity', 'supervisor_claim')):
