@@ -76,16 +76,23 @@ class NativeFeishuTransport:
     async def send(self, segment):
         self.lifecycle_check()
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody, CreateMessageRequest, CreateMessageRequestBody
-        items = []
-        if segment.get('mention_open_id'):
-            items.append({'tag': 'at', 'user_id': segment['mention_open_id']})
-        items.append({'tag': 'text', 'text': '\n' + segment['text']})
-        content = json.dumps({'zh_cn': {'content': [items]}}, ensure_ascii=False)
+        if 'card' in segment:
+            if not isinstance(segment['card'], dict) or not segment['card']:
+                raise ManagementError('invalid_change', 'An approval card must be a nonempty object.')
+            message_type = 'interactive'
+            content = json.dumps(segment['card'], ensure_ascii=False)
+        else:
+            items = []
+            if segment.get('mention_open_id'):
+                items.append({'tag': 'at', 'user_id': segment['mention_open_id']})
+            items.append({'tag': 'text', 'text': '\n' + segment['text']})
+            message_type = 'post'
+            content = json.dumps({'zh_cn': {'content': [items]}}, ensure_ascii=False)
         if segment.get('path') == 'create':
-            body = CreateMessageRequestBody.builder().receive_id(segment['chat_id']).msg_type('post').content(content).uuid(segment['uuid']).build()
+            body = CreateMessageRequestBody.builder().receive_id(segment['chat_id']).msg_type(message_type).content(content).uuid(segment['uuid']).build()
             request = CreateMessageRequest.builder().receive_id_type('chat_id').request_body(body).build()
         else:
-            body = ReplyMessageRequestBody.builder().msg_type('post').content(content).uuid(segment['uuid']).reply_in_thread(bool(segment.get('thread_id'))).build()
+            body = ReplyMessageRequestBody.builder().msg_type(message_type).content(content).uuid(segment['uuid']).reply_in_thread(bool(segment.get('thread_id'))).build()
             request = ReplyMessageRequest.builder().message_id(segment['reply_to']).request_body(body).build()
         try:
             def reply_if_active():
@@ -104,6 +111,23 @@ class NativeFeishuTransport:
             return {'status': 'unknown', 'code': 0}
         return {'status': 'delivered', 'code': 0,
                 **{k: getattr(data, k, None) for k in ('message_id', 'chat_id', 'root_id', 'parent_id', 'thread_id')}}
+
+    async def update_card(self, value):
+        self.lifecycle_check()
+        from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
+        body = PatchMessageRequestBody.builder().content(json.dumps(value['card'], ensure_ascii=False)).build()
+        request = PatchMessageRequest.builder().message_id(value['message_id']).request_body(body).build()
+        try:
+            def patch_if_active():
+                self.lifecycle_check()
+                return self.native.im.v1.message.patch(request)
+            response = await asyncio.to_thread(patch_if_active)
+            self.lifecycle_check()
+        except Exception:
+            return {'status': 'unknown'}
+        if type(response.code) is not int:
+            return {'status': 'unknown'}
+        return {'status': 'updated' if response.code == 0 else 'failed', 'code': response.code}
 
 
 def read_github_issue(url, *, expected_account=None):

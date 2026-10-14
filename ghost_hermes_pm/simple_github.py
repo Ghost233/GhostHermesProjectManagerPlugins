@@ -36,8 +36,27 @@ class GitHubWorkSource:
         return self._run(*args, payload=payload)
 
     def read_issue(self, url):
-        value = json.loads(self._business('issue', 'view', url, '--json', 'url,title,body,updatedAt'))
-        return {'url': value['url'], 'title': value['title'], 'body': value['body'], 'updated_at': value['updatedAt']}
+        value = json.loads(self._business('issue', 'view', url, '--json', 'url,title,body,updatedAt,state'))
+        return {'url': value['url'], 'title': value['title'], 'body': value['body'], 'updated_at': value['updatedAt'],
+                'state': value.get('state', '').lower()}
+
+    def read_subissues(self, url):
+        repository, number = url.removeprefix('https://github.com/').split('/issues/')
+        pages = json.loads(self._business('api', 'repos/' + repository + '/issues/' + number + '/sub_issues',
+            '--hostname', 'github.com', '--paginate', '--slurp'))
+        return [{'url': value['html_url'], 'state': value['state'].lower()} for page in pages for value in page]
+
+    def read_pr(self, url):
+        value = json.loads(self._business('pr', 'view', url, '--json',
+            'url,state,reviewDecision,headRefOid,headRefName,baseRefName,mergeCommit'))
+        return {'url': value['url'], 'state': value['state'].lower(),
+                'review': value.get('reviewDecision', '').lower(), 'head_commit': value['headRefOid'],
+                'head_branch': value['headRefName'], 'base_branch': value['baseRefName'],
+                'merge_commit': (value.get('mergeCommit') or {}).get('oid')}
+
+    def read_branch(self, repository, branch):
+        return self._business('api', 'repos/' + repository + '/git/ref/heads/' + branch,
+            '--hostname', 'github.com', '--jq', '.object.sha').strip()
 
     def create_issue(self, repository, title, body, marker):
         value = json.loads(self._business('api', 'repos/' + repository + '/issues', '--hostname', 'github.com',

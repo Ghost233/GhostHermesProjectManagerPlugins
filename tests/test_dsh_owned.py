@@ -17,6 +17,8 @@ from ghost_hermes_pm.dsh_owned import DshOwnedAdapter
 from ghost_hermes_pm.dsh_owned_transport import NativeOwnedTransport
 from ghost_hermes_pm.manager import ManagementError
 
+pytestmark = pytest.mark.retired_independent_runtime
+
 
 @pytest.fixture(scope='module')
 def runtime_root():

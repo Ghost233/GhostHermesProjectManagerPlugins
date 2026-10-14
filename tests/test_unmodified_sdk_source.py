@@ -9,11 +9,6 @@ from sdk_source_integrity import source_snapshot
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_direct_sdk_loading_removes_the_mutating_preparation_pipeline():
-    assert not (ROOT / 'tools' / 'prepare_sdk_privacy.py').exists()
-    assert not (ROOT / 'tools' / 'sdk-patches' / 'native-log-privacy.patch').exists()
-
-
 def test_complete_inventory_observes_changes_outside_compatibility_pointers(tmp_path):
     source = tmp_path / 'official-fixture'
     source.mkdir()

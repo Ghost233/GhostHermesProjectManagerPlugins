@@ -8,7 +8,9 @@ import stat
 def source_snapshot(root):
     root = Path(root).resolve(strict=True)
     result = {}
-    for directory, children, files in os.walk(root, followlinks=False):
+    def unreadable(error):
+        raise error
+    for directory, children, files in os.walk(root, followlinks=False, onerror=unreadable):
         children[:] = sorted(name for name in children if name not in {'.git', '__pycache__'})
         aliases = [name for name in children if (Path(directory) / name).is_symlink()]
         for name in sorted([*files, *aliases]):
@@ -26,4 +28,7 @@ def source_snapshot(root):
             else:
                 raise ValueError('The SDK fixture contains a non-source special file.')
             result[relative] = (kind, stat.S_IMODE(metadata.st_mode), hashlib.sha256(data).hexdigest())
+    anchor = '@deepseek-ai/dsh/lib/profile-boot.js'
+    if (root / anchor).is_file() and anchor not in result:
+        raise ValueError('The selected DSH SDK inventory omitted its readable original profile entry.')
     return result

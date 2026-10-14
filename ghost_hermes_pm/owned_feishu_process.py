@@ -150,6 +150,12 @@ class FeishuProcessTransport:
         except (ManagementError, TimeoutError, OSError):
             return {'status': 'unknown'}
 
+    async def update_card(self, value):
+        try:
+            return await self.call('update_card', value)
+        except (ManagementError, TimeoutError, OSError):
+            return {'status': 'unknown'}
+
     def request_close(self):
         self._close_requested = True
         if self.writer is not None:
@@ -198,6 +204,22 @@ class FeishuProcessTransport:
         self._closed = True
 
 
+def _native_event_handler(write):
+    import lark_oapi as lark
+    from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
+
+    def event(data):
+        write({'kind': 'event', 'payload': json.loads(lark.JSON.marshal(data))})
+
+    def card_action(data):
+        event(data)
+        return P2CardActionTriggerResponse({'toast': {
+            'type': 'info', 'content': '正在核验本人身份与原审批，请以卡片更新为准。'}})
+
+    return (lark.EventDispatcherHandler.builder('', '').register_p2_im_message_receive_v1(event)
+            .register_p2_card_action_trigger(card_action).build())
+
+
 def _serve(fd):
     # This process belongs only to this plugin. No host logger/factory/signal is altered.
     import logging
@@ -236,11 +258,7 @@ def _serve(fd):
 
     transport.bind_lifecycle_guard(require_active)
 
-    def event(data):
-        # Marshall only official event data, over inherited private descriptors.
-        write({'kind': 'event', 'payload': json.loads(lark.JSON.marshal(data))})
-
-    handler = lark.EventDispatcherHandler.builder('', '').register_p2_im_message_receive_v1(event).build()
+    handler = _native_event_handler(write)
     ws = WSClient(credentials['app_id'], credentials['app_secret'], event_handler=handler,
                   log_level=lark.LogLevel.CRITICAL, domain=domain, extra_ua_tags=['channel'])
 
@@ -268,7 +286,7 @@ def _serve(fd):
             try:
                 require_active()
                 operation, value = frame['operation'], frame['value']
-                if operation not in {'verify_identity', 'verify_channel', 'send'}:
+                if operation not in {'verify_identity', 'verify_channel', 'send', 'update_card'}:
                     raise ValueError('unsupported operation')
                 method = getattr(transport, operation)
                 result = asyncio.run(method(*value) if operation == 'verify_channel' else method(value))

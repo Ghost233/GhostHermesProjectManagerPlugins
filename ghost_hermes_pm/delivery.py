@@ -9,11 +9,17 @@ import shlex
 from .manager import ManagementError, _git, _public_text
 
 
-def source_state(repository):
+def source_state(repository, *, git_read=_git):
     root = Path(repository['worktree'])
-    result = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True)
-    head = result.stdout.strip() if result.returncode == 0 else None
-    files = _git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z').split('\0')
+    if git_read is _git:
+        result = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True)
+        head = result.stdout.strip() if result.returncode == 0 else None
+    else:
+        try:
+            head = git_read(root, 'rev-parse', 'HEAD').strip()
+        except ManagementError:
+            head = None
+    files = git_read(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z').split('\0')
     digest = hashlib.sha256()
     file_digests = {}
     artifacts = [Path(p) for p in repository['test_artifact_paths']]
@@ -32,7 +38,7 @@ def source_state(repository):
             continue
         digest.update(raw if raw is not None else b'<deleted>')
         file_digests[name] = hashlib.sha256(raw).hexdigest() if raw is not None else None
-    return {'head': head, 'source_digest': digest.hexdigest(), 'file_digests': file_digests, 'workspace_status': _git(root, 'status', '--porcelain=v1')}
+    return {'head': head, 'source_digest': digest.hexdigest(), 'file_digests': file_digests, 'workspace_status': git_read(root, 'status', '--porcelain=v1')}
 
 
 
@@ -67,6 +73,7 @@ def delivery_requirements(body):
             if not re.search(r'\bmerg(?:e|ed|es|ing)\b|合并', clause, re.IGNORECASE):
                 continue
             negative = re.search(r"\b(?:must not|shall not|do not|don't|never)\s+(?:be\s+)?merg(?:e|ed)\b|(?:禁止|不得|不要|不能|勿)\s*(?:合并|(?:此|本|该)?\s*PR\s*合并)", clause, re.IGNORECASE)
+            compound_negative = re.search(r'不\s*创建\s*或\s*合并\s*PR\b', clause, re.IGNORECASE)
             optional = OPTIONAL_MERGE.search(clause)
             affirmative = OPTIONAL_MERGE.sub(' ', clause)
             # Status-bearing noun phrases are subjects/objects, not merge commands.
@@ -74,9 +81,9 @@ def delivery_requirements(body):
             obligation = re.search(r'\b(?:must|shall|has to|have to|needs to|is required to)\s+(?:be\s+)?merg(?:e|ed)\b|\bmerg(?:e|ed|ing)\b.{0,40}\b(?:is required|is mandatory)\b|^\s*merge\b|(?:必须|务必|须|应当|需要|要求)\s*(?:先|完成\s*(?:此|本|该)?\s*PR\s*)?合并|^\s*(?:合并(?:此|本|该)?\s*PR|将.+合并到)|完成\s*PR\s*合并(?:后|之后).{0,20}(?:交付|验收)', affirmative, re.IGNORECASE)
             reporting = re.search(r'\b(?:show(?:n|s|ing)?|display(?:ed|s|ing)?|report(?:ed|s|ing)?|list(?:ed|s|ing)?|record(?:ed|s|ing)?|track(?:ed|s|ing)?|describe(?:d|s)?)\b|展示|显示|呈现|记录|列出|跟踪', clause, re.IGNORECASE) and re.search(r'\b(?:status|state|whether)\b|状态|是否|待审查|待合并|已合并', clause, re.IGNORECASE)
             conditional = re.search(r'\b(?:if|unless)\b|(?:如果|若|除非)', clause, re.IGNORECASE)
-            if optional and obligation:
+            if optional and obligation or compound_negative and (conditional or obligation):
                 unclear.append(criterion)
-            elif negative:
+            elif negative or compound_negative:
                 forbidden.append(criterion)
             elif optional:
                 continue

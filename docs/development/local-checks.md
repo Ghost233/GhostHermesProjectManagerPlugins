@@ -1,16 +1,31 @@
 # 本地检查与审查阶段门禁
 
-2026-10-09 执行目标修订：当前优先由 Hermes 管理专用 DSH 执行实例，停止 Codex 适配，配套认证组件已撤回；Desktop 手动接入非默认，缺获准独立原生连接时不可观察／接管，见[DSH 修订](../specs/dsh-executor-transition.md)。本文保留的旧 JSONL／stdio 协议 peer、旧执行器收据和既有测试描述是迁移前历史证据，不证明 DSH 通过。业务授权、资料保护、写入与生命周期门槛继续有效，执行相关路径须按 DSH 重新验证。
+当前执行端复用同一个 DSH Desktop 后端。原生 Kanban 派发仓库工作，飞书承担收发和人工应答。执行范围见[当前规格](../specs/hermes-development-coordination-v2.md)和[同实例接入决定](../adr/0002-dsh-led-repository-work.md)。
 
-提交前从准备好的 Python ≥3.11 环境运行 `python tools/local_checks.py`。固定 SDK 路径由 `HERMES_TEST_SDK_ROOT` 提供；本机独立 SDK Python 可由 `HERMES_TEST_SESSION_PYTHON` 提供。DSH 原安装 Node 包由 `DSH_TEST_SDK_ROOT` 提供，目录含 `@deepseek-ai/dsh`，完整检查缺失时失败。仍核对原 Gateway／审批和事件语义契约，撤回认证组件后不再要求配套 Cordis 组件入口或其生命周期测试。
+## 本机核心门禁
 
-默认执行配置为 `owned_native`，插件不依赖本轮已撤回的 Python stdio SDK。自有 `owned_native_host.mjs` 随插件包和本机复制安装一起提供；原 DSH 包只从受限配置引用。`sdk_source_integrity` 仍核对原 Hermes／DSH SDK 完整源码清单和字节不变。
+从准备好的 Python ≥3.11 环境运行 `python tools/local_checks.py`。固定 Hermes SDK 路径由 `HERMES_TEST_SDK_ROOT` 提供；本机 SDK Python 可由 `HERMES_TEST_SESSION_PYTHON` 提供。`DSH_TEST_SDK_ROOT` 指向原 DSH 安装的 Node 包目录，目录包含 `@deepseek-ai/dsh`。默认核心检查和 pytest 定点检查缺少 SDK 时失败。
 
-入口先检查 runtime、固定 test 依赖与 Node，再执行 F821、required SDK pytest、Dashboard 与 `owned_native_host.mjs` 的 Node syntax 和 Git diff。具体参数见 `--help`；远端 CI 可调用同一入口作为补充证据。验收仍须覆盖本机完整测试、实际 Hermes／飞书／DSH 协作及合并后主工作区同步与最终验证。
+默认 pytest 范围由 `pyproject.toml` 的 `testpaths` 指定，覆盖共享 Desktop、原生 Kanban 和飞书的核心行为。历史独立运行时用例默认未选中；原失败、超时和清理记录保留，未选中不算通过。其他有价值的回归按相关变更触发，测试数量不作为目标。
 
-Ruff 仅检查 F821。test extra 固定 [官方 Ruff 0.16.8](https://github.com/astral-sh/ruff/releases/tag/0.16.8)；[官方规则说明](https://docs.astral.sh/ruff/rules/undefined-name/)列明它捕获未定义名称。它不替代原 SDK 行为断言。
+入口先核对 Python、固定测试依赖和 Node，再执行 SDK 测试接缝静态检查、Ruff F821、核心 pytest 和 Git diff 检查。pytest 使用首错即停、跳过原因和短临时目录。新增修改先运行定点及受影响验证，复用输入未变且不受修改影响的有效结果。同一输入、环境和命令只保留一个有效长测。
 
-默认 stdout 是简短状态及 artifact 路径。完整 command、原 exit、terminal 标记、日志 digest、开始/结束源码指纹在 `result.json` 和原日志中。`-- COMMAND` 只验证这一条定点命令，不表示完整门禁已通过。原命令失败保留其 exit；command 0 而来源变化、准备不足、取消或无 terminal 时 validation 非零。artifact 必须放在冻结仓库外；只有完整模式所有命令真实通过且前后来源一致，才可提交。
+Ruff 版本由 `pyproject.toml` 的 test extra 固定，当前为 `0.15.10`。检查仅选择 [F821](https://docs.astral.sh/ruff/rules/undefined-name/)，捕获未定义名称。SDK 加载、工作区与会话、问答、审批、预算、写入和生命周期仍须通过原生行为验证。`sdk_source_integrity` 核对原 Hermes／DSH SDK 完整源码清单和字节不变。
+
+默认 stdout 是简短状态及 artifact 路径。完整 command、原 exit、terminal 标记、日志 digest、开始和结束源码指纹保存在 `result.json` 和原日志中。`-- COMMAND` 只验证这一条命令，不表示核心门禁已通过。原命令失败保留其 exit；command 为 0，但来源变化、准备不足、取消或缺少 terminal 时，validation 非零。artifact 必须保存在冻结仓库外。提交前，本次修改所需检查须真实通过，并覆盖最终待提交内容。
+
+## 远端 CI
+
+[GitHub Actions](../../.github/workflows/checks.yml) 在 Ubuntu 上执行四项静态检查：
+
+- Python 未定义名称：`python -m ruff check --no-cache --select F821 ghost_hermes_pm tests tools __init__.py`。
+- SDK 测试接缝：`python tools/check_sdk_test_seams.py`。
+- 当前 DSH Hook 语法：`node --check ghost_hermes_pm/shared_native_hook.mjs`。
+- 提交差异的空白错误：`git diff --check HEAD~1 HEAD`。
+
+每项独立显示原始输出和退出结果。远端通过只证明这些静态检查通过；原 SDK 和本机沙箱行为、当前 Hermes／飞书／DSH 实际流程、交付及本地分支同步继续在本机验收。远端 CI 是补充证据，不是本机个人使用的交付或合并硬门禁。
+
+## 双轴审查阶段
 
 双轴审查阶段结束时运行 `python tools/phase_gate.py --manifest <manifest.json>`。三个证据由审查完成后保存，manifest 的固定 source 使用 `tools.check_support.fingerprint` 的完整结果：
 

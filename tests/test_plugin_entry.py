@@ -2,6 +2,11 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import json
+import os
+import shutil
+import subprocess
+import sys
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -49,20 +54,105 @@ def load_entry():
     return module
 
 
-def test_formal_plugin_registers_synchronously_without_configuration_side_effects(tmp_path, monkeypatch):
+@pytest.fixture(scope='session')
+def current_sdk_entry():
+    """Observe the current entry through the original SDK loader and public registries."""
+    from sdk_source_integrity import source_snapshot
+    sdk = Path(os.environ['HERMES_TEST_SDK_ROOT']).resolve(strict=True)
+    before = source_snapshot(sdk)
+    with tempfile.TemporaryDirectory(prefix='hpe-', dir='/tmp') as runtime:
+        scratch = Path(runtime).resolve()
+        home = scratch / 'home'
+        plugin = home / 'plugins' / 'ghost-hermes-pm'
+        plugin.mkdir(parents=True)
+        for name in ('__init__.py', 'plugin.yaml', 'ghost_hermes_pm'):
+            source = ROOT / name
+            if source.is_dir():
+                shutil.copytree(source, plugin / name, ignore=shutil.ignore_patterns('__pycache__'))
+            else:
+                shutil.copy2(source, plugin / name)
+        github = scratch / 'github-config'
+        github.mkdir(mode=0o700)
+        import yaml
+        settings = {'state_dir': str(scratch / 'state'), 'simple_development': {
+            'enabled': True, 'github_account': 'fixture-user', 'github_config_dir': str(github)}}
+        (home / 'config.yaml').write_text(yaml.safe_dump({'plugins': {'enabled': ['ghost-hermes-pm'],
+            'entries': {'ghost-hermes-pm': {'settings': settings}}}}))
+        script = '''import json, sys
+from pathlib import Path
+def audit(event, args):
+    if event == 'socket.connect':
+        raise RuntimeError('Entry validation cannot contact external services.')
+sys.addaudithook(audit)
+import hermes_bootstrap
+import yaml
+from hermes_cli.plugins import get_plugin_manager, get_plugin_commands, invoke_hook
+from gateway.platform_registry import platform_registry
+from tools.registry import registry
+manager = get_plugin_manager()
+manager.discover_and_load()
+def facts():
+    row = next(row for row in manager.list_plugins() if row['name'] == 'ghost-hermes-pm')
+    names = [name for name in registry.get_all_tool_names() if name.startswith('hermes_pm_')]
+    return {'plugin': row, 'tools': names,
+        'platform': platform_registry.get('hermes_feishu_pm') is not None,
+        'legacy_command': 'hermes-pm' in get_plugin_commands(),
+        'snapshot': json.loads(registry.dispatch('hermes_pm_snapshot', {})),
+        'hooks': {name: invoke_hook(name, event=None, gateway=None, tool_name='fixture', args={})
+            for name in ('pre_gateway_dispatch', 'pre_tool_call', 'post_tool_call')}}
+first = facts()
+manager.unload()
+assert not any(name.startswith('hermes_pm_') for name in registry.get_all_tool_names())
+assert platform_registry.get('hermes_feishu_pm') is None
+manager.discover_and_load(force=True)
+second = facts()
+assert second == first
+manager.unload()
+config = Path(sys.argv[2])
+settings = yaml.safe_load(config.read_text())
+settings['plugins']['entries']['ghost-hermes-pm']['settings']['simple_development']['enabled'] = False
+missing_state = config.parent.parent / 'missing-state'
+settings['plugins']['entries']['ghost-hermes-pm']['settings']['state_dir'] = str(missing_state)
+config.write_text(yaml.safe_dump(settings))
+manager.discover_and_load(force=True)
+first['missing'] = next(row for row in manager.list_plugins() if row['name'] == 'ghost-hermes-pm')
+assert not any(name.startswith('hermes_pm_') for name in registry.get_all_tool_names())
+assert platform_registry.get('hermes_feishu_pm') is None
+assert 'hermes-pm' not in get_plugin_commands()
+assert not missing_state.exists()
+manager.unload()
+Path(sys.argv[1]).write_text(json.dumps(first))
+'''
+        environment = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+            'HOME': str(scratch), 'HERMES_HOME': str(home), 'XDG_STATE_HOME': str(scratch / 'os-state'),
+            'XDG_CONFIG_HOME': str(scratch / 'os-config'), 'HERMES_BUNDLED_PLUGINS': str(home / 'empty-bundled'),
+            'HERMES_SKIP_PM_BOOTSTRAP': '1', 'HERMES_DISABLE_PROJECT_PLUGINS': '1',
+            'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONPATH': str(sdk)}
+        result_path = scratch / 'result.json'
+        result = subprocess.run([sys.executable, '-c', script, str(result_path), str(home / 'config.yaml')], cwd=scratch,
+            env=environment, text=True, capture_output=True, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert source_snapshot(sdk) == before, 'Plugin registration must not change SDK bytes.'
+        return json.loads(result_path.read_text())
+
+
+@pytest.mark.parametrize('configuration', [None, {}, {'enabled': False}, {'enabled': 'true'}, []])
+def test_formal_plugin_rejects_missing_current_configuration_without_side_effects(tmp_path, monkeypatch, configuration):
     fixture_native_home(monkeypatch, tmp_path / 'native-home')
-    ctx = Context({})
-    result = load_entry().register(ctx)
-    assert result is None
-    status = json.loads(ctx.tools['hermes_pm_snapshot']({}))
-    assert status['runtime'] == 'configuring'
-    assert status['execution'] == 'not_enabled'
-    assert 'hermes-pm' in ctx.commands
+    state = tmp_path / 'state'
+    ctx = Context({'simple_development': configuration, 'state_dir': str(state),
+        'manager_profile': Context.profile_name, 'owner_identity_ref': 'fixture-owner',
+        'dashboard_credential_ref': 'native:FIXTURE_OLD_OWNER'})
+    with pytest.raises(Exception) as error:
+        load_entry().register(ctx)
+    assert type(error.value).__name__ == 'ManagementError'
+    assert error.value.code == 'configuration_missing'
+    assert not ctx.tools and not ctx.hooks and not ctx.commands and not ctx.platforms
     assert not ctx.cleanups
-    assert 'hermes_feishu_pm' in ctx.platforms
-    assert 'feishu' not in ctx.platforms
+    assert not state.exists() and not (tmp_path / 'native-home').exists()
 
 
+@pytest.mark.retired_legacy_manager
 def test_native_reader_with_participant_secret_but_missing_state_path_stays_configuring(tmp_path, monkeypatch):
     fixture_native_home(monkeypatch, tmp_path / 'native-home')
     from types import ModuleType
@@ -80,6 +170,7 @@ def test_native_reader_with_participant_secret_but_missing_state_path_stays_conf
     assert not ctx.cleanups
 
 
+@pytest.mark.retired_legacy_manager
 def test_participant_snapshot_rejects_owner_token_alias_without_revealing_secret(tmp_path, monkeypatch):
     fixture_native_home(monkeypatch, tmp_path / 'native-home')
     from types import ModuleType
@@ -121,6 +212,7 @@ def test_participant_snapshot_rejects_owner_token_alias_without_revealing_secret
                 assert [p['id'] for p in scoped['projects']] == ['mono']
 
 
+@pytest.mark.retired_legacy_manager
 def test_management_profile_cli_registration_does_not_start_or_lease_authority(monkeypatch):
     from types import ModuleType
     import sys

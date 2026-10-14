@@ -36,9 +36,16 @@ def _configured_executors(configurations, state_dir):
 
 
 def register_native(ctx):
-    if ctx.get_config('simple_development', {}).get('enabled') is True:
-        from .simple_development import register_simple_development
-        return register_simple_development(ctx)
+    configuration = ctx.get_config('simple_development', {})
+    if not isinstance(configuration, dict) or configuration.get('enabled') is not True:
+        raise ManagementError('configuration_missing',
+            'configuration_missing: Enable the current repository development configuration before loading this plugin.')
+    from .simple_development import register_simple_development
+    return register_simple_development(ctx)
+
+
+def _retired_register_legacy_native(ctx):
+    """Historical directory runtime; the current public entry never registers it."""
     from .migration_capture import capture_request
     ctx.register_hook('pre_api_request', capture_request)
     from .native_maintenance import loaded_fact

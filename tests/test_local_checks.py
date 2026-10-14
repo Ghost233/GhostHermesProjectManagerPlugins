@@ -166,3 +166,23 @@ def test_pytest_requires_sdk_references_before_execution(tmp_path, monkeypatch):
     assert not (root / 'unprepared-ran').exists()
     assert result.returncode == record['validation_exit_code'] == 3
     assert record['command_exit_code'] is None
+
+
+def test_default_gate_uses_configured_core_scope_without_retired_syntax_checks(tmp_path, monkeypatch):
+    root = pytest_repo(tmp_path, monkeypatch, 'raise RuntimeError("Unselected regression must not be imported.")\n')
+    (root / 'test_selected.py').write_text('def test_selected():\n    assert 6 * 7 == 42\n')
+    (root / 'pyproject.toml').write_text(
+        '[project.optional-dependencies]\ntest = ["ruff==0.15.10"]\n'
+        '[tool.pytest.ini_options]\ntestpaths = ["test_selected.py"]\n')
+    for name in ('ghost_hermes_pm', 'tests', 'tools'):
+        (root / name).mkdir()
+    (root / '__init__.py').write_text('')
+    (root / 'tools/check_sdk_test_seams.py').write_text('print("Fixture SDK seam checked.")\n')
+    artifacts = tmp_path / 'core-artifacts'
+    result = subprocess.run([sys.executable, str(CHECKS), '--root', str(root), '--artifacts', str(artifacts)],
+                            capture_output=True, text=True)
+    record = json.loads((artifacts / 'result.json').read_text())
+    assert result.returncode == record['command_exit_code'] == record['validation_exit_code'] == 0, record
+    assert record['source_unchanged'] is True
+    output = '\n'.join(path.read_text() for path in artifacts.glob('command-*.log'))
+    assert '1 passed' in output and 'Unselected regression' not in output

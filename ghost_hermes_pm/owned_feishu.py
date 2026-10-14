@@ -7,6 +7,7 @@ import os
 import stat
 import tempfile
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +78,9 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
         self._connection_lock = asyncio.Lock()
         self._transport_close_task = None
         self._ordinary_active = False
+        self._command_source = ContextVar('owned_feishu_command_source', default=None)
+        from .native_slash_cards import NativeSlashCards
+        self._slash_cards = NativeSlashCards(self)
         self._owned_timer_tasks = set()
         self._group_rules = extra.get('group_rules', {})
         if not isinstance(self._group_rules, dict) or any(not isinstance(rule, dict) for rule in self._group_rules.values()):
@@ -217,6 +221,7 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
         self._running = False
         self._ordinary_active = False
         self._discard_ordinary_buffers()
+        await self._slash_cards.close()
         task, self._ws_supervisor = self._ws_supervisor, None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
@@ -250,7 +255,11 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
         async def scoped_handler(event):
             if not self._ordinary_active or self._close_requested or self.intake.closed or generation != self.intake.generation:
                 return None
-            result = await handler(event)
+            token = self._command_source.set(event.source)
+            try:
+                result = await handler(event)
+            finally:
+                self._command_source.reset(token)
             if not self._ordinary_active or self._close_requested or self.intake.closed or generation != self.intake.generation:
                 return None
             return result
@@ -312,6 +321,16 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
             return False
 
     async def receive_payload(self, payload):
+        if payload.get('header', {}).get('event_type') == 'card.action.trigger':
+            from .native_slash_cards import KIND
+            value = payload.get('event', {}).get('action', {}).get('value')
+            if isinstance(value, dict) and value.get('kind') == KIND:
+                await self._slash_cards.receive(payload)
+                return
+            callback = getattr(self, '_handle_card_action_payload', None)
+            if callable(callback):
+                await callback(payload)
+            return
         def namespace(value):
             if isinstance(value, dict):
                 return SimpleNamespace(**{k: namespace(v) for k, v in value.items()})
@@ -396,7 +415,10 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id):
         return {'type': 'group'}
 
-    def _base_admit(self, sender, message):
+    async def send_slash_confirm(self, chat_id, title, message, session_key, confirm_id, metadata=None):
+        return await self._slash_cards.send(chat_id, title, message, session_key, confirm_id, metadata)
+
+    def _base_admit(self, sender, message, *, card_action=False):
         if getattr(getattr(sender, 'sender_id', None), 'open_id', None) == self._bot_open_id:
             return 'self_echo'
         if sender.sender_type in {'bot', 'app'} and self._allow_bots not in {'mentions', 'all'}:
@@ -427,7 +449,7 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
             require_mention = rule.get('require_mention', self._require_mention)
             require_mention = require_mention is True or require_mention in {'true', 1}
             text = getattr(message, 'content', '')
-            if (require_mention or is_bot) and not any(getattr(getattr(m, 'id', None), 'open_id', None) == self._bot_open_id
+            if not card_action and (require_mention or is_bot) and not any(getattr(getattr(m, 'id', None), 'open_id', None) == self._bot_open_id
                        and getattr(m, 'tenant_key', None) == binding.get('recipient_tenant_key')
                        and getattr(m, 'mentioned_type', None) == 'bot'
                        and isinstance(getattr(m, 'key', None), str) and m.key and m.key in text
