@@ -332,6 +332,7 @@ async def main():
         material_cases = []
         material_observations = []
         material_pending = None
+        material_legacy_delivery = None
         if shared_scenario == 'question_material':
             docs = repo / 'docs'
             docs.mkdir()
@@ -345,6 +346,10 @@ async def main():
             (docs / 'large.md').write_text('L' * 16001)
             (docs / 'long-message.md').write_text('M' * 7500)
             material_cases = [('relative', '`docs/spec.md`', True),
+                ('token_metadata', '现有token权限检查与token预算；`docs/spec.md`', True),
+                ('token_metadata_legacy', '现有token权限检查；`docs/spec.md`', True),
+                ('token_value', '请提供token值；`docs/spec.md`', False),
+                ('token_access', '请批准扩展token权限；`docs/spec.md`', False),
                 ('link', '[方案](docs/spec.md)', True), ('bare', '`README.md`', True),
                 ('absolute', '`' + str(docs / 'spec.md') + '`', True),
                 ('inside_parent', '`docs/../README.md`', True),
@@ -1456,14 +1461,49 @@ async def main():
                 if material_pending is not None:
                     question = next((question for question in latest['dsh_execution'].get('questions', [])
                         if question['id'] == 'message-' + str(material_pending)), None)
-                    if question and question.get('notification') == 'delivered':
+                    legacy_observed = (material_cases[len(material_observations)][0] != 'token_metadata_legacy'
+                        or question and question.get('state') == 'open')
+                    if question and question.get('notification') == 'delivered' and legacy_observed:
+                        if material_cases[len(material_observations)][0] == 'missing':
+                            send_count = len(sent)
+                            read_count = sum(call.get('endpoint') == 'session/follow' for call in peer['streams'])
+                            until = time.monotonic() + 5
+                            while sum(call.get('endpoint') == 'session/follow' for call in peer['streams']) < read_count + 6:
+                                assert time.monotonic() < until, 'The original observer did not revisit the same round.'
+                                await asyncio.sleep(.05)
+                            assert len(sent) == send_count, 'Unreadable material was repeatedly re-published.'
+                            assert not record()['dsh_execution']['questions'][-1].get('notification_history')
                         delivered = next(message for index, message in enumerate(sent, 1)
                             if 'om_sent_' + str(index) == question['delivery']['message_id'])
+                        if material_cases[len(material_observations)][0] == 'token_metadata_legacy':
+                            assert question['answerable'] is True, 'The original misclassified open round must become readable.'
+                            assert question['delivery']['message_id'] != material_legacy_delivery
+                            assert question['notification_history'][0]['delivery']['message_id'] == material_legacy_delivery
+                            before_reply = len(peer['prompts'])
+                            await receive(adapter, raw('om_old_private_answer', '@_user_1 answer：Stale notice answer',
+                                parent_id=material_legacy_delivery))
+                            assert len(peer['prompts']) == before_reply
+                            assert not record()['dsh_execution']['questions'][-1]['answers']
                         material_observations.append((question, delivered.request_body.content))
                         material_pending = None
                 if material_pending is None and len(material_observations) < len(material_cases):
                     label, reference_text, _ = material_cases[len(material_observations)]
                     material_pending = len(rows)
+                    if label == 'token_metadata_legacy':
+                        previous = record()
+                        notice = await adapter.send(previous['source_anchor']['chat_id'], 'Historical private planning notice.',
+                            reply_to=previous['source_anchor']['message_id'])
+                        assert notice.success
+                        material_legacy_delivery = notice.message_id
+                        original_questions = [{'id': 'answer', 'question': '请确认方案 ' + reference_text + '？'}]
+                        previous['dsh_execution']['questions'].append({'id': 'message-' + str(material_pending),
+                            'kind': 'natural', 'state': 'expired', 'answerable': False, 'source_seq': material_pending,
+                            'event_id': None, 'generation': previous['dsh_execution']['generation'], 'session_id': sid,
+                            'source_digest': hashlib.sha256(json.dumps(original_questions, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+                            'answers': {}, 'reply_messages': [], 'notification': 'delivered',
+                            'delivery': {**{key: previous['source_anchor'][key] for key in ('app_id','transport_tenant_key',
+                                'recipient_tenant_key','recipient_open_id','chat_id')}, 'message_id': material_legacy_delivery}})
+                        adapter.intake._save_execution(previous, fields=['questions'])
                     rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows),
                         'time': 5 + len(material_observations), 'data': {'turn': 1, 'step': len(material_observations),
                             'message': {'id': 'fixture-plan-' + label, 'role': 'assistant',
@@ -2896,7 +2936,7 @@ async def main():
             result['concurrent_claim'] = claim_result
         (scratch / 'shared-worker-result.json').write_text(json.dumps(result))
     except BaseException:
-        if supervise_slice or owner_context or qa_preinput_retry or supervision_checkpoints:
+        if supervise_slice or owner_context or qa_preinput_retry or supervision_checkpoints or shared_scenario == 'question_material':
             import traceback
             (scratch / 'supervise-failure.json').write_text(json.dumps({
                 'traceback': traceback.format_exc(), 'public_work': record(),
@@ -2907,7 +2947,7 @@ async def main():
         raise
     finally:
         model.worker_request_release.set()
-        if (supervise_slice or expired_window or qa_preinput_retry or supervision_checkpoints) and worker is not None:
+        if (supervise_slice or expired_window or qa_preinput_retry or supervision_checkpoints or shared_scenario == 'question_material') and worker is not None:
             # Keep both services alive through the original scoped native cleanup.
             from simple_worker_evidence import cleanup_worker
             cleanup = await asyncio.to_thread(cleanup_worker, worker, scratch / 'home')

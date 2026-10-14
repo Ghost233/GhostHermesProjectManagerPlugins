@@ -29,7 +29,11 @@ def _safe_questions(intake, questions):
         _public_text(material, intake.secret_values)
     except ManagementError:
         return False
-    if re.search(r'password|passwd|secret|token|api[_ -]?key|private[_ -]?key|密码|密钥|凭据|令牌', material, re.I):
+    # Budget/account metadata does not solicit a credential. Original secret
+    # values and credential syntax were checked before this terminology filter.
+    credential_material = re.sub(r'tokens?(?=\s*(?:预算|配额|上限|限制|用量|数量|权限|budget\b|usage\b|limit\b|count\b|permissions?\b))',
+                                 'metadata', material, flags=re.I)
+    if re.search(r'password|passwd|secret|token|api[_ -]?key|private[_ -]?key|密码|密钥|凭据|令牌', credential_material, re.I):
         return False
     if re.search(r'(?:approve|allow|批准|允许).*(?:execut|shell|command|tool|权限|执行|命令)', material, re.I):
         return False
@@ -227,8 +231,19 @@ async def _observe_questions(intake, record, carrier, events, projections, gener
             if not safe:
                 question.pop('questions')
             rounds.append(question)
-        elif question['source_digest'] != digest or question['generation'] != execution['generation']:
+        elif (question['source_digest'] != digest or question['generation'] != execution['generation']
+              or question['session_id'] != execution['session_id']):
             raise ManagementError('binding_conflict', 'Original question changed its identity or contents.')
+        elif (question.get('answerable') is False and 'questions' not in question
+              and question.get('notification') == 'delivered'
+              and not question.get('reply_status') and candidate['state'] in {'open', 'continued'}
+              and _safe_questions(intake, candidate['questions'])):
+            # Preserve the old notice, and re-publish this same verified round
+            # after a corrected safety policy. Unreadable material retains its
+            # questions payload and cannot repeatedly take this refresh path.
+            question.setdefault('notification_history', []).append({
+                'notification': question.pop('notification'), 'delivery': question.pop('delivery', None)})
+            question.update(questions=candidate['questions'], answerable=True)
         question['state'] = candidate['state']
         if question.get('notification') or question.get('reply_status'):
             continue
@@ -259,7 +274,8 @@ async def _observe_questions(intake, record, carrier, events, projections, gener
         question['notification'] = 'intent'
         intake._save_execution(record, fields=['questions'])
         anchor = record['source_anchor']
-        response = await transport.send({'uuid': hashlib.sha256((record['id'] + question['id']).encode()).hexdigest()[:32],
+        notice_key = record['id'] + question['id'] + (':public' if question.get('notification_history') else '')
+        response = await transport.send({'uuid': hashlib.sha256(notice_key.encode()).hexdigest()[:32],
             'text': text, 'chat_id': binding['chat_id'], 'reply_to': anchor['message_id'],
             'mention_open_id': binding['owner_open_id'], 'thread_id': anchor.get('thread_id')})
         intake.require_active(generation)
