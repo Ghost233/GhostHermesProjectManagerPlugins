@@ -1199,7 +1199,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
         raise ManagementError('binding_conflict', 'The accepted delivery source no longer matches the repository.')
     baseline = _source_core(execution.get('baseline'))
     current = _source_core(source)
-    if baseline is None or current is None or not missing_report and baseline == current:
+    if baseline is None or current is None:
         raise ManagementError('binding_conflict', 'The delivered source was not promoted from the original baseline.')
     current_window = budget.get('renewWindow')
     if current_window is None:
@@ -2708,6 +2708,129 @@ def verify_configuration(configuration, *, workspace=None):
     return verification
 
 
+def refresh_shared_verification_versions(intake):
+    """Adopt only this loaded runner's version after fresh idle original-work proof."""
+    from .repository_acceptance import repository_source_state
+    from .repository_control import _card, _worker_end
+    from .repository_supervision import owned_call
+    runner = Path(__file__).with_name('repository_test_runner.py').resolve(strict=True)
+    runner_digest = hashlib.sha256(runner.read_bytes()).hexdigest()
+    descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        _acquire_shared_intake_lock(intake, descriptor, intake.generation)
+        groups = {}
+        for record in intake.snapshot()['work']:
+            reference = record.get('target', {}).get('execution_ref')
+            if reference:
+                groups.setdefault(reference, []).append(record)
+        for name, records in groups.items():
+            reference = private_file(name)
+            raw = reference.read_bytes()
+            original = json.loads(raw)
+            verification = original.get('verification', {})
+            if original.get('mode') != 'shared_native' or verification.get('runner_sha256') == runner_digest:
+                continue
+            if verification.get('runner') != str(runner) or not re.fullmatch(r'[a-f0-9]{64}', verification.get('runner_sha256', '')):
+                raise ManagementError('binding_conflict', 'Only the currently loaded original test runner version may refresh.')
+            old_digest = hashlib.sha256(raw).hexdigest()
+            updated = deepcopy(original)
+            updated['verification']['runner_sha256'] = runner_digest
+            proofs = []
+            for record in records:
+                execution = record.get('dsh_execution', {})
+                if execution.get('reference_sha256') is not None and execution.get('reference_sha256') != old_digest:
+                    raise ManagementError('binding_conflict', 'The original work reference changed before runner version maintenance.')
+                configuration = shared_configuration(reference, updated, workspace=record['target']['repo_path'])
+                if not execution.get('session_id'):
+                    if any(execution.get(key) for key in ('generation', 'first_input', 'native_identity', 'supervisor_claim')):
+                        raise ManagementError('outcome_unknown', 'An unstarted runner version reference has active work evidence.')
+                    if execution.get('reference_sha256') is not None:
+                        proofs.append((record, {'unstarted': True}))
+                    continue
+                if (execution.get('reference_sha256') != old_digest or execution.get('mode') != 'shared_native'
+                        or execution.get('state') != 'awaiting_acceptance' or execution.get('first_input') != 'accepted'
+                        or execution.get('terminal_reason') != {'kind': 'completed'} or execution.get('stop_requested')
+                        or execution.get('lifecycle_end') or execution.get('continuation_control', {}).get('status') in {'admitted', 'input_intent'}):
+                    raise ManagementError('outcome_unknown', 'Only idle original work may refresh its runner version.')
+                card = _card(intake, record)
+                if card.get('status') not in {'blocked', 'triage'} or card.get('current_run_id') is not None or card.get('worker_pid') is not None:
+                    raise ManagementError('outcome_unknown', 'The original worker is not idle for runner version maintenance.')
+                worker = _worker_end(intake, record)
+                configuration.update(workspace=record['target']['repo_path'], session_id=execution['session_id'],
+                    generation=execution['generation'], workspace_id=execution.get('workspace_id'))
+                budget_file = ledger_path(configuration, execution['session_id'])
+                budget_before = private_file(budget_file).read_bytes()
+                read_ledger(configuration, execution)
+                source = repository_source_state(record['target'], configuration=configuration)
+                if _source_core(source) is None:
+                    raise ManagementError('outcome_unknown', 'The original source proof is incomplete for runner version maintenance.')
+                carrier = SharedDesktopTransport(configuration)
+                try:
+                    stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
+                        'sessionId': execution['session_id']}, 'maxMessages': 500}})
+                    try:
+                        snapshot = next(stream)
+                    finally:
+                        stream.close()
+                    header = snapshot.get('header', {})
+                    values = snapshot.get('projections', {}).get('values', {})
+                    events = [row['event'] for row in snapshot.get('records', [])]
+                    starts = [event for event in events if event.get('type') == 'turn/start']
+                    ends = [event for event in events if event.get('type') == 'turn/end']
+                    sessions = [row for row in owned_call(carrier, 'session/list', {})['items']
+                        if row.get('sessionId') == execution['session_id']]
+                    jobs = carrier.owned_jobs()
+                    if (carrier.native_identity != execution.get('native_identity') or snapshot.get('hasMore') is not False
+                            or header.get('id') != execution['session_id'] or header.get('createdAt') != execution.get('session_created_at')
+                            or header.get('cwd') != configuration['workspace'] or values.get('agentPreset') != configuration['agent_preset']
+                            or values.get('permissions') != {'currentValue': 'workspace-write'}
+                            or values.get('inbox') != {'next-turn': [], 'next-step': []}
+                            or values.get('userQuestions', {}).get('active') != []
+                            or not starts or not ends or ends[-1]['seq'] <= starts[-1]['seq']
+                            or ends[-1].get('data', {}).get('reason') != execution['terminal_reason']
+                            or len(sessions) != 1 or sessions[0].get('cwd') != configuration['workspace']
+                            or sessions[0].get('running') is not False or sessions[0].get('agentAvailable') is not True
+                            or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'}
+                                or job.get('owner', execution['session_id']) != execution['session_id'] for job in jobs)):
+                        raise ManagementError('outcome_unknown', 'Fresh original lifecycle proof is unavailable for runner version maintenance.')
+                finally:
+                    carrier.close()
+                if (private_file(budget_file).read_bytes() != budget_before
+                        or repository_source_state(record['target'], configuration=configuration) != source
+                        or _worker_end(intake, record) != worker):
+                    raise ManagementError('binding_conflict', 'Original work changed during runner version maintenance.')
+                proofs.append((record, {'source': _source_core(source), 'ledger_sha256': hashlib.sha256(budget_before).hexdigest(),
+                    'snapshot_sha256': hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest()}))
+            if reference.read_bytes() != raw or hashlib.sha256(runner.read_bytes()).hexdigest() != runner_digest:
+                raise ManagementError('binding_conflict', 'The original runner reference changed during maintenance.')
+            backup = reference.with_name(reference.name + '.before-runner-version-' + old_digest)
+            if not backup.exists():
+                with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as output:
+                    output.write(raw)
+                    output.flush()
+                    os.fsync(output.fileno())
+            if private_file(backup).read_bytes() != raw:
+                raise ManagementError('binding_conflict', 'The original runner version backup differs.')
+            content = (json.dumps(updated, indent=2) + '\n').encode()
+            temporary = reference.with_name(reference.name + '.' + uuid.uuid4().hex)
+            with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            intake.require_active(intake.generation)
+            os.replace(temporary, reference)
+            for record, proof in proofs:
+                execution = record['dsh_execution']
+                execution['reference_sha256'] = hashlib.sha256(content).hexdigest()
+                execution.setdefault('verification_version_history', []).append({'backup': str(backup),
+                    'old_reference_sha256': old_digest, 'reference_sha256': execution['reference_sha256'],
+                    'old_runner_sha256': verification['runner_sha256'], 'runner_sha256': runner_digest, **proof})
+                intake._save_execution(record, fields=['reference_sha256', 'verification_version_history'])
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def verification_command(configuration, execution, workspace, test_files):
     verification = verify_configuration(configuration, workspace=workspace)
     if (not isinstance(test_files, list) or not test_files or len(test_files) != len(set(test_files))
@@ -2715,6 +2838,9 @@ def verification_command(configuration, execution, workspace, test_files):
             or not (Path(workspace) / path).resolve(strict=True).is_relative_to(Path(workspace))
             or not (Path(workspace) / path).is_file() for path in test_files)):
         raise ManagementError('test_evidence_missing', 'Actual explicit in-repository test files are required.')
+    python_files = [Path(path).suffix == '.py' for path in test_files]
+    if any(python_files) and not all(python_files):
+        raise ManagementError('test_evidence_missing', 'Python unittest and Node test files require separate bound calls.')
     work = execution['verification']
     return shlex.join([verification['python'], '-I', verification['runner'], workspace, work['artifact_root'],
         '--node', verification['node'], '--binding', execution['session_id'], execution['generation'], work['nonce'], '--', *test_files])
@@ -2772,10 +2898,11 @@ def _prompt(intake, record, *, test_files=None):
           'Only access the bound repository ' + record['target']['repository'] + '. '
           'Do not merge the game PR. Develop code yourself, run actual tests through the original bash tool, '
           'then submit the fixed-source PR and synchronize the original local branch. '
-          'After writing your actual Node test files, run the fixed trusted test entry through the original bash tool: '
+          'After writing your actual Python unittest or Node test files, run the fixed trusted test entry through the original bash tool: '
         + record['dsh_execution'].get('verification_prefix', 'The fixed test entry must be prepared before dispatch.')
         + ' followed by the explicit relative test file paths; do not append commands, redirect output, or replace the entry. '
-          'It uses native node:test events to prove actual test results; ordinary command success is insufficient. '
+          'Explicit .py files use standard-library unittest results; Node files use native node:test events. '
+          'Run each file type in a separate call; ordinary command success is insufficient. '
           'Report with HERMES_REPOSITORY_DELIVERY_JSON followed by one JSON object with source_commit, '
           'issue_updated_at, criteria [{text,test_call_ids}], test_files, fine_issue_urls, pr_url, '
           'sync_branches, leftovers. Reference exact successful native bash test call IDs. '
@@ -2792,8 +2919,7 @@ def _prompt(intake, record, *, test_files=None):
             if canonical else 'No valid explicit test file list is available for a complete canonical command yet. ')
         + 'Never replace IDs with narrative descriptions. '
           "Never infer receipt meaning from list order. Use only the actual trusted test command's own native call ID; "
-          'Git/other IDs do not belong in test_call_ids; test_files are exactly that command\'s explicit Node test file list, '
-          'formal pytest evidence separately in prose. '
+          'Git/other IDs do not belong in test_call_ids; test_files are exactly that command\'s explicit test file list. '
           'Outer Kanban acceptance belongs to the supervisor.')
 
 

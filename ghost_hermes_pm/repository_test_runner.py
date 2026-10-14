@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 import sys
 import subprocess
+import unittest
 
 if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,6 +28,29 @@ class TestReports:
             self.skipped += 1
         if report.failed:
             self.failed += 1
+
+
+class UnittestReports(unittest.TextTestResult):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.passed = 0
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        self.passed += 1
+
+
+def run_unittest(repository, paths):
+    output = io.StringIO()
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(repository))
+    with redirect_stdout(output), redirect_stderr(output):
+        suite = unittest.TestLoader().loadTestsFromNames(['.'.join(Path(path).with_suffix('').parts) for path in paths])
+        result = unittest.TextTestRunner(stream=output, resultclass=UnittestReports).run(suite)
+    return 0 if result.wasSuccessful() else 1, {
+        'executed_tests': result.passed, 'skipped_tests': len(result.skipped) + len(result.expectedFailures),
+        'failed_tests': len(result.failures) + len(result.errors) + len(result.unexpectedSuccesses),
+        'output': output.getvalue()}
 
 
 NODE_REPORTER = '''export default async function* (source) {
@@ -91,10 +115,16 @@ def main(arguments):
     if not paths or any(p.startswith('-') or not (repository / p).resolve(strict=True).is_relative_to(repository)
                         or not (repository / p).is_file() for p in paths):
         raise ValueError('Explicit in-repository test files are required.')
+    python_files = [Path(path).suffix == '.py' for path in paths]
+    if node and any(python_files) and not all(python_files):
+        raise ValueError('Python unittest and Node test files must run in separate bound calls.')
     settings = {'worktree': str(repository), 'test_artifact_paths': []}
     with safe_git_reads(repository) as git_read:
         before = source_state(settings, git_read=git_read)
-    if node:
+    runner = 'unittest' if node and all(python_files) else 'node:test' if node else 'pytest'
+    if runner == 'unittest':
+        code, results = run_unittest(repository, paths)
+    elif node:
         code, results = run_node(repository, artifacts, node, paths)
     else:
         import pytest
@@ -108,7 +138,7 @@ def main(arguments):
                    'failed_tests': reports.failed, 'output': output.getvalue()}
     with safe_git_reads(repository) as git_read:
         after = source_state(settings, git_read=git_read)
-    receipt = {'runner': 'node:test' if node else 'pytest', 'exit_code': code, **results,
+    receipt = {'runner': runner, 'exit_code': code, **results,
                'source_commit': before['head'],
                'before_source_digest': before['source_digest'], 'after_source_digest': after['source_digest'],
                'before_workspace_status': before['workspace_status'], 'after_workspace_status': after['workspace_status'],

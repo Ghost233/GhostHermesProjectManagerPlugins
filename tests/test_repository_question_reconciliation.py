@@ -1,11 +1,46 @@
 """Lost acknowledgements reconcile from original audit without replaying answers."""
 from copy import deepcopy
 import asyncio
+import hashlib
+import json
 from types import SimpleNamespace as NS
 
 import pytest
 
 from ghost_hermes_pm.repository_questions import _observe_questions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('wrapped', [False, True])
+async def test_complete_delivery_payload_does_not_create_a_question_or_keep_old_misclassification(wrapped):
+    criterion = '请确认合成规则，需要我决定测试 token 上限。'
+    report = {'source_commit': 'a' * 40, 'issue_updated_at': '2026-10-10T00:00:00Z',
+        'criteria': [{'text': criterion, 'test_call_ids': ['fixture-test']}], 'test_files': ['test_fixture.py'],
+        'fine_issue_urls': [], 'pr_url': None, 'sync_branches': [], 'leftovers': []}
+    text = json.dumps(report, ensure_ascii=False)
+    if wrapped:
+        text = '```json\n' + text + '\n```\n\n合成测试证据已回传。'
+    text = 'HERMES_REPOSITORY_DELIVERY_JSON\n' + text
+    question = {'id': 'message-1', 'kind': 'natural', 'state': 'open', 'answerable': False,
+        'generation': 'fixture-generation', 'session_id': 'fixture-session', 'source_seq': 1,
+        'source_digest': hashlib.sha256(json.dumps([{'id': 'answer', 'question': text}],
+            sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+    record = {'id': 'fixture-work', 'profile_id': 'fixture-profile', 'source_anchor': {},
+        'dsh_execution': {'generation': 'fixture-generation', 'session_id': 'fixture-session',
+            'state': 'awaiting_acceptance', 'questions': [question]}}
+    intake = NS(require_active=lambda generation: None, snapshot=lambda: {'work': [record]},
+        _save_execution=lambda *args, **kwargs: None, secret_values=[], transports=[])
+    carrier = NS(event_frames=lambda: {'generation': 'fixture-generation', 'session_id': 'fixture-session', 'frames': []})
+    events = [{'seq': 1, 'type': 'assistant/message', 'data': {'turn': 1, 'message': {
+        'content': [{'type': 'text', 'text': text}]}}},
+        {'seq': 2, 'type': 'turn/end', 'data': {'turn': 1, 'reason': {'kind': 'completed'}}}]
+    projections = {'userQuestions': {'active': [], 'settled': []}}
+
+    assert await _observe_questions(intake, record, carrier, events, projections, 0) is False
+    assert record['dsh_execution']['questions'] == [question]
+    assert question['state'] == 'expired' and not question.get('reply_status')
+    from ghost_hermes_pm.repository_acceptance import _report
+    assert _report(events) == (None if wrapped else report)
 
 
 @pytest.fixture
@@ -25,6 +60,48 @@ def settled_round():
         {'seq': 2, 'type': 'tool/result', 'data': {'message': {'toolCallId': 'call-question', 'isError': False}}}]
     projections = {'userQuestions': {'active': [], 'settled': [{'callId': 'call-question', 'answers': [answer]}]}}
     return intake, record, carrier, events, projections
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('text', [
+    'HERMES_REPOSITORY_DELIVERY_JSON\n请确认合成测试范围？',
+    'HERMES_REPOSITORY_DELIVERY_JSON\n{}\n需要我决定合成测试范围。',
+    'HERMES_REPOSITORY_DELIVERY_JSON\n```json\n{"criteria": [{"text": "请确认？"}]}',
+    '请确认合成测试范围？',
+])
+async def test_incomplete_delivery_marker_and_real_questions_remain_pending(settled_round, text):
+    intake, record, carrier, _events, projections = settled_round
+    record['dsh_execution']['questions'] = []
+    record.update(profile_id='fixture-profile', source_anchor={})
+    intake.secret_values, intake.transports = [], []
+    projections['userQuestions']['settled'] = []
+    events = [{'seq': 1, 'type': 'assistant/message', 'data': {'turn': 1, 'message': {
+        'content': [{'type': 'text', 'text': text}]}}}]
+
+    assert await _observe_questions(intake, record, carrier, events, projections, 0) is True
+    question = record['dsh_execution']['questions'][0]
+    assert question['state'] == 'open' and question['questions'][0]['question'] == text
+
+
+@pytest.mark.asyncio
+async def test_complete_delivery_payload_keeps_a_real_surrounding_question(settled_round):
+    intake, record, carrier, _events, projections = settled_round
+    record['dsh_execution']['questions'] = []
+    record.update(profile_id='fixture-profile', source_anchor={})
+    intake.secret_values, intake.transports = [], []
+    projections['userQuestions']['settled'] = []
+    report = {'source_commit': 'a' * 40, 'issue_updated_at': '2026-10-10T00:00:00Z',
+        'criteria': [{'text': 'Synthetic verification completed.', 'test_call_ids': ['fixture-test']}],
+        'test_files': ['test_fixture.py'], 'fine_issue_urls': [], 'sync_branches': [], 'leftovers': []}
+    text = 'HERMES_REPOSITORY_DELIVERY_JSON\n```json\n' + json.dumps(report) + '\n```\n请确认下一步合成范围？'
+    events = [{'seq': 1, 'type': 'assistant/message', 'data': {'turn': 1, 'message': {
+        'content': [{'type': 'text', 'text': text}]}}}]
+
+    assert await _observe_questions(intake, record, carrier, events, projections, 0) is True
+    question = record['dsh_execution']['questions'][0]
+    assert question['state'] == 'open'
+    assert '请确认下一步合成范围？' in question['questions'][0]['question']
+    assert 'Synthetic verification completed.' not in question['questions'][0]['question']
 
 
 @pytest.mark.asyncio

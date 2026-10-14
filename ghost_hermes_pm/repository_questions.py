@@ -46,6 +46,30 @@ def _natural_question(events):
     event = messages[-1]
     content = event['data'].get('message', {}).get('content', [])
     text = '\n'.join(block['text'] for block in content if block.get('type') == 'text')
+    from .repository_acceptance import DELIVERY_MARKER
+    if text.count(DELIVERY_MARKER) == 1:
+        prefix, material = text.split(DELIVERY_MARKER, 1)
+        material = material.lstrip()
+        fenced = material.startswith('```json\n')
+        try:
+            report, end = json.JSONDecoder().raw_decode(material[8:] if fenced else material)
+            tail = (material[8:] if fenced else material)[end:]
+            if fenced:
+                if not re.match(r'\n```(?:$|\s)', tail):
+                    raise ValueError('The delivery JSON fence is incomplete.')
+                tail = tail[4:]
+            required = {'source_commit', 'issue_updated_at', 'criteria', 'test_files',
+                        'fine_issue_urls', 'sync_branches', 'leftovers'}
+            if (isinstance(report, dict) and required <= report.keys()
+                    and isinstance(report['source_commit'], str) and report['source_commit']
+                    and isinstance(report['issue_updated_at'], str) and report['issue_updated_at']
+                    and isinstance(report['criteria'], list) and report['criteria']
+                    and all(isinstance(item, dict) and isinstance(item.get('text'), str)
+                            and isinstance(item.get('test_call_ids'), list) for item in report['criteria'])
+                    and all(isinstance(report[key], list) for key in ('test_files', 'fine_issue_urls', 'sync_branches', 'leftovers'))):
+                text = prefix + '\n' + tail
+        except ValueError:
+            pass
     if not re.search(r'[?？]|(?:请|需要).*(?:确认|选择|回答|决定|补充)', text):
         return None
     if any(row['seq'] > event['seq'] and row['type'] in {'user/message', 'tool/call', 'assistant/attempt'} for row in events):

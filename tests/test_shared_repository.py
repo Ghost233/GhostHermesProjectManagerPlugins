@@ -415,6 +415,208 @@ def test_natural_qa_rework_active_public_tool_queues_one_same_session_prompt(tmp
     assert len(carrier.prompts) == 0
 
 
+def test_natural_qa_read_only_report_can_resume_normal_acceptance(tmp_path, monkeypatch):
+    from ghost_hermes_pm import shared_repository
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    source_chain = shared_repository._verified_source_chain
+    record, context, intake, carrier, ledger, source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    execution = record['dsh_execution']
+    execution['baseline'] = deepcopy(source)
+    monkeypatch.setattr(shared_repository, '_verified_source_chain', source_chain)
+    monkeypatch.setattr(shared_repository, 'shared_receipts', lambda _configuration, _execution, suffix:
+        [{'source_before': source, 'source_after': source, 'generation': execution['generation'],
+          'session_id': execution['session_id'], 'name': 'bash', 'execution_admission': 'admitted',
+          'is_error': False, 'kind': 'foreground', 'exit_code': 0, 'timed_out': False,
+          'aborted': False, 'native_session_seq': 1}] if suffix == '.tools.jsonl' else [])
+    acceptance, budget_before = deepcopy(execution['acceptance']), ledger.read_bytes()
+
+    result = admit_shared_natural_qa_rework(intake, record, context,
+        'Clarify only the original synthetic read-only acceptance.', None, intake.generation)
+
+    assert result == {'status': 'accepted', 'work_id': record['id']}
+    assert execution['state'] == 'continuation_pending' and intake.card['status'] == 'ready'
+    assert execution['baseline'] == source and execution['acceptance'] == acceptance
+    assert ledger.read_bytes() == budget_before and not carrier.prompts
+
+
+@pytest.mark.parametrize('change', ['source', 'report', 'source_chain', 'generation', 'jobs', 'queue', 'scope', 'owner', 'question'])
+def test_read_only_qa_keeps_original_binding_and_evidence_guards(tmp_path, monkeypatch, change):
+    from ghost_hermes_pm import repository_acceptance, shared_repository
+    source_chain = shared_repository._verified_source_chain
+    record, context, intake, carrier, ledger, source, _request = _natural_qa_fixture(tmp_path, monkeypatch)
+    execution = record['dsh_execution']
+    execution['baseline'] = deepcopy(source)
+    if change == 'source':
+        monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda _target: dict(source, source_digest='f' * 64))
+    elif change == 'report':
+        snapshot = next(carrier.stream('session/follow', {}))
+        snapshot['records'][1]['event']['data']['message']['content'][0]['text'] = (
+            'HERMES_REPOSITORY_DELIVERY_JSON ' + json.dumps({'source_commit': 'f' * 40}))
+    elif change in {'source_chain', 'generation'}:
+        monkeypatch.setattr(shared_repository, '_verified_source_chain', source_chain)
+        receipts = shared_repository.shared_receipts
+        monkeypatch.setattr(shared_repository, 'shared_receipts', lambda *args: [dict(row,
+            **({'generation': 'foreign-generation'} if change == 'generation' else {})) for row in receipts(*args)])
+    elif change == 'jobs':
+        carrier.owned_jobs = lambda: [{'owner': 'foreign-session', 'status': 'running'}]
+    elif change == 'queue':
+        next(carrier.stream('session/follow', {}))['projections']['values']['inbox']['next-turn'] = [{'id': 'foreign-input'}]
+    elif change == 'scope':
+        Path(record['target']['execution_ref']).write_text('{}')
+    elif change == 'owner':
+        context['profile_id'] = 'foreign-profile'
+    else:
+        execution['questions'] = [{'state': 'open', 'reply_status': None}]
+    original, budget_before = deepcopy(record), ledger.read_bytes()
+
+    with pytest.raises(ManagementError):
+        shared_repository.admit_shared_natural_qa_rework(intake, record, context,
+            'Clarify only the original synthetic read-only acceptance.', None, intake.generation)
+
+    assert record == original and ledger.read_bytes() == budget_before
+    assert not intake.saved and not carrier.prompts and intake.card['status'] == 'blocked'
+
+
+def _verification_version_fixture(tmp_path, monkeypatch):
+    from ghost_hermes_pm import repository_acceptance, shared_repository
+    record, context, intake, carrier, ledger, source, request = _natural_qa_fixture(tmp_path, monkeypatch)
+    runner = Path(__file__).resolve().parents[1] / 'ghost_hermes_pm/repository_test_runner.py'
+    configuration = deepcopy(intake.config)
+    configuration.pop('reference_sha256')
+    configuration.update(mode='shared_native', schema=1, approved=True,
+        verification={'runner': str(runner), 'runner_sha256': '0' * 64})
+    reference = Path(record['target']['execution_ref'])
+    reference.write_text(json.dumps(configuration, indent=2) + '\n')
+    raw = reference.read_bytes()
+    record['dsh_execution']['reference_sha256'] = hashlib.sha256(raw).hexdigest()
+    intake.records = [record]
+    intake.snapshot = lambda: {'work': intake.records}
+    snapshot = next(carrier.stream('session/follow', {}))
+    snapshot['projections']['values']['userQuestions'] = {'active': [], 'settled': []}
+    def validate(path, candidate, *, workspace=None):
+        expected = deepcopy(configuration)
+        expected['verification']['runner_sha256'] = hashlib.sha256(runner.read_bytes()).hexdigest()
+        assert candidate == expected
+        return dict(candidate, reference_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    monkeypatch.setattr(shared_repository, 'shared_configuration', validate)
+    monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda _target, **_kwargs: source)
+    return record, context, intake, carrier, ledger, reference, raw, source, request
+
+
+def test_normal_load_refreshes_only_runner_version_and_keeps_queued_work_unstarted(tmp_path, monkeypatch):
+    from ghost_hermes_pm.shared_repository import refresh_shared_verification_versions
+    record, _context, intake, carrier, ledger, reference, raw, _source, _request = _verification_version_fixture(tmp_path, monkeypatch)
+    queued = {'id': 'work-queued', 'target': deepcopy(record['target']), 'dsh_execution': {'mode': 'shared_native', 'state': 'queued'}}
+    intake.records.append(queued)
+    original, budget_before = deepcopy(intake.records), ledger.read_bytes()
+
+    refresh_shared_verification_versions(intake)
+
+    updated = json.loads(reference.read_text())
+    expected = json.loads(raw)
+    expected['verification']['runner_sha256'] = hashlib.sha256(Path(expected['verification']['runner']).read_bytes()).hexdigest()
+    assert updated == expected
+    execution = record['dsh_execution']
+    assert execution['reference_sha256'] == hashlib.sha256(reference.read_bytes()).hexdigest()
+    history = execution.pop('verification_version_history')
+    assert len(history) == 1 and Path(history[0]['backup']).read_bytes() == raw
+    original[0]['dsh_execution']['reference_sha256'] = execution['reference_sha256']
+    assert intake.records == original and queued == original[1]
+    assert ledger.read_bytes() == budget_before and not carrier.prompts
+    assert intake.card['status'] == 'blocked'
+
+
+@pytest.mark.parametrize('change', ['task_hash', 'other_scope', 'runner_path', 'active_turn', 'running_session',
+    'active_job', 'queue', 'foreign_identity', 'foreign_sid', 'native_question', 'worker', 'other_record_hash', 'source'])
+def test_runner_version_maintenance_rejects_scope_or_original_lifecycle_changes(tmp_path, monkeypatch, change):
+    from ghost_hermes_pm import repository_acceptance, repository_supervision, shared_repository
+    record, _context, intake, carrier, ledger, reference, raw, _source, _request = _verification_version_fixture(tmp_path, monkeypatch)
+    execution = record['dsh_execution']
+    snapshot = next(carrier.stream('session/follow', {}))
+    if change == 'task_hash':
+        execution['reference_sha256'] = 'f' * 64
+    elif change in {'other_scope', 'runner_path'}:
+        changed = json.loads(raw)
+        if change == 'other_scope':
+            changed['budget']['max_model_requests'] += 1
+        else:
+            changed['verification']['runner'] = str(tmp_path / 'foreign-runner.py')
+        reference.write_text(json.dumps(changed))
+    elif change == 'active_turn':
+        snapshot['records'].append({'event': {'type': 'turn/start', 'seq': 3, 'data': {'turn': 2}}})
+    elif change == 'running_session':
+        original_call = repository_supervision.owned_call
+        monkeypatch.setattr(repository_supervision, 'owned_call', lambda *args: {'items': [
+            {'sessionId': execution['session_id'], 'cwd': record['target']['repo_path'], 'running': True,
+             'agentAvailable': False}]} if args[1] == 'session/list' else original_call(*args))
+    elif change == 'active_job':
+        carrier.owned_jobs = lambda: [{'owner': execution['session_id'], 'status': 'running'}]
+    elif change == 'queue':
+        snapshot['projections']['values']['inbox']['next-turn'] = [{'id': 'foreign-input'}]
+    elif change == 'foreign_identity':
+        carrier.native_identity = dict(carrier.native_identity, lease='foreign-lease')
+    elif change == 'foreign_sid':
+        snapshot['header']['id'] = 'foreign-session'
+    elif change == 'native_question':
+        snapshot['projections']['values']['userQuestions']['active'] = [{'callId': 'original-question'}]
+    elif change == 'worker':
+        intake.card['worker_pid'] = 1
+    elif change == 'other_record_hash':
+        intake.records.append({'id': 'work-other', 'target': deepcopy(record['target']),
+            'dsh_execution': {'mode': 'shared_native', 'state': 'queued', 'reference_sha256': 'f' * 64}})
+    else:
+        monkeypatch.setattr(repository_acceptance, 'repository_source_state', lambda *_args, **_kwargs: {})
+    original, budget_before, reference_before = deepcopy(intake.records), ledger.read_bytes(), reference.read_bytes()
+
+    with pytest.raises(ManagementError):
+        shared_repository.refresh_shared_verification_versions(intake)
+
+    assert intake.records == original and ledger.read_bytes() == budget_before
+    assert reference.read_bytes() == reference_before and not list(reference.parent.glob(reference.name + '.before-runner-version-*'))
+    assert not intake.saved and not carrier.prompts
+
+
+@pytest.mark.asyncio
+async def test_normal_registration_and_question_observation_admit_original_report_clarification(tmp_path, monkeypatch):
+    from ghost_hermes_pm import simple_development
+    from ghost_hermes_pm.repository_questions import observe_questions
+    from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
+    from test_plugin_entry import Context
+    monkeypatch.syspath_prepend(os.environ['HERMES_TEST_SDK_ROOT'])
+    record, context, intake, carrier, ledger, _reference, _raw, _source, _request = _verification_version_fixture(tmp_path, monkeypatch)
+    snapshot = next(carrier.stream('session/follow', {}))
+    message = snapshot['records'][1]['event']['data']['message']['content'][0]
+    report = json.loads(message['text'].split('HERMES_REPOSITORY_DELIVERY_JSON ', 1)[1])
+    criterion = '请确认合成规则，需要我决定测试 token 上限。'
+    report['criteria'][0]['text'] = criterion
+    record['issue']['body'] = criterion
+    message['text'] = 'HERMES_REPOSITORY_DELIVERY_JSON\n```json\n' + json.dumps(report, ensure_ascii=False) + '\n```\n\n合成证据已回传。'
+    question = {'id': 'message-1', 'kind': 'natural', 'state': 'open', 'answerable': False,
+        'generation': record['dsh_execution']['generation'], 'session_id': record['dsh_execution']['session_id'], 'source_seq': 1}
+    record['dsh_execution'].update(questions=[question])
+    record['dsh_execution']['acceptance']['unmet'] = ['delivery_report_missing']
+    intake.lock = asyncio.Lock()
+    intake.deactivate = lambda: None
+    carrier.event_frames = lambda: {'generation': record['dsh_execution']['generation'],
+        'session_id': record['dsh_execution']['session_id'], 'frames': []}
+    intake.transports = []
+    monkeypatch.setattr(simple_development, 'RepositoryIntake', lambda *_args: intake)
+    ctx = Context({})
+    ctx.register_system_prompt_section = lambda *_args: None
+    simple_development.register_simple_development(ctx)
+    assert 'hermes_pm_repository_rework' in ctx.tools
+    events = [row['event'] for row in snapshot['records']]
+    await observe_questions(intake, record, carrier, events, snapshot['projections']['values'], intake.generation)
+    assert question['state'] == 'expired' and not question.get('reply_status')
+    from ghost_hermes_pm.repository_acceptance import _report
+    assert _report(events) is None
+    before_acceptance, budget_before = deepcopy(record['dsh_execution']['acceptance']), ledger.read_bytes()
+    result = admit_shared_natural_qa_rework(intake, record, context, 'Clarify the original synthetic scope.', None, intake.generation)
+    assert result == {'status': 'accepted', 'work_id': record['id']}
+    assert record['dsh_execution']['acceptance'] == before_acceptance
+    assert ledger.read_bytes() == budget_before and not carrier.prompts
+
+
 @pytest.mark.asyncio
 async def test_cancelled_claimed_supervisor_does_not_late_acquire_or_leak_intake_lock(tmp_path, monkeypatch):
     import fcntl
@@ -2442,7 +2644,9 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
     assert json.loads((tmp_path / 'shared-worker-result.json').read_text())['status'] == 'passed'
 
 
-@pytest.mark.parametrize('change', ['none', 'source_changed', 'failed_test', 'wrong_command', 'non_test', 'true', 'missing_test', 'failing', 'zero_tests', 'wrong_report_call'])
+@pytest.mark.parametrize('change', ['none', 'python_unittest', 'python_nonce', 'python_session', 'python_generation',
+    'python_runner', 'python_source', 'python_files', 'source_changed', 'failed_test', 'wrong_command', 'non_test', 'true',
+    'missing_test', 'failing', 'zero_tests', 'wrong_report_call'])
 def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_path, monkeypatch, change):
     from ghost_hermes_pm.simple_development import RepositoryIntake
     from ghost_hermes_pm.repository_acceptance import accept_repository_work, repository_source_state
@@ -2450,8 +2654,10 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
     repo.mkdir()
     subprocess.run(['git', 'init', '-q', '-b', 'fixture-delivery', str(repo)], check=True)
     baseline = repository_source_state({'repo_path': str(repo)})
-    test_file = 'feature.test.mjs'
-    (repo / test_file).write_text("console.log('900 passed');\n" if change == 'zero_tests' else
+    test_file = 'test_feature.py' if change.startswith('python_') else 'feature.test.mjs'
+    (repo / test_file).write_text(
+        'import unittest\nclass Feature(unittest.TestCase):\n    def test_feature(self):\n        self.assertEqual(40 + 2, 42)\n'
+        if change.startswith('python_') else "console.log('900 passed');\n" if change == 'zero_tests' else
         "import test from 'node:test'; import assert from 'node:assert/strict';\n"
         "test('real assertion',()=>{assert.equal(40+2," + ('41' if change in {'non_test', 'failing'} else '42') + ")});\n")
     subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
@@ -2481,6 +2687,17 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
     actual_test = subprocess.run(['/bin/bash', '-c', command], cwd=repo,
         env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True)
     assert actual_test.returncode == (1 if change in {'failing', 'missing_test'} else 0), actual_test.stderr
+    if change in {'python_nonce', 'python_session', 'python_generation', 'python_runner', 'python_source', 'python_files'}:
+        forged = json.loads(actual_test.stdout)
+        if change in {'python_nonce', 'python_session', 'python_generation'}:
+            forged['binding'][{'python_nonce': 'nonce', 'python_session': 'session_id', 'python_generation': 'generation'}[change]] = 'foreign-binding'
+        elif change == 'python_runner':
+            forged['runner'] = 'node:test'
+        elif change == 'python_source':
+            forged['before_source_digest'] = 'f' * 64
+        else:
+            forged['test_files'] = ['foreign.test.mjs']
+        actual_test.stdout = json.dumps(forged)
     issue = {'url': 'https://github.com/fixture-user/fixture/issues/7', 'title': 'Verify synthetic feature',
         'body': '- [ ] Verify the fixture feature.', 'updated_at': '2026-10-10T00:00:00Z'}
     state = tmp_path / 'github.json'
@@ -2551,14 +2768,14 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
         'requests_used': 7, 'requests_remaining': 33, 'wall_seconds_remaining': None}
     result = asyncio.run(accept_repository_work(intake, record, carrier, events,
         {'inbox': {'next-turn': [], 'next-step': []}}, intake.generation, current_budget=current_budget))
-    assert (result['status'] == 'accepted') == (change == 'none'), json.dumps(result)
+    assert (result['status'] == 'accepted') == (change in {'none', 'python_unittest'}), json.dumps(result)
     if change in {'source_changed', 'wrong_report_call'}:
         assert 'test_source_unconfirmed' in result['unmet']
-    elif change in {'non_test', 'true', 'zero_tests'}:
+    elif change in {'non_test', 'true', 'zero_tests', 'python_nonce', 'python_session', 'python_generation', 'python_runner', 'python_source', 'python_files'}:
         assert 'test_runner_unconfirmed' in result['unmet']
-    elif change != 'none':
+    elif change not in {'none', 'python_unittest'}:
         assert 'test_evidence_missing' in result['unmet']
-    assert result['eligible_test_calls'] == (['fixture-test'] if change in {'none', 'wrong_report_call'} else [])
+    assert result['eligible_test_calls'] == (['fixture-test'] if change in {'none', 'python_unittest', 'wrong_report_call'} else [])
     assert result['test_files'] == ([] if change == 'missing_test' else test_files)
     assert result['changed_files'] == [test_file]
     assert result['current_budget'] == current_budget

@@ -50,6 +50,33 @@ def test_sentence_initial_merge_status_is_reporting(tmp_path, criterion):
         assert result['pr_status'] == 'none'
 
 
+def test_explicit_no_create_or_merge_pr_allows_verified_delivery(tmp_path):
+    criterion = '不创建或合并PR；完成合成测试后交付。'
+    with original_task(tmp_path, criterion) as (_, client, request_id, _, repo, scope):
+        result = actual_delivery(tmp_path, client, request_id, repo, scope)
+        assert result['task_delivery'] == 'delivered' and result['repository_released'] is True
+        assert result['pr_status'] == 'none'
+        assert result['delivery_requirements']['merge_required'] is False
+        assert result['delivery_requirements']['merge_forbidden'] is True
+        assert result['delivery_requirements']['clarification_criteria'] == []
+
+
+@pytest.mark.parametrize('criterion', [
+    '创建或合并PR的安排待确认。',
+    '如果负责人批准，不创建或合并PR。',
+    '不创建或合并PR，但必须合并PR后交付。',
+    '不创建或合并PR；必须合并PR后交付。',
+])
+def test_uncertain_or_conflicting_compound_merge_scope_stays_blocked(tmp_path, criterion):
+    with original_task(tmp_path, criterion) as (_, client, request_id, _, repo, scope):
+        with pytest.raises(ManagementError) as blocked:
+            actual_delivery(tmp_path, client, request_id, repo, scope)
+        assert blocked.value.code == 'needs_clarification'
+        task = client.read_snapshot()['requests'][0]
+        assert task['accepted_scope'] == scope
+        assert task['task_delivery'] == 'unmet' and task['repository_released'] is False
+
+
 def test_original_owner_append_resolves_conditional_acceptance(tmp_path):
     criterion = 'Merge the PR if the Owner approves.'
     with original_task(tmp_path, criterion) as (_, client, request_id, session, repo, scope):

@@ -648,6 +648,8 @@ def register_simple_development(ctx):
                               ctx.get_config('simple_development'), ctx.get_config('state_dir'))
     home = get_hermes_home().resolve()
     ctx.on_unload(intake.deactivate)
+    from .shared_repository import refresh_shared_verification_versions
+    refresh_shared_verification_versions(intake)
     active_adapter = {'value': None}
     natural_qa_results = {}
     natural_qa_inflight = {}

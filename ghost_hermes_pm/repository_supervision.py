@@ -165,7 +165,8 @@ def acceptance_text(record):
         receipts = acceptance.get('test_evidence', {}).get('runner_receipts', [])
         if receipts:
             for index, receipt in enumerate(receipts, 1):
-                text += ('\n原生 Node 测试（运行 ' + str(index) + '）：' + str(receipt['executed_tests']) + ' passed；'
+                framework = 'Python unittest' if receipt.get('runner') == 'unittest' else 'Node'
+                text += ('\n原生 ' + framework + ' 测试（运行 ' + str(index) + '）：' + str(receipt['executed_tests']) + ' passed；'
                     + str(receipt['failed_tests']) + ' failed；' + str(receipt['skipped_tests']) + ' skipped；退出 '
                     + str(receipt['exit_code']))
         else:

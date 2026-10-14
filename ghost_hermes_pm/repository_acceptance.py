@@ -14,11 +14,12 @@ from .manager import ManagementError, _git
 DELIVERY_MARKER = 'HERMES_REPOSITORY_DELIVERY_JSON'
 
 
-def repository_source_state(target):
+def repository_source_state(target, *, configuration=None):
     if target.get('execution_ref'):
         from .repository_execution import private_file, execution_configuration
         if json.loads(private_file(target['execution_ref']).read_text()).get('mode') == 'shared_native':
-            configuration, _ = execution_configuration(target)
+            if configuration is None:
+                configuration, _ = execution_configuration(target)
             source = configuration['source_snapshot']
             result = subprocess.run([source['python'], '-I', source['reader'], target['repo_path'], '--repository-state'],
                 capture_output=True, text=True, timeout=15)
@@ -106,7 +107,8 @@ def _shared_runner_receipt(configuration, execution, target, current, test_files
             or output.get('byte_length') != len(text.encode()) or receipt.get('stderr', {}).get('byte_length') != 0):
         return None
     verified = json.loads(text)
-    if (verified.get('schema') != 1 or verified.get('runner') != 'node:test'
+    expected_runner = 'unittest' if all(Path(path).suffix == '.py' for path in test_files) else 'node:test'
+    if (verified.get('schema') != 1 or verified.get('runner') != expected_runner
             or verified.get('binding') != {'session_id': execution['session_id'], 'generation': execution['generation'],
                 'nonce': execution['verification']['nonce']}
             or verified.get('test_files') != test_files or verified.get('exit_code') != 0
