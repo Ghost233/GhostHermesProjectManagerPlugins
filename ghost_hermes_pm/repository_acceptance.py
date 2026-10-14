@@ -196,7 +196,11 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
                for e in events if e['type'] == 'tool/result'}
     receipts = {r.get('call_id'): r for r in execution['tool_receipts']}
     test_ids = []
+    derive_criteria = []
     for criterion in criteria:
+        if execution.get('mode') == 'shared_native' and set(criterion) == {'text'}:
+            derive_criteria.append(criterion)
+            continue
         ids = criterion.get('test_call_ids')
         if set(criterion) - {'text', 'test_call_ids'} or not isinstance(ids, list) or not ids:
             unmet.append('test_evidence_missing')
@@ -253,6 +257,15 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
         eligible = (_eligible_shared_test_calls(getattr(carrier, 'config', {}), execution, target, current,
             test_files, receipts, calls, settled) if carrier and valid_files else [])
         result.update(eligible_test_calls=eligible, test_files=test_files if valid_files else [])
+        if derive_criteria:
+            if not eligible:
+                unmet.append('test_evidence_missing')
+            else:
+                # Bind report criteria to original exact-command, fixed-source
+                # receipts here; the model need not discover platform IDs.
+                test_ids.extend(eligible)
+                result['criterion_test_calls'] = [dict(criterion, test_call_ids=list(eligible))
+                    for criterion in derive_criteria]
     if not carrier or not isinstance(test_files, list) or not test_files or not test_ids:
         unmet.append('test_evidence_missing')
     elif not unmet and execution.get('mode') == 'shared_native':

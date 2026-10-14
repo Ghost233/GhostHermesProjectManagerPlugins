@@ -964,7 +964,7 @@ async def main():
                         and latest['dsh_execution'].get('acceptance', {}).get('status') == 'unmet'):
                     actual_prompt = peer['prompts'][0]['content'][0]['text']
                     assert initial['issue']['updated_at'] in actual_prompt
-                    assert 'only text and test_call_ids' in actual_prompt and 'array of branch names' in actual_prompt
+                    assert 'only text; omit internal test_call_ids' in actual_prompt and 'array of branch names' in actual_prompt
                     assert 'native sub-issue relationships' in actual_prompt and 'body links alone do not count' in actual_prompt
                     assert 'Never infer receipt meaning from list order' in actual_prompt
                     assert latest['dsh_execution']['state'] == 'awaiting_acceptance'

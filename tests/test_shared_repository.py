@@ -671,7 +671,8 @@ def test_runner_version_maintenance_rejects_scope_or_original_lifecycle_changes(
 
 
 @pytest.mark.asyncio
-async def test_normal_registration_and_question_observation_admit_original_report_clarification(tmp_path, monkeypatch):
+@pytest.mark.parametrize('include_call_ids', [True, False])
+async def test_normal_registration_and_question_observation_admit_original_report_clarification(tmp_path, monkeypatch, include_call_ids):
     from ghost_hermes_pm import simple_development
     from ghost_hermes_pm.repository_questions import observe_questions
     from ghost_hermes_pm.shared_repository import admit_shared_natural_qa_rework
@@ -681,12 +682,16 @@ async def test_normal_registration_and_question_observation_admit_original_repor
     snapshot = next(carrier.stream('session/follow', {}))
     message = snapshot['records'][1]['event']['data']['message']['content'][0]
     report = json.loads(message['text'].split('HERMES_REPOSITORY_DELIVERY_JSON ', 1)[1])
+    if not include_call_ids:
+        report['criteria'][0].pop('test_call_ids')
     criterion = '请确认合成规则，需要我决定测试 token 上限。'
     report['criteria'][0]['text'] = criterion
     record['issue']['body'] = criterion
     message['text'] = 'HERMES_REPOSITORY_DELIVERY_JSON\n```json\n' + json.dumps(report, ensure_ascii=False) + '\n```\n\n合成证据已回传。'
     question = {'id': 'message-1', 'kind': 'natural', 'state': 'open', 'answerable': False,
-        'generation': record['dsh_execution']['generation'], 'session_id': record['dsh_execution']['session_id'], 'source_seq': 1}
+        'generation': record['dsh_execution']['generation'], 'session_id': record['dsh_execution']['session_id'], 'source_seq': 1,
+        'source_digest': hashlib.sha256(json.dumps([{'id': 'answer', 'question': message['text']}],
+            sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
     record['dsh_execution'].update(questions=[question])
     record['dsh_execution']['acceptance']['unmet'] = ['delivery_report_missing']
     intake.lock = asyncio.Lock()
@@ -2740,8 +2745,12 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
 
 @pytest.mark.parametrize('change', ['none', 'python_unittest', 'python_nonce', 'python_session', 'python_generation',
     'python_runner', 'python_source', 'python_files', 'source_changed', 'failed_test', 'wrong_command', 'non_test', 'true',
-    'missing_test', 'failing', 'zero_tests', 'wrong_report_call'])
+    'missing_test', 'failing', 'zero_tests', 'wrong_report_call', 'derived_none', 'derived_python_unittest',
+    'derived_source_changed', 'derived_failed_test', 'derived_wrong_command', 'derived_python_nonce',
+    'derived_python_session', 'derived_python_generation', 'derived_python_files', 'derived_non_test', 'derived_zero_tests'])
 def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_path, monkeypatch, change):
+    derive_ids = change.startswith('derived_')
+    change = change.removeprefix('derived_')
     from ghost_hermes_pm.simple_development import RepositoryIntake
     from ghost_hermes_pm.repository_acceptance import accept_repository_work, repository_source_state
     repo = tmp_path / 'repository'
@@ -2829,6 +2838,8 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
     report = {'issue_updated_at': issue['updated_at'], 'source_commit': source['head'],
         'criteria': [{'text': 'Verify the fixture feature.', 'test_call_ids': ['fixture-test']}],
         'fine_issue_urls': [], 'sync_branches': [], 'leftovers': [], 'test_files': test_files}
+    if derive_ids:
+        report['criteria'][0].pop('test_call_ids')
     events = [{'seq': 0, 'type': 'turn/start', 'data': {'turn': 1}},
         {'seq': 1, 'type': 'tool/call', 'data': {'callId': 'fixture-test', 'name': 'bash', 'arguments': {'command': command}}},
         {'seq': 2, 'type': 'tool/result', 'data': {'message': {'toolCallId': 'fixture-test', 'isError': actual_test.returncode != 0,
@@ -2863,7 +2874,9 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
     result = asyncio.run(accept_repository_work(intake, record, carrier, events,
         {'inbox': {'next-turn': [], 'next-step': []}}, intake.generation, current_budget=current_budget))
     assert (result['status'] == 'accepted') == (change in {'none', 'python_unittest'}), json.dumps(result)
-    if change in {'source_changed', 'wrong_report_call'}:
+    if derive_ids and change not in {'none', 'python_unittest'}:
+        assert 'test_evidence_missing' in result['unmet']
+    elif change in {'source_changed', 'wrong_report_call'}:
         assert 'test_source_unconfirmed' in result['unmet']
     elif change in {'non_test', 'true', 'zero_tests', 'python_nonce', 'python_session', 'python_generation', 'python_runner', 'python_source', 'python_files'}:
         assert 'test_runner_unconfirmed' in result['unmet']
@@ -2873,3 +2886,6 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
     assert result['test_files'] == ([] if change == 'missing_test' else test_files)
     assert result['changed_files'] == [test_file]
     assert result['current_budget'] == current_budget
+    if derive_ids and change in {'none', 'python_unittest'}:
+        assert result['test_evidence']['original_call_ids'] == ['fixture-test']
+        assert result['criterion_test_calls'] == [{'text': 'Verify the fixture feature.', 'test_call_ids': ['fixture-test']}]

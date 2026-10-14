@@ -70,7 +70,7 @@ def _natural_question(events):
                     and isinstance(report['issue_updated_at'], str) and report['issue_updated_at']
                     and isinstance(report['criteria'], list) and report['criteria']
                     and all(isinstance(item, dict) and isinstance(item.get('text'), str)
-                            and isinstance(item.get('test_call_ids'), list) for item in report['criteria'])
+                            and ('test_call_ids' not in item or isinstance(item['test_call_ids'], list)) for item in report['criteria'])
                     and all(isinstance(report[key], list) for key in ('test_files', 'fine_issue_urls', 'sync_branches', 'leftovers'))):
                 text = prefix + '\n' + tail
         except ValueError:

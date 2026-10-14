@@ -784,7 +784,7 @@ def _qa_rework_prompt(intake, record, feedback, *, test_files=None):
             'Retain the frozen original Issue URL and body; do not expand the scope, create a new Session, '
             'request a new budget, or merge any PR. Use this same repository and finite renewal window. '
             'Run the actual tests through the original native bash tool. Emit one corrected delivery JSON with '
-            'actual native bash call IDs, including source_commit, issue_updated_at, criteria [{text,test_call_ids}], '
+            'declared test files, including source_commit, issue_updated_at, criteria [{text}], '
             'test_files, fine_issue_urls, pr_url, sync_branches, and leftovers.\n\n' + _prompt(intake, record, test_files=test_files))
 
 
@@ -2918,10 +2918,11 @@ def _prompt(intake, record, *, test_files=None):
           'Explicit .py files use standard-library unittest results; Node files use native node:test events. '
           'Run each file type in a separate call; ordinary command success is insufficient. '
           'Report with HERMES_REPOSITORY_DELIVERY_JSON followed by one JSON object with source_commit, '
-          'issue_updated_at, criteria [{text,test_call_ids}], test_files, fine_issue_urls, pr_url, '
-          'sync_branches, leftovers. Reference exact successful native bash test call IDs. '
+          'issue_updated_at, criteria [{text}], test_files, fine_issue_urls, pr_url, '
+          'sync_branches, leftovers. The supervisor binds each criterion to the original exact-command, fixed-source test receipts. '
+          'Do not search platform state, ledgers or other session stores for internal call IDs. '
         + 'issue_updated_at must be the frozen value ' + record['issue']['updated_at']
-        + '; comment timestamps do not replace it. Each criteria item has only text and test_call_ids, no note or other keys. '
+        + '; comment timestamps do not replace it. Each criteria item has only text; omit internal test_call_ids. No note or other keys. '
           'sync_branches is an array of branch names, not an object. fine_issue_urls requires GitHub native sub-issue relationships; body links alone do not count. '
         + 'Copy each frozen acceptance criterion verbatim and in order: ' + json.dumps(acceptance_criteria(record['issue']['body']), ensure_ascii=False)
         + '. Verified eligible original native test evidence for the exact current source: '
@@ -2931,9 +2932,9 @@ def _prompt(intake, record, *, test_files=None):
             + '. Send this exact string unchanged as one separate native bash call. Do not prepend cd/env, '
               'reorder arguments, append commands or wrap the command. '
             if canonical else 'No valid explicit test file list is available for a complete canonical command yet. ')
-        + 'Never replace IDs with narrative descriptions. '
-          "Never infer receipt meaning from list order. Use only the actual trusted test command's own native call ID; "
-          'Git/other IDs do not belong in test_call_ids; test_files are exactly that command\'s explicit test file list. '
+        + 'Never invent evidence. Never infer receipt meaning from list order. '
+          'test_files are exactly the trusted command\'s explicit test file list; different file types use separate calls, '
+          'and the report declares one tested file set for the supervisor to verify. '
           'Outer Kanban acceptance belongs to the supervisor.')
 
 
