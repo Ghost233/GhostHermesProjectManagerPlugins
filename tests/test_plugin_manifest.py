@@ -1,4 +1,6 @@
 from pathlib import Path
+import shutil
+import subprocess
 
 import yaml
 
@@ -24,3 +26,17 @@ def test_sdk_loader_reports_missing_configuration_without_legacy_registration(cu
     missing = current_sdk_entry['missing']
     assert 'configuration_missing' in missing['error']
     assert missing['tools'] == missing['hooks'] == missing['commands'] == 0
+
+
+def test_source_install_does_not_advertise_retired_dashboard(tmp_path):
+    # Native Git installs exclude ignored personal metadata. Discovery uses
+    # dashboard/manifest.json; the cache refreshes when dashboard/ disappears.
+    installed = tmp_path / 'plugin'
+    files = subprocess.check_output(['git', 'ls-files', '--cached', '--others', '--exclude-standard', '-z'], cwd=ROOT).decode().split('\0')
+    for name in set(files):
+        if name.startswith(('dashboard/', 'retired_dashboard/')) and (ROOT / name).is_file():
+            destination = installed / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, destination)
+    assert not (installed / 'dashboard').is_dir(), 'Source installs must invalidate the retired dashboard cache.'
+    assert (installed / 'retired_dashboard' / 'manifest.json').is_file(), 'Keep the original dashboard declaration as historical evidence.'
