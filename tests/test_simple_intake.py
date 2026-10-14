@@ -132,6 +132,9 @@ def test_current_snapshot_is_compact_and_uses_only_bound_current_facts(tmp_path,
         'issue': {'url': 'https://github.com/fixture-user/fixture/issues/1', 'body': 'private issue body' * 20000},
         'dsh_execution': {'mode': 'shared_native', 'state': 'released', 'session_id': 'fixture-session',
             'generation': 'fixture-generation', 'reference_sha256': 'bound-reference-hash', 'history': 'private history' * 20000,
+            'questions': [{'state': 'continued', 'reply_status': 'accepted',
+                'answers': {key: 'private answer' * 20000}} for key in ('fixture-plan', 'fixture-playtest')],
+            'approvals': [], 'jobs': [], 'lifecycle_end': {'status': 'ended'},
             'baseline': {'file_digests': {'feature.mjs': 'old'}},
             'acceptance': {'status': 'accepted', 'delivered': True, 'source_commit': 'a' * 40,
                 'source_digest': 'current-digest', 'workspace_status': '', 'pr_status': 'awaiting_review', 'review_status': 'pending',
@@ -149,7 +152,11 @@ def test_current_snapshot_is_compact_and_uses_only_bound_current_facts(tmp_path,
     before = intake.snapshot()
     view = intake.current_snapshot('fixture-native', args)
     encoded = json.dumps(view, ensure_ascii=False)
-    assert len(encoded) < 1500 and 'private history' not in encoded and 'private issue body' not in encoded
+    assert len(encoded) < 1500 and all(text not in encoded for text in ('private history', 'private issue body', 'private answer'))
+    if section == 'overview':
+        assert view['questions_pending'] == view['approvals_pending'] == 0
+        assert view['answers_accepted'] == 2 and view['accepted_question_ids'] == ['fixture-plan', 'fixture-playtest']
+        assert view['jobs'] == [] and view['lifecycle_status'] == 'ended'
     if section in {'overview', 'budget'}:
         assert view['budget']['requests_total'] == 27 and view['budget']['requests_remaining'] == 33
     elif section == 'delivery':
@@ -160,6 +167,17 @@ def test_current_snapshot_is_compact_and_uses_only_bound_current_facts(tmp_path,
     assert intake.current_snapshot('foreign-native', {'work_id': record['id']}) == {'status': 'rejected', 'code': 'unauthorized'}
     assert intake.current_snapshot('fixture-native', {'path': '/private/foreign'}) == {'status': 'rejected', 'code': 'invalid_change'}
     assert intake.snapshot() == before
+    if section == 'overview':
+        execution = record['dsh_execution']
+        execution['questions'].append({'state': 'open'})
+        execution['approvals'].append({'state': 'pending'})
+        execution.pop('jobs')
+        execution.pop('lifecycle_end')
+        intake._save(record)
+        unknown = intake.current_snapshot('fixture-native', args)
+        assert unknown['questions_pending'] == unknown['approvals_pending'] == 1
+        assert unknown['answers_accepted'] == 2
+        assert unknown['jobs'] is None and unknown['lifecycle_status'] == 'unknown'
 
 
 def test_worker_save_preserves_current_shared_observer(tmp_path):

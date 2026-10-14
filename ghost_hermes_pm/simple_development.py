@@ -110,6 +110,16 @@ class RepositoryIntake(FeishuEntry):
                 acceptance_status=acceptance.get('status', 'unknown'), unmet=acceptance.get('unmet'),
                 pr={'url': acceptance.get('pr', {}).get('url'), 'status': acceptance.get('pr_status'),
                     'review_status': acceptance.get('review_status')})
+        if section == 'overview':
+            from .repository_acceptance import _human_pending
+            questions = execution.get('questions', [])
+            value.update(questions_pending=sum(_human_pending({'questions': [q]}) for q in questions),
+                approvals_pending=sum(_human_pending({'approvals': [a]}) for a in execution.get('approvals', [])),
+                answers_accepted=sum(q.get('reply_status') == 'accepted' for q in questions),
+                accepted_question_ids=[key for q in questions if q.get('reply_status') == 'accepted'
+                    for key in q.get('answers', {})],
+                jobs=[{'status': job['status']} for job in execution['jobs']] if 'jobs' in execution else None,
+                lifecycle_status=execution.get('lifecycle_end', {}).get('status', 'unknown'))
         if section == 'delivery':
             value.update(sync=acceptance.get('sync'), fine_issues=[{key: row.get(key) for key in ('url', 'state')}
                 for row in acceptance.get('fine_issues', [])], test_files=test_files,
