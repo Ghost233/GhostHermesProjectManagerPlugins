@@ -45,8 +45,8 @@ testpaths = [
     "tests/test_phase_gate.py",
     "tests/test_sdk_source_integrity.py",
 ]
-addopts = "-m 'not retired_independent_runtime'"
-markers = ["retired_independent_runtime: historical standalone DSH startup and lifecycle; excluded from the shared Desktop regression"]
+addopts = "-m 'not retired_independent_runtime and not retired_legacy_manager'"
+markers = ["retired_independent_runtime: historical standalone DSH startup and lifecycle; excluded from the shared Desktop regression", "retired_legacy_manager: historical directory Manager registration, which is not exposed by the current plugin entry"]
 
 [tool.ruff]
 target-version = "py311"
