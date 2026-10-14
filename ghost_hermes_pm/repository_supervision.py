@@ -149,6 +149,7 @@ def acceptance_text(record):
     text = ('交付已通过总 Issue 验收。' if record['dsh_execution']['state'] == 'released'
         else '总 Issue 验收已通过；交付收尾尚未核实，保留仓库占用。') if acceptance['status'] == 'accepted' else '开发与测试结果待验收，尚未交付；总 Issue 验收未满足。'
     text += '\n总 Issue：' + record['issue']['url']
+    text += '\n工作引用：' + record['id']
     if acceptance.get('source_commit'):
         text += '\n交付版本：' + acceptance['source_commit']
     pr = {'none': '未提供 PR', 'awaiting_review': '待审查', 'awaiting_merge': '待合并', 'merged': '已合并'}

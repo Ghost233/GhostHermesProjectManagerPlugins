@@ -72,7 +72,7 @@ def delivery_requirements(body):
         for clause in re.split(r'[；;。\n]+', criterion):
             if not re.search(r'\bmerg(?:e|ed|es|ing)\b|合并', clause, re.IGNORECASE):
                 continue
-            negative = re.search(r"\b(?:must not|shall not|do not|don't|never)\s+(?:be\s+)?merg(?:e|ed)\b|(?:禁止|不得|不要|不能|勿)\s*(?:合并|(?:此|本|该)?\s*PR\s*合并)", clause, re.IGNORECASE)
+            negative = re.search(r"\b(?:must not|shall not|do not|don't|never)\s+(?:be\s+)?merg(?:e|ed)\b|(?:禁止|不得|不要|不能|勿)\s*(?:合并|(?:此|本|该)?\s*PR\s*合并)|(?:^|[，,：:])\s*不\s*合并|(?:PR|拉取请求)\s*(?:保持|继续)?\s*不\s*合并", clause, re.IGNORECASE)
             compound_negative = re.search(r'不\s*创建\s*或\s*合并\s*PR\b', clause, re.IGNORECASE)
             optional = OPTIONAL_MERGE.search(clause)
             affirmative = OPTIONAL_MERGE.sub(' ', clause)
@@ -80,8 +80,8 @@ def delivery_requirements(body):
             affirmative = re.sub(r'\bmerg(?:e|ed|ing)\s+(?:status|state)\b|合并\s*(?:(?:此|本|该)?\s*(?:PR|拉取请求|代码|变更|提交))?\s*(?:的)?\s*(?:当前|相关|最终)?\s*状态', ' ', affirmative, flags=re.IGNORECASE)
             obligation = re.search(r'\b(?:must|shall|has to|have to|needs to|is required to)\s+(?:be\s+)?merg(?:e|ed)\b|\bmerg(?:e|ed|ing)\b.{0,40}\b(?:is required|is mandatory)\b|^\s*merge\b|(?:必须|务必|须|应当|需要|要求)\s*(?:先|完成\s*(?:此|本|该)?\s*PR\s*)?合并|^\s*(?:合并(?:此|本|该)?\s*PR|将.+合并到)|完成\s*PR\s*合并(?:后|之后).{0,20}(?:交付|验收)', affirmative, re.IGNORECASE)
             reporting = re.search(r'\b(?:show(?:n|s|ing)?|display(?:ed|s|ing)?|report(?:ed|s|ing)?|list(?:ed|s|ing)?|record(?:ed|s|ing)?|track(?:ed|s|ing)?|describe(?:d|s)?)\b|展示|显示|呈现|记录|列出|跟踪', clause, re.IGNORECASE) and re.search(r'\b(?:status|state|whether)\b|状态|是否|待审查|待合并|已合并', clause, re.IGNORECASE)
-            conditional = re.search(r'\b(?:if|unless)\b|(?:如果|若|除非)', clause, re.IGNORECASE)
-            if optional and obligation or compound_negative and (conditional or obligation):
+            conditional = re.search(r'\b(?:if|unless)\b|(?:如果|若|除非)|不\s*合并.{0,30}(?:就|则)', clause, re.IGNORECASE)
+            if optional and obligation or (negative or compound_negative) and (conditional or obligation):
                 unclear.append(criterion)
             elif negative or compound_negative:
                 forbidden.append(criterion)

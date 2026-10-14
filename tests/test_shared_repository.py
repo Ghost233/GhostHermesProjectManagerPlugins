@@ -2749,7 +2749,9 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
     'python_runner', 'python_source', 'python_files', 'source_changed', 'failed_test', 'wrong_command', 'non_test', 'true',
     'missing_test', 'failing', 'zero_tests', 'wrong_report_call', 'derived_none', 'derived_python_unittest',
     'derived_source_changed', 'derived_failed_test', 'derived_wrong_command', 'derived_python_nonce',
-    'derived_python_session', 'derived_python_generation', 'derived_python_files', 'derived_non_test', 'derived_zero_tests'])
+    'derived_python_session', 'derived_python_generation', 'derived_python_files', 'derived_non_test', 'derived_zero_tests',
+    'chinese_forbidden', 'chinese_pr_forbidden', 'chinese_conditional', 'chinese_conflict', 'chinese_no_auto',
+    'chinese_merge_condition', 'chinese_pr_merge_condition'])
 def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_path, monkeypatch, change):
     derive_ids = change.startswith('derived_')
     change = change.removeprefix('derived_')
@@ -2803,8 +2805,17 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
         else:
             forged['test_files'] = ['foreign.test.mjs']
         actual_test.stdout = json.dumps(forged)
+    merge_cases = {
+        'chinese_forbidden': '保持任务范围，不合并现有测试PR；保留代码和历史，测试PR保持不合并。',
+        'chinese_pr_forbidden': '完成测试，测试PR不合并。',
+        'chinese_conditional': '如果测试通过，不合并测试PR。',
+        'chinese_conflict': '不合并测试PR，但必须合并PR后交付。',
+        'chinese_no_auto': '不自动合并测试PR。',
+        'chinese_merge_condition': '不合并测试PR就不能交付。',
+        'chinese_pr_merge_condition': '测试PR不合并则无法验收。'}
+    criterion = merge_cases.get(change, 'Verify the fixture feature.')
     issue = {'url': 'https://github.com/fixture-user/fixture/issues/7', 'title': 'Verify synthetic feature',
-        'body': '- [ ] Verify the fixture feature.', 'updated_at': '2026-10-10T00:00:00Z'}
+        'body': '- [ ] ' + criterion, 'updated_at': '2026-10-10T00:00:00Z'}
     state = tmp_path / 'github.json'
     state.write_text(json.dumps({'url': issue['url'], 'title': issue['title'], 'body': issue['body'],
         'updatedAt': issue['updated_at'], 'state': 'OPEN'}))
@@ -2838,7 +2849,7 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
     elif change == 'wrong_command':
         receipt['command_sha256'] = hashlib.sha256(b'echo ignored').hexdigest()
     report = {'issue_updated_at': issue['updated_at'], 'source_commit': source['head'],
-        'criteria': [{'text': 'Verify the fixture feature.', 'test_call_ids': ['fixture-test']}],
+        'criteria': [{'text': criterion, 'test_call_ids': ['fixture-test']}],
         'fine_issue_urls': [], 'sync_branches': [], 'leftovers': [], 'test_files': test_files}
     if derive_ids:
         report['criteria'][0].pop('test_call_ids')
@@ -2875,16 +2886,19 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
         'requests_used': 7, 'requests_remaining': 33, 'wall_seconds_remaining': None}
     result = asyncio.run(accept_repository_work(intake, record, carrier, events,
         {'inbox': {'next-turn': [], 'next-step': []}}, intake.generation, current_budget=current_budget))
-    assert (result['status'] == 'accepted') == (change in {'none', 'python_unittest'}), json.dumps(result)
-    if derive_ids and change not in {'none', 'python_unittest'}:
+    accepted_cases = {'none', 'python_unittest', 'chinese_forbidden', 'chinese_pr_forbidden'}
+    assert (result['status'] == 'accepted') == (change in accepted_cases), json.dumps(result)
+    if change in {'chinese_conditional', 'chinese_conflict', 'chinese_no_auto', 'chinese_merge_condition', 'chinese_pr_merge_condition'}:
+        assert result['unmet'] == ['merge_obligation_unclear']
+    elif derive_ids and change not in accepted_cases:
         assert 'test_evidence_missing' in result['unmet']
     elif change in {'source_changed', 'wrong_report_call'}:
         assert 'test_source_unconfirmed' in result['unmet']
     elif change in {'non_test', 'true', 'zero_tests', 'python_nonce', 'python_session', 'python_generation', 'python_runner', 'python_source', 'python_files'}:
         assert 'test_runner_unconfirmed' in result['unmet']
-    elif change not in {'none', 'python_unittest'}:
+    elif change not in accepted_cases:
         assert 'test_evidence_missing' in result['unmet']
-    assert result['eligible_test_calls'] == (['fixture-test'] if change in {'none', 'python_unittest', 'wrong_report_call'} else [])
+    assert result['eligible_test_calls'] == (['fixture-test'] if change in {'none', 'python_unittest', 'wrong_report_call'} | set(merge_cases) else [])
     assert result['test_files'] == ([] if change == 'missing_test' else test_files)
     assert result['changed_files'] == [test_file]
     assert result['current_budget'] == current_budget
