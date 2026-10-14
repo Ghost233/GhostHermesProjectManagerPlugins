@@ -5,6 +5,43 @@ import json
 from .manager import ManagementError
 
 
+def inbound_text(message):
+    """Read textual posts while keeping actual mention elements separate from labels."""
+    payload = json.loads(message.content)
+    if message.message_type == 'text':
+        text = payload['text']
+        if not isinstance(text, str):
+            raise ValueError('Text content must be a string.')
+        return text, {m.key for m in (message.mentions or []) if isinstance(m.key, str) and m.key in text}
+    if message.message_type != 'post' or not isinstance(payload, dict):
+        raise ValueError('Unsupported message content.')
+    if not isinstance(payload.get('content'), list):
+        payload = next((payload[key] for key in ('zh_cn', 'en_us')
+                        if isinstance(payload.get(key), dict) and isinstance(payload[key].get('content'), list)), {})
+    rows = payload['content']
+    parts, mentions = [payload.get('title', '')], set()
+    for row in rows:
+        line = []
+        for element in row:
+            tag = element['tag']
+            if tag == 'at':
+                value = element['user_id']
+                mentions.add(value)
+            elif tag == 'text':
+                value = element['text']
+            elif tag == 'a':
+                value = element['href']
+            elif tag == 'br':
+                value = '\n'
+            else:
+                raise ValueError('Unsupported non-textual post element.')
+            if not isinstance(value, str):
+                raise ValueError('Post text must be a string.')
+            line.append(value)
+        parts.append(''.join(line))
+    return '\n'.join(parts).strip(), mentions
+
+
 class NativeFeishuTransport:
     def __init__(self, native):
         self.native = native

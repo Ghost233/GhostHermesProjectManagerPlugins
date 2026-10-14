@@ -27,6 +27,7 @@ from hermes_constants import get_hermes_home
 from .manager import ManagementError, VerifiedIdentity
 from .messages import OWNED_PLATFORM
 from .owned_feishu_process import FeishuProcessTransport
+from .feishu import inbound_text
 
 logger = logging.getLogger(__name__)
 
@@ -350,9 +351,9 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
                 return
             if self._admit(sender, message) is not None:
                 return
-            if message.message_type != 'text' or not isinstance(message.message_id, str) or not message.message_id:
+            if not isinstance(message.message_id, str) or not message.message_id:
                 return
-            text = json.loads(message.content)['text']
+            text, _ = inbound_text(message)
             if not isinstance(text, str) or any(secret in text for secret in self.intake.secret_values if secret):
                 return
             for mention in getattr(message, 'mentions', None) or []:
@@ -448,11 +449,11 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
                     return 'owned_group_policy_rejected'
             require_mention = rule.get('require_mention', self._require_mention)
             require_mention = require_mention is True or require_mention in {'true', 1}
-            text = getattr(message, 'content', '')
+            mention_keys = inbound_text(message)[1] if not card_action else set()
             if not card_action and (require_mention or is_bot) and not any(getattr(getattr(m, 'id', None), 'open_id', None) == self._bot_open_id
                        and getattr(m, 'tenant_key', None) == binding.get('recipient_tenant_key')
                        and getattr(m, 'mentioned_type', None) == 'bot'
-                       and isinstance(getattr(m, 'key', None), str) and m.key and m.key in text
+                       and isinstance(getattr(m, 'key', None), str) and m.key and m.key in mention_keys
                        for m in getattr(message, 'mentions', None) or []):
                 return 'owned_real_mention_required'
         return None

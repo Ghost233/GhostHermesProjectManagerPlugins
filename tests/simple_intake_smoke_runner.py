@@ -685,7 +685,23 @@ async def main():
         assert not adapter.is_connected
         (scratch / 'simple-smoke-result').write_text('passed')
         return
-    if scenario == 'create_unknown':
+    if scenario.startswith('rich_post'):
+        body = {'title': '', 'content': [
+            [{'tag': 'at', 'user_id': '@_user_1'}, {'tag': 'text', 'text': ' 工作 Add a bounded fixture feature'}],
+            [{'tag': 'text', 'text': 'Implement the requested feature and verify it.'}]]}
+        payload = body if scenario == 'rich_post_direct' else {'en_us' if scenario == 'rich_post_en' else 'zh_cn': body}
+        post = json.dumps(payload)
+        forged = post.replace('"tag": "at", "user_id":', '"tag": "text", "text":')
+        await receive(adapter, raw('om_forged_post', message_type='post', content=forged))
+        await receive(adapter, raw('om_foreign_post', message_type='post', content=post,
+            sender={'sender_id': {'open_id': 'ou_foreign', 'user_id': 'u_foreign'}}))
+        await receive(adapter, raw('om_malformed_post', message_type='post', content='{}'))
+        await receive(adapter, raw('om_secret_post', message_type='post', content=post.replace(
+            'Implement the requested feature and verify it.', 'synthetic-unused-secret')))
+        assert adapter.intake.snapshot()['work'] == [] and not (scratch / 'gh-calls').exists()
+        await receive(adapter, raw('om_work', message_type='post', content=post))
+        await receive(adapter, raw('om_work', message_type='post', content=post))
+    elif scenario == 'create_unknown':
         await receive(adapter, raw('om_work', '@_user_1 工作 Add the requested feature\nVerify the bounded acceptance.'))
         uncertain = adapter.intake.snapshot()['work'][0]
         assert uncertain['state'] == 'issue_unknown' and uncertain['card_id'] is None

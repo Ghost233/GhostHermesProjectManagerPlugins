@@ -271,6 +271,9 @@ def test_shared_prompt_reports_original_ids_and_current_budget(tmp_path, monkeyp
 
 @pytest.mark.parametrize('scenario', [
     'existing',
+    'rich_post',
+    'rich_post_direct',
+    'rich_post_en',
     'create_unknown',
     'private_issue',
     'concurrent',

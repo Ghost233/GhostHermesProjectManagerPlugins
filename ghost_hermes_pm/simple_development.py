@@ -13,6 +13,7 @@ import stat
 from .manager import ManagementError, _private_state_directory, _public_text
 from .messages import FeishuEntry, OWNED_PLATFORM
 from .simple_github import GitHubWorkSource
+from .feishu import inbound_text
 
 
 OWNER_CONTEXT_MAX_CHARS = 4000
@@ -207,7 +208,7 @@ class RepositoryIntake(FeishuEntry):
             source, header, raw = event.source, event.raw_message.header, event.raw_message.event
             sender, message = raw.sender, raw.message
             ids = sender.sender_id
-            if getattr(source.platform, 'value', source.platform) != OWNED_PLATFORM or header.event_type != 'im.message.receive_v1' or message.chat_type != 'group' or message.message_type != 'text':
+            if getattr(source.platform, 'value', source.platform) != OWNED_PLATFORM or header.event_type != 'im.message.receive_v1' or message.chat_type != 'group' or message.message_type not in {'text', 'post'}:
                 return None
             if source.user_id != (getattr(ids, 'user_id', None) or ids.open_id) or source.chat_id != message.chat_id or event.message_id != message.message_id or source.message_id != message.message_id:
                 return None
@@ -227,10 +228,10 @@ class RepositoryIntake(FeishuEntry):
                 if source.is_bot is not True or len(bots) != 1:
                     return None
                 authorized_profiles = bots[0]['dispatch_profiles']
-            text = json.loads(message.content)['text']
+            text, mention_keys = inbound_text(message)
             mentions = [m for m in (message.mentions or []) if m.id.open_id == binding['recipient_open_id']
                         and m.tenant_key == binding['recipient_tenant_key'] and m.mentioned_type == 'bot'
-                        and isinstance(m.key, str) and m.key and m.key in text]
+                        and isinstance(m.key, str) and m.key and m.key in mention_keys]
             if len(mentions) != 1:
                 return None
             command = text.replace(mentions[0].key, '').strip()
