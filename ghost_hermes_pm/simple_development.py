@@ -374,28 +374,50 @@ class RepositoryIntake(FeishuEntry):
             marker = '<!-- hermes-outer:' + hashlib.sha256(record['issue']['url'].encode()).hexdigest() + ' -->'
             matches = []
             for item in listing.get('tasks', []):
-                card = self._kanban('kanban_show', {'task_id': item['id']}).get('task', {})
+                facts = self._kanban('kanban_show', {'task_id': item['id']})
+                card = facts.get('task', {})
                 if marker in (card.get('body') or '') or card.get('id') == card_id:
-                    matches.append(card)
+                    matches.append(facts)
         except ManagementError:
             return None
         if len(matches) != 1:
             return None
-        card = matches[0]
+        facts = matches[0]
+        card = facts['task']
         try:
             actual_path = Path(card['workspace_path']).resolve(strict=True)
         except (TypeError, KeyError, OSError):
             return None
         target = record['target']
-        statuses = {'blocked', 'ready', 'running', 'triage'} if record.get('dsh_execution') else {'blocked'}
+        statuses = {'blocked', 'ready', 'running', 'triage', 'todo'} if record.get('dsh_execution') else {'blocked'}
         if record.get('dsh_execution', {}).get('acceptance', {}).get('status') == 'accepted':
             statuses.add('done')
+        if (record.get('dsh_execution', {}).get('state') == 'stopped'
+                and record['dsh_execution'].get('stop_control', {}).get('status') == 'stopped'):
+            statuses.add('archived')
         if (card.get('assignee') != target['native_profile'] or card.get('workspace_kind') != 'dir'
             or actual_path != path or card.get('title') != record['issue']['title']
             or card.get('body') != self._card_body(record) or card.get('status') not in statuses
+            or not set(record.get('repository_parents', [])).issubset(facts.get('parents', []))
             or card_id is not None and card.get('id') != card_id):
             return None
         return card['id']
+
+    def _repository_parents(self, record, saved):
+        from .queue import logical_repository
+        key = logical_repository(record['target']['repo_path'])
+        parents = []
+        for prior in saved:
+            if prior['id'] == record['id']:
+                break
+            if (prior.get('dsh_execution', {}).get('state') in {'stopped', 'released'}
+                    or logical_repository(prior['target']['repo_path']) != key or not prior.get('card_id')):
+                continue
+            parent = self._verified_card(prior, Path(prior['target']['repo_path']).resolve(strict=True), prior['card_id'])
+            if parent is None:
+                raise ManagementError('outcome_unknown', 'Earlier original repository work has an unverified outer card.')
+            parents.append(parent)
+        return parents
 
     def _issue_material(self, material):
         _public_text(material, self.secret_values)
@@ -496,12 +518,14 @@ class RepositoryIntake(FeishuEntry):
                     card_id = self._verified_card(record, path)
                 else:
                     record['state'] = 'card_unknown'
+                    record['repository_parents'] = self._repository_parents(record, saved)
                     self._save(record)
                     issue = record['issue']
                     try:
                         value = self._kanban('kanban_create', {'title': issue['title'], 'body': self._card_body(record),
                             'assignee': target['native_profile'], 'workspace_kind': 'dir', 'workspace_path': str(path),
-                            'project': '', 'initial_status': 'blocked', 'idempotency_key': key})
+                            'project': '', 'initial_status': 'blocked', 'idempotency_key': key,
+                            'parents': record['repository_parents']})
                         card_id = self._verified_card(record, path, value['task_id'])
                     except (ManagementError, KeyError):
                         return record

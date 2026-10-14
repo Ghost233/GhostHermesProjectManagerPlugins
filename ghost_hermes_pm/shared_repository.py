@@ -2944,6 +2944,38 @@ def _verified_background_notice(execution, event, item):
         and bool(worker.get('run_id')) and bool(worker.get('identity')))
 
 
+def _waiting_repository_successor(intake, record, candidate):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    execution = candidate.get('dsh_execution', {})
+    if (execution.get('mode') != 'shared_native'
+            or any(execution.get(key) for key in ('generation', 'session_id', 'request_id', 'first_input',
+                'native_identity', 'supervisor_claim', 'baseline', 'tool_receipts', 'continuation_control', 'stop_requested'))):
+        return False
+    with connect_closing(board=intake.board) as connection:
+        card = kb.get_task(connection, candidate['card_id'])
+        parents = kb.parent_ids(connection, candidate['card_id'])
+        runs = kb.list_runs(connection, candidate['card_id'])
+    if (not _original_shared_card(intake, candidate, card) or card.status not in {'todo', 'blocked'}
+            or card.current_run_id is not None or card.worker_pid is not None
+            or record['card_id'] not in parents
+            or not set(candidate.get('repository_parents', [])).issubset(parents)):
+        return False
+    if runs:
+        try:
+            _unstarted_shared_worker_end(intake, candidate, statuses=frozenset({'todo', 'blocked'}))
+        except ManagementError:
+            return False
+    return True
+
+
+def _original_shared_card(intake, record, card):
+    return (card is not None and card.id == record['card_id']
+        and card.assignee == record['target']['native_profile'] and card.workspace_kind == 'dir'
+        and Path(card.workspace_path).resolve(strict=True) == Path(record['target']['repo_path']).resolve(strict=True)
+        and card.title == record['issue']['title'] and card.body == intake._card_body(record))
+
+
 async def run_shared_work(ctx, intake, record, generation):
     from .repository_execution import execution_configuration
     from .repository_supervision import current_worker, native_call, owned_call, original_history, execution_event_references
@@ -2977,9 +3009,12 @@ async def run_shared_work(ctx, intake, record, generation):
         pending_continuation = continuation.get('status') == 'admitted' and continuation.get('dispatch_status') == 'accepted'
         if execution.get('stop_requested') or execution['state'] in {'budget_stopped', 'stopped'} or execution['state'] == 'execution_failed' and not pending_continuation:
             return {'status': execution['state'], 'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
+        from .queue import logical_repository
+        repository_key = logical_repository(record['target']['repo_path'])
         occupied = [row for row in intake.snapshot()['work'] if row['id'] != record['id']
-            and row['target'].get('repo_path') == record['target']['repo_path']
-            and row.get('dsh_execution', {}).get('state') not in {None, 'admitted', 'stopped', 'released'}]
+            and row.get('dsh_execution', {}).get('state') not in {None, 'admitted', 'stopped', 'released'}
+            and logical_repository(row['target']['repo_path']) == repository_key
+            and not _waiting_repository_successor(intake, record, row)]
         if occupied:
             raise ManagementError('repository_busy', 'Earlier work retains this repository.')
         if 'generation' not in execution:
@@ -3357,6 +3392,24 @@ async def run_shared_work(ctx, intake, record, generation):
             carrier.close()
 
 
+def _terminal_shared_job_notices(carrier, execution, inbox, jobs):
+    receipts = shared_receipts(carrier.config, execution, '.tools.jsonl')
+    background = {row.get('job_id') for row in receipts if row.get('name') == 'bash'
+        and row.get('kind') in {'background', 'promoted'} and row.get('execution_admission') == 'admitted'}
+    registered = {row['job_id'] for row in shared_receipts(carrier.config, execution, '.jobs.jsonl')
+        if row['type'] == 'registered' and row.get('owner') == execution['session_id']}
+    return (isinstance(inbox, dict) and set(inbox) == {'next-turn', 'next-step'}
+        and inbox['next-turn'] == [] and isinstance(inbox['next-step'], list) and bool(inbox['next-step'])
+        and bool(jobs) and all(job['status'] in {'completed', 'killed', 'failed'}
+            and job['id'] in registered and job['id'] in background for job in jobs)
+        and all(isinstance(item, dict) and item.get('role') == 'user'
+            and isinstance(item.get('id'), str) and bool(item['id']) and isinstance(item.get('source'), dict)
+            and set(item['source']) == {'kind', 'form', 'summary'}
+            and item['source'].get('kind') == 'tool-jobs' and item['source'].get('form') == 'notice'
+            and isinstance(item['source'].get('summary'), str) and bool(item['source']['summary'])
+            for item in inbox['next-step']))
+
+
 async def end_shared_background(intake, record, message_id, generation):
     """End registered background jobs after foreground completion; retain the work."""
     from .repository_control import _card, _worker_end
@@ -3431,17 +3484,7 @@ async def end_shared_background(intake, record, message_id, generation):
                 if row['type'] == 'registered' and row.get('owner') == execution['session_id']}
             inbox = projections.get('inbox')
             if inbox != {'next-turn': [], 'next-step': []}:
-                if (not isinstance(inbox, dict) or set(inbox) != {'next-turn', 'next-step'}
-                        or inbox['next-turn'] != [] or not isinstance(inbox['next-step'], list) or not inbox['next-step']
-                        or not jobs or any(job['status'] not in {'completed', 'killed', 'failed'}
-                            or job['id'] not in registered or job['id'] not in background for job in jobs)
-                        or any(not isinstance(item, dict) or item.get('role') != 'user'
-                            or not isinstance(item.get('id'), str) or not item['id']
-                            or not isinstance(item.get('source'), dict)
-                            or set(item['source']) != {'kind', 'form', 'summary'}
-                            or item['source'].get('kind') != 'tool-jobs' or item['source'].get('form') != 'notice'
-                            or not isinstance(item['source'].get('summary'), str) or not item['source']['summary']
-                            for item in inbox['next-step'])):
+                if not _terminal_shared_job_notices(carrier, execution, inbox, jobs):
                     raise ManagementError('outcome_unknown', 'Foreign or unconfirmed input in the shared Session was preserved.')
                 execution['stop_control'] = control
                 for item in inbox['next-step']:
@@ -3507,6 +3550,42 @@ async def end_shared_background(intake, record, message_id, generation):
         carrier.close()
 
 
+def _unstarted_shared_worker_end(intake, record, *, statuses=frozenset({'blocked', 'triage'})):
+    """Close only a native worker which ended before any DSH creation intent."""
+    import psutil
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from gateway.drain_control import current_instantiation_epoch
+    from gateway.status import get_process_start_time
+    execution = record['dsh_execution']
+    if (execution.get('mode') != 'shared_native' or any(execution.get(key) for key in
+            ('generation', 'session_id', 'request_id', 'first_input', 'native_identity', 'supervisor_claim',
+             'baseline', 'workspace_id', 'session_created_at', 'github_reference'))):
+        raise ManagementError('outcome_unknown', 'Original pre-input worker scope is unverified.')
+    with connect_closing(board=intake.board) as connection:
+        card = kb.get_task(connection, record['card_id'])
+        runs = kb.list_runs(connection, record['card_id'])
+        events = kb.list_events(connection, record['card_id'])
+    if (not _original_shared_card(intake, record, card) or card.status not in statuses or card.current_run_id is not None
+            or card.worker_pid is not None or len(runs) != 1 or runs[0].ended_at is None
+            or runs[0].status == 'running' or runs[0].profile != record['target']['native_profile']):
+        raise ManagementError('outcome_unknown', 'Original pre-input worker end is unverified.')
+    spawned = [event.payload for event in events if event.run_id == runs[0].id and event.kind == 'spawned']
+    if (len(spawned) != 1 or type(spawned[0].get('pid')) is not int or spawned[0]['pid'] <= 0
+            or not isinstance(spawned[0].get('started_at'), str) or '|' not in spawned[0]['started_at']
+            or not spawned[0]['started_at'].split('|', 1)[1]):
+        raise ManagementError('outcome_unknown', 'Original pre-input worker birth is unavailable.')
+    identity = spawned[0]
+    if psutil.pid_exists(identity['pid']):
+        current = get_process_start_time(identity['pid'])
+        if current is None or f'{current_instantiation_epoch()}|{current}' == identity['started_at']:
+            raise ManagementError('outcome_unknown', 'Original pre-input worker process remains unconfirmed.')
+    text = kb.read_worker_log(card.id, tail_bytes=4000, board=intake.board)
+    if not isinstance(text, str) or re.findall(r'^\[kanban-worker-exit\] rc=(-?\d+)\s*$', text, re.MULTILINE) != ['0']:
+        raise ManagementError('outcome_unknown', 'Original pre-input worker has no unique successful native exit.')
+    return {'run_id': runs[0].id, 'identity': identity, 'exit_code': 0, 'not_started': True}
+
+
 async def stop_shared_work(intake, record, generation):
     from .repository_supervision import owned_call, original_history
     from .repository_control import _card, _worker_end
@@ -3549,10 +3628,15 @@ async def stop_shared_work(intake, record, generation):
                 submitted.update(control.get('request_id') for control in execution.get('owner_context_history', []))
                 submitted.update(question.get('request_id') for question in execution.get('questions', []))
                 submitted.discard(None)
+                jobs = await asyncio.to_thread(carrier.owned_jobs)
+                notices = [item for item in inbox['next-step'] if item.get('source', {}).get('kind') == 'tool-jobs']
+                if (any(item.get('source', {}).get('kind') != 'user'
+                        or item.get('source', {}).get('rpcId') not in submitted
+                        for item in [*inbox['next-turn'], *inbox['next-step']] if item not in notices)
+                        or notices and not _terminal_shared_job_notices(carrier, execution,
+                            {'next-turn': [], 'next-step': notices}, jobs)):
+                    raise ManagementError('outcome_unknown', 'Foreign input in the shared Session was preserved.')
                 for item in [*inbox['next-turn'], *inbox['next-step']]:
-                    source = item.get('source', {})
-                    if source.get('kind') != 'user' or source.get('rpcId') not in submitted:
-                        raise ManagementError('outcome_unknown', 'Foreign input in the shared Session was preserved.')
                     removed = control.setdefault('queue_remove', {})
                     if removed.get(item['id']) == 'intent':
                         raise ManagementError('outcome_unknown', 'Owned queued input removal was not confirmed; no replay.')
@@ -3565,7 +3649,6 @@ async def stop_shared_work(intake, record, generation):
                             raise ManagementError('outcome_unknown', 'Owned shared pending input removal was not confirmed.')
                         removed[item['id']] = 'accepted'
                         intake._save_execution(record, fields=['stop_control'])
-                jobs = await asyncio.to_thread(carrier.owned_jobs)
                 registered = {row['job_id'] for row in shared_receipts(carrier.config, execution, '.jobs.jsonl')
                               if row['type'] == 'registered' and row.get('owner') == execution['session_id']}
                 for job in jobs:
@@ -3614,14 +3697,33 @@ async def stop_shared_work(intake, record, generation):
             except ManagementError as error:
                 if error.code != 'outcome_unknown':
                     raise
+                if not execution.get('generation') and not execution.get('session_id'):
+                    worker = _unstarted_shared_worker_end(intake, record)
+                    break
             await asyncio.sleep(.05)
         else:
             raise ManagementError('outcome_unknown', 'The original outer worker exit is unconfirmed.')
         source = await asyncio.to_thread(repository_source_state, record['target'])
         await asyncio.to_thread(cleanup_shared_github, intake, record)
-        control.update(status='stopped', proof={'session': proof, 'worker': worker, 'repository': source})
-        execution.update(state='stopped', stop_control=control)
-        intake._save_execution(record, fields=['state', 'stop_control'])
+        descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            lock_deadline = time.monotonic() + SHARED_INTAKE_LOCK_TIMEOUT_SECONDS
+            while not _try_shared_intake_lock(intake, descriptor, generation, lock_deadline):
+                await asyncio.sleep(.02)
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(board=intake.board) as connection:
+                card = kb.get_task(connection, record['card_id'])
+                if card is None or card.current_run_id is not None or card.worker_pid is not None or card.status not in {'blocked', 'triage'}:
+                    raise ManagementError('outcome_unknown', 'The stopped original outer card changed before archival.')
+                if not kb.archive_task(connection, record['card_id']):
+                    raise ManagementError('outcome_unknown', 'Original stopped outer card archival is unconfirmed.')
+            control.update(status='stopped', proof={'session': proof, 'worker': worker, 'repository': source})
+            execution.update(state='stopped', stop_control=control)
+            intake._save_execution(record, fields=['state', 'stop_control'])
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
         return record
     finally:
         if carrier is not None:

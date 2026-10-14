@@ -2260,7 +2260,86 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
-@pytest.mark.parametrize('scenario', ['terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata', 'qa_preinput_retry', 'supervision_checkpoints', 'qa_request_only_resume', 'background_cleanup', 'background_cleanup_ended_worker', 'background_cleanup_unknown_stop', 'background_cleanup_secret_stop', 'background_cleanup_foreign_notice'])
+@pytest.mark.parametrize('change', ['rc1', 'same_birth_live', 'generation_intent', 'input_intent'])
+def test_shared_preinput_stop_read_facts_fail_closed(tmp_path, monkeypatch, change):
+    """Adverse read facts; public_entry[repository_preinput_stop] is the canonical native proof."""
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'home'))
+    monkeypatch.syspath_prepend(os.environ['HERMES_TEST_SDK_ROOT'])
+    from hermes_cli import kanban_db as kb, kanban_db_connect
+    from gateway.drain_control import current_instantiation_epoch
+    from gateway.status import get_process_start_time
+    from ghost_hermes_pm.shared_repository import _unstarted_shared_worker_end
+    from ghost_hermes_pm.manager import ManagementError
+    child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+    try:
+        identity = {'pid': child.pid, 'started_at': f'{current_instantiation_epoch()}|{get_process_start_time(child.pid)}'}
+        if change != 'same_birth_live':
+            child.communicate(b'')
+            assert child.returncode == 0
+        execution = {'mode': 'shared_native', 'state': 'outcome_unknown'}
+        if change == 'generation_intent':
+            execution['generation'] = 'fixture-creation-intent'
+        elif change == 'input_intent':
+            execution['first_input'] = 'intent'
+        record = {'card_id': 'fixture-card', 'target': {'repo_path': str(tmp_path), 'native_profile': 'fixture-worker'},
+            'issue': {'title': 'Frozen original work', 'body': 'Frozen original body'},
+            'dsh_execution': execution}
+        card = SimpleNamespace(id='fixture-card', status='blocked', current_run_id=None, worker_pid=None,
+            assignee='fixture-worker', workspace_kind='dir', workspace_path=str(tmp_path),
+            title=record['issue']['title'], body=record['issue']['body'])
+        run = SimpleNamespace(id=17, profile='fixture-worker', status='blocked', ended_at=100)
+        event = SimpleNamespace(run_id=17, kind='spawned', payload=identity)
+        @contextmanager
+        def connect_closing(*, board):
+            assert board == 'fixture-board'
+            yield None
+        monkeypatch.setattr(kanban_db_connect, 'connect_closing', connect_closing)
+        monkeypatch.setattr(kb, 'get_task', lambda *_: card)
+        monkeypatch.setattr(kb, 'list_runs', lambda *_: [run])
+        monkeypatch.setattr(kb, 'list_events', lambda *_: [event])
+        monkeypatch.setattr(kb, 'read_worker_log', lambda *_args, **_kwargs:
+            '[kanban-worker-exit] rc=' + ('1' if change == 'rc1' else '0') + '\n')
+        intake = SimpleNamespace(board='fixture-board', _card_body=lambda row: row['issue']['body'])
+        before = json.dumps(record, sort_keys=True)
+        with pytest.raises(ManagementError) as caught:
+            _unstarted_shared_worker_end(intake, record)
+        assert caught.value.code == 'outcome_unknown'
+        assert json.dumps(record, sort_keys=True) == before
+    finally:
+        if child.poll() is None:
+            child.communicate(b'')
+
+
+def test_waiting_repository_successor_uses_native_reads_inside_owned_worker(tmp_path, monkeypatch):
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'home'))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path / 'home'))
+    monkeypatch.setenv('HERMES_BUNDLED_PLUGINS', str(tmp_path / 'empty-bundled'))
+    monkeypatch.setenv('HERMES_SKIP_PM_BOOTSTRAP', '1')
+    monkeypatch.setenv('HERMES_DISABLE_PROJECT_PLUGINS', '1')
+    monkeypatch.syspath_prepend(os.environ['HERMES_TEST_SDK_ROOT'])
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from ghost_hermes_pm.simple_development import RepositoryIntake
+    from ghost_hermes_pm.shared_repository import _waiting_repository_successor
+    intake = object.__new__(RepositoryIntake)
+    intake.board = 'default'
+    target = {'repo_path': str(tmp_path), 'native_profile': 'fixture-worker', 'execution_ref': 'fixture-ref'}
+    parent = {'target': dict(target), 'issue': {'title': 'Earlier task', 'body': 'Frozen earlier scope',
+        'url': 'https://github.com/fixture-user/fixture/issues/1'}}
+    candidate = {'target': dict(target), 'issue': {'title': 'Queued task', 'body': 'Frozen later scope',
+        'url': 'https://github.com/fixture-user/fixture/issues/2'}, 'dsh_execution': {'mode': 'shared_native', 'state': 'admitted'}}
+    with connect_closing(board=intake.board) as db:
+        parent['card_id'] = kb.create_task(db, title=parent['issue']['title'], body=intake._card_body(parent),
+            assignee=target['native_profile'], workspace_kind='dir', workspace_path=str(tmp_path), project_id='', initial_status='blocked')
+        candidate['card_id'] = kb.create_task(db, title=candidate['issue']['title'], body=intake._card_body(candidate),
+            assignee=target['native_profile'], workspace_kind='dir', workspace_path=str(tmp_path), project_id='',
+            initial_status='blocked', parents=[parent['card_id']])
+        assert kb.unblock_task(db, candidate['card_id'])
+    monkeypatch.setenv('HERMES_KANBAN_TASK', parent['card_id'])
+    assert _waiting_repository_successor(intake, parent, candidate) is True
+
+
+@pytest.mark.parametrize('scenario', ['repository_preinput_stop', 'repository_preinput_unverified', 'background_cleanup_whole_stop', 'repository_queue', 'terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata', 'qa_preinput_retry', 'supervision_checkpoints', 'qa_request_only_resume', 'background_cleanup', 'background_cleanup_ended_worker', 'background_cleanup_unknown_stop', 'background_cleanup_secret_stop', 'background_cleanup_foreign_notice'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])
@@ -2274,7 +2353,7 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
             shutil.copytree(root / name, plugin / name, ignore=shutil.ignore_patterns('__pycache__'))
         else:
             shutil.copy2(root / name, plugin / name)
-    if scenario == 'supervise_slice' or scenario.startswith('supervise_takeover'):
+    if scenario in {'supervise_slice', 'repository_queue'} or scenario.startswith('supervise_takeover'):
         production = root / 'ghost_hermes_pm/shared_repository.py'
         copied = plugin / 'ghost_hermes_pm/shared_repository.py'
         declaration = 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 300'

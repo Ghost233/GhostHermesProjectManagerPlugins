@@ -18,12 +18,16 @@ if observer_restart:
     shared_scenario = 'terminal'
 supervise_takeover = shared_scenario.startswith('supervise_takeover')
 takeover_case = shared_scenario.removeprefix('supervise_takeover_') if shared_scenario != 'supervise_takeover' else 'valid'
-supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover
+repository_queue = shared_scenario == 'repository_queue'
+preinput_stop = shared_scenario == 'repository_preinput_stop'
+preinput_unverified = shared_scenario == 'repository_preinput_unverified'
+supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover or repository_queue
 background_ended_worker = shared_scenario == 'background_cleanup_ended_worker'
 background_secret = shared_scenario == 'background_cleanup_secret_stop'
 background_unknown = shared_scenario == 'background_cleanup_unknown_stop' or background_secret
 background_foreign_notice = shared_scenario == 'background_cleanup_foreign_notice'
-background_cleanup = shared_scenario == 'background_cleanup' or background_ended_worker or background_unknown or background_foreign_notice
+background_whole_stop = shared_scenario == 'background_cleanup_whole_stop'
+background_cleanup = shared_scenario == 'background_cleanup' or background_ended_worker or background_unknown or background_foreign_notice or background_whole_stop
 supervision_checkpoints = shared_scenario == 'supervision_checkpoints' or background_cleanup
 expired_window = shared_scenario == 'supervise_expired_window'
 if expired_window:
@@ -314,6 +318,7 @@ async def main():
             'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     service.im.v1.message.reply = reply
     worker = None
+    preflight_runs = []
     try:
         material_cases = []
         material_observations = []
@@ -349,8 +354,9 @@ async def main():
             (scratch / 'issue-body-override').write_text('Repair synthetic browser QA.\n'
                 'Historical budget: stop after 30 minutes, 80 model requests and 300000 reported tokens.\n')
         await receive(adapter, raw('om_shared'))
+        primary_id = adapter.intake.snapshot()['work'][0]['id']
         def record():
-            return adapter.intake.snapshot()['work'][0]
+            return next(row for row in adapter.intake.snapshot()['work'] if row['id'] == primary_id)
         service_namespace['record'] = record
         def checkpoint_progress(requests):
             sid = record()['dsh_execution']['session_id']
@@ -377,6 +383,73 @@ async def main():
             os.replace(temporary, path)
             return path
         initial = record()
+        queued = None
+        if repository_queue or background_whole_stop or preinput_stop:
+            await receive(adapter, raw('om_successor', '@_user_1 派发 https://github.com/fixture-user/fixture/issues/8'))
+            queued = adapter.intake.snapshot()['work'][1]
+            assert queued['card_id'] != initial['card_id'] and not queued['dsh_execution'].get('session_id')
+            # Reproduce a persisted pre-input failure from the former ungated
+            # successor worker. Native queued-card facts must prove it cannot run.
+            if repository_queue:
+                with connect_closing() as db:
+                    assert kb.unlink_tasks(db, initial['card_id'], queued['card_id'])
+                queued.pop('repository_parents')
+                adapter.intake._save(queued)
+                initial['dsh_execution']['state'] = 'outcome_unknown'
+                adapter.intake._save_execution(initial, fields=['state'])
+                assert 'error' not in json.loads(registry.dispatch('kanban_block', {
+                    'task_id': initial['card_id'], 'kind': 'needs_input', 'reason': 'Original work requires supervision.'}))
+                model.repeat_supervise = False
+                with connect_closing() as db:
+                    assert dispatch_once(db, max_spawn=1).spawned
+                    worker = remember_worker(db, queued['card_id'])
+                until = time.monotonic() + 15
+                while time.monotonic() < until:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        break
+                    await asyncio.sleep(.05)
+                else:
+                    raise AssertionError('Original historical successor worker did not normally end.')
+                worker = None
+                queued = adapter.intake.snapshot()['work'][1]
+                assert queued['dsh_execution']['state'] == 'outcome_unknown' and not queued['dsh_execution'].get('generation')
+                assert not peer['prompts']
+                assert 'error' not in json.loads(registry.dispatch('kanban_link', {
+                    'parent_id': initial['card_id'], 'child_id': queued['card_id']}))
+                assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': queued['card_id']}))
+                assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
+                # This restored unknown card legitimately permits a handoff;
+                # start the model at supervision, not the unrelated premature block probe.
+                model.worker_steps = 1
+                model.repeat_supervise = True
+                model.worker_terminal_attempt_at = 5
+                model.worker_finish_at = 6
+            if preinput_stop:
+                # Simulate the archive/private-save crash window through the
+                # original native lifecycle, without declaring private release.
+                initial['dsh_execution']['state'] = 'outcome_unknown'
+                adapter.intake._save_execution(initial, fields=['state'])
+                with connect_closing() as db:
+                    assert kb.archive_task(db, initial['card_id'])
+                primary_id = queued['id']
+                initial = queued
+        if preinput_unverified:
+            with connect_closing() as db:
+                claimed = kb.claim_task(db, initial['card_id'])
+                assert claimed
+                assert kb.block_task(db, initial['card_id'], kind='needs_input', reason='Native spawn identity unavailable.')
+            await receive(adapter, raw('om_stop_unverified_preinput', '@_user_1 停止 ' + initial['id']))
+            assert record()['dsh_execution']['state'] != 'stopped'
+            assert record()['dsh_execution']['stop_control']['status'] == 'unverified'
+            assert record()['dsh_execution']['last_failure']['code'] == 'outcome_unknown'
+            assert not peer['prompts'] and not record()['dsh_execution'].get('session_id')
+            with connect_closing() as db:
+                assert kb.get_task(db, initial['card_id']).status == 'blocked'
+            (scratch / 'shared-worker-result.json').write_text(json.dumps({
+                'status': 'passed', 'missing_native_birth_preserved_unknown': True}))
+            return
         compact = json.loads(registry.dispatch('hermes_pm_snapshot', {'work_id': initial['id'], 'section': 'overview'}))
         assert compact['work_id'] == initial['id'] and len(json.dumps(compact)) < 1500
         assert 'dsh_execution' not in compact and 'history' not in compact
@@ -443,6 +516,12 @@ async def main():
             observer_deadline = time.monotonic() + 45
             while time.monotonic() < observer_deadline:
                 current = record()['dsh_execution']
+                if (repository_queue and current['state'] == 'outcome_unknown'
+                        and current.get('last_failure', {}).get('code') == 'repository_busy'):
+                    raise AssertionError('Queued successor blocked its predecessor: ' + json.dumps(current['last_failure']))
+                if repository_queue:
+                    active = json.loads(registry.dispatch('kanban_show', {'task_id': initial['card_id']}))['task']
+                    assert active['status'] == 'running', 'The original fixture worker ended before supervision: ' + json.dumps(active)
                 observer = current.get('shared_event_observer', {})
                 if (observer.get('status') == 'ready' and observer.get('session_id') == current.get('session_id')
                         and observer.get('generation') == current.get('generation')
@@ -483,6 +562,33 @@ async def main():
         supervise_terminal = None
         supervise_ledger = None
         while time.monotonic() < deadline:
+            if preinput_stop and record()['dsh_execution']['state'] == 'outcome_unknown':
+                assert record()['dsh_execution']['last_failure']['code'] == 'repository_busy'
+                assert not peer['prompts'] and not record()['dsh_execution'].get('session_id')
+                model.repeat_supervise = False
+                until = time.monotonic() + 10
+                while time.monotonic() < until:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        break
+                    await asyncio.sleep(.05)
+                else:
+                    raise AssertionError('Original pre-input worker did not normally end.')
+                await receive(adapter, raw('om_stop_preinput', '@_user_1 停止 ' + initial['id']))
+                stopped = record()['dsh_execution']
+                assert stopped['state'] == 'stopped', stopped.get('last_failure')
+                assert stopped['stop_control']['proof']['worker']['not_started'] is True
+                assert stopped['stop_control']['proof']['worker']['exit_code'] == 0
+                assert adapter.intake.snapshot()['work'][0]['dsh_execution']['state'] == 'outcome_unknown'
+                with connect_closing() as db:
+                    assert kb.get_task(db, initial['card_id']).status == 'archived'
+                worker = None
+                (scratch / 'shared-worker-result.json').write_text(json.dumps({
+                    'status': 'passed', 'preinput_original_worker_verified': True, 'archive_crash_window_retained_unknown': True}))
+                return
+            if repository_queue:
+                assert record()['dsh_execution']['state'] != 'outcome_unknown', record()['dsh_execution'].get('last_failure')
             if supervision_checkpoints and peer['prompts'] and checkpoint_ledger is None:
                 checkpoint_ledger = checkpoint_progress(1)
                 checkpoint_first_budget = checkpoint_ledger.read_bytes()
@@ -683,6 +789,21 @@ async def main():
                     assert latest['dsh_execution']['acceptance']['status'] == 'unmet'
                     notices = [message for message in sent if checkpoint['summary'] in message.request_body.content]
                     assert len(notices) == 1 and notices[0].message_id == 'om_shared'
+                    if background_whole_stop:
+                        await receive(adapter, raw('om_whole_stop', '@_user_1 停止 ' + latest['id']))
+                        stopped = record()['dsh_execution']
+                        assert stopped['state'] == 'stopped', stopped.get('last_failure')
+                        assert stopped['stop_control']['queue_remove'] == {'fixture-native-job-notice': 'accepted'}
+                        assert stopped['stop_control']['proof']['worker']['exit_code'] == 0
+                        assert stopped['session_id'] == latest['dsh_execution']['session_id']
+                        with connect_closing() as db:
+                            assert kb.get_task(db, initial['card_id']).status == 'archived'
+                            assert kb.get_task(db, queued['card_id']).status == 'ready'
+                            assert kb.unsatisfied_parents(db, queued['card_id']) == []
+                        worker = None
+                        (scratch / 'shared-worker-result.json').write_text(json.dumps({
+                            'status': 'passed', 'whole_stop_owned_notice': True, 'native_dependency_released': True}))
+                        return
                     if background_ended_worker:
                         model.review_supervision_checkpoints = False
                         model.worker_steps = 3
@@ -903,6 +1024,13 @@ async def main():
                 stopped_results = [result for result in tool_results
                                    if result.get('status') == 'budget_stopped']
                 rejected_results = [result for result in tool_results if result.get('status') == 'unverified']
+                if repository_queue and running_results:
+                    waiting = json.loads(registry.dispatch('kanban_show', {'task_id': queued['card_id']}))
+                    assert initial['card_id'] in waiting['parents']
+                    with connect_closing() as db:
+                        assert kb.claim_task(db, queued['card_id']) is None
+                    assert len(peer['prompts']) == 1 and peer['prompts'][0]['sessionId'] == record()['dsh_execution']['session_id']
+                    assert not adapter.intake.snapshot()['work'][1]['dsh_execution'].get('session_id')
                 if takeover is not None and takeover_case != 'valid' and rejected_results:
                     takeover_rejection = rejected_results[-1]
                     expected_code = ('unauthorized' if takeover_case == 'card' else 'outcome_unknown'
