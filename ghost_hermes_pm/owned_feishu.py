@@ -372,8 +372,12 @@ class OwnedFeishuAdapter(BasePlatformAdapter):
                 reply_to_message_id=getattr(message, 'parent_id', None) or getattr(message, 'upper_message_id', None) or getattr(message, 'root_id', None),
                 timestamp=datetime.now())
             await self._dispatch_inbound_event(event)
-        except Exception:
-            logger.warning('Owned intake not accepted: malformed or unavailable input.')
+        except Exception as exc:
+            frame = exc.__traceback__
+            while frame.tb_next is not None:
+                frame = frame.tb_next
+            logger.warning('Owned intake not accepted: %s at %s:%d; input was not completed.',
+                           type(exc).__name__, frame.tb_frame.f_code.co_name, frame.tb_lineno)
 
     def build_source(self, chat_id, **fields):
         owner = getattr(self, '_owner_profile', None)

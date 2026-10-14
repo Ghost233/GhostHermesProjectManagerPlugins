@@ -417,6 +417,26 @@ assert not authorization._adapter_extra_allowlist_authorizes(source,'u_unknown',
 ''')
 
 
+def test_owned_receive_failure_reports_location_without_message_or_credentials(tmp_path):
+    _sdk_business_case(tmp_path, r'''
+import logging
+logs=[]
+class Capture(logging.Handler):
+ def emit(self,record):logs.append(record.getMessage())
+logging.getLogger().addHandler(Capture());logging.getLogger().setLevel(logging.WARNING)
+async def failed_dispatch(event):
+ raise RuntimeError('synthetic-secret private-owner-body Authorization: Bearer synthetic-token')
+adapter._dispatch_inbound_event=failed_dispatch
+raw={'header':{'app_id':'cli_synthetic','tenant_key':'tenant_app','event_type':'im.message.receive_v1'},'event':{
+ 'sender':{'sender_id':{'open_id':'ou_owner','user_id':'u_owner'},'sender_type':'user','tenant_key':'tenant_owner'},
+ 'message':{'message_id':'om_failure','chat_id':'oc_group','chat_type':'group','message_type':'text','content':json.dumps({'text':'@_user_1 private-owner-body'}),
+ 'mentions':[{'key':'@_user_1','tenant_key':'tenant_bot','mentioned_type':'bot','id':{'open_id':'ou_target'}}]}}}
+asyncio.run(adapter.receive_payload(raw))
+assert any('RuntimeError at failed_dispatch:' in line for line in logs), logs
+assert not any(marker in '\n'.join(logs) for marker in ['synthetic-secret','private-owner-body','synthetic-token','oc_group','om_failure','ou_owner'])
+''')
+
+
 @pytest.mark.parametrize('extra,accepted', [
     ({'group_rules': {'oc_group': {'policy': 'disabled'}}}, False),
     ({'default_group_policy': 'disabled'}, False),
