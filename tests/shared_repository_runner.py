@@ -30,7 +30,8 @@ unstarted_stop = shared_scenario == 'repository_unstarted_stop' or unstarted_rea
 preinput_unverified = shared_scenario == 'repository_preinput_unverified'
 supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover or repository_queue or blocked_question_takeover
 background_later_worker = shared_scenario == 'background_cleanup_later_worker'
-background_ended_worker = shared_scenario == 'background_cleanup_ended_worker' or background_later_worker
+background_failed_worker = shared_scenario == 'background_cleanup_failed_worker'
+background_ended_worker = shared_scenario == 'background_cleanup_ended_worker' or background_later_worker or background_failed_worker
 background_secret = shared_scenario == 'background_cleanup_secret_stop'
 background_unknown = shared_scenario == 'background_cleanup_unknown_stop' or background_secret
 background_foreign_notice = shared_scenario == 'background_cleanup_foreign_notice'
@@ -981,18 +982,30 @@ async def main():
                         return
                     if background_ended_worker:
                         model.review_supervision_checkpoints = False
-                        model.worker_steps = 3
-                        model.worker_finish_at = 5
+                        if background_failed_worker:
+                            model.fail_worker_after = model.worker_steps + 1
+                        else:
+                            model.worker_steps = 3
+                            model.worker_finish_at = 5
                         until = time.monotonic() + 10
                         while time.monotonic() < until:
                             waited, status = os.waitpid(worker['pid'], os.WNOHANG)
                             if waited:
-                                assert os.waitstatus_to_exitcode(status) == 0
+                                assert (os.waitstatus_to_exitcode(status) != 0) is background_failed_worker
                                 old_claim = record()['dsh_execution']['supervisor_claim']
                                 worker = None
                                 break
                             await asyncio.sleep(.05)
                         assert worker is None, 'The original preview supervisor did not normally block and exit.'
+                        if background_failed_worker:
+                            model.fail_worker_after = None
+                            os.environ['HERMES_KANBAN_CRASH_GRACE_SECONDS'] = '0'
+                            with connect_closing() as db:
+                                dispatch_once(db, max_spawn=0)
+                                failed_run = kb.get_run(db, old_claim['run_id'])
+                                assert failed_run.status in {'failed', 'crashed', 'timed_out', 'gave_up'}
+                            assert 'error' not in json.loads(registry.dispatch('kanban_block', {
+                                'task_id': initial['card_id'], 'kind': 'needs_input', 'reason': 'Owner ends the failed original work.'}))
                         if background_later_worker:
                             model.repeat_supervise = False
                             model.worker_steps = 1
@@ -1112,6 +1125,21 @@ async def main():
                     assert any(item.get('source', {}).get('kind') == 'tool-jobs' for row in peer['journals'][sid]
                         if row['event']['type'] == 'agent/inbox/spliced' for item in row['event']['data'].get('inserted', []))
                     assert not record()['dsh_execution'].get('stop_requested')
+                    if background_failed_worker:
+                        proof = cleanup['stop_control']['proof']['worker']
+                        assert proof['exit_code'] is None and any(code != 0 for code in proof['exit_receipts'])
+                        assert old_claim['run_id'] in proof['native_failed_run_ids']
+                        assert cleanup['acceptance']['status'] != 'accepted'
+                        await receive(adapter, raw('om_stop_failed_original', '@_user_1 停止 ' + latest['id']))
+                        stopped = record()['dsh_execution']
+                        assert stopped['state'] == 'stopped', stopped.get('last_failure')
+                        assert stopped['stop_control']['proof']['worker']['exit_code'] is None
+                        assert stopped['acceptance']['status'] != 'accepted' and len(peer['prompts']) == 1
+                        with connect_closing() as db:
+                            assert kb.get_task(db, initial['card_id']).status == 'archived'
+                        (scratch / 'shared-worker-result.json').write_text(json.dumps({
+                            'status': 'passed', 'actual_failed_worker_exit_preserved': True, 'no_false_delivery': True}))
+                        return
                     if background_later_worker:
                         assert cleanup['stop_control']['proof']['worker']['run_id'] == old_claim['run_id']
                         await receive(adapter, raw('om_stop_after_later_worker', '@_user_1 停止 ' + latest['id']))

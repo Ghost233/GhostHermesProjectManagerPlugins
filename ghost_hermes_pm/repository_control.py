@@ -36,7 +36,7 @@ def _unspawned_block_run(run, events):
         and rows[0].payload.get('source_status') == 'ready')
 
 
-def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, allow_later_terminal=False):
+def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, allow_later_terminal=False, allow_failed_exit=False):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
     from .trusted_controller import controller_identity
@@ -120,7 +120,11 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, al
                 receipt = re.fullmatch(rb'\[kanban-worker-exit\] rc=(-?\d+)\s*', line)
                 if receipt:
                     codes.append(receipt.group(1))
-        if len(codes) != 1 + sum(not proof.get('not_started') for proof in later_proofs) or any(code != b'0' for code in codes):
+        failed_run_ids = [candidate.id for candidate in [run, *later_runs]
+            if candidate.status in {'crashed', 'timed_out', 'failed', 'gave_up'}]
+        nonzero_count = sum(code != b'0' for code in codes)
+        if (len(codes) != 1 + sum(not proof.get('not_started') for proof in later_proofs)
+                or nonzero_count and (not allow_failed_exit or nonzero_count > len(failed_run_ids))):
             raise ManagementError('outcome_unknown', 'Original and later worker exit receipts are incomplete or unsuccessful.')
     else:
         text = kb.read_worker_log(card.id, tail_bytes=min(4000, size - offset), board=intake.board)
@@ -130,6 +134,13 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, al
         if not codes or codes[-1] != '0':
             raise ManagementError('outcome_unknown', 'The original worker has no successful native exit receipt.')
     proof = {'run_id': run.id, 'identity': identity, 'exit_code': 0}
+    if allow_later_terminal and nonzero_count:
+        # Native log trailers have no run IDs. Preserve failure without assigning
+        # a later successful trailer to the original worker.
+        proof.update(exit_code=None, exit_receipts=[int(code) for code in codes],
+            native_failed_run_ids=failed_run_ids, exit_receipts_unattributed=True)
+        for later in later_proofs:
+            later['exit_code'] = None
     if later_proofs:
         proof['later_runs'] = later_proofs
     return proof

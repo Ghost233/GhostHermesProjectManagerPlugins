@@ -3683,7 +3683,7 @@ async def end_shared_background(intake, record, message_id, generation):
                 or controller_identity(active.worker_pid) != claim['identity']):
             raise ManagementError('binding_conflict', 'The original background supervisor claim changed.')
     else:
-        worker = _worker_end(intake, record, allow_later_terminal=True)
+        worker = _worker_end(intake, record, allow_later_terminal=True, allow_failed_exit=True)
     carrier = shared_attach(intake, record, observe=False)
     try:
         budget = read_ledger(carrier.config, execution)
@@ -3953,7 +3953,7 @@ async def stop_shared_work(intake, record, generation):
             while time.monotonic() < deadline:
                 intake.require_active(generation)
                 try:
-                    worker = await asyncio.to_thread(_worker_end, intake, record, allow_later_terminal=True)
+                    worker = await asyncio.to_thread(_worker_end, intake, record, allow_later_terminal=True, allow_failed_exit=True)
                     break
                 except ManagementError as error:
                     if error.code != 'outcome_unknown':
