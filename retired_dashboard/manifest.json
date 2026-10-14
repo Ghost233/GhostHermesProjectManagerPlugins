@@ -1,0 +1,1 @@
+{"name":"ghost-hermes-pm","label":"Projects","description":"Project and Profile directory; execution capabilities remain disabled until verified.","icon":"FolderGit2","version":"0.1.0","tab":{"path":"/ghost-hermes-pm","position":"end"},"entry":"dist/index.js","api":"plugin_api.py"}

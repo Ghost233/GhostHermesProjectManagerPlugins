@@ -1,0 +1,158 @@
+// One instance-local composition over the unmodified original DSH public APIs.
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import {pathToFileURL} from 'node:url';
+
+export async function bootOwnedRuntime(config) {
+  for (const binding of config.source_bindings ?? []) {
+    const resolved = fs.realpathSync(binding.path);
+    const info = fs.statSync(resolved, {bigint: true});
+    if (resolved !== binding.resolved || String(info.dev) !== binding.device || String(info.ino) !== binding.inode
+        || binding.sha256 && crypto.createHash('sha256').update(fs.readFileSync(resolved)).digest('hex') !== binding.sha256) {
+      throw new Error('Original owned source identity changed.');
+    }
+  }
+  const home = fs.lstatSync(config.dsh_home, {bigint: true});
+  if (!home.isDirectory() || home.uid !== BigInt(process.getuid()) || (home.mode & 0o077n) !== 0n
+      || fs.realpathSync(config.dsh_home) !== config.dsh_home) throw new Error('Owned home is not private.');
+  const {runProfile} = await import(pathToFileURL(path.join(config.runtime_package_root, '@deepseek-ai/dsh/lib/profile-boot.js')));
+  const {createLaunchEnvironmentSnapshot} = await import(pathToFileURL(path.join(config.runtime_package_root, '@deepseek-ai/dsh-launch-environment/lib/index.js')));
+  const disabled = ['preset-standard', 'preset-minimal', 'preset-ptc', 'preset-cordis', 'terminal-controller', 'ui-sidebar-terminal',
+    'cordis-host-runner', 'cordis-client-runner', 'cordis-inspect-providers', 'ui-cordis', 'ui-plugin-manager', 'tool-plugin-manager',
+    'schedule', 'ui-schedule', 'mcp-resources', 'session-title-llm', 'tool-working-directory', 'permission', 'webserver', 'web-runtime'];
+  const plugins = [
+    {id: 'persona', name: '@deepseek-ai/dsh-persona', config: {prefix: 'Work in the bound repository. Follow its instructions and the installed Matt workflow. Report real tool results and ask the user about unresolved decisions.', complete: true, includeRuntimeContext: false}},
+    {id: 'tool-bash', name: '@deepseek-ai/dsh-tool-bash', config: {enableRunInBackground: true, promoteOnTimeout: true}},
+    {id: 'tool-jobs', name: '@deepseek-ai/dsh-tool-jobs', config: {completionDelivery: 'quiet'}},
+    {id: 'tool-ask-user', name: '@deepseek-ai/dsh-tool-ask-user', config: {mode: 'timed', timeout: 15}},
+  ];
+  const settings = config.runtime_configuration ?? {};
+  if (settings.skill_directories?.length) plugins.push(
+    {id: 'skill-filesystem', name: '@deepseek-ai/dsh-skill-filesystem', config: {customSkillDirs: settings.skill_directories, includeDefaultRoots: false, watch: false}},
+    {id: 'tool-skill', name: '@deepseek-ai/dsh-tool-skill'},
+  );
+  const overlay = [
+    ...disabled.map(id => ({id, disabled: true})),
+    {id: 'tools', config: {mode: 'native'}},
+    {id: 'sandbox-policy', config: {mode: 'workspace-write', workspaceRoot: config.workspace}},
+    {id: 'agent-preset-registry', config: {default: 'hermes-owned', selectedDefault: 'hermes-owned'}},
+    {insert: [
+      {id: 'owned-permission', name: '@deepseek-ai/dsh-permission-presets', config: {presets: {
+        'read-only': {sandbox: 'read-only', approval: 'ask'}, 'workspace-write': {sandbox: 'workspace-write', approval: 'ask'}}}},
+      {id: 'preset-hermes-owned', name: '@deepseek-ai/dsh-agent-preset', config: {id: 'hermes-owned', plugins}},
+    ]},
+  ];
+  if (settings.model) overlay.push(
+    {id: 'agent-default-model', config: {provider: settings.model.provider, model: settings.model.model}},
+    {id: 'llm-pi-ai', config: {providers: {[settings.model.provider]: settings.model.configuration}}},
+  );
+  const patch = path.join(config.dsh_home, '.hermes-owned-overlay.json');
+  fs.writeFileSync(patch, JSON.stringify(overlay), {mode: 0o600});
+  const runtime = await runProfile({environment: createLaunchEnvironmentSnapshot([{source: 'process', values: {...process.env}}]),
+    profile: 'hermes-owned', patchFiles: [patch], args: ['--host', '127.0.0.1', '--port', '0'],
+    ...(!fs.existsSync(path.join(config.dsh_home, 'profiles/hermes-owned/package.json')) ? {fromDefaultProfile: 'web'} : {}),
+  });
+  const inventory = await runtime.ctx.get('agentPresets').compositionInventory();
+  if (inventory.length !== 1 || inventory[0].id !== 'hermes-owned' || inventory[0].broken
+      || runtime.ctx.get('shell').sandboxMode !== 'workspace-write'
+      || ['terminalController', 'dynamicCordisRunner', 'cordisInspect', 'webServer', 'webRuntime'].some(name => runtime.ctx.get(name) !== undefined)) {
+    await runtime.shutdown.shutdown(1);
+    throw new Error('The original owned composition is unavailable.');
+  }
+  const rejectedCalls = new Set();
+  const release = runtime.ctx.get('tools').guard(exec => {
+    const reject = reason => {rejectedCalls.add(exec.callId); return reason;};
+    if (!['bash', 'job_kill', 'job_list', 'job_output', 'ask_user_question', ...(settings.skill_directories?.length ? ['skill'] : [])].includes(exec.name)) return reject('Unverified owned capability rejected.');
+    const session = exec.agent?.session;
+    if (!session || session.id !== config.session_id || !session.header.cwd
+        || fs.realpathSync(session.header.cwd) !== config.workspace) return reject('Owned Session binding rejected.');
+    const policy = runtime.ctx.get('sandboxPolicy').resolve({session});
+    if (!['read-only', 'workspace-write'].includes(policy.mode)) return reject('Unsupported sandbox rejected.');
+    if (exec.arguments?.sandbox_permissions === 'danger-full-access') return reject('Danger permission rejected.');
+    if (['job_kill', 'job_output'].includes(exec.name)) {
+      try {
+        if (runtime.ctx.get('jobs').get(exec.arguments?.job_id, config.session_id).owner !== config.session_id) return reject('Unowned job rejected.');
+      } catch {return reject('Foreign or absent job rejected.');}
+    }
+  });
+  runtime.ctx.effect(() => release);
+  const jobs = runtime.ctx.get('jobs');
+  if (!jobs?.events?.subscribe || typeof runtime.ctx.get('subprocess')?.disposeManagedProcesses !== 'function') {
+    await runtime.shutdown.shutdown(1);
+    throw new Error('Original managed lifecycle is unavailable.');
+  }
+  jobs.events.subscribe({owner: config.session_id}, event => {
+    if (!['registered', 'settled', 'removed'].includes(event.type) || event.job?.owner !== config.session_id) return;
+    const row = {generation: config.generation, session_id: config.session_id, type: event.type,
+      job_id: event.job.id, owner: event.job.owner, kind: event.job.kind, status: event.job.status,
+      command_sha256: crypto.createHash('sha256').update(event.job.label).digest('hex'),
+      started_at_ms: event.job.startedAt, finished_at_ms: event.job.finishedAt,
+      ...(event.type === 'settled' ? {cause: event.cause} : {})};
+    fs.appendFileSync(path.join(config.dsh_home, '.hermes-native-jobs.jsonl'), JSON.stringify(row) + '\n', {mode: 0o600});
+  });
+  runtime.ctx.on('tools/result', (exec, result) => {
+    if (exec.agent?.session?.id !== config.session_id) return;
+    const value = result.value;
+    const command = typeof exec.arguments?.command === 'string' ? exec.arguments.command : null;
+    const credential = settings.model?.configuration?.apiKeyEnv && process.env[settings.model.configuration.apiKeyEnv];
+    const sensitiveCommand = command && (credential && command.includes(credential)
+      || /(?:password|passwd|secret|token|api[_ -]?key|private[_ -]?key)\s*[:=]\s*\S+|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+|sk-[A-Za-z0-9_-]{16,}|-----BEGIN[^\n]*PRIVATE KEY/i.test(command));
+    const output = part => ({sha256: crypto.createHash('sha256').update(part.text).digest('hex'),
+      byte_length: Buffer.byteLength(part.text), truncated: part.truncated});
+    const row = {generation: config.generation, session_id: config.session_id, call_id: exec.callId,
+      name: exec.name, is_error: result.isError, execution_admission: rejectedCalls.has(exec.callId) ? 'rejected' : 'admitted',
+      ...(exec.name === 'bash' ? {cwd: exec.agent.session.header.cwd,
+        command_sha256: crypto.createHash('sha256').update(command ?? '').digest('hex'),
+        ...(!sensitiveCommand ? {command} : {command_omitted: 'sensitive'})} : {}),
+      ...(['background', 'promoted'].includes(value?.kind) ? {kind: value.kind, job_id: value.jobId} : {}),
+      ...(value?.kind === 'foreground' ? {kind: value.kind, exit_code: value.exitCode,
+        sandbox: value.sandbox, aborted: value.aborted, timed_out: value.timedOut,
+        stdout: output(value.stdout), stderr: output(value.stderr)} : {}),
+      ...(exec.name === 'skill' && typeof value?.name === 'string' ? {skill_name: value.name,
+        skill_content_sha256: typeof value.content === 'string' ? crypto.createHash('sha256').update(value.content).digest('hex') : null} : {})};
+    fs.appendFileSync(path.join(config.dsh_home, '.hermes-tool-receipts.jsonl'), JSON.stringify(row) + '\n', {mode: 0o600});
+  });
+  if (settings.budget) {
+    const budget = settings.budget;
+    const statePath = path.join(config.dsh_home, '.hermes-budget.json');
+    const state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8'))
+      : {generation: config.generation, started_at_ms: null, requests: 0, stop_reason: null, usage: null};
+    if (state.generation !== config.generation) {await runtime.shutdown.shutdown(1); throw new Error('Original budget generation changed.');}
+    const save = () => fs.writeFileSync(statePath, JSON.stringify(state), {mode: 0o600});
+    const readUsage = session => runtime.ctx.get('sessionProjections').stateOf(session, 'tokenUsage');
+    const stopped = agent => {
+      if (state.stop_reason) {agent.cancel({kind: 'hook', reason: state.stop_reason}, {keepInbox: false}); return true;}
+      if (state.started_at_ms !== null && Date.now() - state.started_at_ms >= budget.max_wall_seconds * 1000) {
+        state.stop_reason = 'owned-budget-deadline'; save();
+        agent.cancel({kind: 'hook', reason: state.stop_reason}, {keepInbox: false}); return true;
+      }
+      return false;
+    };
+    runtime.ctx.on('agent/request', async (payload, next) => {
+      const agent = payload.agent;
+      if (agent.session.id !== config.session_id) throw new Error('Owned model Session differs.');
+      if (state.started_at_ms === null) state.started_at_ms = Date.now();
+      state.usage = readUsage(agent.session) ?? null;
+      const totals = state.usage?.totals;
+      const knownTokens = totals ? totals.uncachedInputTokens + totals.outputTokens + totals.cacheReadTokens + totals.cacheWriteTokens : null;
+      if (state.requests >= budget.max_model_requests || knownTokens !== null && knownTokens >= budget.max_reported_tokens) {
+        state.stop_reason = 'owned-budget-observed-limit'; save();
+      }
+      if (stopped(agent)) throw new Error('Owned budget stopped this work.');
+      const request = await next();
+      if (request.provider !== settings.model.provider || request.model !== settings.model.model) throw new Error('Owned model route changed.');
+      state.requests++; save();
+      return {...request, maxTokens: budget.max_output_tokens_per_request};
+    });
+    runtime.ctx.on('session/event', session => {
+      if (session.id === config.session_id) {state.usage = readUsage(session) ?? null; save();}
+    });
+    const timer = setInterval(() => {
+      const agent = runtime.ctx.get('agents').get(config.session_id);
+      if (agent) stopped(agent);
+    }, 100);
+    runtime.ctx.effect(() => () => clearInterval(timer));
+  }
+  return runtime;
+}

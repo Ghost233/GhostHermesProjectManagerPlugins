@@ -1,0 +1,71 @@
+"""Multi-thread synthetic JSONL service; durable bridge state governs every start."""
+import json
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, os.environ.get('HERMES_FIXTURE_PLUGIN_ROOT', str(Path(__file__).resolve().parents[1])))
+from ghost_hermes_pm import VerifiedIdentity
+from ghost_hermes_pm.snapshots import SnapshotReader
+reader = SnapshotReader(root / 'state', owner_identity_ref='fixture:owner')
+identity = VerifiedIdentity('fixture:owner', 'owned-original-service-public-observer')
+
+
+def committed_requests(method):
+    snapshot = reader.read_snapshot(identity)
+    with (root / 'public-snapshots.jsonl').open('a') as log:
+        log.write(json.dumps({'method': method, 'snapshot': snapshot}) + '\n')
+    return snapshot['requests']
+
+external = root / 'queue-external.json'
+threads = json.loads(external.read_text()) if external.exists() else {}
+sequence = 0
+
+def state():
+    observed = root / 'queue-observed.json'
+    for thread_id, patch in json.loads(observed.read_text()).items() if observed.exists() else []:
+        threads[thread_id].update(patch)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    with (root / 'wire.jsonl').open('a') as log:
+        log.write(json.dumps(request) + '\n')
+    method, params = request['method'], request.get('params', {})
+    state()
+    if method == 'fixture/ready':
+        continue
+    if method == 'fixture/connect':
+        result = {'userAgent': 'fixture-cli/fixture-v1', 'fixtureHome': str(root / 'fixture-home'), 'platformFamily': 'unix', 'platformOs': 'fixture'}
+    elif method == 'fixture/policy':
+        result = {'data': [{'id': 'fixture-boundary', 'allowed': True}], 'nextCursor': None}
+    elif method == 'fixture/loaded':
+        result = {'data': list(threads), 'nextCursor': None}
+    elif method == 'fixture/create':
+        sequence += 1
+        thread_id = 'queue-thread-' + str(sequence)
+        thread = {'id': thread_id, 'cwd': params['cwd'], 'cliVersion': 'fixture-v1', 'status': {'type': 'idle'}, 'turns': [], 'canAcceptDirectInput': True}
+        threads[thread_id] = thread
+        result = {'thread': thread, 'model': 'fixture-model', 'cwd': params['cwd'], 'activePermissionProfile': {'id': params['permissions']}, 'runtimeWorkspaceRoots': params['runtimeWorkspaceRoots']}
+    elif method == 'fixture/start':
+        records = committed_requests(method)
+        assert any(r.get('session', {}).get('thread_id') == params['threadId'] and not r.get('repository_released') for r in records)
+        sequence += 1
+        turn = {'id': 'queue-turn-' + str(sequence), 'status': 'inProgress', 'itemsView': 'full', 'items': []}
+        thread = threads[params['threadId']]
+        thread['turns'].append(turn)
+        thread['status'] = {'type': 'active', 'activeFlags': []}
+        result = {'turn': turn}
+    elif method == 'fixture/read':
+        result = {'thread': threads[params['threadId']]}
+    elif method == 'fixture/background':
+        path = root / 'queue-background.json'
+        pages = json.loads(path.read_text()) if path.exists() else {}
+        result = pages.get(params['threadId'], {}).get(params.get('cursor', ''), {'data': [], 'nextCursor': None})
+    elif method == 'fixture/stop':
+        result = {}
+    else:
+        print(json.dumps({'id': request['id'], 'error': {'code': -32601, 'message': 'Unsupported queue fixture method'}}), flush=True)
+        continue
+    (root / 'active-threads.json').write_text(json.dumps([t for t in threads.values() if t['status']['type'] == 'active']))
+    print(json.dumps({'id': request['id'], 'result': result}), flush=True)

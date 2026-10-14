@@ -1,0 +1,106 @@
+"""Admit one explicitly approved, private original DSH execution reference."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+
+from .manager import ManagementError
+
+
+def private_file(reference):
+    path = Path(reference)
+    if not path.is_absolute() or path.is_symlink() or str(path.resolve(strict=True)) != str(path):
+        raise ManagementError('unsafe_state', 'Execution references require canonical private files.')
+    if any((parent / '.git').exists() for parent in path.parents):
+        raise ManagementError('unsafe_state', 'Private execution references must remain outside source worktrees.')
+    info = path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ManagementError('unsafe_state', 'Execution references must be owner-only files.')
+    return path
+
+
+def execution_configuration(target):
+    """Configuration approval is separate from live startup and stop evidence."""
+    validation_step = 'execution_reference'
+    try:
+        reference = private_file(target['execution_ref'])
+        configuration = json.loads(reference.read_text())
+        if not isinstance(configuration, dict) or configuration.get('mode') != 'shared_native':
+            raise ManagementError('configuration_missing', 'Repository execution requires shared_native on the existing DSH instance; dedicated execution is retired.')
+        if configuration.get('mode') == 'shared_native':
+            from .shared_repository import shared_configuration
+            return shared_configuration(reference, configuration, workspace=target['repo_path']), {}
+        if (set(configuration) != {'schema', 'approved', 'runtime_package_root', 'node_bin', 'model', 'budget', 'skill_directories', 'tool_receipt_ref'}
+            or configuration.get('schema') != 1 or configuration.get('approved') is not True):
+            raise ValueError('Unapproved execution reference.')
+        validation_step = 'canonical_runtime_paths'
+        sdk = Path(configuration['runtime_package_root'])
+        node = Path(configuration['node_bin'])
+        if any(not p.is_absolute() or str(p.resolve(strict=True)) != str(p) for p in (sdk, node)):
+            raise ValueError('Canonical original runtime paths required.')
+        validation_step = 'model_configuration'
+        model = configuration['model']
+        if (set(model) != {'api', 'base_url', 'model', 'context_window', 'api_key_env', 'env_file'}
+                or model['api'] != 'openai-completions' or not model['base_url'].startswith('http://127.0.0.1:')
+                or not isinstance(model['model'], str) or not model['model']
+                or type(model['context_window']) is not int or model['context_window'] <= 0):
+            raise ValueError('Approved local model configuration required.')
+        validation_step = 'private_model_environment'
+        env = {}
+        for line in private_file(model['env_file']).read_text().splitlines():
+            if line.strip() and not line.lstrip().startswith('#'):
+                key, value = line.split('=', 1)
+                env[key.strip()] = value.strip().strip('\"\'')
+        key_name = model['api_key_env']
+        if key_name not in env or not env[key_name]:
+            raise ValueError('An approved private credential reference is required.')
+        validation_step = 'execution_budget'
+        budget = configuration['budget']
+        fields = {'max_wall_seconds', 'max_model_requests', 'max_reported_tokens', 'max_output_tokens_per_request'}
+        if set(budget) != fields or any(type(budget[k]) is not int or not 0 < budget[k] <= 1000000 for k in fields):
+            raise ValueError('Explicit finite execution limits required.')
+        if budget['max_output_tokens_per_request'] > model['context_window']:
+            raise ValueError('Output limit exceeds actual context.')
+        validation_step = 'workflow_skill_roots'
+        skills = configuration['skill_directories']
+        if not isinstance(skills, list) or any(not Path(p).is_absolute() or str(Path(p).resolve(strict=True)) != p or not Path(p).is_dir() for p in skills):
+            raise ValueError('Approved original skill directories are required.')
+        validation_step = 'original_tool_composition'
+        receipt = json.loads(private_file(configuration['tool_receipt_ref']).read_text())
+        source = Path(__file__).with_name('owned_runtime.mjs')
+        catalog = ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', *(['skill'] if skills else [])]
+        sdk_sources = {'@deepseek-ai/dsh/lib/profile-boot.js', '@deepseek-ai/dsh-sandbox-policy/lib/index.js',
+                       '@deepseek-ai/dsh-tool-bash/lib/index.js', '@deepseek-ai/dsh-tool-jobs/lib/index.js',
+                       '@deepseek-ai/dsh-jobs-local/lib/index.js', '@deepseek-ai/dsh-agent-loop/lib/index.js',
+                       '@deepseek-ai/dsh-tool-ask-user/lib/index.js', '@deepseek-ai/dsh-subprocess-local/lib/index.js',
+                       '@deepseek-ai/dsh-subprocess/lib/index.js', '@deepseek-ai/dsh-bash-local/lib/index.js',
+                       '@deepseek-ai/dsh-api-job-controller/lib/index.js'}
+        if skills:
+            sdk_sources.update({'@deepseek-ai/dsh-tool-skill/lib/index.js', '@deepseek-ai/dsh-skill-filesystem/lib/index.js'})
+        if (receipt.get('status') != 'passed' or receipt.get('managed_jobs') != {'foreground': True, 'background': True, 'scope': 'darwin_process_group'}
+            or sorted(receipt.get('tool_catalog', [])) != catalog
+            or not {'allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied', 'danger_denied', 'runtime_directory', 'foreground_job_registered', 'managed_background_stopped', 'foreground_cancelled', 'foreground_promoted',
+                    'foreign_job_kill_denied', 'background_write_boundary'} <= set(receipt.get('passed_cases', []))
+            or receipt.get('composition_sha256') != hashlib.sha256(source.read_bytes()).hexdigest()
+            or receipt.get('owned_host_sha256') != hashlib.sha256(source.with_name('owned_persistent_host.mjs').read_bytes()).hexdigest()
+            or receipt.get('node_sha256') != hashlib.sha256(node.read_bytes()).hexdigest()
+            or not sdk_sources <= set(receipt.get('sdk_sources', {}))):
+            raise ValueError('Exact original tool composition has not been verified.')
+        validation_step = 'original_sdk_sources'
+        for relative, digest in receipt['sdk_sources'].items():
+            path = sdk / relative
+            if not path.resolve(strict=True).is_relative_to(sdk) or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise ValueError('Original SDK proof source changed.')
+        runtime = {'model': {'provider': 'hermes-owned', 'model': model['model'], 'configuration': {
+            'api': model['api'], 'baseURL': model['base_url'], 'apiKeyEnv': key_name,
+            'models': [{'id': model['model'], 'contextWindow': model['context_window'],
+                        'maxTokens': budget['max_output_tokens_per_request'], 'input': ['text']}]}},
+                   'budget': budget, 'skill_directories': skills}
+        return {'runtime_package_root': str(sdk), 'node_bin': str(node), 'runtime_configuration': runtime,
+                'reference_sha256': hashlib.sha256(reference.read_bytes()).hexdigest()}, {key_name: env[key_name]}
+    except ManagementError:
+        raise
+    except (KeyError, TypeError, ValueError, OSError) as error:
+        raise ManagementError('configuration_missing', 'The approved dedicated execution configuration is incomplete or unverified ('
+            + validation_step + ', ' + type(error).__name__ + ').') from None

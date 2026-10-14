@@ -1,1 +1,8 @@
 /.ghswitch
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+/build/
+/dist/

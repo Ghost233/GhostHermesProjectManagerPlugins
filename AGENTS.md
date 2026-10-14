@@ -1,8 +1,16 @@
+## 个人使用范围与资料边界
+
+- 插件仅供本人在自己的 Mac 上使用，不要求适用于所有环境。未经明确要求，不扩展跨平台兼容或通用部署能力。
+- 验收以本机完整测试、实际 Hermes／飞书／DSH 工作流程，以及合并后本地主工作区同步和最终验证为准。远端 CI 与跨环境复现不是交付或合并硬门禁，不因等待远端 CI 阻塞可开展的本机工作。
+- 受管个人项目的真实相关信息不得硬编码或写入插件源码、测试夹具、版本化文档、AGENTS.md、公开 Issue／PR，包括真实项目名称、仓库地址、本地路径、群／机器人／应用／用户标识、凭据、私有资料与聊天内容。
+- 运行必需的最少真实绑定保存在仓库外受限的本机配置或状态中，通过配置注入。源码、示例与测试使用合成占位数据。
+- 2026-10-10 用户已允许原生日志在仅本人可访问的本机目录保存非秘密绑定，原生任务和会话记录也限于受限本机。凭据不得进入普通诊断日志、群消息或公开产物；群通知只包含允许分享的内容。实施日志配置时遵循 `docs/adr/0007-private-local-runtime-logs.md` 并核验实际权限，不修改 SDK 或全局替换宿主 logger／信号处理。
+
 ## Agent skills
 
 ### Issue 跟踪器
 
-规格、决策地图和工单保存在 Ghost233/GhostHermesProjectManagerPlugins 的 GitHub Issues。参见 `docs/agents/issue-tracker.md`。
+规格、决策地图和工单保存在本机配置指定的 GitHub Issue 跟踪器。参见 `docs/agents/issue-tracker.md`。
 
 ### 分类标签
 
@@ -14,7 +22,7 @@
 
 ## GitHub 与 Git
 
-- 所有 GitHub 操作使用 Ghost233。每次需要认证的 gh 业务操作前执行 `gh auth switch --hostname github.com --user Ghost233`，再用 `gh api --hostname github.com user --jq .login` 核验；核验失败时停止 GitHub 操作。
+- 所有 GitHub 操作使用受限本机配置指定并授权的账号。每次认证业务操作前执行账号切换，再读取实际 login 并与配置账号比较；不符则停止。具体命令参见 `docs/agents/issue-tracker.md`。
 - 远程更新后同步涉及的本地分支，仅允许 fast-forward；结束前核对当前工作区、本地与远端完整提交 hash。
 - 不自动 stash、移动、删除、覆盖用户的未提交或未跟踪文件。不使用额外 worktree 或临时集成分支替代当前本地分支。
-- Wayfinder 默认只规划。本轮只形成插件规格与决策地图，不安装插件或修改正在运行的 Hermes。
+- 简化首版范围与公共测试接缝已确认，实施先读取 `docs/specs/hermes-development-coordination-v2.md`，决定依据见 `docs/planning/hermes-plugin-simplification.md`。旧规格、18 张工单和旧测试仅作原方案参考，后续工单按新规格形成。实施仍使用 TDD、双轴审查与 Retro；正式安装、开通机器人和迁移真实资料按具体计划另行执行。

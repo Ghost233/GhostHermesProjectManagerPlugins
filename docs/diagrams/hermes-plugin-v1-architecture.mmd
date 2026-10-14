@@ -7,17 +7,23 @@ flowchart TB
         Sources["授权资料来源<br/>Wiki 原库 / 登记旧档案"]
         Gateway["Hermes Gateway<br/>总管、负责人、独立助手"]
         Coordinator["统一管理实例<br/>授权、队列、监督"]
-        Codex["实际 Codex 执行服务"]
+        NativeHost["主插件自有 Node 子进程<br/>owned_native"]
+        DSH["原 DSH Profile / Gateway<br/>专用 home"]
+        Runtime["受限配置引用的原安装包<br/>不复制或修改"]
+        Desktop["Desktop 手动实例<br/>非默认：须独立原生连接"]
         Repos["登记的仓库<br/>源码 / Git / 测试产物"]
         Store["SQLite 状态<br/>受保护档案与备份"]
         Operator <-->|"群内真实 @ 请求与答复"| Gateway
         Dashboard <-->|"查看与管理：同一规则"| Coordinator
         Gateway <-->|"核验后的请求与进展"| Coordinator
-        Coordinator <-->|"原会话控制与事件"| Codex
-        Codex -->|"已核验的仓库范围"| Repos
+        Coordinator <-->|"自有进程通信"| NativeHost
+        NativeHost <-->|"原 invoke / wireStream"| DSH
+        Runtime -->|"原 runProfile"| NativeHost
+        Coordinator -.->|"缺连接：不可观察 / 接管，覆盖未知"| Desktop
+        DSH -->|"已核验的本地仓库范围"| Repos
         Coordinator <-->|"按来源范围查询"| Sources
         Coordinator -->|"持久化处理凭据"| Store
     end
     classDef component fill:#ffffff,stroke:#64748b,color:#0f172a
-    class Operator,Dashboard,Sources,Gateway,Coordinator,Codex,Repos,Store component
+    class Operator,Dashboard,Sources,Gateway,Coordinator,NativeHost,DSH,Runtime,Desktop,Repos,Store component
     style System fill:#ffffff,stroke:#cbd5e1

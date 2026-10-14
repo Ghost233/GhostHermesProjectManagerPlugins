@@ -1,0 +1,267 @@
+"""Finite external model responses for the real native dispatcher and DSH."""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import threading
+import fcntl
+import time
+
+
+class WorkerModelService:
+    def __init__(self, query_lock=None, refuse=False, hold_dsh=False, budget_stop=False, hold_after_write=False, uncovered_shell=False, question_after_write=False, native_foreground=False, native_service=None, repeat_supervise=False):
+        self.requests = []
+        self.worker_tool_results = []
+        self.worker_terminal_results = []
+        self.worker_steps = 0
+        self.dsh_steps = 0
+        self.budget_stop = budget_stop
+        self.native_service = native_service
+        self.repeat_supervise = repeat_supervise
+        self.review_supervision_checkpoints = False
+        self.checkpoint_review_calls = []
+        self.checkpoint_duplicate_sent = False
+        self.worker_finish_at = None
+        self.worker_terminal_attempt_at = None
+        self.worker_preflight = False
+        self.worker_first_heartbeat = False
+        self.worker_pause_on_unmet = False
+        self.worker_request_ready = threading.Event()
+        self.worker_request_release = threading.Event()
+        self.fail_worker_after = None
+        self.foreign_task_id = None
+        self.query_ready = threading.Event()
+        self.dsh_ready = threading.Event()
+        self.dsh_release = threading.Event()
+        service = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{}' if self.path == '/models-dev' else b'{"data":[{"id":"fixture-model"}]}')
+
+            def do_CONNECT(self):
+                self.send_error(502, 'Only fixture local external services are available.')
+
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                names = [tool['function']['name'] for tool in payload.get('tools', [])]
+                worker = payload['model'] == 'fixture-model'
+                expected_key = 'synthetic-model-only-key' if worker else 'synthetic-only-key'
+                authenticated = self.headers.get('Authorization') == 'Bearer ' + expected_key
+                service.requests.append({'worker': worker, 'tool_names': names,
+                    'ordinary_canary': any('请回复普通会话测试' in str(message.get('content', '')) for message in payload.get('messages', [])),
+                    'historical_question_reply': any('colour：Blue' in str(message.get('content', '')) for message in payload.get('messages', [])),
+                    'authentication_accepted': authenticated,
+                    'outer_instructions_present': any('Managed outer card:' in str(m.get('content', '')) for m in payload.get('messages', [])),
+                    'skill_catalog': any('fixture-matt' in str(m.get('content', '')) for m in payload.get('messages', []))})
+                if worker:
+                    results = []
+                    terminal_calls = set()
+                    for message in payload.get('messages', []):
+                        for tool_call in message.get('tool_calls') or []:
+                            function = tool_call.get('function', {})
+                            try:
+                                arguments = json.loads(function.get('arguments', '{}'))
+                            except json.JSONDecodeError:
+                                continue
+                            if (function.get('name') == 'kanban_block'
+                                    and arguments.get('reason') == 'Fixture premature budget terminal attempt.'):
+                                terminal_calls.add(tool_call['id'])
+                    for message in payload.get('messages', []):
+                        content = message.get('content')
+                        if message.get('role') != 'tool' or not isinstance(content, str):
+                            continue
+                        try:
+                            results.append(json.loads(content))
+                        except json.JSONDecodeError:
+                            # Preserve native display text without interpreting it.
+                            results.append({'content': content})
+                        if message.get('tool_call_id') in terminal_calls:
+                            service.worker_terminal_results.append({
+                                'call_id': message['tool_call_id'], 'tool_name': 'kanban_block', 'content': content})
+                    service.worker_tool_results.append(results)
+                    if service.worker_pause_on_unmet and any(result.get('status') == 'unmet'
+                            for result in results if isinstance(result, dict)):
+                        service.worker_pause_on_unmet = False
+                        service.worker_request_ready.set()
+                        if not service.worker_request_release.wait(timeout=10):
+                            raise AssertionError('The bounded external worker response was not released.')
+                if not authenticated:
+                    self.send_response(401)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({'error': {'message': 'Synthetic model authentication failed.',
+                        'type': 'authentication_error'}}).encode())
+                    return
+                if worker and service.fail_worker_after is not None and service.worker_steps + 1 >= service.fail_worker_after:
+                    self.send_response(401)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(b'{"error":{"message":"The finite synthetic worker provider is unavailable.","type":"authentication_error"}}')
+                    return
+                if worker:
+                    service.worker_steps += 1
+                    step = service.worker_steps
+                    extra = []
+                    call = (('kanban_create', {'title': 'Forbidden fine card', 'assignee': 'default'}) if step == 1 else
+                        ('hermes_pm_supervise', {}) if step == 2 else
+                        ('kanban_block', {'task_id': service.foreign_task_id, 'kind': 'needs_input', 'reason': 'Fixture wrong target block.'}) if step == 3 else
+                        ('kanban_block', {'kind': 'needs_input', 'reason': 'Dedicated execution awaits acceptance.'}) if step == 4 else
+                        ('kanban_block', {'kind': 'needs_input', 'reason': 'Fixture stale claim block.'}) if step == 5 else None)
+                    if step == 1:
+                        extra = [('kanban_block', {'kind': 'needs_input', 'reason': 'Fixture premature block.'})]
+                    elif step == 5:
+                        extra = [('kanban_complete', {'summary': 'Forbidden premature delivery.'})]
+                    if service.repeat_supervise and step >= 2:
+                        call = ('hermes_pm_supervise', {})
+                        extra = []
+                    if service.review_supervision_checkpoints:
+                        last = results[-1] if results else {}
+                        if isinstance(last.get('content'), str):
+                            try:
+                                native = json.JSONDecoder().raw_decode(last['content'])[0]
+                            except ValueError:
+                                native = {}
+                            if isinstance(native, dict) and native.get('ok') is True:
+                                last = native
+                        extra = []
+                        if last.get('status') == 'review_required':
+                            review = {'checkpoint_id': last['checkpoint']['id'],
+                                'summary': 'Synthetic checkpoint review ' + str(len(service.checkpoint_review_calls) + 1)
+                                    + '. Verified original DSH progress.',
+                                'notify_owner': bool(service.checkpoint_review_calls) or getattr(service, 'notify_first_checkpoint', False)}
+                            service.checkpoint_review_calls.append(review)
+                            call = ('hermes_pm_supervise', review)
+                        elif last.get('status') == 'reviewed' and len(service.checkpoint_review_calls) == 2 \
+                                and not service.checkpoint_duplicate_sent:
+                            service.checkpoint_duplicate_sent = True
+                            call = ('hermes_pm_supervise', service.checkpoint_review_calls[-1])
+                        elif last.get('status') in {'stopped', 'stop_requested'}:
+                            call = ('kanban_block', {'kind': 'needs_input', 'reason': 'Owner stopped the original shared work.'})
+                        elif last.get('status') == 'unmet':
+                            call = ('kanban_block', {'kind': 'needs_input', 'reason': 'Original delivery evidence remains unmet.'})
+                        elif last.get('status') in {'blocked', 'triage'} \
+                                or last.get('task', {}).get('status') in {'blocked', 'triage'}:
+                            call = None
+                        else:
+                            call = ('hermes_pm_supervise', {})
+                    if service.worker_preflight:
+                        call = ('kanban_heartbeat', {})
+                        extra = []
+                    if service.worker_first_heartbeat and step == 1:
+                        call = ('kanban_heartbeat', {})
+                        extra = []
+                    if step == service.worker_terminal_attempt_at:
+                        call = ('kanban_block', {'kind': 'needs_input', 'reason': 'Fixture premature budget terminal attempt.'})
+                        extra = []
+                    if service.worker_finish_at is not None and step >= service.worker_finish_at:
+                        call = None
+                        extra = []
+                    if refuse:
+                        call = None
+                        extra = []
+                else:
+                    extra = []
+                    service.dsh_steps += 1
+                    call = (('skill', {'name': 'fixture-matt'}) if service.dsh_steps == 1 else
+                        ('bash', {'description': 'Write and verify one bounded synthetic work result.',
+                                 'command': "printf 'native-worker\\n' > native-delivery.txt && cat native-delivery.txt"}) if service.dsh_steps == 2 else ('skill', {'name': 'fixture-matt'}) if service.budget_stop else None)
+                    if native_foreground and service.dsh_steps == 2:
+                        call = ('bash', {'description': 'Run real Node development through the original foreground tool.',
+                            'command': "node -e \"require('fs').writeFileSync('native-delivery.txt','native-worker\\n')\""})
+                    if service.native_service and service.dsh_steps == 3:
+                        call = ('bash', {'description': 'Start one original job-owned finite Node development server.',
+                            'command': "node -e \"const fs=require('fs'); const server=require('http').createServer((q,r)=>r.end('native-service')); server.listen(0,'127.0.0.1',()=>fs.writeFileSync('native-service.json',JSON.stringify({pid:process.pid,port:server.address().port}))); setTimeout(()=>server.close(),25000)\"",
+                            'run_in_background': service.native_service == 'background',
+                            'timeoutMs': 100 if service.native_service == 'promoted' else 30000})
+                    if question_after_write and service.dsh_steps == 3:
+                        call = ('ask_user_question', {'timeout': -1, 'questions': [{'id': 'colour', 'question': 'Which colour?', 'options': [{'label': 'Blue'}, {'label': 'Green'}]}]})
+                    if uncovered_shell and service.dsh_steps == 2:
+                        call = ('bash', {'description': 'Demonstrate a foreground receipt with an unregistered finite descendant.',
+                            'command': "sleep 20 >/dev/null 2>&1 & printf '%s\\n' \"$!\" > pending-child.pid; printf 'native-worker\\n' > native-delivery.txt"})
+                    if hold_dsh and service.dsh_steps == 1 or hold_after_write and service.dsh_steps == 3:
+                        service.dsh_ready.set()
+                        if not service.dsh_release.wait(timeout=45):
+                            raise AssertionError('Bounded external DSH response was not released.')
+                        call = None
+                    if query_lock and service.dsh_steps == 3:
+                        service.query_ready.set()
+                        until = time.monotonic() + 10
+                        with open(query_lock, 'rb') as lock:
+                            while time.monotonic() < until:
+                                try:
+                                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                    fcntl.flock(lock, fcntl.LOCK_UN)
+                                except BlockingIOError:
+                                    # The public intake already read its work row before scanning native cards.
+                                    time.sleep(.04)
+                                    break
+                                time.sleep(.002)
+                calls = [call, *extra] if call else []
+                delta = {'tool_calls': [{'index': index, 'id': 'fixture-call-' + str(len(service.requests)) + '-' + str(index), 'type': 'function',
+                        'function': {'name': value[0], 'arguments': json.dumps(value[1])}} for index, value in enumerate(calls)]} if call else {'content': 'Original execution is awaiting acceptance.'}
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.end_headers()
+                for part, reason in (({'role': 'assistant'}, None), (delta, None), ({}, 'tool_calls' if call else 'stop')):
+                    chunk = {'id': 'fixture-completion', 'object': 'chat.completion.chunk', 'created': 1,
+                             'model': payload['model'], 'choices': [{'index': 0, 'delta': part, 'finish_reason': reason}]}
+                    self.wfile.write(('data: ' + json.dumps(chunk) + '\n\n').encode())
+                self.wfile.write(('data: ' + json.dumps({'id': 'fixture-completion', 'object': 'chat.completion.chunk', 'created': 1,
+                    'model': payload['model'], 'choices': [], 'usage': {'prompt_tokens': 12, 'completion_tokens': 8, 'total_tokens': 20}}) + '\n\n').encode())
+                self.wfile.write(b'data: [DONE]\n\n')
+
+            def log_message(self, *_):
+                pass
+
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f'http://127.0.0.1:{self.server.server_port}/v1'
+
+    def close(self):
+        self.dsh_release.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(2)
+        assert not self.thread.is_alive()
+
+
+def execution_reference(scratch, base_url, sdk):
+    """A private synthetic approval fixture; real receipts remain separate."""
+    from pathlib import Path
+    import hashlib
+    node = Path('/opt/homebrew/bin/node').resolve(strict=True)
+    root = Path(__file__).resolve().parents[1]
+    skills = scratch / 'skills'
+    (skills / 'fixture-matt').mkdir(parents=True)
+    (skills / 'fixture-matt/SKILL.md').write_text('---\nname: fixture-matt\ndescription: Bounded synthetic workflow.\n---\nImplement the single requested change and report actual tests.\n')
+    receipt = scratch / 'tool-receipt.json'
+    native_sources = ['@deepseek-ai/dsh/lib/profile-boot.js', '@deepseek-ai/dsh-sandbox-policy/lib/index.js',
+        '@deepseek-ai/dsh-tool-bash/lib/index.js', '@deepseek-ai/dsh-tool-jobs/lib/index.js',
+        '@deepseek-ai/dsh-jobs-local/lib/index.js', '@deepseek-ai/dsh-agent-loop/lib/index.js',
+        '@deepseek-ai/dsh-tool-ask-user/lib/index.js', '@deepseek-ai/dsh-tool-skill/lib/index.js',
+        '@deepseek-ai/dsh-skill-filesystem/lib/index.js', '@deepseek-ai/dsh-subprocess-local/lib/index.js',
+        '@deepseek-ai/dsh-subprocess/lib/index.js', '@deepseek-ai/dsh-bash-local/lib/index.js',
+        '@deepseek-ai/dsh-api-job-controller/lib/index.js']
+    receipt.write_text(json.dumps({'status': 'passed', 'managed_jobs': {'foreground': True, 'background': True, 'scope': 'darwin_process_group'},
+        'tool_catalog': ['ask_user_question', 'bash', 'job_kill', 'job_list', 'job_output', 'skill'],
+        'passed_cases': ['allowed_write', 'outside_write_denied', 'symlink_write_denied', 'hardlink_write_denied', 'danger_denied', 'runtime_directory',
+            'foreground_job_registered', 'managed_background_stopped', 'foreground_cancelled', 'foreground_promoted', 'foreign_job_kill_denied', 'background_write_boundary'],
+        'composition_sha256': hashlib.sha256((root / 'ghost_hermes_pm/owned_runtime.mjs').read_bytes()).hexdigest(),
+        'owned_host_sha256': hashlib.sha256((root / 'ghost_hermes_pm/owned_persistent_host.mjs').read_bytes()).hexdigest(),
+        'node_sha256': hashlib.sha256(node.read_bytes()).hexdigest(),
+        'sdk_sources': {p: hashlib.sha256((sdk / p).read_bytes()).hexdigest() for p in native_sources}}))
+    receipt.chmod(0o600)
+    env = scratch / 'model.env'
+    env.write_text('DSH_FIXTURE_MODEL_KEY=synthetic-only-key\n')
+    env.chmod(0o600)
+    reference = scratch / 'execution.json'
+    reference.write_text(json.dumps({'schema': 1, 'approved': True, 'runtime_package_root': str(sdk), 'node_bin': str(node),
+        'model': {'api': 'openai-completions', 'base_url': base_url, 'model': 'fixture-dsh', 'context_window': 16384,
+                  'api_key_env': 'DSH_FIXTURE_MODEL_KEY', 'env_file': str(env)},
+        'skill_directories': [str(skills)], 'tool_receipt_ref': str(receipt),
+        'budget': {'max_wall_seconds': 20, 'max_model_requests': 5, 'max_reported_tokens': 1000, 'max_output_tokens_per_request': 256}}))
+    reference.chmod(0o600)
+    return str(reference)
