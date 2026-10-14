@@ -53,9 +53,17 @@ def _report(events):
     for event in messages:
         for block in event['data'].get('message', {}).get('content', []):
             if block.get('type') == 'text' and DELIVERY_MARKER in block.get('text', ''):
+                if block['text'].count(DELIVERY_MARKER) != 1:
+                    return None
                 raw = block['text'].split(DELIVERY_MARKER, 1)[1].strip()
                 try:
-                    candidates.append(json.JSONDecoder().raw_decode(raw)[0])
+                    if raw.startswith('```'):
+                        fenced = re.fullmatch(r'```json\n(.*)\n```', raw, re.DOTALL)
+                        if fenced is None:
+                            return None
+                        candidates.append(json.loads(fenced.group(1)))
+                    else:
+                        candidates.append(json.JSONDecoder().raw_decode(raw)[0])
                 except ValueError:
                     return None
     return candidates[0] if len(candidates) == 1 and isinstance(candidates[0], dict) else None

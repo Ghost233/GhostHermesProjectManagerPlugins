@@ -2837,6 +2837,52 @@ def record_shared_natural_qa_proposal(intake, record, proposal_id, delivery_cont
         os.close(descriptor)
 
 
+def continue_shared_pending_question(intake, record, message_id):
+    """Requeue the owner's original triage card; never replay its Session input."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect_closing
+    from .repository_control import _worker_end
+    from .repository_execution import execution_configuration
+    execution = record['dsh_execution']
+    if execution.get('mode') != 'shared_native' or not execution.get('workspace_id'):
+        raise ManagementError('binding_conflict', 'The original pending-question Workspace is unverified.')
+    _worker_end(intake, record, statuses={'triage'}, allow_later_terminal=True)
+    configuration, _ = execution_configuration(record['target'])
+    configuration['workspace'] = record['target']['repo_path']
+    budget_file = ledger_path(configuration, execution['session_id'])
+    budget_before = private_file(budget_file).read_bytes()
+    carrier = shared_attach(intake, record, observe=False)
+    try:
+        stream = carrier.stream('session/follow', {'request': {'address': {'kind': 'session',
+            'sessionId': execution['session_id']}, 'maxMessages': 500}})
+        try:
+            snapshot = next(stream)
+        finally:
+            stream.close()
+        header = snapshot.get('header', {})
+        if (header.get('id') != execution['session_id'] or header.get('cwd') != configuration['workspace']
+                or header.get('createdAt') != execution.get('session_created_at')
+                or snapshot.get('projections', {}).get('values', {}).get('agentPreset') != configuration['agent_preset']):
+            raise ManagementError('binding_conflict', 'Original pending-question Session identity changed.')
+        if not _take_over_gave_up_claim(intake, record, None, configuration, carrier,
+                snapshot=snapshot, verify_only=True):
+            raise ManagementError('outcome_unknown', 'The original pending-question claim is unverified.')
+        if private_file(budget_file).read_bytes() != budget_before:
+            raise ManagementError('outcome_unknown', 'The original pending-question budget changed.')
+        with connect_closing(board=intake.board) as connection:
+            card = kb.get_task(connection, record['card_id'])
+            if (not _original_shared_card(intake, record, card) or card.status != 'triage'
+                    or card.current_run_id is not None or card.worker_pid is not None):
+                raise ManagementError('binding_conflict', 'Original pending-question triage card changed.')
+            if not kb.specify_triage_task(connection, record['card_id'], author='verified-owner'):
+                raise ManagementError('outcome_unknown', 'Original pending-question dispatch is unconfirmed.')
+        execution.setdefault('control_message_ids', []).append(message_id)
+        intake._save_execution(record, fields=['control_message_ids'])
+        return record
+    finally:
+        carrier.close()
+
+
 def _pending_original_question(execution, snapshot, carrier):
     from .dsh import DshRemoteAdapter
     if not isinstance(snapshot, dict) or snapshot.get('hasMore') is not False:
@@ -2880,7 +2926,7 @@ def _pending_original_question(execution, snapshot, carrier):
         raise ManagementError('outcome_unknown', 'Original open question ownership is unverified.')
 
 
-def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier, *, snapshot=None):
+def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier, *, snapshot=None, verify_only=False):
     import psutil
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
@@ -2895,6 +2941,8 @@ def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier, *, 
     with connect_closing(board=intake.board) as connection:
         old = kb.get_run(connection, previous['run_id'])
     blocked_question = old is not None and old.status == old.outcome == 'blocked'
+    if verify_only and not blocked_question:
+        raise ManagementError('outcome_unknown', 'Only an original blocked-question worker may be requeued.')
     if blocked_question:
         with connect_closing(board=intake.board) as connection:
             card = kb.get_task(connection, record['card_id'])
@@ -2953,6 +3001,8 @@ def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier, *, 
             and _source_core(source) is not None and not receipts
             or _verified_source_chain(execution, execution.get('baseline'), receipts, source, owned_jobs)):
         raise ManagementError('binding_conflict', 'The original shared source changed before supervision takeover.')
+    if verify_only:
+        return True
     execution.update(state='running', supervisor_claim={'run_id': run_id, 'identity': controller_identity(),
         'exit_log_offset': path.stat().st_size})
     intake._save_execution(record, fields=['state', 'supervisor_claim'])

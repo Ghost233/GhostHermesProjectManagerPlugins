@@ -445,7 +445,14 @@ async def process_control(intake, prepared, generation):
                 text = '已受理独立新一轮执行；沿用原总 Issue 和外层卡，旧会话、预算与失败记录完整保留，等待原生派发。'
                 result = {'status': record['dsh_execution']['state'], 'work_id': record['id']}
             elif prepared.command.startswith('继续 '):
-                if execution.get('owner_context_maintenance_checkpoint'):
+                if (execution.get('state') in {'running', 'outcome_unknown'} and any(
+                        question.get('kind') == 'structured' and question.get('state') == 'open'
+                        for question in execution.get('questions', []))):
+                    from .shared_repository import continue_shared_pending_question
+                    record = await asyncio.to_thread(continue_shared_pending_question, intake, record, message_id)
+                    text = '原待答会话的外层卡已重新受理，等待原生派发；原 SID、问题、历史与预算保持，尚未重发输入或答案。'
+                    result = {'status': 'queued', 'work_id': record['id'], 'delivered': False}
+                elif execution.get('owner_context_maintenance_checkpoint'):
                     from .shared_repository import admit_shared_owner_maintenance
                     record = await asyncio.to_thread(admit_shared_owner_maintenance, intake, record, message_id, generation)
                     text = '原 SID 正常维护接纳已核实；原窗口与累计用量保持，卡片保持待处理，尚未发送输入。请明确补充最终要求。'

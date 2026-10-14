@@ -2260,6 +2260,32 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
+@pytest.mark.parametrize('wrapped', [False, True])
+def test_original_delivery_json_allows_one_complete_json_fence(wrapped):
+    from ghost_hermes_pm.repository_acceptance import _report
+    report = {'source_commit': 'fixture-commit', 'criteria': [], 'test_files': []}
+    text = json.dumps(report)
+    if wrapped:
+        text = '```json\n' + text + '\n```'
+    events = [{'type': 'assistant/message', 'seq': 0, 'data': {'turn': 1, 'message': {'content': [{
+        'type': 'text', 'text': 'HERMES_REPOSITORY_DELIVERY_JSON\n' + text}]}}},
+        {'type': 'turn/end', 'seq': 1, 'data': {'turn': 1, 'reason': {'kind': 'completed'}}}]
+    assert _report(events) == report
+
+
+@pytest.mark.parametrize('text', [
+    '```json\n{}', '```python\n{}\n```', '```json\n{} {}\n```',
+    '```json\n{}\n```\n```json\n{}\n```', '```json\n{}\n``` trailing',
+    '```json\n{}\n```\nHERMES_REPOSITORY_DELIVERY_JSON {}',
+])
+def test_original_delivery_json_rejects_incomplete_or_multiple_fence_reports(text):
+    from ghost_hermes_pm.repository_acceptance import _report
+    events = [{'type': 'assistant/message', 'seq': 0, 'data': {'turn': 1, 'message': {'content': [{
+        'type': 'text', 'text': 'HERMES_REPOSITORY_DELIVERY_JSON\n' + text}]}}},
+        {'type': 'turn/end', 'seq': 1, 'data': {'turn': 1, 'reason': {'kind': 'completed'}}}]
+    assert _report(events) is None
+
+
 @pytest.mark.parametrize('change', ['foreign_rpc', 'foreign_sid', 'foreign_generation', 'question_digest', 'foreign_queue', 'missing_call'])
 def test_blocked_pending_question_read_facts_reject_unowned_history(change):
     from ghost_hermes_pm.shared_repository import _pending_original_question
@@ -2378,7 +2404,7 @@ def test_waiting_repository_successor_uses_native_reads_inside_owned_worker(tmp_
     assert _waiting_repository_successor(intake, parent, candidate) is True
 
 
-@pytest.mark.parametrize('scenario', ['missing_report_rework', 'blocked_question_takeover', 'repository_preinput_stop', 'repository_preinput_unverified', 'background_cleanup_whole_stop', 'repository_queue', 'terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata', 'qa_preinput_retry', 'supervision_checkpoints', 'qa_request_only_resume', 'background_cleanup', 'background_cleanup_ended_worker', 'background_cleanup_unknown_stop', 'background_cleanup_secret_stop', 'background_cleanup_foreign_notice'])
+@pytest.mark.parametrize('scenario', ['blocked_question_continue', 'missing_report_rework', 'blocked_question_takeover', 'repository_preinput_stop', 'repository_preinput_unverified', 'background_cleanup_whole_stop', 'repository_queue', 'terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata', 'qa_preinput_retry', 'supervision_checkpoints', 'qa_request_only_resume', 'background_cleanup', 'background_cleanup_ended_worker', 'background_cleanup_unknown_stop', 'background_cleanup_secret_stop', 'background_cleanup_foreign_notice'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])
@@ -2392,7 +2418,7 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
             shutil.copytree(root / name, plugin / name, ignore=shutil.ignore_patterns('__pycache__'))
         else:
             shutil.copy2(root / name, plugin / name)
-    if scenario in {'supervise_slice', 'repository_queue', 'blocked_question_takeover'} or scenario.startswith('supervise_takeover'):
+    if scenario in {'supervise_slice', 'repository_queue', 'blocked_question_takeover', 'blocked_question_continue'} or scenario.startswith('supervise_takeover'):
         production = root / 'ghost_hermes_pm/shared_repository.py'
         copied = plugin / 'ghost_hermes_pm/shared_repository.py'
         declaration = 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 300'

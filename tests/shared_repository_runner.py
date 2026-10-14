@@ -19,7 +19,8 @@ if observer_restart:
 supervise_takeover = shared_scenario.startswith('supervise_takeover')
 takeover_case = shared_scenario.removeprefix('supervise_takeover_') if shared_scenario != 'supervise_takeover' else 'valid'
 repository_queue = shared_scenario == 'repository_queue'
-blocked_question_takeover = shared_scenario == 'blocked_question_takeover'
+blocked_question_continue = shared_scenario == 'blocked_question_continue'
+blocked_question_takeover = shared_scenario in {'blocked_question_takeover', 'blocked_question_continue'}
 missing_report_rework = shared_scenario == 'missing_report_rework'
 if missing_report_rework:
     shared_scenario = 'terminal'
@@ -609,6 +610,32 @@ async def main():
                         'phase': 'worker_claim', 'code': 'repository_busy', 'message': 'Earlier work retains this repository.'})
                     adapter.intake._save_execution(prior, fields=['state', 'last_failure'])
                     assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
+                    if blocked_question_continue:
+                        with connect_closing() as db:
+                            before_card = kb.get_task(db, initial['card_id'])
+                            assert kb.block_task(db, initial['card_id'], kind='needs_input', reason='Original question still awaits owner.')
+                            assert kb.get_task(db, initial['card_id']).status == 'triage'
+                        pending_budget_path = ledger / (hashlib.sha256(sid.encode()).hexdigest() + '.json')
+                        prior_budget = pending_budget_path.read_bytes()
+                        wrong_scope = record()
+                        wrong_scope['dsh_execution']['questions'][0]['generation'] = 'foreign-question-generation'
+                        adapter.intake._save_execution(wrong_scope, fields=['questions'])
+                        await receive(adapter, raw('om_continue_foreign_question', '@_user_1 继续 ' + initial['id']))
+                        with connect_closing() as db:
+                            assert kb.get_task(db, initial['card_id']).status == 'triage'
+                        assert record()['dsh_execution']['supervisor_claim'] == previous_claim
+                        assert pending_budget_path.read_bytes() == prior_budget and len(peer['prompts']) == 1
+                        restored = record()
+                        restored['dsh_execution']['questions'][0]['generation'] = restored['dsh_execution']['generation']
+                        adapter.intake._save_execution(restored, fields=['questions'])
+                        await receive(adapter, raw('om_continue_pending_question', '@_user_1 继续 ' + initial['id']))
+                        with connect_closing() as db:
+                            after_card = kb.get_task(db, initial['card_id'])
+                            assert after_card.status in {'todo', 'ready'}, {'card_status': after_card.status, 'failure': record()['dsh_execution'].get('last_failure'), 'messages': sent[-2:]}
+                            assert (after_card.title, after_card.body) == (before_card.title, before_card.body)
+                        assert pending_budget_path.read_bytes() == prior_budget
+                        assert record()['dsh_execution']['supervisor_claim'] == previous_claim
+                        assert record()['dsh_execution']['session_id'] == sid and len(peer['prompts']) == 1
                     model.worker_steps = 1
                     model.repeat_supervise = True
                     model.worker_terminal_attempt_at = 5
