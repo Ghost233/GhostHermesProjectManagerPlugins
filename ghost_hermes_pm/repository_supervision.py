@@ -200,6 +200,9 @@ async def notify_acceptance(intake, record, generation):
         'thread_id': anchor.get('thread_id')})
     intake.require_active(generation)
     execution['delivery_notification']['status'] = result.get('status', 'unknown')
+    if result.get('status') == 'delivered' and isinstance(result.get('message_id'), str) and result['message_id']:
+        execution['delivery_notification'].update(message_id=result['message_id'],
+            session_id=execution.get('session_id'), generation=execution.get('generation'))
     intake._save_execution(record, fields=['delivery_notification'])
 
 

@@ -1542,7 +1542,7 @@ def test_supervision_takeover_read_boundary_retries_only_exact_recoverable_cause
             shared_repository._take_over_gave_up_claim(intake, record, 18, {}, Carrier())
         assert caught.value.code == 'outcome_unknown'
         assert str(caught.value) == 'The original worker input remains unconfirmed; no claim transfer.'
-        assert reads == [] and saves == [] and carrier_calls == []
+        assert reads == ['run'] and saves == [] and carrier_calls == []
         assert json.dumps(execution, sort_keys=True, separators=(',', ':')).encode() == before
 
 
@@ -2260,6 +2260,45 @@ def test_shared_github_reference_is_private_native_tmp_and_keeps_host_environmen
             cleanup_github_execution(reference, 'fixture-generation')
 
 
+@pytest.mark.parametrize('change', ['foreign_rpc', 'foreign_sid', 'foreign_generation', 'question_digest', 'foreign_queue', 'missing_call'])
+def test_blocked_pending_question_read_facts_reject_unowned_history(change):
+    from ghost_hermes_pm.shared_repository import _pending_original_question
+    from ghost_hermes_pm.manager import ManagementError
+    questions = [{'id': 'q1', 'question': 'Choose a fixture contract.'}]
+    question = {'id': 'fixture-call', 'kind': 'structured', 'state': 'open', 'questions': questions,
+        'session_id': 'fixture-sid', 'generation': 'fixture-generation', 'source_seq': 1,
+        'event_id': 'fixture-gateway-event',
+        'source_digest': hashlib.sha256(json.dumps(questions, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+    execution = {'session_id': 'fixture-sid', 'generation': 'fixture-generation', 'request_id': 'fixture-input',
+        'questions': [question], 'native_identity': {'lease': 'fixture-lease'}, 'shared_event_observer': {
+            'status': 'ready', 'client_id': 'fixture-client', 'session_id': 'fixture-sid',
+            'generation': 'fixture-generation', 'host_lease': 'fixture-lease'}}
+    snapshot = {'hasMore': False, 'cursor': 1, 'records': [
+        {'type': 'event', 'event': {'type': 'user/message', 'seq': 0,
+            'data': {'source': {'kind': 'user', 'rpcId': 'fixture-input'}}}},
+        {'type': 'event', 'event': {'type': 'tool/call', 'seq': 1,
+            'data': {'name': 'ask_user_question', 'callId': 'fixture-call'}}}],
+        'projections': {'values': {'inbox': {'next-turn': [], 'next-step': []},
+            'userQuestions': {'active': [{'callId': 'fixture-call', 'state': 'open', 'questions': questions}]}}}}
+    if change == 'foreign_rpc':
+        snapshot['records'][0]['event']['data']['source']['rpcId'] = 'foreign-input'
+    elif change == 'foreign_sid':
+        question['session_id'] = 'foreign-sid'
+    elif change == 'foreign_generation':
+        question['generation'] = 'foreign-generation'
+    elif change == 'question_digest':
+        question['source_digest'] = 'foreign-digest'
+    elif change == 'foreign_queue':
+        snapshot['projections']['values']['inbox']['next-turn'] = [{'id': 'foreign-message'}]
+    else:
+        snapshot['records'][1]['event']['data']['callId'] = 'foreign-call'
+    before = json.dumps(execution, sort_keys=True)
+    with pytest.raises(ManagementError) as caught:
+        _pending_original_question(execution, snapshot, None)
+    assert caught.value.code in {'outcome_unknown', 'binding_conflict'}
+    assert json.dumps(execution, sort_keys=True) == before
+
+
 @pytest.mark.parametrize('change', ['rc1', 'same_birth_live', 'generation_intent', 'input_intent'])
 def test_shared_preinput_stop_read_facts_fail_closed(tmp_path, monkeypatch, change):
     """Adverse read facts; public_entry[repository_preinput_stop] is the canonical native proof."""
@@ -2339,7 +2378,7 @@ def test_waiting_repository_successor_uses_native_reads_inside_owned_worker(tmp_
     assert _waiting_repository_successor(intake, parent, candidate) is True
 
 
-@pytest.mark.parametrize('scenario', ['repository_preinput_stop', 'repository_preinput_unverified', 'background_cleanup_whole_stop', 'repository_queue', 'terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata', 'qa_preinput_retry', 'supervision_checkpoints', 'qa_request_only_resume', 'background_cleanup', 'background_cleanup_ended_worker', 'background_cleanup_unknown_stop', 'background_cleanup_secret_stop', 'background_cleanup_foreign_notice'])
+@pytest.mark.parametrize('scenario', ['missing_report_rework', 'blocked_question_takeover', 'repository_preinput_stop', 'repository_preinput_unverified', 'background_cleanup_whole_stop', 'repository_queue', 'terminal', 'observer_restart', 'stop', 'reconcile_intent', 'prepare_continue', 'continue_restart', 'continue_unknown', 'continue_triage', 'continue_claim_race', 'continue_native_restore', 'question_material', 'continue_tokens_uncapped', 'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'renew_window', 'renew_window_unknown', 'renew_window_continue', 'resume_completed_window', 'renew_window_again', 'owner_context', 'owner_maintenance', 'supervise_slice', 'supervise_takeover', 'supervise_takeover_nonzero', 'supervise_takeover_reclaimed', 'supervise_takeover_source', 'supervise_takeover_sid', 'supervise_takeover_native', 'supervise_takeover_ledger', 'supervise_takeover_card', 'supervise_expired_window', 'runtime_metadata', 'qa_preinput_retry', 'supervision_checkpoints', 'qa_request_only_resume', 'background_cleanup', 'background_cleanup_ended_worker', 'background_cleanup_unknown_stop', 'background_cleanup_secret_stop', 'background_cleanup_foreign_notice'])
 def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp_path, scenario):
     root = Path(__file__).resolve().parents[1]
     sdk = Path(os.environ['HERMES_TEST_SDK_ROOT'])
@@ -2353,7 +2392,7 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
             shutil.copytree(root / name, plugin / name, ignore=shutil.ignore_patterns('__pycache__'))
         else:
             shutil.copy2(root / name, plugin / name)
-    if scenario in {'supervise_slice', 'repository_queue'} or scenario.startswith('supervise_takeover'):
+    if scenario in {'supervise_slice', 'repository_queue', 'blocked_question_takeover'} or scenario.startswith('supervise_takeover'):
         production = root / 'ghost_hermes_pm/shared_repository.py'
         copied = plugin / 'ghost_hermes_pm/shared_repository.py'
         declaration = 'SUPERVISE_OBSERVATION_SLICE_SECONDS = 300'

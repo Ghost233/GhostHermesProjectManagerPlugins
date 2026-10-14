@@ -14,7 +14,7 @@ from sdk_source_integrity import source_snapshot
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize('case', ['current', 'history', 'pending', 'intent', 'not_requested', 'unknown_quote',
+@pytest.mark.parametrize('case', ['delivery', 'delivery_unknown', 'delivery_wrong_sid', 'delivery_wrong_generation', 'current', 'history', 'pending', 'intent', 'not_requested', 'unknown_quote',
     'wrong_sid', 'wrong_generation', 'wrong_anchor', 'wrong_profile', 'duplicate', 'question', 'approval'])
 def test_only_delivered_checkpoint_owner_quotes_enter_ordinary_discussion(tmp_path, case):
     from copy import deepcopy
@@ -41,7 +41,17 @@ def test_only_delivered_checkpoint_owner_quotes_enter_ordinary_discussion(tmp_pa
         'profile_id': 'lead', 'superior_profile_id': 'steward', 'source_anchor': dict(anchor),
         'target': {'repo_path': str(tmp_path)}, 'dsh_execution': execution}
     parent, text = 'fixture-cp-message', '@_user_1 请纠正总结中的旧预算。'
-    if case == 'history':
+    if case.startswith('delivery'):
+        parent = 'fixture-delivery-message'
+        execution['delivery_notification'] = {'status': 'delivered', 'message_id': parent,
+            'session_id': execution['session_id'], 'generation': execution['generation']}
+        if case == 'delivery_unknown':
+            execution['delivery_notification']['status'] = 'unknown'
+        elif case == 'delivery_wrong_sid':
+            execution['delivery_notification']['session_id'] = 'foreign-session'
+        elif case == 'delivery_wrong_generation':
+            execution['delivery_notification']['generation'] = 'foreign-generation'
+    elif case == 'history':
         execution['supervision_history'] = [checkpoint]
         execution['supervision_checkpoint'] = {**checkpoint, 'delivery': {'status': 'not_requested'}}
     elif case in {'pending', 'intent', 'not_requested'}:
@@ -80,7 +90,7 @@ def test_only_delivered_checkpoint_owner_quotes_enter_ordinary_discussion(tmp_pa
             event=NS(sender=sender, message=message)))
     before = intake.snapshot()
     prepared = intake.prepare(event, adapter)
-    if case in {'current', 'history'}:
+    if case in {'current', 'history', 'delivery'}:
         assert prepared is None, 'Verified checkpoint feedback was diverted into question handling.'
     else:
         assert prepared is not None

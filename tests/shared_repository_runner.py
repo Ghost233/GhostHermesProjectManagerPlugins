@@ -19,9 +19,13 @@ if observer_restart:
 supervise_takeover = shared_scenario.startswith('supervise_takeover')
 takeover_case = shared_scenario.removeprefix('supervise_takeover_') if shared_scenario != 'supervise_takeover' else 'valid'
 repository_queue = shared_scenario == 'repository_queue'
+blocked_question_takeover = shared_scenario == 'blocked_question_takeover'
+missing_report_rework = shared_scenario == 'missing_report_rework'
+if missing_report_rework:
+    shared_scenario = 'terminal'
 preinput_stop = shared_scenario == 'repository_preinput_stop'
 preinput_unverified = shared_scenario == 'repository_preinput_unverified'
-supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover or repository_queue
+supervise_slice = shared_scenario == 'supervise_slice' or supervise_takeover or repository_queue or blocked_question_takeover
 background_ended_worker = shared_scenario == 'background_cleanup_ended_worker'
 background_secret = shared_scenario == 'background_cleanup_secret_stop'
 background_unknown = shared_scenario == 'background_cleanup_unknown_stop' or background_secret
@@ -89,7 +93,7 @@ service_source = service_source.replace("state['journals'].setdefault(value['ses
                         state['workspace']['sessionIds'].append(value['sessionId'])
                 next(row for row in state['sessions'] if row['sessionId'] == value['sessionId'])['agentAvailable'] = True""")
 service_source = service_source.replace("'values': {'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []})}",
-    "'values': {'agentPreset': behavior.get('agent_preset', 'fixture-shared'), 'userQuestions': {'active': [], 'settled': []}, "
+    "'values': {'agentPreset': behavior.get('agent_preset', 'fixture-shared'), 'userQuestions': behavior.get('user_questions', {'active': [], 'settled': []}), "
     "'permissions': {'currentValue': 'workspace-write'}, "
     "'inbox': behavior.get('inbox', {'next-turn': [], 'next-step': []}), "
     "**({'contextHeaders': behavior['context_headers']} if 'context_headers' in behavior else {})}")
@@ -463,6 +467,7 @@ async def main():
             assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
         takeover = None
         preflight_runs = []
+        blocked_question_stage = None
         if supervise_takeover:
             # One real 8/8 exit after a rejected terminal attempt consumes the native
             # failure allowance. The second worker's real 8/8 exhaustion closes
@@ -562,6 +567,64 @@ async def main():
         supervise_terminal = None
         supervise_ledger = None
         while time.monotonic() < deadline:
+            if blocked_question_takeover and peer['prompts']:
+                sid = record()['dsh_execution']['session_id']
+                if blocked_question_stage is None:
+                    pending_questions = [{'id': 'q1', 'question': 'Which fixture contract?'},
+                        {'id': 'q2', 'question': 'Which fixture test?'}]
+                    journal = peer['journals'][sid]
+                    journal.append({'type': 'event', 'event': {'type': 'tool/call', 'seq': len(journal), 'time': 4,
+                        'data': {'turn': 1, 'step': 1, 'callId': 'fixture-blocked-question', 'name': 'ask_user_question',
+                            'arguments': json.dumps({'questions': pending_questions})}}})
+                    fixture_behavior['user_questions'] = {'active': [{'callId': 'fixture-blocked-question',
+                        'state': 'open', 'questions': pending_questions}], 'settled': []}
+                    peer['send_remote']({'type': 'waterfall', 'event': 'user-questions/request',
+                        'agentId': sid, 'eventId': 'fixture-blocked-question-event',
+                        'request': {'wait': {'callId': 'fixture-blocked-question'}, 'questions': pending_questions}})
+                    blocked_question_stage = 'published'
+                pending = next((q for q in record()['dsh_execution'].get('questions', [])
+                    if q['id'] == 'fixture-blocked-question'), None)
+                if blocked_question_stage == 'published' and pending and pending.get('notification') == 'delivered':
+                    await receive(adapter, raw('om_partial_question', '@_user_1 q1：Bounded contract',
+                        parent_id=pending['delivery']['message_id']))
+                    assert list(record()['dsh_execution']['questions'][0]['answers']) == ['q1']
+                    with connect_closing() as db:
+                        assert kb.block_task(db, initial['card_id'], kind='needs_input', reason='Original question awaits owner.',
+                            expected_run_id=worker['run_id'])
+                    model.repeat_supervise = False
+                    model.worker_steps = 3
+                    until = time.monotonic() + 10
+                    while time.monotonic() < until:
+                        waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                        if waited:
+                            assert os.waitstatus_to_exitcode(status) == 0
+                            break
+                        await asyncio.sleep(.05)
+                    else:
+                        raise AssertionError('Original pending-question supervisor did not end normally.')
+                    worker = None
+                    prior = record()
+                    previous_claim = dict(prior['dsh_execution']['supervisor_claim'])
+                    prior['dsh_execution'].update(state='outcome_unknown', last_failure={
+                        'phase': 'worker_claim', 'code': 'repository_busy', 'message': 'Earlier work retains this repository.'})
+                    adapter.intake._save_execution(prior, fields=['state', 'last_failure'])
+                    assert 'error' not in json.loads(registry.dispatch('kanban_unblock', {'task_id': initial['card_id']}))
+                    model.worker_steps = 1
+                    model.repeat_supervise = True
+                    model.worker_terminal_attempt_at = 5
+                    model.worker_finish_at = 6
+                    with connect_closing() as db:
+                        assert dispatch_once(db, max_spawn=1).spawned
+                        worker = remember_worker(db, initial['card_id'])
+                    blocked_question_stage = 'reclaimed'
+                    continue
+                if blocked_question_stage == 'reclaimed':
+                    current = record()['dsh_execution']
+                    assert current.get('last_failure', {}).get('message') != 'The original worker input remains unconfirmed; no claim transfer.', current.get('last_failure')
+                    if current['supervisor_claim']['run_id'] == worker['run_id']:
+                        assert current['session_id'] == sid and len(peer['prompts']) == 1
+                        assert current['questions'][0]['state'] == 'open' and list(current['questions'][0]['answers']) == ['q1']
+                        blocked_question_stage = 'verified'
             if preinput_stop and record()['dsh_execution']['state'] == 'outcome_unknown':
                 assert record()['dsh_execution']['last_failure']['code'] == 'repository_busy'
                 assert not peer['prompts'] and not record()['dsh_execution'].get('session_id')
@@ -772,6 +835,67 @@ async def main():
                 next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
                 ended = True
             latest = record()
+            if (missing_report_rework and ended and latest['dsh_execution']['state'] == 'awaiting_acceptance'
+                    and 'delivery_report_missing' in latest['dsh_execution'].get('acceptance', {}).get('unmet', [])):
+                until = time.monotonic() + 12
+                while time.monotonic() < until:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        break
+                    await asyncio.sleep(.05)
+                else:
+                    raise AssertionError('Original missing-report supervisor did not normally end.')
+                worker = None
+                budget_file = checkpoint_progress(1)
+                before_budget = budget_file.read_bytes()
+                before_acceptance = json.loads(json.dumps(record()['dsh_execution']['acceptance']))
+                notification = record()['dsh_execution']['delivery_notification']
+                assert notification['status'] == 'delivered' and notification.get('message_id')
+                result = {}
+                async def report_handler(event):
+                    result['value'] = json.loads(await asyncio.to_thread(registry.dispatch,
+                        'hermes_pm_repository_rework', {'work_id': initial['id']}))
+                runner._wire_adapter_handlers(adapter, message_handler=report_handler)
+                await receive(adapter, raw('om_report_request', '@_user_1 请在原会话补齐真实报告和实际测试，保留原预算。',
+                    parent_id=notification['message_id']))
+                until = time.monotonic() + 8
+                while not result and time.monotonic() < until:
+                    await asyncio.sleep(.02)
+                assert result.get('value', {}).get('status') == 'accepted' and result['value'].get('work_id') == initial['id'], result
+                assert result['value'].get('execution_started') is False
+                assert record()['dsh_execution']['acceptance'] == before_acceptance
+                assert record()['dsh_execution']['session_id'] == latest['dsh_execution']['session_id']
+                assert len(peer['prompts']) == 1 and budget_file.read_bytes() == before_budget
+                model.worker_steps = 1
+                with connect_closing() as db:
+                    assert dispatch_once(db, max_spawn=1).spawned
+                    worker = remember_worker(db, initial['card_id'])
+                until = time.monotonic() + 12
+                while len(peer['prompts']) < 2 and time.monotonic() < until:
+                    assert record()['dsh_execution']['state'] != 'outcome_unknown', record()['dsh_execution'].get('last_failure')
+                    await asyncio.sleep(.05)
+                assert len(peer['prompts']) == 2
+                assert peer['prompts'][1]['sessionId'] == latest['dsh_execution']['session_id']
+                assert 'HERMES_REPOSITORY_DELIVERY_JSON' in peer['prompts'][1]['content'][0]['text']
+                assert budget_file.read_bytes() == before_budget and record()['dsh_execution']['acceptance'] == before_acceptance
+                journal = peer['journals'][latest['dsh_execution']['session_id']]
+                journal.append({'type': 'event', 'event': {'type': 'turn/start', 'seq': len(journal), 'time': 8, 'data': {'turn': 2}}})
+                journal.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(journal), 'time': 8,
+                    'data': {'turn': 2, 'reason': {'kind': 'completed'}}}})
+                next(row for row in peer['sessions'] if row['sessionId'] == latest['dsh_execution']['session_id'])['running'] = False
+                until = time.monotonic() + 12
+                while time.monotonic() < until:
+                    waited, status = os.waitpid(worker['pid'], os.WNOHANG)
+                    if waited:
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        worker = None
+                        break
+                    await asyncio.sleep(.05)
+                assert worker is None
+                (scratch / 'shared-worker-result.json').write_text(json.dumps({
+                    'status': 'passed', 'missing_report_public_intake': True, 'acceptance_not_fabricated': True}))
+                return
             if background_cleanup and not background_foreign_notice:
                 assert latest['dsh_execution']['state'] != 'outcome_unknown', latest['dsh_execution'].get('last_failure')
             if supervision_checkpoints:
@@ -1016,7 +1140,7 @@ async def main():
                         'notification_count': len(notices), 'duplicate': True, 'unauthorized': json.loads(unauthorized),
                         'worker_exit': 0, 'ledger_before_stop': json.loads(checkpoint_budget), 'stop_proof': proof}
                     break
-            if supervise_slice:
+            if supervise_slice and (not blocked_question_takeover or blocked_question_stage == 'verified'):
                 tool_results = [result for batch in getattr(model, 'worker_tool_results', []) for result in batch
                                 if isinstance(result, dict)]
                 running_results = [result for result in tool_results

@@ -281,7 +281,18 @@ class RepositoryIntake(FeishuEntry):
                         and checkpoint.get('status') == 'reviewed' and checkpoint.get('notify_owner') is True
                         and checkpoint.get('delivery', {}).get('status') == 'delivered'
                         and checkpoint.get('delivery', {}).get('message_id') == envelope['parent_id']]
-                    if (sender.sender_type == 'user' and len(checkpoint_quotes) == 1
+                    delivery_quotes = [record for record in self.snapshot()['work']
+                        if record['profile_id'] in authorized_profiles and _qa_profile_matches(record, binding['profile_id'])
+                        and all(record.get('source_anchor', {}).get(key) == envelope[key] for key in
+                            ('app_id', 'transport_tenant_key', 'tenant_key', 'recipient_tenant_key',
+                             'recipient_open_id', 'chat_id', 'sender_open_id'))
+                        and record.get('dsh_execution', {}).get('mode') == 'shared_native'
+                        and record['dsh_execution'].get('session_id') and record['dsh_execution'].get('generation')
+                        and record['dsh_execution'].get('delivery_notification', {}).get('status') == 'delivered'
+                        and record['dsh_execution']['delivery_notification'].get('session_id') == record['dsh_execution']['session_id']
+                        and record['dsh_execution']['delivery_notification'].get('generation') == record['dsh_execution']['generation']
+                        and record['dsh_execution']['delivery_notification'].get('message_id') == envelope['parent_id']]
+                    if (sender.sender_type == 'user' and len(checkpoint_quotes + delivery_quotes) == 1
                             and not command.startswith(('派发 ', '工作 ', '核对 ', '停止 ', '结束后台 ', '重试 ', '继续 ', '续预算 ', '补充 '))):
                         return None
                     from .repository_questions import prepare_reply

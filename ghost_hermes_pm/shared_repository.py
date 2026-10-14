@@ -680,10 +680,10 @@ def _qa_rework_acceptance(execution):
     return ((execution.get('state') == 'awaiting_acceptance' or _pending_qa_rework_retry(execution))
             and execution.get('terminal_reason') == {'kind': 'completed'}
             and acceptance.get('status') == 'unmet' and acceptance.get('delivered') is False
-            and isinstance(unmet, list) and 'delivery_report_missing' not in unmet
-            and isinstance(acceptance.get('source_commit'), str) and acceptance.get('source_commit')
+            and isinstance(unmet, list) and ('delivery_report_missing' in unmet
+            or isinstance(acceptance.get('source_commit'), str) and acceptance.get('source_commit')
             and isinstance(acceptance.get('source_digest'), str) and acceptance.get('source_digest')
-            and isinstance(acceptance.get('workspace_status'), str))
+            and isinstance(acceptance.get('workspace_status'), str)))
 
 
 def _sealed_unknown_usage(events, previous_window):
@@ -1170,6 +1170,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
             or _human_pending(execution)):
         raise ManagementError('outcome_unknown', 'Only one idle unmet browser acceptance may queue QA rework.')
     acceptance = execution['acceptance']
+    missing_report = 'delivery_report_missing' in acceptance.get('unmet', [])
     card = _card(intake, record)
     if card['status'] not in {'blocked', 'triage'} or card.get('current_run_id') is not None or card.get('worker_pid') is not None:
         raise ManagementError('outcome_unknown', 'The browser acceptance rework card is not idle.')
@@ -1192,13 +1193,13 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
         if adopting else configuration)
     budget = read_ledger(ledger_configuration, execution)
     source = repository_source_state(record['target'])
-    if (source.get('head') != acceptance.get('source_commit')
+    if not missing_report and (source.get('head') != acceptance.get('source_commit')
             or source.get('source_digest') != acceptance.get('source_digest')
             or source.get('workspace_status') != acceptance.get('workspace_status')):
         raise ManagementError('binding_conflict', 'The accepted delivery source no longer matches the repository.')
     baseline = _source_core(execution.get('baseline'))
     current = _source_core(source)
-    if baseline is None or current is None or baseline == current:
+    if baseline is None or current is None or not missing_report and baseline == current:
         raise ManagementError('binding_conflict', 'The delivered source was not promoted from the original baseline.')
     current_window = budget.get('renewWindow')
     if current_window is None:
@@ -1288,7 +1289,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
                 or ends[-1].get('data', {}).get('reason') != execution.get('terminal_reason')):
             raise ManagementError('outcome_unknown', 'The original completed browser acceptance evidence is unconfirmed.')
         report = _report(events)
-        if (report is None or report.get('source_commit') != acceptance.get('source_commit')
+        if not missing_report and (report is None or report.get('source_commit') != acceptance.get('source_commit')
                 or 'source_digest' in report and report.get('source_digest') != acceptance.get('source_digest')
                 or 'workspace_status' in report and report.get('workspace_status') != acceptance.get('workspace_status')):
             raise ManagementError('outcome_unknown', 'The original completed browser acceptance evidence is unconfirmed.')
@@ -1308,8 +1309,9 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
                 or any(not isinstance(job, dict) or job.get('status') not in {'completed', 'killed', 'failed'}
                     or job.get('owner', execution['session_id']) != execution['session_id'] for job in jobs)):
             raise ManagementError('outcome_unknown', 'The original Session, Workspace, receipts or jobs are not idle.')
-        if not _verified_source_chain(execution, execution.get('baseline'), receipts, source, jobs,
-                job_receipts=shared_receipts(receipt_configuration, execution, '.jobs.jsonl')):
+        if not (missing_report and baseline == current and not receipts
+                or _verified_source_chain(execution, execution.get('baseline'), receipts, source, jobs,
+                    job_receipts=shared_receipts(receipt_configuration, execution, '.jobs.jsonl'))):
             raise ManagementError('outcome_unknown', 'Original source attribution receipts are unverified.')
         if private_file(budget_file).read_bytes() != budget_before:
             raise ManagementError('outcome_unknown', 'The original Session, Workspace, receipts or jobs are not idle.')
@@ -1327,6 +1329,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
                 'worker': worker, 'cursor': before['cursor'],
                 'snapshot_sha256': hashlib.sha256(json.dumps(before, sort_keys=True).encode()).hexdigest(),
                 'ledger_sha256': hashlib.sha256(budget_before).hexdigest(), 'qa_feedback': feedback,
+                **({'repository_source': current, 'missing_report': True} if missing_report else {}),
                 'qa_proposal': prior_natural.get('proposal'),
                 'workspace': {'workspace_id': account['workspaceId'], 'session_ids': account['sessionIds']}}
             execution['state'] = 'continuation_pending'
@@ -2834,7 +2837,50 @@ def record_shared_natural_qa_proposal(intake, record, proposal_id, delivery_cont
         os.close(descriptor)
 
 
-def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier):
+def _pending_original_question(execution, snapshot, carrier):
+    from .dsh import DshRemoteAdapter
+    if not isinstance(snapshot, dict) or snapshot.get('hasMore') is not False:
+        raise ManagementError('outcome_unknown', 'Original pending-question history is incomplete.')
+    events = [DshRemoteAdapter._journal_event(row) for row in snapshot.get('records', [])]
+    if (len(events) != snapshot.get('cursor', -2) + 1
+            or any(event['seq'] != index for index, event in enumerate(events))
+            or not any(event['type'] == 'user/message'
+                and event['data'].get('source') == {'kind': 'user', 'rpcId': execution.get('request_id')}
+                for event in events)):
+        raise ManagementError('outcome_unknown', 'Original pending-question input has no complete native audit.')
+    projections = snapshot.get('projections', {}).get('values', {})
+    if projections.get('inbox') != {'next-turn': [], 'next-step': []}:
+        raise ManagementError('outcome_unknown', 'Pending-question Session has unrelated queued input.')
+    # Waterfall clients belong to the gateway. A worker can verify its fresh
+    # native projection against the question already registered by that gateway.
+    observer = execution.get('shared_event_observer', {})
+    if (observer.get('status') != 'ready' or not observer.get('client_id')
+            or observer.get('session_id') != execution['session_id']
+            or observer.get('generation') != execution['generation']
+            or observer.get('host_lease') != execution.get('native_identity', {}).get('lease')):
+        raise ManagementError('binding_conflict', 'Original pending-question observer belongs to another execution.')
+    active = projections.get('userQuestions', {}).get('active', [])
+    matched = []
+    for question in execution.get('questions', []):
+        if question.get('kind') != 'structured' or question.get('state') != 'open':
+            continue
+        native = [row for row in active if row.get('callId') == question['id'] and row.get('state') == 'open'
+            and row.get('questions') == question['questions']]
+        calls = [event for event in events if event['type'] == 'tool/call'
+            and event['data'].get('name') == 'ask_user_question' and event['data'].get('callId') == question['id']
+            and event['seq'] == question['source_seq']]
+        digest = hashlib.sha256(json.dumps(question['questions'], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        if (question.get('session_id') == execution['session_id'] and question.get('generation') == execution['generation']
+                and question.get('source_digest') == digest and len(native) == len(calls) == 1
+                and isinstance(question.get('event_id'), str) and bool(question['event_id'])
+                and not any(event['type'] == 'tool/result'
+                    and event['data'].get('message', {}).get('toolCallId') == question['id'] for event in events)):
+            matched.append(question['id'])
+    if not matched or len(matched) != len(active):
+        raise ManagementError('outcome_unknown', 'Original open question ownership is unverified.')
+
+
+def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier, *, snapshot=None):
     import psutil
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
@@ -2845,22 +2891,32 @@ def _take_over_gave_up_claim(intake, record, run_id, configuration, carrier):
     previous = execution.get('supervisor_claim', {})
     if not previous or previous.get('run_id') == run_id:
         return False
+    identity = previous.get('identity', {})
+    with connect_closing(board=intake.board) as connection:
+        old = kb.get_run(connection, previous['run_id'])
+    blocked_question = old is not None and old.status == old.outcome == 'blocked'
+    if blocked_question:
+        with connect_closing(board=intake.board) as connection:
+            card = kb.get_task(connection, record['card_id'])
+        if (not _original_shared_card(intake, record, card) or old.profile != record['target']['native_profile']
+                or execution.get('stop_requested') or execution.get('stop_control')
+                or execution.get('first_input') != 'accepted' or continuation
+                or execution.get('state') not in {'running', 'outcome_unknown'}):
+            raise ManagementError('outcome_unknown', 'Original blocked-question supervision scope is unverified.')
+        _pending_original_question(execution, snapshot, carrier)
     failure = execution.get('last_failure', {})
     if (execution.get('state') not in {'running', 'outcome_unknown'}
             or execution.get('first_input') != 'accepted'
-            or execution.get('state') == 'outcome_unknown' and failure.get('code') != 'unauthorized'
+            or not blocked_question and execution.get('state') == 'outcome_unknown' and failure.get('code') != 'unauthorized'
             and (failure.get('code'), failure.get('message')) not in {
                 ('binding_conflict', 'The original shared source changed before supervision takeover.'),
                 ('outcome_unknown', 'The original worker input remains unconfirmed; no claim transfer.')}
             or continuation and continuation.get('status') != 'accepted'):
         raise ManagementError('outcome_unknown', 'The original worker input remains unconfirmed; no claim transfer.')
-    identity = previous.get('identity', {})
-    with connect_closing(board=intake.board) as connection:
-        old = kb.get_run(connection, previous['run_id'])
     if (old is None or old.id != previous['run_id'] or old.task_id != record['card_id']
-            or old.status != 'gave_up' or old.outcome != 'gave_up' or old.ended_at is None
-            or old.worker_pid not in {None, identity.get('pid')} or not isinstance(old.error, str)
-            or re.fullmatch(r'Iteration budget exhausted \(([1-9]\d*)/\1\) — task could not complete within the allowed iterations', old.error) is None):
+            or old.ended_at is None or old.worker_pid not in {None, identity.get('pid')}
+            or not blocked_question and (old.status != 'gave_up' or old.outcome != 'gave_up' or not isinstance(old.error, str)
+                or re.fullmatch(r'Iteration budget exhausted \(([1-9]\d*)/\1\) — task could not complete within the allowed iterations', old.error) is None)):
         raise ManagementError('outcome_unknown', 'The original iteration-budget worker cannot be safely supervised.')
     try:
         if type(identity.get('pid')) is not int or identity['pid'] <= 0:
@@ -3113,10 +3169,13 @@ async def run_shared_work(ctx, intake, record, generation):
             raise ManagementError('binding_conflict', 'Original shared Session header or preset is unverified.')
         if execution.get('session_created_at', header.get('createdAt')) != header.get('createdAt'):
             raise ManagementError('binding_conflict', 'Original shared Session creation identity changed.')
-        _take_over_gave_up_claim(intake, record, run_id, configuration, carrier)
+        _take_over_gave_up_claim(intake, record, run_id, configuration, carrier, snapshot=snapshot)
         phase = 'continuation_checkpoint'
         if pending_continuation:
             budget = read_ledger(configuration, execution)
+            if (continuation.get('missing_report') and _source_core(await asyncio.to_thread(
+                    repository_source_state, record['target'])) != continuation.get('repository_source')):
+                raise ManagementError('binding_conflict', 'The checkpointed missing-report repository source changed.')
             snapshot_matches = (hashlib.sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest() == continuation['snapshot_sha256']
                 if continuation.get('kind') in {'max_tokens', 'renew_window', 'resume_window', 'qa_rework'} else _maintenance_snapshot_matches(snapshot, execution['maintenance_checkpoint']))
             if continuation.get('kind') == 'max_tokens':
