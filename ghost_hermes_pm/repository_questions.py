@@ -33,6 +33,7 @@ def _safe_questions(intake, questions):
     # values and credential syntax were checked before this terminology filter.
     credential_material = re.sub(r'tokens?(?=\s*(?:预算|配额|上限|限制|用量|数量|权限|budget\b|usage\b|limit\b|count\b|permissions?\b))',
                                  'metadata', material, flags=re.I)
+    credential_material = credential_material.replace('席位凭据自动重连', '席位自动重连')
     if re.search(r'password|passwd|secret|token|api[_ -]?key|private[_ -]?key|密码|密钥|凭据|令牌', credential_material, re.I):
         return False
     if re.search(r'(?:approve|allow|批准|允许).*(?:execut|shell|command|tool|权限|执行|命令)', material, re.I):

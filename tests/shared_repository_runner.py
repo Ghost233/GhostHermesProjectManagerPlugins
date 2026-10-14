@@ -347,6 +347,8 @@ async def main():
             (docs / 'long-message.md').write_text('M' * 7500)
             material_cases = [('relative', '`docs/spec.md`', True),
                 ('token_metadata', '现有token权限检查与token预算；`docs/spec.md`', True),
+                ('seat_metadata', '刷新页面可凭席位凭据自动重连；`docs/spec.md`', True),
+                ('seat_value', '请提供席位凭据值；`docs/spec.md`', False),
                 ('token_metadata_legacy', '现有token权限检查；`docs/spec.md`', True),
                 ('token_value', '请提供token值；`docs/spec.md`', False),
                 ('token_access', '请批准扩展token权限；`docs/spec.md`', False),
