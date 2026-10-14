@@ -55,8 +55,9 @@ owner_maintenance = shared_scenario == 'owner_maintenance'
 owner_context = shared_scenario == 'owner_context' or owner_maintenance
 renew_window_again = shared_scenario == 'renew_window_again' or owner_context
 completed_renewed_window = resume_completed_window or renew_window_again or qa_preinput_retry
-renew_window = shared_scenario in {'renew_window', 'renew_window_unknown', 'renew_window_continue'}
-max_tokens_continuation = shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'continue_tokens_uncapped', 'renew_window', 'renew_window_unknown', 'renew_window_continue'}
+renew_request_window = shared_scenario == 'renew_request_window'
+renew_window = shared_scenario in {'renew_window', 'renew_window_unknown', 'renew_window_continue', 'renew_request_window'}
+max_tokens_continuation = renew_request_window or shared_scenario in {'continue_max_tokens', 'continue_max_tokens_unknown', 'continue_max_tokens_last_slot', 'continue_tokens_uncapped', 'renew_window', 'renew_window_unknown', 'renew_window_continue'}
 max_tokens_unknown = shared_scenario in {'continue_max_tokens_unknown', 'renew_window_unknown'}
 max_tokens_last_slot = shared_scenario == 'continue_max_tokens_last_slot'
 tokens_uncapped = shared_scenario == 'continue_tokens_uncapped'
@@ -271,6 +272,10 @@ reference.write_text(json.dumps({'schema': 1, 'approved': True, 'mode': 'shared_
         'runner_sha256': hashlib.sha256((ROOT / 'ghost_hermes_pm/repository_test_runner.py').read_bytes()).hexdigest(),
         'node_sha256': hashlib.sha256(Path(shutil.which('node')).resolve().read_bytes()).hexdigest()}}))
 reference.chmod(0o600)
+if renew_request_window:
+    request_scope = json.loads(reference.read_text())
+    request_scope['budget'] = {'max_model_requests': 8}
+    reference.write_text(json.dumps(request_scope))
 if qa_request_only_resume:
     policy_scope = json.loads(reference.read_text())
     policy_scope['supervision'] = {'interval_seconds': 3600, 'request_interval': 10}
@@ -2551,9 +2556,10 @@ async def main():
                                 budget_row['state'] = {'started_at_ms': int(time.time() * 1000), 'requests': 8,
                                     'reported_tokens': 345200 if tokens_uncapped else 145200,
                                     'admissions': ['fixture-request-' + str(step) for step in range(8)],
-                                    'stop_reason': None}
+                                    'stop_reason': 'shared-work-observed-budget' if renew_request_window else None}
                                 budget_file.write_text(json.dumps(budget_row))
-                                reason = {'kind': 'max-tokens'}
+                                reason = ({'kind': 'aborted', 'reason': {'kind': 'hook', 'reason': 'shared-work-observed-budget'}}
+                                    if renew_request_window else {'kind': 'max-tokens'})
                             rows.append({'type': 'event', 'event': {'type': 'turn/end', 'seq': len(rows),
                                 'time': 6, 'data': {'turn': 2, 'reason': reason}}})
                             next(row for row in peer['sessions'] if row['sessionId'] == sid)['running'] = False
@@ -2585,11 +2591,24 @@ async def main():
                         before_max = record()['dsh_execution']
                         max_budget_before = budget_file.read_bytes()
                         max_control_before = before_max['continuation_control']
-                        assert before_max['terminal_reason'] == {'kind': 'max-tokens'}
+                        assert before_max['terminal_reason'] == ({'kind': 'aborted', 'reason': {'kind': 'hook', 'reason': 'shared-work-observed-budget'}}
+                            if renew_request_window else {'kind': 'max-tokens'})
                         if renew_window:
                             old_budget = json.loads(max_budget_before)
-                            old_budget['state'].update(started_at_ms=int(time.time() * 1000) - 61000,
-                                stop_reason='shared-work-wall-budget')
+                            if not renew_request_window:
+                                old_budget['state'].update(started_at_ms=int(time.time() * 1000) - 61000,
+                                    stop_reason='shared-work-wall-budget')
+                            else:
+                                incomplete = json.loads(max_budget_before)
+                                incomplete['state']['requests'] -= 1
+                                incomplete['state']['admissions'].pop()
+                                budget_file.write_text(json.dumps(incomplete))
+                                await receive(adapter, raw('om_window_not_exhausted', '@_user_1 续预算 ' + latest['id']))
+                                denied = record()['dsh_execution']
+                                assert not denied.get('renew_window_checkpoint') and len(peer['prompts']) == 2
+                                assert denied['last_failure']['phase'] == 'renew_window'
+                                assert denied['last_failure']['code'] == 'outcome_unknown'
+                                assert budget_file.read_bytes() == json.dumps(incomplete).encode()
                             budget_file.write_text(json.dumps(old_budget))
                             max_budget_before = budget_file.read_bytes()
                             await receive(adapter, raw('om_window_plain_continue', '@_user_1 继续 ' + latest['id']))

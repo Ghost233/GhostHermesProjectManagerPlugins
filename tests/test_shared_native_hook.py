@@ -12,7 +12,7 @@ from sdk_source_integrity import source_snapshot
 
 
 @pytest.mark.parametrize('scenario', ['basic', 'integrity', 'limits', 'unknown', 'observer', 'recovery',
-                                      'lifecycle', 'tool_guard', 'inherited', 'guard_deadline', 'team', 'host_restart', 'late_host', 'renew_window', 'renew_interrupted', 'settlement_history',
+                                      'lifecycle', 'tool_guard', 'inherited', 'guard_deadline', 'team', 'host_restart', 'late_host', 'renew_window', 'renew_interrupted', 'renew_request_window', 'settlement_history',
                                       'runtime_stale_hash', 'runtime_noncanonical', 'runtime_workspace', 'runtime_writable',
                                       'runtime_notexec', 'runtime_old_version', 'runtime_entry_failed', 'runtime_reader_changed',
                                       'repeat_settlement', 'optional_caps'])

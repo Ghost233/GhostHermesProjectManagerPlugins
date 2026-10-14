@@ -1869,12 +1869,16 @@ def prepare_shared_window(intake, record, message_id):
     from .repository_control import _card, _worker_end
     from .repository_supervision import owned_call
     execution = record['dsh_execution']
+    request_stopped = (execution.get('state') == 'budget_stopped'
+        and execution.get('terminal_reason') == {'kind': 'aborted',
+            'reason': {'kind': 'hook', 'reason': 'shared-work-observed-budget'}})
     if (execution.get('mode') != 'shared_native' or execution.get('state') not in {'execution_failed', 'budget_stopped'}
-            or execution.get('terminal_reason', {}).get('kind') != 'max-tokens' or execution.get('first_input') != 'accepted'
+            or not (request_stopped or execution.get('terminal_reason', {}).get('kind') == 'max-tokens')
+            or execution.get('first_input') != 'accepted'
             or execution.get('stop_requested') or execution.get('lifecycle_end')
             or execution.get('acceptance', {}).get('status') == 'accepted'
             or execution.get('continuation_control', {}).get('status') not in {None, 'accepted'}):
-        raise ManagementError('outcome_unknown', 'Only an explicitly unfinished original max-tokens window may be prepared.')
+        raise ManagementError('outcome_unknown', 'Only an explicitly unfinished original max-tokens or request-stopped window may be prepared.')
     _card(intake, record)
     worker = _worker_end(intake, record)
     scope = json.loads(private_file(record['target']['execution_ref']).read_text())
@@ -1887,10 +1891,16 @@ def prepare_shared_window(intake, record, message_id):
     raw = private_file(budget_file).read_bytes()
     row = read_ledger(configuration, execution)
     state = row['state']
+    request_limit = row['budget'].get('max_model_requests')
+    expired = (type(request_limit) is int and request_limit > 0
+        and type(state.get('requests')) is int and state['requests'] == request_limit
+        and state.get('stop_reason') == 'shared-work-observed-budget') if request_stopped else (
+            'max_wall_seconds' in row['budget'] and type(state.get('started_at_ms')) is int
+            and time.time() * 1000 >= state['started_at_ms'] + row['budget']['max_wall_seconds'] * 1000
+            and state.get('stop_reason') in {None, 'shared-work-wall-budget'})
     if ('renewWindow' in row or type(state.get('started_at_ms')) is not int or not 0 < state['started_at_ms'] <= time.time() * 1000
-            or time.time() * 1000 < state['started_at_ms'] + row['budget']['max_wall_seconds'] * 1000
-            or state.get('stop_reason') not in {None, 'shared-work-wall-budget'} or state.get('requests', 0) <= 0):
-        raise ManagementError('outcome_unknown', 'Only one known expired original wall window may gain a prepared renewal.')
+            or not expired or type(state.get('requests')) is not int or state['requests'] <= 0):
+        raise ManagementError('outcome_unknown', 'Only one confirmed exhausted original budget may gain a prepared renewal.')
     carrier = SharedDesktopTransport(configuration)
     try:
         if carrier.native_identity != execution['native_identity']:

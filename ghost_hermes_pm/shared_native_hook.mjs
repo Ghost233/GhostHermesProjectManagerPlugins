@@ -139,7 +139,7 @@ export default function sharedNativeHook(ctx, config) {
         || window.original_state?.requests !== window.request_base
         || !integer(window.original_state?.started_at_ms) || window.original_state.started_at_ms <= 0
         || !integer(window.original_state?.reported_tokens) || state.reported_tokens < window.original_state.reported_tokens
-        || ![null, 'shared-work-wall-budget'].includes(window.original_state.stop_reason)
+        || ![null, 'shared-work-wall-budget', 'shared-work-observed-budget'].includes(window.original_state.stop_reason)
         || state.started_at_ms !== window.original_state.started_at_ms || state.stop_reason !== window.original_state.stop_reason
         || !Array.isArray(window.original_state.admissions) || window.original_state.admissions.length !== window.request_base
         || !window.original_state.admissions.every((key, index) => state.admissions[index] === key)

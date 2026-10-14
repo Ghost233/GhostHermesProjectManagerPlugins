@@ -150,7 +150,7 @@ try {
         : crypto.createHash('sha256').update(fs.readFileSync(reader)).digest('hex')};
   }
   const removePreset = await ctx.agentPresets.register(declaration);
-  if (scenario === 'late_host' || scenario === 'renew_window' || scenario === 'renew_interrupted') {
+  if (scenario === 'late_host' || scenario === 'renew_window' || scenario === 'renew_interrupted' || scenario === 'renew_request_window') {
     const configs = {'dsh-storage-json': {root: path.join(scratch, 'domain')},
       'dsh-storage-domain': {backend: 'json'},
       'dsh-session-persistence-jsonl': {root: path.join(scratch, 'sessions')},
@@ -707,17 +707,19 @@ try {
       await owned.dispose();
     }
     settlementEvidence = {repeat_accepted: accepted, repeat_rejected: variants.filter(name => !accepted.includes(name))};
-  } else if (scenario === 'renew_window' || scenario === 'renew_interrupted') {
+  } else if (scenario === 'renew_window' || scenario === 'renew_interrupted' || scenario === 'renew_request_window') {
     const renew = async (id, model = 'fixture-route') => {
       const original = await create(id);
       const registration = register(original.agent, {model});
-      registration.budget.max_wall_seconds = 1;
+      if (scenario === 'renew_request_window') registration.budget = {max_model_requests: 2};
+      else registration.budget.max_wall_seconds = 1;
       fs.writeFileSync(ledgerPath(id), JSON.stringify(registration));
       await prompt(original.agent);
-      await new Promise(resolve => setTimeout(resolve, 1200));
+      if (scenario === 'renew_request_window') { await prompt(original.agent); await prompt(original.agent); }
+      else await new Promise(resolve => setTimeout(resolve, 1200));
       const raw = fs.readFileSync(ledgerPath(id));
       const row = JSON.parse(raw);
-      assert.equal(row.state.stop_reason, 'shared-work-wall-budget');
+      assert.equal(row.state.stop_reason, scenario === 'renew_request_window' ? 'shared-work-observed-budget' : 'shared-work-wall-budget');
       const oldEvents = Array.from({length: original.agent.session.seq}, (_, index) => structuredClone(original.agent.session.eventAt(index)));
       if (scenario === 'renew_interrupted') {
         assert.deepEqual(oldEvents.slice(-3).map(event => event.type), ['assistant/message', 'step/end', 'turn/end']);
@@ -778,15 +780,17 @@ try {
     await prompt(counted);
     const countedRow = JSON.parse(fs.readFileSync(ledgerPath(counted.session.id)));
     assert.equal(countedRow.state.requests - countedRow.renewWindow.request_base, 2);
-    assert.equal(countedRow.state.requests, 3, 'Cumulative reservations are never reset.');
-    assert.equal(countedRow.state.reported_tokens, 60);
+    assert.equal(countedRow.state.requests, scenario === 'renew_request_window' ? 4 : 3, 'Cumulative reservations are never reset.');
+    assert.equal(countedRow.state.reported_tokens, scenario === 'renew_request_window' ? 80 : 60);
     assert.equal(countedRow.renewWindow.stop_reason, 'shared-work-observed-budget');
-    assert.equal(calls.length, 3, 'Exactly two new requests fit the explicit window.');
+    assert.equal(calls.length, scenario === 'renew_request_window' ? 4 : 3, 'Exactly two new requests fit the explicit window.');
+    if (scenario !== 'renew_request_window') {
     const timed = await renew('fixture-window-wall', 'fixture-window-wait');
     const timedRow = JSON.parse(fs.readFileSync(ledgerPath(timed.session.id)));
     assert.equal(timedRow.renewWindow.stop_reason, 'shared-work-wall-budget');
     assert.equal(timedRow.state.stop_reason, 'shared-work-wall-budget');
     assert.equal(calls.length, 5, 'The new wall stop cancels the fifth external request.');
+    }
     }
   } else if (scenario === 'limits') {
     const tokens = await create('fixture-token-limit');

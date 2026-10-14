@@ -567,10 +567,11 @@ async def process_control(intake, prepared, generation):
             intake.require_active(generation)
             record = _record(intake, prepared.work_id)
             execution = record.get('dsh_execution', {})
-            if prepared.command.startswith(('停止 ', '结束后台 ')):
+            if prepared.command.startswith(('停止 ', '结束后台 ', '续预算 ')):
                 from .shared_repository import _record_shared_failure
                 _record_shared_failure(intake, record, error,
-                    'background_cleanup' if prepared.command.startswith('结束后台 ') else 'whole_stop')
+                    'background_cleanup' if prepared.command.startswith('结束后台 ') else
+                    'renew_window' if prepared.command.startswith('续预算 ') else 'whole_stop')
             if prepared.command.startswith(('停止 ', '结束后台 ')) and execution.get('stop_control'):
                 execution['stop_control'].update(status='unverified',
                     last_failure={key: execution['last_failure'][key] for key in ('code', 'type', 'message')})
