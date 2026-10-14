@@ -139,6 +139,8 @@ def test_supervision_checkpoint_pending_counts_follow_acceptance(question, appro
     budget = {'state': {'requests': 1, 'reported_tokens': 1, 'started_at_ms': int(time.time() * 1000) - 301000}}
     checkpoint = supervision_checkpoint(intake, record, {'budget': {}}, budget)
     assert (checkpoint['questions_pending'], checkpoint['approvals_pending']) == expected
+    assert checkpoint['answers_accepted'] == (1 if question.get('reply_status') == 'accepted' else 0)
+    assert checkpoint['jobs'] is None
 
 
 def test_shared_prompt_uses_current_ledger_and_verified_test_mapping(tmp_path, monkeypatch):

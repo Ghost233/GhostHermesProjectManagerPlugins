@@ -546,7 +546,7 @@ def _active_budget_snapshot(configuration, budget):
         'wall_seconds_remaining': _wall_remaining(configuration, active.get('started_at_ms')) if 'max_wall_seconds' in limits else None}
 
 
-def supervision_checkpoint(intake, record, configuration, budget, events=()):
+def supervision_checkpoint(intake, record, configuration, budget, events=(), *, carrier=None):
     from .manager import _public_text
     from .repository_acceptance import _human_pending
     execution = record['dsh_execution']
@@ -571,6 +571,7 @@ def supervision_checkpoint(intake, record, configuration, budget, events=()):
         reasons.append('requests')
     if not reasons:
         return None
+    jobs = carrier.owned_jobs() if carrier is not None else None
     starts = [event for event in events if event['type'] == 'turn/start']
     current_turn = {'turn': starts[-1]['data'].get('turn'), 'start_seq': starts[-1]['seq']} if starts else None
     checkpoint = {'id': uuid.uuid4().hex, 'status': 'pending', 'observed_at': now,
@@ -579,7 +580,9 @@ def supervision_checkpoint(intake, record, configuration, budget, events=()):
         'reported_tokens': budget['state']['reported_tokens'], 'trigger': reasons,
         'observed_state': execution['state'], 'journal_cursor': execution.get('journal_cursor'),
         'questions_pending': sum(_human_pending({'questions': [q]}) for q in latest.get('questions', [])),
+        'answers_accepted': sum(q.get('reply_status') == 'accepted' for q in latest.get('questions', [])),
         'approvals_pending': sum(_human_pending({'approvals': [a]}) for a in latest.get('approvals', [])),
+        'jobs': [{'status': job['status']} for job in jobs] if jobs is not None else None,
         'budget': _active_budget_snapshot(configuration, budget),
         'current_turn': current_turn, 'acceptance_status': latest.get('acceptance', {}).get('status', 'unverified')
             if execution['state'] == 'awaiting_acceptance' else 'unverified'}
@@ -3614,12 +3617,14 @@ async def run_shared_work(ctx, intake, record, generation):
                         return result
                 else:
                     return {'status': state, 'next_action': 'kanban_block', 'block_kind': 'needs_input', 'delivered': False}
-            checkpoint = supervision_checkpoint(intake, record, configuration, budget, events)
+            checkpoint = await asyncio.to_thread(supervision_checkpoint, intake, record, configuration, budget, events, carrier=carrier)
             if checkpoint is not None:
                 return {'status': 'review_required', 'next_action': 'hermes_pm_supervise',
                     'checkpoint': checkpoint, 'delivered': False,
                     'instruction': 'Summarize the verified checkpoint and decide whether immediate owner feedback is needed. '
-                        'Use checkpoint budget, pending counts and acceptance_status as the authoritative current facts. '
+                        'Use checkpoint budget, pending counts, answers_accepted, jobs and acceptance_status as the authoritative current facts. '
+                        'Narrative progress is not current job or question state, even when it is from the current turn. '
+                        'An accepted answer is already sent to DSH; completed, killed or failed jobs are no longer running. '
                         'Limits absent from budget.limits are not configured; no plugin token quota applies. '
                         'Progress with from_current_turn=false is historical reference, not this turn\'s acceptance or active preview evidence. '
                         'A running turn is unverified; do not reuse old report prose as current acceptance. '

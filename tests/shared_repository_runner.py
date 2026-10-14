@@ -383,7 +383,8 @@ async def main():
                 rows.append({'type': 'event', 'event': {'type': 'assistant/message', 'seq': len(rows), 'time': 4,
                     'data': {'turn': 1, 'step': index, 'usage': {'inputTokens': 12, 'outputTokens': 8},
                         'message': {'id': 'fixture-checkpoint-settlement-' + str(index), 'role': 'assistant',
-                            'content': [{'type': 'text', 'text': 'Synthetic active DSH progress.'}]}}}})
+                            'content': [{'type': 'text', 'text': 'Synthetic preview still active; waiting for owner feedback.'
+                                if shared_scenario == 'supervision_checkpoints' else 'Synthetic active DSH progress.'}]}}}})
             row['state'].update(started_at_ms=row['state']['started_at_ms'] or int(time.time() * 1000) - 1100,
                 requests=requests, reported_tokens=requests * 20,
                 admissions=['fixture-checkpoint-request-' + str(index) for index in range(requests)])
@@ -972,6 +973,8 @@ async def main():
                     assert latest['dsh_execution']['acceptance']['status'] == 'unmet'
                     notices = [message for message in sent if checkpoint['summary'] in message.request_body.content]
                     assert len(notices) == 1 and notices[0].message_id == 'om_shared'
+                    assert checkpoint['jobs'] == [{'status': 'running'}]
+                    assert '后台作业：运行 1，已结束 0' in notices[0].request_body.content
                     if background_whole_stop:
                         await receive(adapter, raw('om_whole_stop', '@_user_1 停止 ' + latest['id']))
                         stopped = record()['dsh_execution']
@@ -1271,14 +1274,17 @@ async def main():
                     assert checkpoint['requests'] == 11 and checkpoint['reported_tokens'] == 220
                     assert checkpoint['budget']['requests_used'] == 11 and checkpoint['budget']['requests_remaining'] is None
                     assert checkpoint['latest_progress']['from_current_turn'] is True
+                    assert checkpoint['jobs'] == []
                     instructions = [item['instruction'] for item in results if item.get('status') == 'review_required']
                     assert instructions and all('authoritative current facts' in text and 'from_current_turn=false' in text
                         and 'no plugin token quota' in text for text in instructions)
+                    assert all('Narrative progress is not current job or question state' in text for text in instructions)
                     assert latest['dsh_execution']['supervision_history'][-1] == checkpoint_quiet
                     notices = [message for message in sent if checkpoint['summary'] in message.request_body.content]
                     assert len(notices) == 1 and notices[0].message_id == 'om_shared'
                     assert '未设置请求上限' in notices[0].request_body.content and '无插件时限' in notices[0].request_body.content
                     assert '待答问题：0' in notices[0].request_body.content and '当前验收状态：unverified' in notices[0].request_body.content
+                    assert '后台作业：运行 0，已结束 0' in notices[0].request_body.content
                     assert checkpoint['delivery']['status'] == 'delivered'
                     assert checkpoint_ledger.read_bytes() == checkpoint_budget
                     assert latest['dsh_execution']['state'] == 'running' and len(peer['prompts']) == 1

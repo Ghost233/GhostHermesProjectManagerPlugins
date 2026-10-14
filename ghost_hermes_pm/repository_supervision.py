@@ -252,10 +252,15 @@ async def notify_checkpoint(intake, record, generation):
     checkpoint['delivery'] = {'status': 'intent'}
     intake._save_execution(record, fields=['supervision_checkpoint'])
     budget_text = _current_budget_text(checkpoint.get('budget'))
+    jobs = checkpoint.get('jobs')
+    job_text = ('后台作业：状态未核实' if jobs is None else '后台作业：运行 '
+        + str(sum(job['status'] in {'running', 'stopping'} for job in jobs)) + '，已结束 '
+        + str(sum(job['status'] in {'completed', 'killed', 'failed'} for job in jobs)))
     text = ('进度检查（截至 ' + time.strftime('%H:%M:%S', time.localtime(checkpoint['observed_at'])) + '）：'
         + '\n执行状态：' + checkpoint['observed_state'] + '\n本段模型请求：' + str(checkpoint['request_delta'])
         + '；累计：' + str(checkpoint['requests']) + '\n待答问题：' + str(checkpoint['questions_pending'])
         + '；待批操作：' + str(checkpoint['approvals_pending']) + budget_text
+        + '\n已送回原任务的答复：' + str(checkpoint.get('answers_accepted', 0)) + '；' + job_text
         + '\n当前验收状态：' + checkpoint.get('acceptance_status', 'unverified')
         + ('\n最近进度文字来自旧轮次，仅供参考。' if checkpoint.get('latest_progress', {}).get('from_current_turn') is False else '')
         + '\n\n' + checkpoint['summary'])
