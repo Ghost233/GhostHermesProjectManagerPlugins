@@ -26,6 +26,16 @@ def _card(intake, record):
     return intake._kanban('kanban_show', {'task_id': record['card_id']})['task']
 
 
+def _unspawned_block_run(run, events):
+    """Native ready-card blocking records a zero-duration run without a worker."""
+    rows = [event for event in events if event.run_id == run.id]
+    return (getattr(run, 'status', None) == getattr(run, 'outcome', None) == 'blocked'
+        and getattr(run, 'worker_pid', None) is None and getattr(run, 'worker_started_at', None) is None
+        and type(getattr(run, 'started_at', None)) is int and run.started_at == run.ended_at
+        and len(rows) == 1 and rows[0].kind in {'blocked', 'block_loop_detected', 'dependency_wait'}
+        and rows[0].payload.get('source_status') == 'ready')
+
+
 def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, allow_later_terminal=False):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect_closing
@@ -34,6 +44,7 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, al
         card = kb.get_task(connection, record['card_id'])
         latest = kb.latest_run(connection, record['card_id'])
         runs = kb.list_runs(connection, record['card_id'])
+        events = kb.list_events(connection, record['card_id']) if allow_later_terminal else []
     if not card or card.status not in statuses or card.current_run_id is not None or card.worker_pid is not None:
         raise ManagementError('outcome_unknown', 'The original Kanban worker has not ended.')
     claim = record['dsh_execution'].get('supervisor_claim')
@@ -51,8 +62,9 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, al
         or run.worker_pid not in {None, identity['pid']} or run.status == 'running' or run.ended_at is None):
         raise ManagementError('outcome_unknown', 'The original claimed run has not ended.')
     terminal_statuses = {'done', 'blocked', 'crashed', 'timed_out', 'failed', 'released'}
+    later_runs = sorted((candidate for candidate in runs if candidate.id > run.id), key=lambda candidate: candidate.id)
     if allow_later_terminal and any(candidate.task_id != card.id or candidate.status not in terminal_statuses
-                                    or candidate.ended_at is None for candidate in runs if candidate.id > run.id):
+                                    or candidate.ended_at is None or candidate.profile != run.profile for candidate in later_runs):
         raise ManagementError('outcome_unknown', 'A later original worker remains active or unknown.')
     if psutil.pid_exists(identity['pid']):
         process = psutil.Process(identity['pid'])
@@ -64,6 +76,33 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, al
                 process.wait(timeout=.05)
             except psutil.TimeoutExpired:
                 raise ManagementError('outcome_unknown', 'The original worker process still exists.') from None
+    later_proofs = []
+    if allow_later_terminal:
+        from gateway.status import get_process_start_time
+        for candidate in later_runs:
+            if _unspawned_block_run(candidate, events):
+                later_proofs.append({'run_id': candidate.id, 'identity': None, 'exit_code': None, 'not_started': True})
+                continue
+            spawned = [event.payload for event in events if event.run_id == candidate.id and event.kind == 'spawned']
+            if (len(spawned) != 1 or type(spawned[0].get('pid')) is not int or spawned[0]['pid'] <= 0
+                    or not isinstance(spawned[0].get('started_at'), str) or '|' not in spawned[0]['started_at']
+                    or not spawned[0]['started_at'].split('|', 1)[1]
+                    or candidate.worker_pid not in {None, spawned[0]['pid']}
+                    or getattr(candidate, 'worker_started_at', None) not in {None, spawned[0]['started_at']}):
+                raise ManagementError('outcome_unknown', 'A later worker has no verified native birth identity.')
+            native_identity = spawned[0]
+            if psutil.pid_exists(native_identity['pid']):
+                current = get_process_start_time(native_identity['pid'])
+                if current is None:
+                    raise ManagementError('outcome_unknown', 'A later worker kernel identity is unavailable.')
+                if str(current) == native_identity['started_at'].split('|', 1)[1]:
+                    try:
+                        psutil.Process(native_identity['pid']).wait(timeout=.05)
+                    except psutil.TimeoutExpired:
+                        raise ManagementError('outcome_unknown', 'A later worker process still exists.') from None
+                    except psutil.NoSuchProcess:
+                        pass
+            later_proofs.append({'run_id': candidate.id, 'identity': native_identity, 'exit_code': 0})
     offset = claim.get('exit_log_offset')
     path = kb.worker_log_path(card.id, board=intake.board)
     size = path.stat().st_size
@@ -73,13 +112,27 @@ def _worker_end(intake, record, statuses=frozenset({'blocked', 'triage'}), *, al
         offset = 0
     if type(offset) is not int or offset < 0 or offset > size:
         raise ManagementError('outcome_unknown', 'Original worker log boundary changed.')
-    text = kb.read_worker_log(card.id, tail_bytes=min(4000, size - offset), board=intake.board)
-    if not isinstance(text, str):
-        raise ManagementError('outcome_unknown', 'The original worker log is unavailable.')
-    codes = re.findall(r'^\[kanban-worker-exit\] rc=(-?\d+)\s*$', text, re.MULTILINE)
-    if not codes or (codes[0] if allow_later_terminal else codes[-1]) != '0':
-        raise ManagementError('outcome_unknown', 'The original worker has no successful native exit receipt.')
-    return {'run_id': run.id, 'identity': identity, 'exit_code': 0}
+    if allow_later_terminal:
+        codes = []
+        with path.open('rb') as log:
+            log.seek(offset)
+            for line in log:
+                receipt = re.fullmatch(rb'\[kanban-worker-exit\] rc=(-?\d+)\s*', line)
+                if receipt:
+                    codes.append(receipt.group(1))
+        if len(codes) != 1 + sum(not proof.get('not_started') for proof in later_proofs) or any(code != b'0' for code in codes):
+            raise ManagementError('outcome_unknown', 'Original and later worker exit receipts are incomplete or unsuccessful.')
+    else:
+        text = kb.read_worker_log(card.id, tail_bytes=min(4000, size - offset), board=intake.board)
+        if not isinstance(text, str):
+            raise ManagementError('outcome_unknown', 'The original worker log is unavailable.')
+        codes = re.findall(r'^\[kanban-worker-exit\] rc=(-?\d+)\s*$', text, re.MULTILINE)
+        if not codes or codes[-1] != '0':
+            raise ManagementError('outcome_unknown', 'The original worker has no successful native exit receipt.')
+    proof = {'run_id': run.id, 'identity': identity, 'exit_code': 0}
+    if later_proofs:
+        proof['later_runs'] = later_proofs
+    return proof
 
 
 def _carrier_end(intake, record):

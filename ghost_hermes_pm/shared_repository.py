@@ -1174,7 +1174,7 @@ def _admit_shared_natural_qa_rework_locked(intake, record, source_context, feedb
     card = _card(intake, record)
     if card['status'] not in {'blocked', 'triage'} or card.get('current_run_id') is not None or card.get('worker_pid') is not None:
         raise ManagementError('outcome_unknown', 'The browser acceptance rework card is not idle.')
-    worker = _worker_end(intake, record)
+    worker = _worker_end(intake, record, allow_later_terminal=True)
     if _pending_qa_rework_retry(execution):
         return _requeue_unstarted_qa(intake, record, source_context, generation, card, worker)
     if prior_natural.get('status') == 'maintenance_required' and feedback == '维护完成':
@@ -3683,7 +3683,7 @@ async def end_shared_background(intake, record, message_id, generation):
                 or controller_identity(active.worker_pid) != claim['identity']):
             raise ManagementError('binding_conflict', 'The original background supervisor claim changed.')
     else:
-        worker = _worker_end(intake, record)
+        worker = _worker_end(intake, record, allow_later_terminal=True)
     carrier = shared_attach(intake, record, observe=False)
     try:
         budget = read_ledger(carrier.config, execution)
@@ -3799,7 +3799,7 @@ async def end_shared_background(intake, record, message_id, generation):
         carrier.close()
 
 
-def _unstarted_shared_worker_end(intake, record, *, statuses=frozenset({'blocked', 'triage'})):
+def _unstarted_shared_worker_end(intake, record, *, statuses=frozenset({'blocked', 'triage', 'todo'})):
     """Close only a native worker which ended before any DSH creation intent."""
     import psutil
     from hermes_cli import kanban_db as kb
@@ -3816,9 +3816,18 @@ def _unstarted_shared_worker_end(intake, record, *, statuses=frozenset({'blocked
         runs = kb.list_runs(connection, record['card_id'])
         events = kb.list_events(connection, record['card_id'])
     if (not _original_shared_card(intake, record, card) or card.status not in statuses or card.current_run_id is not None
-            or card.worker_pid is not None or len(runs) != 1 or runs[0].ended_at is None
+            or card.worker_pid is not None):
+        raise ManagementError('outcome_unknown', 'Original pre-input worker end is unverified.')
+    if not runs:
+        if any(event.kind in {'claimed', 'spawned', 'heartbeat'} for event in events):
+            raise ManagementError('outcome_unknown', 'Original pre-input worker history is incomplete.')
+        return {'run_id': None, 'exit_code': None, 'not_started': True}
+    if (len(runs) != 1 or runs[0].ended_at is None
             or runs[0].status == 'running' or runs[0].profile != record['target']['native_profile']):
         raise ManagementError('outcome_unknown', 'Original pre-input worker end is unverified.')
+    from .repository_control import _unspawned_block_run
+    if _unspawned_block_run(runs[0], events):
+        return {'run_id': runs[0].id, 'exit_code': None, 'not_started': True}
     spawned = [event.payload for event in events if event.run_id == runs[0].id and event.kind == 'spawned']
     if (len(spawned) != 1 or type(spawned[0].get('pid')) is not int or spawned[0]['pid'] <= 0
             or not isinstance(spawned[0].get('started_at'), str) or '|' not in spawned[0]['started_at']
@@ -3938,20 +3947,20 @@ async def stop_shared_work(intake, record, generation):
             raise ManagementError('outcome_unknown', 'Shared Session startup remains unconfirmed.')
         else:
             proof = {'scope': 'not_started', 'host_shutdown': False}
-        while time.monotonic() < deadline:
-            intake.require_active(generation)
-            try:
-                worker = await asyncio.to_thread(_worker_end, intake, record)
-                break
-            except ManagementError as error:
-                if error.code != 'outcome_unknown':
-                    raise
-                if not execution.get('generation') and not execution.get('session_id'):
-                    worker = _unstarted_shared_worker_end(intake, record)
-                    break
-            await asyncio.sleep(.05)
+        if not execution.get('generation') and not execution.get('session_id'):
+            worker = _unstarted_shared_worker_end(intake, record)
         else:
-            raise ManagementError('outcome_unknown', 'The original outer worker exit is unconfirmed.')
+            while time.monotonic() < deadline:
+                intake.require_active(generation)
+                try:
+                    worker = await asyncio.to_thread(_worker_end, intake, record, allow_later_terminal=True)
+                    break
+                except ManagementError as error:
+                    if error.code != 'outcome_unknown':
+                        raise
+                await asyncio.sleep(.05)
+            else:
+                raise ManagementError('outcome_unknown', 'The original outer worker exit is unconfirmed.')
         source = await asyncio.to_thread(repository_source_state, record['target'])
         await asyncio.to_thread(cleanup_shared_github, intake, record)
         descriptor = os.open(intake.lock_path, os.O_RDWR | os.O_NOFOLLOW)
@@ -3963,7 +3972,8 @@ async def stop_shared_work(intake, record, generation):
             from hermes_cli.kanban_db_connect import connect_closing
             with connect_closing(board=intake.board) as connection:
                 card = kb.get_task(connection, record['card_id'])
-                if card is None or card.current_run_id is not None or card.worker_pid is not None or card.status not in {'blocked', 'triage'}:
+                statuses = {'blocked', 'triage', 'todo'} if worker.get('not_started') else {'blocked', 'triage'}
+                if card is None or card.current_run_id is not None or card.worker_pid is not None or card.status not in statuses:
                     raise ManagementError('outcome_unknown', 'The stopped original outer card changed before archival.')
                 if not kb.archive_task(connection, record['card_id']):
                     raise ManagementError('outcome_unknown', 'Original stopped outer card archival is unconfirmed.')

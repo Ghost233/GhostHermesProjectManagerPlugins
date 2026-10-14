@@ -24,6 +24,7 @@ class WorkerModelService:
         self.worker_preflight = False
         self.worker_first_heartbeat = False
         self.worker_pause_on_unmet = False
+        self.worker_pause_on_block = False
         self.worker_request_ready = threading.Event()
         self.worker_request_release = threading.Event()
         self.fail_worker_after = None
@@ -81,9 +82,13 @@ class WorkerModelService:
                             service.worker_terminal_results.append({
                                 'call_id': message['tool_call_id'], 'tool_name': 'kanban_block', 'content': content})
                     service.worker_tool_results.append(results)
-                    if service.worker_pause_on_unmet and any(result.get('status') == 'unmet'
-                            for result in results if isinstance(result, dict)):
+                    if (service.worker_pause_on_unmet and any(result.get('status') == 'unmet'
+                            for result in results if isinstance(result, dict))
+                            or service.worker_pause_on_block and any(result.get('status') in {'blocked', 'triage'}
+                                or result.get('task', {}).get('status') in {'blocked', 'triage'}
+                                for result in results if isinstance(result, dict))):
                         service.worker_pause_on_unmet = False
+                        service.worker_pause_on_block = False
                         service.worker_request_ready.set()
                         if not service.worker_request_release.wait(timeout=10):
                             raise AssertionError('The bounded external worker response was not released.')
@@ -221,6 +226,7 @@ class WorkerModelService:
         self.base_url = f'http://127.0.0.1:{self.server.server_port}/v1'
 
     def close(self):
+        self.worker_request_release.set()
         self.dsh_release.set()
         self.server.shutdown()
         self.server.server_close()
