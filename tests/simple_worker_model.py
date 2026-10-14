@@ -134,7 +134,7 @@ class WorkerModelService:
                         if last.get('status') == 'review_required':
                             review = {'checkpoint_id': last['checkpoint']['id'],
                                 'summary': 'Synthetic checkpoint review ' + str(len(service.checkpoint_review_calls) + 1)
-                                    + '. Verified original DSH progress.',
+                                    + '. ' + getattr(service, 'checkpoint_analysis', 'Verified original DSH progress.'),
                                 'notify_owner': bool(service.checkpoint_review_calls) or getattr(service, 'notify_first_checkpoint', False)}
                             service.checkpoint_review_calls.append(review)
                             call = ('hermes_pm_supervise', review)

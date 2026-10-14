@@ -305,6 +305,7 @@ if supervise_slice:
 if supervision_checkpoints:
     model.review_supervision_checkpoints = True
     model.notify_first_checkpoint = background_cleanup
+    model.checkpoint_analysis = 'Owner playtest feedback is still pending; the preview is still running.'
 service_client, connect_service, receive, raw, ReplyMessageResponse = (namespace[name] for name in
     ('service_client', 'connect_service', 'receive', 'raw', 'ReplyMessageResponse'))
 
@@ -326,9 +327,12 @@ async def main():
     service.request = lambda _: types.SimpleNamespace(code=0, raw=types.SimpleNamespace(
         content=b'{"code":0,"bot":{"open_id":"ou_lead","activate_status":2}}'))
     sent = []
+    sent_by_id = {}
     def reply(request):
         sent.append(request)
-        return ReplyMessageResponse({'code': 0, 'data': {'message_id': 'om_sent_' + str(len(sent)),
+        message_id = 'om_sent_' + str(len(sent))
+        sent_by_id[message_id] = request
+        return ReplyMessageResponse({'code': 0, 'data': {'message_id': message_id,
             'chat_id': 'oc_fixture', 'parent_id': request.message_id}})
     service.im.v1.message.reply = reply
     worker = None
@@ -976,7 +980,8 @@ async def main():
                     assert latest['dsh_execution']['state'] == 'awaiting_acceptance'
                     assert latest['dsh_execution']['jobs'] == [{'id': 'fixture-preview', 'status': 'running'}]
                     assert latest['dsh_execution']['acceptance']['status'] == 'unmet'
-                    notices = [message for message in sent if checkpoint['summary'] in message.request_body.content]
+                    delivered = sent_by_id[checkpoint['delivery']['message_id']]
+                    notices = [message for message in sent if message.request_body.uuid == delivered.request_body.uuid]
                     assert len(notices) == 1 and notices[0].message_id == 'om_shared'
                     assert checkpoint['jobs'] == [{'status': 'running'}]
                     assert '后台作业：运行 1，已结束 0' in notices[0].request_body.content
@@ -1285,8 +1290,12 @@ async def main():
                         and 'no plugin token quota' in text for text in instructions)
                     assert all('Narrative progress is not current job or question state' in text for text in instructions)
                     assert latest['dsh_execution']['supervision_history'][-1] == checkpoint_quiet
-                    notices = [message for message in sent if checkpoint['summary'] in message.request_body.content]
+                    delivered = sent_by_id[checkpoint['delivery']['message_id']]
+                    notices = [message for message in sent if message.request_body.uuid == delivered.request_body.uuid]
                     assert len(notices) == 1 and notices[0].message_id == 'om_shared'
+                    assert model.checkpoint_analysis in checkpoint['summary']
+                    assert model.checkpoint_analysis not in notices[0].request_body.content
+                    assert '当前没有待答问题或待批操作' in notices[0].request_body.content
                     assert '未设置请求上限' in notices[0].request_body.content and '无插件时限' in notices[0].request_body.content
                     assert '待答问题：0' in notices[0].request_body.content and '当前验收状态：unverified' in notices[0].request_body.content
                     assert '后台作业：运行 0，已结束 0' in notices[0].request_body.content

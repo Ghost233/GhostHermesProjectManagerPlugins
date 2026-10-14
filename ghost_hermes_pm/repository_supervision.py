@@ -257,14 +257,18 @@ async def notify_checkpoint(intake, record, generation):
     job_text = ('后台作业：状态未核实' if jobs is None else '后台作业：运行 '
         + str(sum(job['status'] in {'running', 'stopping'} for job in jobs)) + '，已结束 '
         + str(sum(job['status'] in {'completed', 'killed', 'failed'} for job in jobs)))
+    human_status = ('当前没有待答问题或待批操作；已接纳的答复不再等待。'
+        if checkpoint['questions_pending'] == checkpoint['approvals_pending'] == 0
+        else '请处理当前待答问题或待批操作，以原提问消息和原审批卡为准；已接纳的答复不再等待。')
     text = ('进度检查（截至 ' + time.strftime('%H:%M:%S', time.localtime(checkpoint['observed_at'])) + '）：'
+        + '\n总 Issue：' + record['issue']['url'] + '\n工作引用：' + record['id']
         + '\n执行状态：' + checkpoint['observed_state'] + '\n本段模型请求：' + str(checkpoint['request_delta'])
         + '；累计：' + str(checkpoint['requests']) + '\n待答问题：' + str(checkpoint['questions_pending'])
         + '；待批操作：' + str(checkpoint['approvals_pending']) + budget_text
         + '\n已送回原任务的答复：' + str(checkpoint.get('answers_accepted', 0)) + '；' + job_text
         + '\n当前验收状态：' + checkpoint.get('acceptance_status', 'unverified')
-        + ('\n最近进度文字来自旧轮次，仅供参考。' if checkpoint.get('latest_progress', {}).get('from_current_turn') is False else '')
-        + '\n\n' + checkpoint['summary'])
+        + '\n' + human_status
+        + '\n状态与交付结论以本次核验为准；模型分析保留在原工作记录中。')
     result = await transport.send({'uuid': hashlib.sha256((record['id'] + ':checkpoint:' + checkpoint['id']).encode()).hexdigest()[:32],
         'text': text, 'chat_id': binding['chat_id'], 'reply_to': record['source_anchor']['message_id'],
         'thread_id': record['source_anchor'].get('thread_id')})
