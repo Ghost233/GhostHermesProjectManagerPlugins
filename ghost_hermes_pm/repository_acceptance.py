@@ -364,7 +364,7 @@ async def _verify(intake, record, carrier, events, projections, report, result, 
         unmet.append('required_merge_missing')
     if requirements['merge_forbidden'] and pr and pr['state'] == 'merged':
         unmet.append('merge_forbidden')
-    if re.search(r'(?:must|shall|requires?)\b.{0,30}\b(?:approved?\s+review|review\s+approval)\b|(?:必须|需要|要求).{0,20}(?:审查通过|审查批准)', issue['body'], re.IGNORECASE) and result['review_status'] != 'approved':
+    if re.search(r'(?:must|shall|requires?)\b.{0,30}\b(?:approved?\s+review|review\s+approval)\b|(?<!不)(?:必须|需要|要求).{0,20}(?:审查通过|审查批准)', issue['body'], re.IGNORECASE) and result['review_status'] != 'approved':
         unmet.append('required_review_missing')
     after = await asyncio.to_thread(repository_source_state, target)
     if after != current:

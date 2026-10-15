@@ -2751,7 +2751,7 @@ def test_original_kanban_worker_attaches_shared_desktop_through_public_entry(tmp
     'derived_source_changed', 'derived_failed_test', 'derived_wrong_command', 'derived_python_nonce',
     'derived_python_session', 'derived_python_generation', 'derived_python_files', 'derived_non_test', 'derived_zero_tests',
     'chinese_forbidden', 'chinese_pr_forbidden', 'chinese_conditional', 'chinese_conflict', 'chinese_no_auto',
-    'chinese_merge_condition', 'chinese_pr_merge_condition'])
+    'chinese_merge_condition', 'chinese_pr_merge_condition', 'chinese_review_not_required', 'chinese_review_required'])
 def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_path, monkeypatch, change):
     derive_ids = change.startswith('derived_')
     change = change.removeprefix('derived_')
@@ -2812,7 +2812,9 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
         'chinese_conflict': '不合并测试PR，但必须合并PR后交付。',
         'chinese_no_auto': '不自动合并测试PR。',
         'chinese_merge_condition': '不合并测试PR就不能交付。',
-        'chinese_pr_merge_condition': '测试PR不合并则无法验收。'}
+        'chinese_pr_merge_condition': '测试PR不合并则无法验收。',
+        'chinese_review_not_required': '不要求合并或审查通过才能交付；禁止合并测试PR。',
+        'chinese_review_required': '必须审查通过后交付。'}
     criterion = merge_cases.get(change, 'Verify the fixture feature.')
     issue = {'url': 'https://github.com/fixture-user/fixture/issues/7', 'title': 'Verify synthetic feature',
         'body': '- [ ] ' + criterion, 'updated_at': '2026-10-10T00:00:00Z'}
@@ -2886,10 +2888,12 @@ def test_shared_acceptance_reads_fixed_source_and_original_test_settlement(tmp_p
         'requests_used': 7, 'requests_remaining': 33, 'wall_seconds_remaining': None}
     result = asyncio.run(accept_repository_work(intake, record, carrier, events,
         {'inbox': {'next-turn': [], 'next-step': []}}, intake.generation, current_budget=current_budget))
-    accepted_cases = {'none', 'python_unittest', 'chinese_forbidden', 'chinese_pr_forbidden'}
+    accepted_cases = {'none', 'python_unittest', 'chinese_forbidden', 'chinese_pr_forbidden', 'chinese_review_not_required'}
     assert (result['status'] == 'accepted') == (change in accepted_cases), json.dumps(result)
     if change in {'chinese_conditional', 'chinese_conflict', 'chinese_no_auto', 'chinese_merge_condition', 'chinese_pr_merge_condition'}:
         assert result['unmet'] == ['merge_obligation_unclear']
+    elif change == 'chinese_review_required':
+        assert result['unmet'] == ['required_review_missing']
     elif derive_ids and change not in accepted_cases:
         assert 'test_evidence_missing' in result['unmet']
     elif change in {'source_changed', 'wrong_report_call'}:
